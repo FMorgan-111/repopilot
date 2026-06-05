@@ -1,3 +1,4 @@
+import base64
 import os
 import httpx
 
@@ -46,3 +47,19 @@ async def search_code(query: str, owner: str, repo: str) -> list[dict]:
         }
         for item in items
     ]
+
+
+async def read_file(owner: str, repo: str, path: str) -> dict:
+    """Fetch a file's contents from GitHub, decoded from base64."""
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(url, headers=_headers())
+    resp.raise_for_status()
+    data = resp.json()
+    content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
+    return {
+        "path": data.get("path", path),
+        "content": content,
+        "sha": data.get("sha", ""),
+        "size": data.get("size", 0),
+    }

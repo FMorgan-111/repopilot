@@ -53,3 +53,46 @@ def test_get_health_returns_ok():
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_post_agent_routes_to_agent_loop(monkeypatch):
+    async def fake_agent_analyze(issue_url, max_turns=10):
+        return {
+            "done": True,
+            "summary": "Login bug",
+            "files": ["src/auth.py"],
+            "fix_plan": "Patch auth",
+            "trace_id": "abc123def456",
+            "turns": 2,
+        }
+
+    monkeypatch.setattr(main, "agent_analyze", fake_agent_analyze)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/agent",
+        json={"issue_url": "https://github.com/acme/widget/issues/42"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["done"] is True
+    assert data["fix_plan"] == "Patch auth"
+    assert data["turns"] == 2
+
+
+def test_post_agent_invalid_url_returns_error(monkeypatch):
+    async def fake_agent_analyze(issue_url, max_turns=10):
+        return {"error": "Invalid GitHub issue URL: nope", "trace_id": "abc123def456"}
+
+    monkeypatch.setattr(main, "agent_analyze", fake_agent_analyze)
+    client = TestClient(main.app)
+
+    response = client.post("/agent", json={"issue_url": "nope"})
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "error",
+        "error": "Invalid GitHub issue URL: nope",
+        "trace_id": "abc123def456",
+    }

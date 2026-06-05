@@ -1,7 +1,9 @@
+import base64
+
 import httpx
 import pytest
 
-from src.tools import read_issue, search_code
+from src.tools import read_file, read_issue, search_code
 
 
 async def test_read_issue_success_returns_title_body_labels(httpx_mock):
@@ -90,3 +92,31 @@ async def test_search_code_empty_result(httpx_mock):
     )
 
     assert await search_code("missing thing", "acme", "widget") == []
+
+
+async def test_read_file_decodes_base64_content(httpx_mock):
+    content = base64.b64encode(b"print('hi')\n").decode()
+    httpx_mock.add_response(
+        url="https://api.github.com/repos/acme/widget/contents/src/app.py",
+        json={"path": "src/app.py", "content": content, "sha": "abc123", "size": 12, "encoding": "base64"},
+    )
+
+    result = await read_file("acme", "widget", "src/app.py")
+
+    assert result == {
+        "path": "src/app.py",
+        "content": "print('hi')\n",
+        "sha": "abc123",
+        "size": 12,
+    }
+
+
+async def test_read_file_http_error(httpx_mock):
+    httpx_mock.add_response(
+        url="https://api.github.com/repos/acme/widget/contents/missing.py",
+        status_code=404,
+        json={"message": "Not Found"},
+    )
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await read_file("acme", "widget", "missing.py")
