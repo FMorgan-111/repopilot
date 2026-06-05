@@ -49,7 +49,10 @@ async def analyze_issue(issue_url: str) -> dict:
 
     # Step 4: Search code
     try:
-        query = issue["title"][:100]
+        # Build search query from title + body start (better than title alone)
+        raw = f"{issue['title']} {issue['body'][:200]}"
+        # Keep only alphanumeric, spaces, dots, underscores
+        query = ' '.join(w for w in raw.replace('/', ' ').split() if len(w) > 1)[:200]
         files = await search_code(query, owner, repo)
     except Exception as e:
         t.log("search_code", {"query": query, "repo": f"{owner}/{repo}"},

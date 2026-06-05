@@ -21,13 +21,21 @@ def _extract_json(text: str) -> dict:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # Try first { ... } block
-    m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except json.JSONDecodeError:
-            pass
+    # Try first { ... } block with bracket counting (handles arbitrary nesting)
+    start = text.find('{')
+    if start >= 0:
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    block = text[start:i+1]
+                    try:
+                        return json.loads(block)
+                    except json.JSONDecodeError:
+                        break
     raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
