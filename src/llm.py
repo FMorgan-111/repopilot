@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import warnings
 import httpx
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError
@@ -138,10 +139,10 @@ async def validate_or_retry(system: str, user: str, schema: type[BaseModel]) -> 
         validated = schema.model_validate(raw)
         return validated.model_dump()
     except ValidationError as e:
-        # Retry once with error feedback
+        # Retry once with schema-error feedback (JSON parsed fine; schema didn't match)
         errors = str(e.errors())
         retry_user = (
-            f"Your last response was invalid JSON. Errors: {errors}\n\n"
+            f"Your response did not match the required schema. Errors: {errors}\n\n"
             f"Original request:\n{user}\n\n"
             "Return ONLY valid JSON matching the required keys and types."
         )
@@ -149,5 +150,6 @@ async def validate_or_retry(system: str, user: str, schema: type[BaseModel]) -> 
         try:
             validated2 = schema.model_validate(raw2)
             return validated2.model_dump()
-        except ValidationError:
-            return raw  # Fallback: return unvalidated raw dict
+        except ValidationError as e2:
+            warnings.warn(f"validate_or_retry: schema {schema.__name__} failed after retry: {e2.errors()}")
+            return raw2  # Fallback: return last raw dict (closer to correct shape than first)

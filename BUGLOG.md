@@ -18,9 +18,73 @@
 
 **现象**：`.env.example` 里写了 `LLM_MODEL=deepseek-chat`，但代码从来没读这个环境变量。改 `.env` 想切换模型是无效的。
 
-**根因**：`_config()` 只读 `DEEPSEEK_API_KEY` 和 `OPENAI_BASE_URL`，没读 `LLM_MODEL`。`llm_call()` 的 `model` 参数是硬编码的默认值。
+### 完整 Workflow
 
-**解决**：`_config()` 加 `model = os.getenv("LLM_MODEL", "deepseek-v4-pro")`，返回三元组。`llm_call()` 默认值改为 `None`，用 `_config()` 返回的 model。
+**Step 1 — 你在 `.env` 里改了模型**
+
+```
+LLM_MODEL=deepseek-v4-pro
+```
+
+心里想的是"以后所有 LLM 调用都用 v4-pro"。
+
+**Step 2 — 但代码从来没看这个变量**
+
+```python
+# 旧 _config() — 只返回 2 个值
+def _config() -> tuple[str, str]:
+    api_key = os.getenv("DEEPSEEK_API_KEY") ...
+    base_url = os.getenv("OPENAI_BASE_URL", ...)
+    return api_key, base_url     # ← 没有 model！
+```
+
+`_config()` 根本没读 `LLM_MODEL`。它返回的是 `(api_key, base_url)`，没有 model 字段。
+
+**Step 3 — llm_call 用了硬编码的默认值**
+
+```python
+async def llm_call(..., model: str = "deepseek-v4-flash") -> dict:
+    api_key, base_url = _config()
+    # model 参数来自函数签名默认值，不是来自 env
+```
+
+`model` 这个参数完全靠调用者传。如果调用者没传（`classify_issue`、`rank_files`、`generate_fix_plan` 都没传），就走默认值。而这个默认值是写在代码里的 `deepseek-v4-flash`——你在 `.env` 里改什么都没用。
+
+**Step 4 — `.env.example` 写了，代码不读，完全误导**
+
+```bash
+# .env.example
+LLM_MODEL=deepseek-chat   # ← 你觉得改了代码就会听？不会。
+```
+
+你（和其他开发者）看到这个注释，会自然地认为"改这个就能切模型"。实际上这个变量就是个死变量——定义了但没人读。Opus 管这叫"dead config knob"。
+
+### 根因
+
+`_config()` 只关心 API key 和 endpoint。模型名被当成"调用者自己决定的事"，散落在每个函数的默认参数里。环境和代码之间的契约断裂了——环境变量说"我有 LLM_MODEL"，代码说"我不看"。
+
+### 影响
+
+你永远在用代码里硬编码的默认模型。除非你手动改源代码里的函数签名，否则 `.env` 改了白改。
+
+### 解决
+
+让 `_config()` 读 `LLM_MODEL`，返回三元组：
+
+```python
+def _config() -> tuple[str, str, str]:
+    api_key = os.getenv("DEEPSEEK_API_KEY") ...
+    base_url = os.getenv("OPENAI_BASE_URL", ...)
+    model = os.getenv("LLM_MODEL", "deepseek-v4-pro")  # ← 现在真的读了
+    return api_key, base_url, model
+
+async def llm_call(..., model: str = None):
+    api_key, base_url, default_model = _config()
+    if model is None:
+        model = default_model            # ← 默认从 env 来，不是硬编码
+```
+
+`llm_call` 的默认值从 `"v4-flash"` 改成 `None`，意思是"我不做主了，听 `_config()` 的"。你在 `.env` 里改 `LLM_MODEL` 就真的能切模型了。
 
 ---
 
@@ -165,3 +229,78 @@ Opus 看到 `deepseek-v4-flash` 这个命名不像标准 OpenAI 模型（`gpt-4`
 |---|------|------|
 | 7 | `.venv/` 提交了空的虚拟环境，clone 后跑不了 | 从 git 移除 + gitignore |
 | 8 | `requirements.txt` 未锁版本，不可复现 | 全部加 `==` 固定版本 |
+
+---
+
+## 改进：Pydantic 结构化输出验证（已实现 ✅）
+
+### 问题：只验证 JSON 格式，不验证内容
+
+之前 `_extract_json()` 只管"能解析出 JSON 就算赢"。LLM 返回了 `{"type": "bug", "severity": "invalid_value", "confidence": -5}` —— 格式是 JSON，但内容全错了：severity 必须是 low/medium/high，confidence 必须是 0-1。旧代码不会发现这些错误。
+
+### Pydantic 是干什么的
+
+Pydantic 是 Python 的数据校验库。你定义一个模型，它自动检查数据是不是符合规则：
+
+```python
+class Classification(BaseModel):
+    type: str = Field(pattern="^(bug|feature|docs|test|security)$")
+    severity: str = Field(pattern="^(low|medium|high)$")
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = ""
+```
+
+- `type` 只能是 bug/feature/docs/test/security 之一
+- `confidence` 必须是 0 到 1 之间的浮点数
+- 缺字段、多了字段、类型不对——全部自动检测
+
+### 完整 Workflow
+
+**Step 1 — LLM 返回 JSON**
+
+```json
+{"type": "bug", "severity": "INVALID_VALUE", "confidence": 0.9}
+```
+
+JSON 解析成功，旧代码到此就结束了，直接当正确结果用。
+
+**Step 2 — Pydantic 校验**
+
+```python
+Classification.model_validate(raw)
+# → ValidationError: severity='INVALID_VALUE' does not match pattern
+```
+
+Pydantic 发现 `severity` 的值不在允许范围内，抛出详细的错误信息。
+
+**Step 3 — 带错误信息重试**
+
+```python
+retry_user = (
+    f"Your response did not match the schema. Errors: {errors}\n\n"
+    f"Original request:\n{user}\n\n"
+    "Return ONLY valid JSON matching the required keys and types."
+)
+raw2 = await llm_call(system, retry_user)
+```
+
+把具体错在哪里告诉 LLM，让它自己修正。不是模糊地说"重试"，而是说"severity 字段的值不符合 ^(low|medium|high)$ 这个规则"。
+
+**Step 4 — 二次校验 + fallback**
+
+```python
+try:
+    validated2 = schema.model_validate(raw2)
+    return validated2.model_dump()
+except ValidationError as e2:
+    warnings.warn(f"schema failed after retry: {e2.errors()}")
+    return raw2  # 还是失败？返回第二次的数据 + 打 warning
+```
+
+### 3 个关键决策
+
+**1. 两次失败后不崩溃，返回 raw 数据打 warning。** Agent 不能因为校验失败就直接挂掉——返回不完美的结果比什么都不回强。`warnings.warn()` 让生产环境能监控"LLM 输出不合格"的频率。
+
+**2. 错误提示说"schema 不匹配"，不说"JSON 无效"。** JSON 解析成功了（`_extract_json` 过了），问题出在字段内容不符合规则。说错原因会让 LLM 朝错误的方向修改。
+
+**3. `confidence: 0` 改成 `0.0`。** Python 里 `0` 是 int，`0.0` 是 float。Pydantic 的 `float` 字段不认 int。一分钱的类型不匹配就是整个校验失败。

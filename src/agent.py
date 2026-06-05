@@ -43,7 +43,7 @@ async def analyze_issue(issue_url: str) -> dict:
         classification = await classify_issue(issue["title"], issue["body"])
     except Exception as e:
         t.log("classify", {"title": issue["title"]}, {}, error=str(e))
-        classification = {"type": "unknown", "severity": "unknown", "confidence": 0}
+        classification = {"type": "unknown", "severity": "unknown", "confidence": 0.0}
 
     t.log("classify", {"title": issue["title"]}, classification)
 

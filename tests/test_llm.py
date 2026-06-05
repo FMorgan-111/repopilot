@@ -1,6 +1,8 @@
 import json
+import warnings
 
-from src.llm import classify_issue, generate_fix_plan, llm_call, rank_files
+from src.llm import classify_issue, generate_fix_plan, llm_call, rank_files, validate_or_retry
+from src.schemas import Classification
 
 
 def deepseek_response(content):
@@ -99,3 +101,35 @@ async def test_generate_fix_plan_returns_expected_keys(httpx_mock):
     assert result["fix_plan"] == "Patch auth validation."
     assert result["risk_level"] == "medium"
     assert result["test_suggestions"] == ["Add regression test."]
+
+
+async def test_validate_or_retry_succeeds_on_second_attempt(httpx_mock):
+    """First LLM response fails schema; retry returns a valid response."""
+    bad = {"type": "bug", "severity": "INVALID_VALUE", "confidence": 0.9}
+    good = {"type": "bug", "severity": "high", "confidence": 0.9}
+    url = "https://api.deepseek.com/v1/chat/completions"
+    httpx_mock.add_response(method="POST", url=url, json=deepseek_response(bad))
+    httpx_mock.add_response(method="POST", url=url, json=deepseek_response(good))
+
+    result = await validate_or_retry("sys", "user", Classification)
+
+    assert result["severity"] == "high"
+    assert len(httpx_mock.requests) == 2
+    # Retry prompt should mention schema mismatch, not "invalid JSON"
+    retry_body = json.loads(httpx_mock.requests[1].content)
+    assert "schema" in retry_body["messages"][1]["content"]
+
+
+async def test_validate_or_retry_warns_and_falls_back_after_two_failures(httpx_mock):
+    """Both attempts fail schema — falls back to raw dict and emits a warning."""
+    bad = {"type": "bug", "severity": "INVALID_VALUE", "confidence": 0.9}
+    url = "https://api.deepseek.com/v1/chat/completions"
+    httpx_mock.add_response(method="POST", url=url, json=deepseek_response(bad))
+    httpx_mock.add_response(method="POST", url=url, json=deepseek_response(bad))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = await validate_or_retry("sys", "user", Classification)
+
+    assert result == bad
+    assert any("Classification" in str(w.message) for w in caught)
