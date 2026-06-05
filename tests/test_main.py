@@ -38,7 +38,7 @@ def test_post_analyze_invalid_url(monkeypatch):
 
     response = client.post("/analyze", json={"issue_url": "nope"})
 
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.json() == {
         "status": "error",
         "error": "Invalid GitHub issue URL: nope",
@@ -90,7 +90,7 @@ def test_post_agent_invalid_url_returns_error(monkeypatch):
 
     response = client.post("/agent", json={"issue_url": "nope"})
 
-    assert response.status_code == 200
+    assert response.status_code == 400
     assert response.json() == {
         "status": "error",
         "error": "Invalid GitHub issue URL: nope",

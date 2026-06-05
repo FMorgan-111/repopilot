@@ -31,16 +31,19 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
-def _config() -> tuple[str, str]:
-    """Return (api_key, base_url) from environment. base_url includes /v1."""
+def _config() -> tuple[str, str, str]:
+    """Return (api_key, base_url, model) from environment. base_url includes /v1."""
     api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    return api_key, base_url
+    model = os.getenv("LLM_MODEL", "deepseek-chat")
+    return api_key, base_url, model
 
 
-async def llm_call(system_prompt: str, user_prompt: str, model: str = "deepseek-v4-flash") -> dict:
+async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> dict:
     """Call an OpenAI-compatible chat endpoint and return parsed JSON."""
-    api_key, base_url = _config()
+    api_key, base_url, default_model = _config()
+    if model is None:
+        model = default_model
     url = f"{base_url}/chat/completions"
     payload = {
         "model": model,

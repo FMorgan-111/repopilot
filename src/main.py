@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from src.agent import analyze_issue
 from src.agent_loop import agent_analyze
@@ -23,7 +24,8 @@ class AgentRequest(BaseModel):
 async def analyze(req: AnalyzeRequest):
     result = await analyze_issue(req.issue_url)
     if "error" in result:
-        return {"status": "error", **result}
+        status = 400 if "Invalid" in result["error"] else 502
+        return JSONResponse({"status": "error", **result}, status_code=status)
     return result
 
 
@@ -31,7 +33,8 @@ async def analyze(req: AnalyzeRequest):
 async def agent(req: AgentRequest):
     result = await agent_analyze(req.issue_url, req.max_turns)
     if "error" in result:
-        return {"status": "error", **result}
+        status = 400 if "Invalid" in result["error"] else 502
+        return JSONResponse({"status": "error", **result}, status_code=status)
     return result
 
 

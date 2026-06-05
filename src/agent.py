@@ -42,9 +42,6 @@ async def analyze_issue(issue_url: str) -> dict:
     try:
         classification = await classify_issue(issue["title"], issue["body"])
     except Exception as e:
-        import sys, datetime
-        with open('/tmp/repopilot_errors.log', 'a') as f:
-            f.write(f"[{datetime.datetime.now()}] classify: {type(e).__name__}: {e}\n")
         t.log("classify", {"title": issue["title"]}, {}, error=str(e))
         classification = {"type": "unknown", "severity": "unknown", "confidence": 0}
 
