@@ -20,7 +20,7 @@ async def test_llm_call_success_returns_json(httpx_mock, monkeypatch):
     assert result == {"answer": "ok"}
     request = httpx_mock.requests[0]
     assert request.headers["authorization"] == "Bearer test-key"
-    assert json.loads(request.content)["response_format"] == {"type": "json_object"}
+    # DeepSeek doesn't support response_format — we use prompt-based JSON
 
 
 async def test_classify_issue_returns_type_severity_confidence(httpx_mock):
