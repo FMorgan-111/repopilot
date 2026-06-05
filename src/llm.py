@@ -35,7 +35,7 @@ def _config() -> tuple[str, str, str]:
     """Return (api_key, base_url, model) from environment. base_url includes /v1."""
     api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.getenv("LLM_MODEL", "deepseek-chat")
+    model = os.getenv("LLM_MODEL", "deepseek-v4-pro")
     return api_key, base_url, model
 
 
