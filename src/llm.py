@@ -3,6 +3,9 @@ import os
 import re
 import httpx
 from dotenv import load_dotenv
+from pydantic import BaseModel, ValidationError
+
+from .schemas import Classification, FileRanking, FixPlan
 
 load_dotenv(override=True)
 
@@ -73,7 +76,7 @@ async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> d
 
 
 async def classify_issue(title: str, body: str) -> dict:
-    """Classify issue type, severity, and confidence."""
+    """Classify issue type, severity, and confidence (Pydantic-validated)."""
     system = (
         "You are a software engineering triage assistant. "
         "ONLY return valid JSON, no markdown, no explanation outside the JSON. "
@@ -81,11 +84,11 @@ async def classify_issue(title: str, body: str) -> dict:
         "severity (low|medium|high), confidence (0.0-1.0), reasoning (string)."
     )
     user = f"Issue title: {title}\n\nIssue body:\n{body}"
-    return await llm_call(system, user)
+    return await validate_or_retry(system, user, Classification)
 
 
 async def rank_files(issue_title: str, issue_body: str, files: list[dict]) -> list[dict]:
-    """Rank files by relevance to the issue, return list with relevance_score and reason."""
+    """Rank files by relevance (Pydantic-validated)."""
     if not files:
         return []
     file_list = "\n".join(f"- {f['path']}" for f in files)
@@ -99,7 +102,7 @@ async def rank_files(issue_title: str, issue_body: str, files: list[dict]) -> li
     user = (
         f"Issue: {issue_title}\n\nDescription:\n{issue_body}\n\nFiles:\n{file_list}"
     )
-    result = await llm_call(system, user)
+    result = await validate_or_retry(system, user, FileRanking)
     return result.get("files", [])
 
 
@@ -109,7 +112,7 @@ async def generate_fix_plan(
     classification: dict,
     ranked_files: list[dict],
 ) -> dict:
-    """Generate a fix plan, risk level, and test suggestions."""
+    """Generate a fix plan (Pydantic-validated)."""
     files_summary = "\n".join(
         f"- {f.get('path', '?')} (relevance: {f.get('relevance_score', '?')}): {f.get('reason', '')}"
         for f in ranked_files[:5]
@@ -125,4 +128,26 @@ async def generate_fix_plan(
         f"Classification: {json.dumps(classification)}\n\n"
         f"Relevant files:\n{files_summary}"
     )
-    return await llm_call(system, user)
+    return await validate_or_retry(system, user, FixPlan)
+
+
+async def validate_or_retry(system: str, user: str, schema: type[BaseModel]) -> dict:
+    """Call LLM, validate with Pydantic, retry once on failure."""
+    raw = await llm_call(system, user)
+    try:
+        validated = schema.model_validate(raw)
+        return validated.model_dump()
+    except ValidationError as e:
+        # Retry once with error feedback
+        errors = str(e.errors())
+        retry_user = (
+            f"Your last response was invalid JSON. Errors: {errors}\n\n"
+            f"Original request:\n{user}\n\n"
+            "Return ONLY valid JSON matching the required keys and types."
+        )
+        raw2 = await llm_call(system, retry_user)
+        try:
+            validated2 = schema.model_validate(raw2)
+            return validated2.model_dump()
+        except ValidationError:
+            return raw  # Fallback: return unvalidated raw dict
