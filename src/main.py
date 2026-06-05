@@ -1,7 +1,10 @@
 """RepoPilot — AI Agent that turns GitHub issues into fix plans."""
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 from fastapi import FastAPI
 from pydantic import BaseModel
-from .agent import analyze_issue
+from src.agent import analyze_issue
 
 app = FastAPI(title="RepoPilot")
 

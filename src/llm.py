@@ -1,26 +1,53 @@
 import json
 import os
+import re
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv(override=True)
+
+
+def _extract_json(text: str) -> dict:
+    """Extract JSON from LLM response — handles markdown, code fences, raw text."""
+    # Try raw parse first
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Try ```json ... ``` block
+    m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+    # Try first { ... } block
+    m = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
 def _config() -> tuple[str, str]:
-    """Return (api_key, base_url) from environment."""
+    """Return (api_key, base_url) from environment. base_url includes /v1."""
     api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com").rstrip("/")
+    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
     return api_key, base_url
 
 
-async def llm_call(system_prompt: str, user_prompt: str, model: str = "deepseek-chat") -> dict:
+async def llm_call(system_prompt: str, user_prompt: str, model: str = "deepseek-v4-flash") -> dict:
     """Call an OpenAI-compatible chat endpoint and return parsed JSON."""
     api_key, base_url = _config()
-    url = f"{base_url}/v1/chat/completions"
+    url = f"{base_url}/chat/completions"
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "response_format": {"type": "json_object"},
         "temperature": 0.2,
     }
     headers = {
@@ -31,14 +58,15 @@ async def llm_call(system_prompt: str, user_prompt: str, model: str = "deepseek-
         resp = await client.post(url, json=payload, headers=headers)
     resp.raise_for_status()
     content = resp.json()["choices"][0]["message"]["content"]
-    return json.loads(content)
+    return _extract_json(content)
 
 
 async def classify_issue(title: str, body: str) -> dict:
     """Classify issue type, severity, and confidence."""
     system = (
         "You are a software engineering triage assistant. "
-        "Return JSON with keys: type (bug|feature|docs|test|security), "
+        "ONLY return valid JSON, no markdown, no explanation outside the JSON. "
+        "Keys: type (bug|feature|docs|test|security), "
         "severity (low|medium|high), confidence (0.0-1.0), reasoning (string)."
     )
     user = f"Issue title: {title}\n\nIssue body:\n{body}"
@@ -52,7 +80,8 @@ async def rank_files(issue_title: str, issue_body: str, files: list[dict]) -> li
     file_list = "\n".join(f"- {f['path']}" for f in files)
     system = (
         "You are a code reviewer. Given a GitHub issue and a list of file paths, "
-        "return JSON with key 'files': an array of objects, each with: "
+        "ONLY return valid JSON, no markdown. Output JSON with key 'files': "
+        "an array of objects, each with: "
         "path (string), relevance_score (0.0-1.0), reason (string). "
         "Order by relevance_score descending."
     )
