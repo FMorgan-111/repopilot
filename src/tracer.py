@@ -1,0 +1,25 @@
+import json
+import sys
+from uuid import uuid4
+from datetime import datetime, timezone
+
+
+class Tracer:
+    def __init__(self):
+        self.trace_id = uuid4().hex[:12]
+        self.steps: list[dict] = []
+
+    def log(self, step: str, input: dict, output: dict, error: str | None = None) -> None:
+        """Emit a JSONL log entry to stdout and append to internal step list."""
+        entry = {
+            "trace_id": self.trace_id,
+            "step": step,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "input": input,
+            "output": output,
+        }
+        if error is not None:
+            entry["error"] = error
+
+        self.steps.append(entry)
+        print(json.dumps(entry), file=sys.stdout, flush=True)
