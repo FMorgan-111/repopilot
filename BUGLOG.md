@@ -304,3 +304,53 @@ except ValidationError as e2:
 **2. 错误提示说"schema 不匹配"，不说"JSON 无效"。** JSON 解析成功了（`_extract_json` 过了），问题出在字段内容不符合规则。说错原因会让 LLM 朝错误的方向修改。
 
 **3. `confidence: 0` 改成 `0.0`。** Python 里 `0` 是 int，`0.0` 是 float。Pydantic 的 `float` 字段不认 int。一分钱的类型不匹配就是整个校验失败。
+
+---
+
+## 今日工作记录（2026-06-05）
+
+### 1. 补写 Bug 2 完整 Workflow
+
+**原因**：之前 Bug 2 只有 3 行根因+解决。用户问"为什么有 2"。
+
+补充了 4 步完整路径：`.env` 改了模型 → 代码不读 `LLM_MODEL` → `llm_call` 硬编码默认值 → `.env.example` 写成死变量误导所有人。Opus 管这叫 dead config knob。
+
+### 2. 新增 Pydantic 结构化输出章节
+
+**原因**：用户问"Pydantic 是怎么回事"。按 BUGLOG 格式（Workflow 分步 + 根因 + 决策）写了完整说明。
+
+### 3. 解释"invalid JSON" vs "schema 不匹配"
+
+**问题**：旧重试提示说 "Your last response was invalid JSON"——但 JSON 解析成功了，错在 Pydantic 校验（字段值不符合规则）。
+
+**为什么重要**：LLM 收到 "invalid JSON" 会去改格式（加引号、调括号），但真正的问题是内容不合规。说错原因 = 白重试一次。
+
+### 4. 解释 fallback 为什么用 raw2 不用 raw
+
+**决策**：第一次失败后已把具体错误喂给 LLM，第二次尝试的字段值整体更接近正确格式。不是"保证正确"，是"更大概率正确"。
+
+**底线**：加上 `warnings.warn()` 亮信号，生产环境能监控 fallback 频率。
+
+### 5. 解释为什么不多 retry 几次
+
+**三个理由**：
+
+1. **递减回报**：第一次已拿到具体错误反馈，第二次修不了 = 同模型同 prompt 下再多几次也一样
+2. **累积延迟**：每个 retry 1-3 秒，Agent loop 里多轮调用会被放大
+3. **错误分类**：只有"疏忽"能修（1 次够），"规则矛盾"和"能力边界"修不了（N 次也不行）
+
+**替代方案**：不靠增加 retry 次数提高成功率，靠更准的错误提示、写死 prompt、换更强模型、或上 `response_format`。
+
+### 6. Pydantic 校验基准测试
+
+**原因**：用户质疑 "v4-pro 能力边界能不能搞定 schema"——诚实回答"不确定，没测过"。
+
+**测试**：写 `tests/bench_pydantic.py` + `tests/quick_bench.py`，对 Classification / FileRanking / FixPlan 各跑多次。
+
+**结果**：47/47 一次过，0 retry，0 fallback。
+
+**结论**：retry/fallback 代码在 v4-pro 下是死路径，但保留作为模型切换 / API 变更 / prompt 改动时的防御层。
+
+### 7. 确认模型配置
+
+三重验证当前使用 v4-pro：代码默认值、bench 输出自报模型名、47 次全过（v4-flash 大概率会有 retry）。
