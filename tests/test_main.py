@@ -96,3 +96,36 @@ def test_post_agent_invalid_url_returns_error(monkeypatch):
         "error": "Invalid GitHub issue URL: nope",
         "trace_id": "abc123def456",
     }
+
+
+def test_post_agent_v2_routes_to_new_agent(monkeypatch):
+    async def fake_agent_v2(issue_url, max_retries=3, token_budget=50000):
+        return {
+            "done": True,
+            "success": True,
+            "final_phase": "DONE",
+            "issue_url": issue_url,
+            "fix_applied": True,
+            "pr_url": "https://github.com/acme/widget/pull/42",
+            "turns_taken": 6,
+            "token_used": 1234,
+            "error": None,
+        }
+
+    monkeypatch.setattr(main, "agent_v2", fake_agent_v2)
+    client = TestClient(main.app)
+
+    response = client.post(
+        "/agent/v2",
+        json={
+            "issue_url": "https://github.com/acme/widget/issues/42",
+            "max_retries": 2,
+            "token_budget": 5000,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert data["final_phase"] == "DONE"
+    assert data["pr_url"] == "https://github.com/acme/widget/pull/42"

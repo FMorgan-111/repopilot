@@ -4,3 +4,4 @@ uvicorn==0.47.0
 pydantic==2.13.4
 python-dotenv==1.2.2
 pytest==9.0.3
+langgraph==1.2.4
