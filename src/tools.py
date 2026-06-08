@@ -1,6 +1,7 @@
 import base64
 import os
 
+from .cache import cached
 from .http_client import github_request
 
 GITHUB_API = "https://api.github.com"
@@ -14,6 +15,7 @@ def _headers() -> dict:
     return h
 
 
+@cached
 async def read_issue(owner: str, repo: str, issue_number: int) -> dict:
     """Fetch issue title, body, labels, and state from GitHub."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{issue_number}"
@@ -28,6 +30,7 @@ async def read_issue(owner: str, repo: str, issue_number: int) -> dict:
     }
 
 
+@cached
 async def search_code(query: str, owner: str, repo: str) -> list[dict]:
     """Search GitHub code for files related to the query in the given repo."""
     q = f"repo:{owner}/{repo} {query}"
@@ -46,6 +49,7 @@ async def search_code(query: str, owner: str, repo: str) -> list[dict]:
     ]
 
 
+@cached
 async def read_file(owner: str, repo: str, path: str) -> dict:
     """Fetch a file's contents from GitHub, decoded from base64."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"

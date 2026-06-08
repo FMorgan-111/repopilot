@@ -21,22 +21,39 @@ from ..state import (
 
 
 async def git_clone(state: AgentState) -> str:
-    """Clone the target repository to a temporary directory."""
+    """Clone the target repository to a temporary directory.
+
+    Strategy (best → fallback):
+    1. --depth 1 --filter=blob:none --single-branch  (fastest, Git 2.19+)
+    2. --depth 1  (shallow clone, no filter)
+    3. full clone  (no flags)
+    """
     token = os.getenv("GITHUB_TOKEN", "")
     if token:
         repo_url = f"https://x-access-token:{token}@github.com/{state.owner}/{state.repo}.git"
     else:
         repo_url = f"https://github.com/{state.owner}/{state.repo}.git"
     target = tempfile.mkdtemp(prefix=f"repopilot-{state.owner}-{state.repo}-")
-    result = subprocess.run(
+
+    strategies = [
+        ["git", "clone", "--depth", "1", "--filter=blob:none", "--single-branch", repo_url, target],
         ["git", "clone", "--depth", "1", repo_url, target],
-        capture_output=True,
-        text=True,
-        timeout=180,
-    )
-    if result.returncode != 0:
-        raise RuntimeError((result.stderr or result.stdout).strip())
-    return target
+        ["git", "clone", repo_url, target],
+    ]
+
+    last_error = ""
+    for cmd in strategies:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=180,
+        )
+        if result.returncode == 0:
+            return target
+        last_error = (result.stderr or result.stdout).strip()
+
+    raise RuntimeError(last_error)
 
 
 async def apply_patch(repo_path: str, patch_content: str) -> tuple[bool, str]:

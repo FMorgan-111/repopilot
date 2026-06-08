@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 from typing import Any
 
 from ..memory import get_store
@@ -49,24 +51,42 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
     except Exception:
         pass  # memory lookup is best-effort; fall through to API search
 
-    for term in _issue_search_terms(state.issue_title, state.issue_body):
-        try:
-            results = await search_code(term, state.owner, state.repo)
+    terms = _issue_search_terms(state.issue_title, state.issue_body)
+    parallel = not os.getenv("REPOPILOT_DISABLE_PARALLEL")
+
+    # ── search code for every term in parallel (or serial) ──
+    if parallel:
+        search_tasks = [
+            search_code(term, state.owner, state.repo) for term in terms
+        ]
+        all_search_results = await asyncio.gather(
+            *search_tasks, return_exceptions=True
+        )
+    else:
+        all_search_results = []
+        for term in terms:
+            try:
+                all_search_results.append(
+                    await search_code(term, state.owner, state.repo)
+                )
+            except Exception as exc:
+                all_search_results.append(exc)
+
+    for term, results in zip(terms, all_search_results):
+        if isinstance(results, Exception):
             _record_tool(
                 state,
                 "search_code",
                 {"query": term, "owner": state.owner, "repo": state.repo},
-                {"count": len(results)},
-            )
-        except Exception as exc:
-            _record_tool(
-                state,
-                "search_code",
-                {"query": term, "owner": state.owner, "repo": state.repo},
-                error=str(exc),
+                error=str(results),
             )
             continue
-
+        _record_tool(
+            state,
+            "search_code",
+            {"query": term, "owner": state.owner, "repo": state.repo},
+            {"count": len(results)},
+        )
         for result in results:
             path = result.get("path", "")
             if not path or path in by_path:
@@ -83,25 +103,43 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
         by_path.values(), key=lambda item: item.relevance_score, reverse=True
     )[:6]
     hydrated: list[FileInfo] = []
-    for info in ranked:
-        try:
-            file_data = await read_file(state.owner, state.repo, info.path)
-            info.content = file_data.get("content", "")
-            info.sha = file_data.get("sha", info.sha)
-            hydrated.append(info)
+
+    # ── read top files in parallel (or serial) ──
+    if parallel:
+        read_tasks = [
+            read_file(state.owner, state.repo, info.path) for info in ranked
+        ]
+        read_results = await asyncio.gather(
+            *read_tasks, return_exceptions=True
+        )
+    else:
+        read_results = []
+        for info in ranked:
+            try:
+                read_results.append(
+                    await read_file(state.owner, state.repo, info.path)
+                )
+            except Exception as exc:
+                read_results.append(exc)
+
+    for info, file_data in zip(ranked, read_results):
+        if isinstance(file_data, Exception):
             _record_tool(
                 state,
                 "read_file",
                 {"owner": state.owner, "repo": state.repo, "path": info.path},
-                {"size": len(info.content), "sha": info.sha},
+                error=str(file_data),
             )
-        except Exception as exc:
-            _record_tool(
-                state,
-                "read_file",
-                {"owner": state.owner, "repo": state.repo, "path": info.path},
-                error=str(exc),
-            )
+            continue
+        info.content = file_data.get("content", "")
+        info.sha = file_data.get("sha", info.sha)
+        hydrated.append(info)
+        _record_tool(
+            state,
+            "read_file",
+            {"owner": state.owner, "repo": state.repo, "path": info.path},
+            {"size": len(info.content), "sha": info.sha},
+        )
 
     state.relevant_files = hydrated
     state.token_usage += _estimate_tokens(
