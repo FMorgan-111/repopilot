@@ -39,6 +39,7 @@ class Phase(str, Enum):
     UNDERSTAND = "UNDERSTAND"
     LOCATE = "LOCATE"
     PLAN = "PLAN"
+    REFLECT = "REFLECT"
     EXECUTE = "EXECUTE"
     VERIFY = "VERIFY"
     COMMIT = "COMMIT"
@@ -111,6 +112,7 @@ class AgentState(BaseModel):
     pr_url: str | None = None
     failure_reason: str = ""
     trace_id: str = ""
+    reflection_notes: str = ""
 
 
 NodeFn = Callable[[AgentState], Awaitable[AgentState]]
@@ -361,6 +363,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         f"Attempt {idx + 1}: {attempt.test_result}\n{attempt.error_log[:2000]}"
         for idx, attempt in enumerate(state.fix_attempts)
     )
+    reflection_context = ""
+    if state.reflection_notes:
+        reflection_context = f"\n\nREFLECTION ANALYSIS:\n{state.reflection_notes}"
+
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
         f"CONTENT:\n{file.content[:8000]}"
@@ -375,6 +381,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         f"Issue URL: {state.issue_url}\n"
         f"Title: {state.issue_title}\n\nBody:\n{state.issue_body[:4000]}\n\n"
         f"Relevant files:\n{files_context}\n\nPrevious failures:\n{previous_failures}"
+        f"{reflection_context}"
     )
 
     try:
@@ -501,6 +508,59 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
     return state
 
 
+async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
+    """Ask the LLM to analyze WHY the previous fix attempt failed."""
+    state = _as_state(state)
+    if _is_budget_exceeded(state):
+        state.failure_reason = "Token budget exceeded before reflection."
+        state.current_phase = Phase.FAILURE
+        return state
+
+    attempts = state.fix_attempts
+    if not attempts:
+        state.failure_reason = "No fix attempt to reflect on."
+        state.current_phase = Phase.PLAN
+        return state
+
+    latest = attempts[-1]
+    test_output = latest.error_log[:3000] if latest.error_log else "(no output)"
+    patch_snippet = latest.patch_content[:2000] if latest.patch_content else "(no patch)"
+
+    previous_summary = ""
+    if len(attempts) > 1:
+        previous_summary = "\n\n".join(
+            f"Previous attempt {idx + 1}: success={a.success}, test_result={a.test_result}"
+            for idx, a in enumerate(attempts[:-1])
+        ) or "(none)"
+
+    system = (
+        "You are RepoPilot's reflection node. Analyze WHY the fix failed. "
+        "Be specific. Return JSON with keys: root_cause (string), "
+        "what_went_wrong (string), suggested_fix_approach (string), "
+        "files_that_also_need_changes (array of strings)."
+    )
+    user = (
+        f"Issue Title: {state.issue_title}\n\n"
+        f"Issue Body (first 2000 chars):\n{state.issue_body[:2000]}\n\n"
+        f"Patch Applied:\n{patch_snippet}\n\n"
+        f"Test Output:\n{test_output}\n\n"
+        f"Previous Attempts Summary:\n{previous_summary}"
+    )
+
+    try:
+        response = _extract_json_object(await llm_call(system, user))
+        state.reflection_notes = json.dumps(response)
+        state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
+        _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")
+    except Exception as exc:
+        state.reflection_notes = f"Reflection failed: {exc}"
+        state.token_usage += _estimate_tokens(system, user)
+        _remember(state, "assistant", f"Reflection error: {exc}")
+
+    state.current_phase = Phase.PLAN
+    return state
+
+
 def _same_failure_seen_twice(state: AgentState) -> bool:
     if len(state.fix_attempts) < 2:
         return False
@@ -545,7 +605,7 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     state.retry_count += 1
-    state.current_phase = Phase.PLAN
+    state.current_phase = Phase.REFLECT
     return state
 
 
@@ -765,6 +825,8 @@ def route_from_state(state: AgentState | dict[str, Any]) -> str:
         return "locate_code"
     if current == Phase.PLAN:
         return "plan_fix"
+    if current == Phase.REFLECT:
+        return "reflect_on_failure"
     if current == Phase.EXECUTE:
         return "execute_fix"
     if current == Phase.VERIFY:
@@ -822,6 +884,7 @@ def build_agent_graph() -> Any:
             "understand_issue": understand_issue,
             "locate_code": locate_code,
             "plan_fix": plan_fix,
+            "reflect_on_failure": reflect_on_failure,
             "execute_fix": execute_fix,
             "verify_fix": verify_fix,
             "commit_fix": commit_fix,
@@ -837,12 +900,14 @@ def build_agent_graph() -> Any:
     graph.add_node("plan_fix", plan_fix)
     graph.add_node("execute_fix", execute_fix)
     graph.add_node("verify_fix", verify_fix)
+    graph.add_node("reflect_on_failure", reflect_on_failure)
     graph.add_node("commit_fix", commit_fix)
     graph.add_node("handle_failure", handle_failure)
     for node in [
         "understand_issue",
         "locate_code",
         "plan_fix",
+        "reflect_on_failure",
         "execute_fix",
         "verify_fix",
         "commit_fix",
@@ -855,6 +920,7 @@ def build_agent_graph() -> Any:
                 "understand_issue": "understand_issue",
                 "locate_code": "locate_code",
                 "plan_fix": "plan_fix",
+                "reflect_on_failure": "reflect_on_failure",
                 "execute_fix": "execute_fix",
                 "verify_fix": "verify_fix",
                 "commit_fix": "commit_fix",

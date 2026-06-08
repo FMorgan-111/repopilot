@@ -80,5 +80,5 @@ async def test_verify_fix_replans_failed_attempt_once():
 
     next_state = await new_agent.verify_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.current_phase == new_agent.Phase.REFLECT
     assert next_state.retry_count == 1
