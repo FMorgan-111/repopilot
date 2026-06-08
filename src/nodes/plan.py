@@ -19,6 +19,7 @@ from ..llm import llm_call
 
 async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM for a concrete patch-oriented plan."""
+    import sys
     state = _as_state(state)
     if _is_budget_exceeded(state):
         state.failure_reason = "Token budget exceeded before planning."
@@ -51,6 +52,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     )
 
     try:
+        print(f"  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
         response = _extract_json_object(await llm_call(system, user))
     except Exception as exc:
         state.failure_reason = f"Failed to generate fix plan: {exc}"
@@ -60,6 +62,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     state.fix_plan = response.get("plan", "")
     state.patch_content = response.get("patch", "")
     state.test_command = response.get("test_command", "")
+    print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars)", file=sys.stderr, flush=True)
     state.token_usage += _estimate_tokens(system, user, json.dumps(response))
     _remember(state, "assistant", state.fix_plan[:2000])
     state.current_phase = Phase.EXECUTE if state.patch_content else Phase.FAILURE

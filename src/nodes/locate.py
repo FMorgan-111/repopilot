@@ -23,6 +23,7 @@ from ..tools import read_file, search_code
 
 async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
     """Search code and read the most relevant files into working memory."""
+    import sys
     state = _as_state(state)
     if _is_budget_exceeded(state):
         state.failure_reason = "Token budget exceeded before code location."
@@ -52,6 +53,7 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
         pass  # memory lookup is best-effort; fall through to API search
 
     terms = _issue_search_terms(state.issue_title, state.issue_body)
+    print(f"  [locate] Search terms: {terms}", file=sys.stderr, flush=True)
     parallel = not os.getenv("REPOPILOT_DISABLE_PARALLEL")
 
     # ── search code for every term in parallel (or serial) ──
@@ -102,6 +104,7 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
     ranked = sorted(
         by_path.values(), key=lambda item: item.relevance_score, reverse=True
     )[:6]
+    print(f"  [locate] Found {len(by_path)} candidate files, top {len(ranked)} ranked", file=sys.stderr, flush=True)
     hydrated: list[FileInfo] = []
 
     # ── read top files in parallel (or serial) ──

@@ -21,6 +21,7 @@ from ..llm import llm_call
 
 async def understand_issue(state: AgentState | dict[str, Any]) -> AgentState:
     """Read the GitHub issue, classify it, and seed conversation memory."""
+    import sys
     state = _as_state(state)
     try:
         owner, repo, issue_number = parse_issue_url(state.issue_url)
@@ -32,8 +33,10 @@ async def understand_issue(state: AgentState | dict[str, Any]) -> AgentState:
     state.owner = owner
     state.repo = repo
     state.issue_number = issue_number
+    print(f"  [understand] Parsed {owner}/{repo}#{issue_number}", file=sys.stderr, flush=True)
 
     try:
+        print(f"  [understand] Fetching issue from GitHub...", file=sys.stderr, flush=True)
         issue = await read_issue(owner, repo, issue_number)
         _record_tool(
             state,
@@ -57,6 +60,7 @@ async def understand_issue(state: AgentState | dict[str, Any]) -> AgentState:
     labels = [str(label).lower() for label in issue.get("labels", [])]
     state.issue_type = "bug" if "bug" in labels else "feature" if "feature" in labels else "unknown"
     state.severity = "high" if {"security", "critical", "regression"} & set(labels) else "medium"
+    print(f"  [understand] Got issue: \"{state.issue_title[:60]}\" type={state.issue_type}", file=sys.stderr, flush=True)
 
     system = (
         "You classify GitHub issues for an autonomous coding agent. "
