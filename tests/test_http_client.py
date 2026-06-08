@@ -6,11 +6,13 @@ import httpx
 import pytest
 
 from src.http_client import (
+    LLM_MAX_ATTEMPTS,
     MAX_RETRIES,
     RETRYABLE_GITHUB_STATUS,
     RETRYABLE_LLM_STATUS,
     _is_retryable_github,
     _is_retryable_llm,
+    _reset_llm_client,
     github_request,
     llm_request,
 )
@@ -24,6 +26,15 @@ from src.http_client import (
 async def _noop_sleep(*args, **kwargs):
     """Async no-op to replace asyncio.sleep in tests, avoiding real waits."""
     pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_llm_between_tests():
+    """Reset the shared LLM client so each test gets a fresh one (important
+    when httpx_mock swaps out the transport per-test)."""
+    _reset_llm_client()
+    yield
+    _reset_llm_client()
 
 
 # ---------------------------------------------------------------------------
@@ -219,13 +230,11 @@ async def test_github_request_network_error_exhausts_retries(monkeypatch):
 
 
 async def test_llm_request_retries_on_502(httpx_mock, monkeypatch):
-    """Mock returns 502 twice, then 200 — LLM retries should work."""
+    """Mock returns 502 once, then 200 — LLM retries should work (1 retry)."""
     monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
     monkeypatch.setenv("LLM_API_KEY", "test-key")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    httpx_mock.add_response(method="POST", url=url, status_code=502,
-                            json={"error": "bad gateway"})
     httpx_mock.add_response(method="POST", url=url, status_code=502,
                             json={"error": "bad gateway"})
     httpx_mock.add_response(
@@ -236,7 +245,7 @@ async def test_llm_request_retries_on_502(httpx_mock, monkeypatch):
     result = await llm_request([{"role": "user", "content": "hello"}])
 
     assert result["choices"][0]["message"]["content"] == '{"answer":"ok"}'
-    assert len(httpx_mock.requests) == 3
+    assert len(httpx_mock.requests) == LLM_MAX_ATTEMPTS
 
 
 async def test_llm_request_raises_after_max_retries(httpx_mock, monkeypatch):
@@ -245,7 +254,7 @@ async def test_llm_request_raises_after_max_retries(httpx_mock, monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "test-key")
 
     url = "https://api.deepseek.com/v1/chat/completions"
-    for _ in range(MAX_RETRIES + 1):
+    for _ in range(LLM_MAX_ATTEMPTS):
         httpx_mock.add_response(method="POST", url=url, status_code=502,
                                 json={"error": "bad gateway"})
 
@@ -253,7 +262,7 @@ async def test_llm_request_raises_after_max_retries(httpx_mock, monkeypatch):
         await llm_request([{"role": "user", "content": "hello"}])
 
     assert exc_info.value.response.status_code == 502
-    assert len(httpx_mock.requests) == MAX_RETRIES + 1
+    assert len(httpx_mock.requests) == LLM_MAX_ATTEMPTS
 
 
 async def test_llm_request_does_not_retry_on_400(httpx_mock, monkeypatch):
@@ -301,7 +310,7 @@ async def test_llm_request_retries_on_network_error(monkeypatch):
     async def mock_post(self, url, **kwargs):
         nonlocal call_count
         call_count += 1
-        if call_count <= 2:
+        if call_count <= 1:
             raise httpx.NetworkError("connection reset")
         # _llm_request_with_retry calls client.post() not client.request()
         req = httpx.Request("POST", url)
@@ -316,7 +325,7 @@ async def test_llm_request_retries_on_network_error(monkeypatch):
     result = await llm_request([{"role": "user", "content": "hello"}])
 
     assert result["choices"][0]["message"]["content"] == '{"ok":true}'
-    assert call_count == 3
+    assert call_count == LLM_MAX_ATTEMPTS
 
 
 async def test_llm_request_retries_on_timeout(monkeypatch):

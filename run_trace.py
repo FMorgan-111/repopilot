@@ -1,5 +1,6 @@
 import asyncio, json, sys, os
 sys.path.insert(0, '.')
+os.environ.setdefault('LLM_MODEL', 'deepseek-v4-flash')
 os.environ['REPOPILOT_DISABLE_PARALLEL'] = '1'
 os.environ['REPOPILOT_DISABLE_CACHE'] = '1'
 from src.new_agent import agent_v2

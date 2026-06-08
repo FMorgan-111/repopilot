@@ -11,6 +11,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+@pytest.fixture(autouse=True)
+def _reset_llm_global():
+    """Reset the shared LLM connection-pool client between tests so each
+    test gets a fresh transport (important when httpx_mock is in play)."""
+    from src.http_client import _reset_llm_client
+    _reset_llm_client()
+    yield
+    _reset_llm_client()
+
+
 class HTTPXMock:
     def __init__(self):
         self._responses = []

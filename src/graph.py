@@ -19,10 +19,10 @@ except ImportError:  # pragma: no cover - fallback is covered by tests.
 PHASE_TIMEOUTS: dict[str, float] = {
     "understand_issue": 15.0,
     "locate_code": 30.0,
-    "plan_fix": 60.0,
+    "plan_fix": 40.0,
     "execute_fix": 120.0,
     "verify_fix": 15.0,
-    "reflect_on_failure": 60.0,
+    "reflect_on_failure": 35.0,
     "commit_fix": 30.0,
     "handle_failure": 5.0,
 }

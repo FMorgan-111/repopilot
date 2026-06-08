@@ -20,12 +20,37 @@ from .rate_limiter import get_github_limiter
 load_dotenv(override=True)
 
 # ---------------------------------------------------------------------------
+# Module-level connection pool (shared across all callers)
+# ---------------------------------------------------------------------------
+
+_llm_client: httpx.AsyncClient | None = None
+
+
+def _get_llm_client() -> httpx.AsyncClient:
+    """Return the shared LLM :class:`httpx.AsyncClient` with connection pooling."""
+    global _llm_client
+    if _llm_client is None:
+        _llm_client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
+        )
+    return _llm_client
+
+
+def _reset_llm_client() -> None:
+    """Reset the cached LLM client (useful between tests)."""
+    global _llm_client
+    _llm_client = None
+
+
+# ---------------------------------------------------------------------------
 # Retry configuration
 # ---------------------------------------------------------------------------
 
 RETRYABLE_GITHUB_STATUS = {429, 502, 503, 504}
 RETRYABLE_LLM_STATUS = {502, 503, 504}
 MAX_RETRIES = 3
+LLM_MAX_ATTEMPTS = 2  # 1 initial + 1 retry (was 4 with MAX_RETRIES+1)
 
 
 def _is_retryable_github(exc: BaseException) -> bool:
@@ -106,7 +131,9 @@ async def llm_request(
     """LLM API request with exponential-backoff retry.
 
     Retries on  502 / 503 / 504  plus  *NetworkError* / *TimeoutException*.
-    Maximum 3 retries, exponential backoff: 2 s → 4 s → 8 s.
+    Maximum 1 retry (2 total attempts), exponential backoff: 2 s → 4 s.
+    Uses a shared connection pool (``_get_llm_client``) to avoid per-call
+    TCP handshake overhead.
     """
     url = f"{_get_llm_base_url()}/chat/completions"
     payload: dict[str, object] = {
@@ -124,13 +151,13 @@ async def llm_request(
 
 
 @retry(
-    stop=stop_after_attempt(MAX_RETRIES + 1),
+    stop=stop_after_attempt(LLM_MAX_ATTEMPTS),
     wait=wait_exponential(multiplier=2, min=2, max=20),
     retry=retry_if_exception(_is_retryable_llm),
     reraise=True,
 )
 async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dict:
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+    client = _get_llm_client()
+    resp = await client.post(url, json=payload, headers=headers)
+    resp.raise_for_status()
+    return resp.json()
