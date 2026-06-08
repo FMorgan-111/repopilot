@@ -36,8 +36,8 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
 
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
-        f"CONTENT:\n{file.content[:8000]}"
-        for file in state.relevant_files[:4]
+        f"CONTENT:\n{file.content[:2000]}"
+        for file in state.relevant_files[:2]
     )
     system = (
         "You are RepoPilot's planning node. Return ONLY JSON with keys: "
