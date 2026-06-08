@@ -1,0 +1,25 @@
+# Dependencies
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Data (large files)
+data/
+shards/
+logs/
+
+# Environment
+.env
+
+# CI
+.github/
+
+# Docs (not needed in container)
+docs/
+
+# Tests (not needed in container)
+tests/
+
+# Examples
+examples/

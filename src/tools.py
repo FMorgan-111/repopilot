@@ -1,6 +1,7 @@
 import base64
 import os
-import httpx
+
+from .http_client import github_request
 
 GITHUB_API = "https://api.github.com"
 
@@ -16,9 +17,7 @@ def _headers() -> dict:
 async def read_issue(owner: str, repo: str, issue_number: int) -> dict:
     """Fetch issue title, body, labels, and state from GitHub."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/issues/{issue_number}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_headers())
-    resp.raise_for_status()
+    resp = await github_request("GET", url, headers=_headers())
     data = resp.json()
     return {
         "title": data.get("title", ""),
@@ -34,9 +33,7 @@ async def search_code(query: str, owner: str, repo: str) -> list[dict]:
     q = f"repo:{owner}/{repo} {query}"
     url = f"{GITHUB_API}/search/code"
     params = {"q": q, "per_page": 10}
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_headers(), params=params)
-    resp.raise_for_status()
+    resp = await github_request("GET", url, headers=_headers(), params=params)
     items = resp.json().get("items", [])
     return [
         {
@@ -52,9 +49,7 @@ async def search_code(query: str, owner: str, repo: str) -> list[dict]:
 async def read_file(owner: str, repo: str, path: str) -> dict:
     """Fetch a file's contents from GitHub, decoded from base64."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}/contents/{path}"
-    async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.get(url, headers=_headers())
-    resp.raise_for_status()
+    resp = await github_request("GET", url, headers=_headers())
     data = resp.json()
     content = base64.b64decode(data.get("content", "")).decode("utf-8", errors="replace")
     return {

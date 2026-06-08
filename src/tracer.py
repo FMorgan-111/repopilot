@@ -1,7 +1,9 @@
 import json
-import sys
+import logging
 from uuid import uuid4
 from datetime import datetime, timezone
+
+logger = logging.getLogger("repopilot.tracer")
 
 
 class Tracer:
@@ -22,4 +24,4 @@ class Tracer:
             entry["error"] = error
 
         self.steps.append(entry)
-        print(json.dumps(entry), file=sys.stdout, flush=True)
+        logger.info(json.dumps(entry))

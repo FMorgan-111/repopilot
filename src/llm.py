@@ -2,13 +2,11 @@ import json
 import os
 import re
 import warnings
-import httpx
-from dotenv import load_dotenv
+
 from pydantic import BaseModel, ValidationError
 
+from .http_client import llm_request
 from .schemas import Classification, FileRanking, FixPlan
-
-load_dotenv(override=True)
 
 
 def _extract_json(text: str) -> dict:
@@ -43,36 +41,14 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
-def _config() -> tuple[str, str, str]:
-    """Return (api_key, base_url, model) from environment. base_url includes /v1."""
-    api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.getenv("LLM_MODEL", "deepseek-v4-pro")
-    return api_key, base_url, model
-
-
 async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> dict:
     """Call an OpenAI-compatible chat endpoint and return parsed JSON."""
-    api_key, base_url, default_model = _config()
-    if model is None:
-        model = default_model
-    url = f"{base_url}/chat/completions"
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "temperature": 0.2,
-    }
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    content = resp.json()["choices"][0]["message"]["content"]
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    resp_data = await llm_request(messages, model)
+    content = resp_data["choices"][0]["message"]["content"]
     return _extract_json(content)
 
 
