@@ -14,9 +14,11 @@ from typing import Any
 from .state import (
     AgentState,
     ConversationTurn,
+    DecisionFrame,
     FileInfo,
     FinalReport,
     FixAttempt,
+    Hypothesis,
     NodeFn,
     Phase,
     ToolCall,
@@ -27,6 +29,7 @@ from .state import (
     _issue_search_terms,
     _primary_patch_file,
     _rank_reason,
+    _record_decision_frame,
     _record_tool,
     _remember,
 )
@@ -158,6 +161,27 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
     )
 
 
+def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
+    report = final_report_from_state(state, turns_taken)
+    payload = report.model_dump()
+    payload.update(
+        {
+            "done": state.current_phase in {Phase.DONE, Phase.FAILED},
+            "success": state.current_phase == Phase.DONE,
+            "final_phase": state.current_phase.value,
+            "trace_id": state.trace_id,
+            "relevant_files": [file.model_dump() for file in state.relevant_files],
+            "fix_attempts": [attempt.model_dump() for attempt in state.fix_attempts],
+            "decision_frame": (
+                state.decision_frame.model_dump() if state.decision_frame else None
+            ),
+            "frame_history": [frame.model_dump() for frame in state.frame_history],
+            "error": state.failure_reason or None,
+        }
+    )
+    return payload
+
+
 async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 50000) -> dict:
     """Run the full RepoPilot v2 graph with progress output and trace saving."""
     import sys
@@ -198,7 +222,6 @@ async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 500
         }
 
     elapsed = _time.monotonic() - t_start
-    report = final_report_from_state(final_state, len(final_state.tool_calls))
     tracer.log(
         "agent_v2_done",
         {"issue_url": issue_url},
@@ -207,18 +230,7 @@ async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 500
     )
     print(f"[agent_v2] Done in {elapsed:.1f}s → {final_state.current_phase.value}", file=sys.stderr, flush=True)
 
-    payload = report.model_dump()
-    payload.update(
-        {
-            "done": final_state.current_phase in {Phase.DONE, Phase.FAILED},
-            "success": final_state.current_phase == Phase.DONE,
-            "final_phase": final_state.current_phase.value,
-            "trace_id": tracer.trace_id,
-            "relevant_files": [file.model_dump() for file in final_state.relevant_files],
-            "fix_attempts": [attempt.model_dump() for attempt in final_state.fix_attempts],
-            "error": final_state.failure_reason or None,
-        }
-    )
+    payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
 
     # Save trace to file
     _save_trace(tracer, "examples/traces/case_1.json")

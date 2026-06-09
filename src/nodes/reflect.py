@@ -7,11 +7,13 @@ from typing import Any
 
 from ..state import (
     AgentState,
+    DecisionFrame,
     Phase,
     _as_state,
     _estimate_tokens,
     _extract_json_object,
     _is_budget_exceeded,
+    _record_decision_frame,
     _remember,
 )
 from ..llm import llm_call
@@ -46,7 +48,10 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
         "You are RepoPilot's reflection node. Analyze WHY the fix failed. "
         "Be specific. Return JSON with keys: root_cause (string), "
         "what_went_wrong (string), suggested_fix_approach (string), "
-        "files_that_also_need_changes (array of strings)."
+        "files_that_also_need_changes (array of strings), hypotheses (array of "
+        "objects with id, claim, evidence, score), selected_hypothesis_id "
+        "(string), evidence (array of strings), next_checks (array of strings), "
+        "risk (low|medium|high|unknown), confidence (number 0.0 to 1.0)."
     )
     user = (
         f"Issue Title: {state.issue_title}\n\n"
@@ -61,6 +66,28 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
         state.reflection_notes = json.dumps(response)
         state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
         _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")
+        frame = DecisionFrame(
+            stage="reflect",
+            summary=response.get("root_cause", ""),
+            hypotheses=response.get("hypotheses", []),
+            selected_hypothesis_id=response.get("selected_hypothesis_id"),
+            evidence=response.get("evidence", []),
+            next_checks=response.get("next_checks", []),
+            recommended_action="plan",
+            confidence=response.get("confidence", 0.0),
+            risk=response.get("risk", "unknown"),
+            parent_frame_id=state.decision_frame.frame_id if state.decision_frame else None,
+            trace_notes=json.dumps(
+                {
+                    "what_went_wrong": response.get("what_went_wrong", ""),
+                    "suggested_fix_approach": response.get("suggested_fix_approach", ""),
+                    "files_that_also_need_changes": response.get(
+                        "files_that_also_need_changes", []
+                    ),
+                }
+            ),
+        )
+        _record_decision_frame(state, frame)
     except Exception as exc:
         state.reflection_notes = f"Reflection failed: {exc}"
         state.token_usage += _estimate_tokens(system, user)
