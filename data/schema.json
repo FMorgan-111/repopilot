@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "IssueFixExample",
+  "type": "object",
+  "required": ["id", "repo", "issue", "pr", "patch", "signals", "collected_at"],
+  "properties": {
+    "id": { "type": "string", "description": "owner/repo#issue_number:pr_number" },
+    "repo": {
+      "type": "object",
+      "required": ["owner", "name"],
+      "properties": {
+        "owner": { "type": "string" },
+        "name": { "type": "string" },
+        "stars": { "type": "integer" },
+        "language": { "type": "string" }
+      }
+    },
+    "issue": {
+      "type": "object",
+      "required": ["number", "title", "body"],
+      "properties": {
+        "number": { "type": "integer" },
+        "url": { "type": "string", "format": "uri" },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "labels": { "type": "array", "items": { "type": "string" } },
+        "created_at": { "type": "string", "format": "date-time" },
+        "closed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "pr": {
+      "type": "object",
+      "required": ["number", "title", "merged_at"],
+      "properties": {
+        "number": { "type": "integer" },
+        "url": { "type": "string", "format": "uri" },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "merged_at": { "type": "string", "format": "date-time" },
+        "linked_by": { "type": "string", "enum": ["fixes_keyword", "timeline"] }
+      }
+    },
+    "patch": {
+      "type": "object",
+      "required": ["full_diff", "files"],
+      "properties": {
+        "full_diff": { "type": "string", "description": "Unified diff from GitHub API" },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["path", "status", "additions", "deletions"],
+            "properties": {
+              "path": { "type": "string" },
+              "status": { "type": "string", "enum": ["added", "modified", "removed", "renamed"] },
+              "additions": { "type": "integer" },
+              "deletions": { "type": "integer" },
+              "patch": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "signals": {
+      "type": "object",
+      "properties": {
+        "has_tests_changed": { "type": "boolean" },
+        "fix_size_bucket": { "type": "string", "enum": ["small", "medium", "large"] }
+      }
+    },
+    "collected_at": { "type": "string", "format": "date-time" }
+  }
+}

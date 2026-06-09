@@ -1,0 +1,6 @@
+# Ignore heavy dataset files — keep only README, schema, and samples/
+*.jsonl
+*.sqlite3*
+
+# But track the sample data
+!samples/*.jsonl
