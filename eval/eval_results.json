@@ -1,0 +1,141 @@
+[
+  {
+    "id": "tox-dev/tox#3075:3748",
+    "repo": "tox-dev/tox",
+    "issue_title": "Tox 4 trying to reuse env where it didn't in tox 3",
+    "actual_files": [
+      "docs/changelog/3075.bugfix.rst",
+      "src/tox/config/loader/ini/replace.py",
+      "tests/config/loader/ini/replace/test_replace_tox_env.py",
+      "tests/session/cmd/test_show_config.py"
+    ],
+    "has_tests_changed": true,
+    "file_recall": {
+      "k1": 0.0,
+      "k3": 0.0,
+      "k5": 0.0
+    },
+    "patch_apply": false,
+    "patch_apply_error": "error: patch failed: src/tox/tox_env/api.py:55\nerror: src/tox/tox_env/api.py: patch does not apply",
+    "test_pass": null,
+    "test_output": "",
+    "token_usage": {
+      "input": 5397,
+      "output": 8673,
+      "cost": 0.00457947
+    },
+    "agent_patch": "diff --git a/src/tox/tox_env/api.py b/src/tox/tox_env/api.py\nindex 8f7f3a1..b4c5d6e 100644\n--- a/src/tox/tox_env/api.py\n+++ b/src/tox/tox_env/api.py\n@@ -1,3 +1,4 @@\n+from __future__ import annotations\n \"\"\"Defines the abstract base traits of a tox environment.\"\"\"\n \n from __future__ import annotations\n@@ -16,6 +17,7 @@ import sys\n from abc import ABC, abstractmethod\n from contextlib import contextmanager\n from pathlib import Path\n+import platform\n from typing import TYPE_CHECKING, Any, NamedTuple, cast\n \n from tox.execute.request import ExecuteRequest\n@@ -55,6 +57,9 @@ class ToxEnv(ABC):\n         self._suspended_out_err: OutErr | None = None\n         self._execute_statuses: dict[int, ExecuteStatus] = {}\n         self._interrupted = False\n+        self._fully_interrupted = False\n+        self._allow_interrupted_execution = False\n+        self._log_id = 0\n \n     @property\n     def cache(self) -> Info:\n@@ -71,5 +76,18 @@ class ToxEnv(ABC):\n     @abstractmethod\n     def executor(self) -> Execute:\n         raise NotImplementedError\n+\n+    @property\n+    def env_python(self) -> str:\n+        \"\"\"Return the path to the Python executable of this environment.\"\"\"\n+        if platform.system() == \"Windows\":\n+            return str(self.env_dir / \"Scripts\" / \"python.exe\")\n+        else:\n+            return str(self.env_dir / \"bin\" / \"python\")\n+\n+    def expand_envpython(self, command: str) -> str:\n+        \"\"\"Replace {envpython} placeholder with the actual Python path of this environment.\"\"\"\n+        return command.replace(\"{envpython}\", self.env_python)\n+\n \n __all__ = [\n     \"ToxEnv\",\n",
+    "error": null
+  },
+  {
+    "id": "Textualize/textual#4705:4720",
+    "repo": "Textualize/textual",
+    "issue_title": "Several command palette issues on 0.71.0",
+    "actual_files": [
+      "CHANGELOG.md",
+      "docs/guide/command_palette.md",
+      "src/textual/command.py",
+      "tests/snapshot_tests/__snapshots__/test_snapshots.ambr",
+      "tests/snapshot_tests/test_snapshots.py"
+    ],
+    "has_tests_changed": true,
+    "file_recall": {
+      "k1": 0.0,
+      "k3": 0.0,
+      "k5": 0.0
+    },
+    "patch_apply": false,
+    "patch_apply_error": "",
+    "test_pass": null,
+    "test_output": "",
+    "token_usage": {
+      "input": 0,
+      "output": 0,
+      "cost": 0.0
+    },
+    "agent_patch": "",
+    "error": "clone_failed"
+  },
+  {
+    "id": "python/mypy#20532:20643",
+    "repo": "python/mypy",
+    "issue_title": "False positive with warn unreachable, Any, and None",
+    "actual_files": [
+      "mypy/checker.py",
+      "test-data/unit/check-narrowing.test",
+      "test-data/unit/check-unreachable-code.test"
+    ],
+    "has_tests_changed": false,
+    "file_recall": {
+      "k1": 0.0,
+      "k3": 0.0,
+      "k5": 0.0
+    },
+    "patch_apply": false,
+    "patch_apply_error": "error: patch failed: mypy/typeops.py:987\nerror: mypy/typeops.py: patch does not apply",
+    "test_pass": null,
+    "test_output": "",
+    "token_usage": {
+      "input": 1389,
+      "output": 3827,
+      "cost": 0.00175275
+    },
+    "agent_patch": "diff --git a/mypy/typeops.py b/mypy/typeops.py\nindex abcdef1..1234567 100644\n--- a/mypy/typeops.py\n+++ b/mypy/typeops.py\n@@ -987,6 +987,10 @@ def narrow_declared_type_from_binary_expr(\n     If the conditional type map is non-`None`, it will be used to narrow the\n     type of `expr` after the comparison.\n     \"\"\"\n+    # If either side of the comparison is Any, the comparison gives no type\n+    # information and should not narrow the variable.\n+    if isinstance(left_type, AnyType) or isinstance(right_type, AnyType):\n+        return {}\n     if isinstance(left_type, UnionType):\n         return narrow_union_type_from_binary_expr(\n             expr, left_type, right_type, is_comparison, is_equality_guard\n",
+    "error": null
+  },
+  {
+    "id": "ansible/ansible#86228:86302",
+    "repo": "ansible/ansible",
+    "issue_title": "Using ansible_local triggers INJECT_FACTS_AS_VARS deprecation when using Ansible 13 (core 2.20)",
+    "actual_files": [
+      "changelogs/fragments/ansible_local_nodepr.yml",
+      "lib/ansible/vars/manager.py",
+      "test/integration/targets/deprecations/injectfacts.yml",
+      "test/integration/targets/deprecations/runme.sh"
+    ],
+    "has_tests_changed": false,
+    "file_recall": {
+      "k1": 0.0,
+      "k3": 0.0,
+      "k5": 0.0
+    },
+    "patch_apply": false,
+    "patch_apply_error": "",
+    "test_pass": null,
+    "test_output": "",
+    "token_usage": {
+      "input": 0,
+      "output": 0,
+      "cost": 0.0
+    },
+    "agent_patch": "",
+    "error": "clone_failed"
+  },
+  {
+    "id": "ansible/ansible#86395:86403",
+    "repo": "ansible/ansible",
+    "issue_title": "deb822_repository: install_python_debian option leaks into repository definition",
+    "actual_files": [
+      "changelogs/fragments/86403-fix-deb822-repository-output.yml",
+      "lib/ansible/modules/deb822_repository.py",
+      "test/integration/targets/deb822_repository/tasks/test.yml"
+    ],
+    "has_tests_changed": false,
+    "file_recall": {
+      "k1": 0.0,
+      "k3": 0.0,
+      "k5": 0.0
+    },
+    "patch_apply": false,
+    "patch_apply_error": "",
+    "test_pass": null,
+    "test_output": "",
+    "token_usage": {
+      "input": 0,
+      "output": 0,
+      "cost": 0.0
+    },
+    "agent_patch": "",
+    "error": "clone_failed"
+  }
+]
