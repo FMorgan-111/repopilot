@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 import time
 from typing import Any
 
-from .state import AgentState, NodeFn, _as_state, Phase
+from .state import AgentState, NodeFn, Phase, _as_state
 
 try:  # pragma: no cover - exercised only when langgraph is installed.
     from langgraph.graph import END, StateGraph
@@ -25,6 +26,17 @@ PHASE_TIMEOUTS: dict[str, float] = {
     "reflect_on_failure": 35.0,
     "commit_fix": 30.0,
     "handle_failure": 5.0,
+}
+
+logger = logging.getLogger("repopilot.graph")
+
+_RECOMMENDED_PHASES: dict[str, Phase] = {
+    "collect_more_context": Phase.LOCATE,
+    "plan": Phase.PLAN,
+    "execute": Phase.EXECUTE,
+    "reflect": Phase.REFLECT,
+    "stop": Phase.FAILURE,
+    "ask_user": Phase.WAITING_FOR_USER,
 }
 
 
@@ -118,24 +130,165 @@ class FallbackStateGraph:
 
 
 def route_from_state(state: AgentState | dict[str, Any]) -> str:
-    current = _as_state(state).current_phase
-    if current == Phase.UNDERSTAND:
+    working = _as_state(state)
+    recommended = _consume_decision_recommended_phase(working)
+    selected_phase = (
+        recommended["phase"]
+        if recommended and "phase" in recommended
+        else working.current_phase
+    )
+    route = _route_for_phase(selected_phase)
+    _record_route_decision(working, selected_phase, route, recommended)
+    return route
+
+
+def _route_for_phase(phase: Phase) -> str:
+    if phase == Phase.UNDERSTAND:
         return "understand_issue"
-    if current == Phase.LOCATE:
+    if phase == Phase.LOCATE:
         return "locate_code"
-    if current == Phase.PLAN:
+    if phase == Phase.PLAN:
         return "plan_fix"
-    if current == Phase.REFLECT:
+    if phase == Phase.REFLECT:
         return "reflect_on_failure"
-    if current == Phase.EXECUTE:
+    if phase == Phase.EXECUTE:
         return "execute_fix"
-    if current == Phase.VERIFY:
+    if phase == Phase.VERIFY:
         return "verify_fix"
-    if current == Phase.COMMIT:
+    if phase == Phase.COMMIT:
         return "commit_fix"
-    if current == Phase.FAILURE:
+    if phase == Phase.WAITING_FOR_USER:
+        return END
+    if phase == Phase.FAILURE:
         return "handle_failure"
     return END
+
+
+def _consume_decision_recommended_phase(state: AgentState) -> dict[str, Any] | None:
+    frame = state.decision_frame
+    if frame is None:
+        return {"fallback_reason": "no_decision_frame"}
+    if not frame.frame_id:
+        return {
+            "frame_id": "",
+            "recommended_action": frame.recommended_action,
+            "fallback_reason": "no_frame_id",
+        }
+    if not state.frame_history or state.frame_history[-1].frame_id != frame.frame_id:
+        return {
+            "frame_id": frame.frame_id,
+            "recommended_action": frame.recommended_action,
+            "fallback_reason": "stale_frame",
+        }
+    if frame.frame_id == state.decision_route_checked_frame_id:
+        return {
+            "frame_id": frame.frame_id,
+            "recommended_action": frame.recommended_action,
+            "fallback_reason": "already_consumed",
+        }
+
+    expected_phase = _RECOMMENDED_PHASES.get(frame.recommended_action)
+    if expected_phase is None:
+        return {
+            "frame_id": frame.frame_id,
+            "recommended_action": frame.recommended_action,
+            "fallback_reason": "unsupported_recommended_action",
+        }
+
+    original_phase = state.current_phase
+    state.decision_route_checked_frame_id = frame.frame_id
+    if expected_phase == Phase.WAITING_FOR_USER:
+        if expected_phase != original_phase:
+            _record_decision_warning(state, expected_phase, original_phase)
+        _prepare_human_input_request(state)
+        return {
+            "source": "decision_frame",
+            "phase": expected_phase,
+            "frame_id": frame.frame_id,
+            "recommended_action": frame.recommended_action,
+        }
+
+    if expected_phase == original_phase:
+        return {
+            "source": "decision_frame",
+            "phase": expected_phase,
+            "frame_id": frame.frame_id,
+            "recommended_action": frame.recommended_action,
+        }
+
+    _record_decision_warning(state, expected_phase, original_phase)
+    return {
+        "source": "decision_frame",
+        "phase": expected_phase,
+        "frame_id": frame.frame_id,
+        "recommended_action": frame.recommended_action,
+    }
+
+
+def _record_decision_warning(
+    state: AgentState,
+    expected_phase: Phase,
+    actual_phase: Phase,
+) -> None:
+    frame = state.decision_frame
+    if frame is None:
+        return
+    message = (
+        f"DecisionFrame recommended_action '{frame.recommended_action}' "
+        f"expected phase {expected_phase.value} but current_phase is "
+        f"{actual_phase.value}"
+    )
+    warning = {
+        "frame_id": frame.frame_id,
+        "stage": frame.stage,
+        "recommended_action": frame.recommended_action,
+        "expected_phase": expected_phase.value,
+        "actual_phase": actual_phase.value,
+        "message": message,
+    }
+    state.decision_warnings.append(warning)
+    logger.warning(message)
+
+
+def _prepare_human_input_request(state: AgentState) -> None:
+    frame = state.decision_frame
+    if frame is None:
+        return
+    question = frame.next_checks[0].strip() if frame.next_checks else ""
+    if not question:
+        question = frame.summary
+    state.pending_human_input = True
+    state.current_phase = Phase.WAITING_FOR_USER
+    state.human_input_request = {
+        "frame_id": frame.frame_id,
+        "stage": frame.stage,
+        "question": question,
+        "summary": frame.summary,
+        "risk": frame.risk,
+        "confidence": frame.confidence,
+    }
+
+
+def _record_route_decision(
+    state: AgentState,
+    selected_phase: Phase,
+    route: str,
+    recommended: dict[str, Any] | None,
+) -> None:
+    decision = {
+        "source": "decision_frame" if recommended and recommended.get("phase") else "current_phase",
+        "current_phase": state.current_phase.value,
+        "selected_phase": selected_phase.value,
+        "route": route,
+    }
+    if recommended:
+        if "frame_id" in recommended:
+            decision["frame_id"] = recommended["frame_id"]
+        if "recommended_action" in recommended:
+            decision["recommended_action"] = recommended["recommended_action"]
+        if "fallback_reason" in recommended:
+            decision["fallback_reason"] = recommended["fallback_reason"]
+    state.route_decisions.append(decision)
 
 
 async def run_graph(graph: Any, state: AgentState) -> AgentState:

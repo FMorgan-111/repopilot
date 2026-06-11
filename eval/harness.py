@@ -12,22 +12,28 @@ No mocking. Real LLM calls, real git clones, real test runs.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
+import base64 as b64
+import importlib
 import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import time
+import urllib.request as urllib_req
 from pathlib import Path
 from typing import Any
 
-# ── repo root ─────────────────────────────────────────────────────────────
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
-# ── inline LLM client (avoid relative-import issues from src/ modules) ────
 import httpx
 from dotenv import load_dotenv
+
+# ── repo root ─────────────────────────────────────────────────────────────
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 load_dotenv(REPO_ROOT / ".env", override=True)
 
@@ -83,10 +89,6 @@ DEEPSEEK_PRICING = {
     "input": 0.27 / 1_000_000,   # $0.27 per 1M input tokens
     "output": 0.36 / 1_000_000,  # $0.36 per 1M output tokens (cached miss)
 }
-
-# ── GitHub API client (avoids expensive git clone for file discovery) ────
-import urllib.request as urllib_req
-import base64 as b64
 
 _gh_file_cache: dict[str, list[str]] = {}  # "owner/repo" -> [file paths]
 _gh_content_cache: dict[str, str] = {}     # "owner/repo/path" -> file content
@@ -402,7 +404,11 @@ def grep_repo(repo_path: Path, term: str, max_files: int = 15) -> list[str]:
             capture_output=True, text=True, timeout=15,
         )
         if result.returncode == 0:
-            all_files = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
+            all_files = [
+                line.strip()
+                for line in result.stdout.strip().split("\n")
+                if line.strip()
+            ]
             # Match term against file path
             term_lower = term.lower()
             for fpath in all_files:
@@ -863,7 +869,11 @@ async def evaluate_sample(sample: dict, idx: int, model: str = "deepseek-v4-flas
                 ["git", "ls-files"], cwd=str(repo_path),
                 capture_output=True, text=True, timeout=15,
             )
-            all_files = [l.strip() for l in ls_result.stdout.split("\n") if l.strip()]
+            all_files = [
+                line.strip()
+                for line in ls_result.stdout.split("\n")
+                if line.strip()
+            ]
         else:
             print(f"  [{sample_id}] {len(all_files)} files via API", flush=True)
 
@@ -1051,5 +1061,47 @@ async def run_eval(
     return results
 
 
+async def run_agent_v2_eval(
+    n_samples: int = MAX_SAMPLES,
+    max_retries: int = 3,
+    token_budget: int = 50000,
+) -> list[dict[str, Any]]:
+    module = importlib.import_module("eval.agent_v2_harness")
+    return await module.run_agent_v2_eval(
+        n_samples=n_samples,
+        max_retries=max_retries,
+        token_budget=token_budget,
+    )
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="python eval/harness.py",
+        description="Run RepoPilot evals.",
+    )
+    parser.add_argument(
+        "--agent-v2",
+        action="store_true",
+        help="Run the state-graph agent eval mode with saved-run replay.",
+    )
+    parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
+    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--token-budget", type=int, default=50000)
+    args = parser.parse_args(argv)
+
+    if args.agent_v2:
+        asyncio.run(
+            run_agent_v2_eval(
+                n_samples=args.samples,
+                max_retries=args.max_retries,
+                token_budget=args.token_budget,
+            )
+        )
+        return
+
+    asyncio.run(run_eval(n_samples=args.samples, model=args.model))
+
+
 if __name__ == "__main__":
-    asyncio.run(run_eval())
+    main()

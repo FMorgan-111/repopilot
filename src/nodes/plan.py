@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..llm import llm_call
+from ..schemas import PlanDecision
 from ..state import (
     AgentState,
     Phase,
@@ -12,9 +14,34 @@ from ..state import (
     _estimate_tokens,
     _extract_json_object,
     _is_budget_exceeded,
+    _record_decision_frame,
     _remember,
 )
-from ..llm import llm_call
+
+
+def _normalize_plan_decision(response: dict[str, Any]) -> PlanDecision:
+    if "decision_frame" in response:
+        return PlanDecision.model_validate(response)
+    return PlanDecision.model_validate(
+        {
+            "plan": response.get("plan", ""),
+            "patch": response.get("patch", ""),
+            "files": response.get("files", []),
+            "test_command": response.get("test_command", ""),
+            "decision_frame": {
+                "stage": "plan",
+                "summary": response.get("plan", ""),
+                "hypotheses": response.get("hypotheses", []),
+                "selected_hypothesis_id": response.get("selected_hypothesis_id"),
+                "evidence": response.get("evidence", []),
+                "next_checks": response.get("next_checks", []),
+                "recommended_action": "execute" if response.get("patch") else "stop",
+                "confidence": response.get("confidence", 0.0),
+                "risk": response.get("risk", "unknown"),
+                "trace_notes": json.dumps({"files": response.get("files", [])}),
+            },
+        }
+    )
 
 
 async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
@@ -42,7 +69,15 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     system = (
         "You are RepoPilot's planning node. Return ONLY JSON with keys: "
         "plan (markdown string), patch (unified diff string), files (array of paths), "
-        "test_command (string). The patch should be apply-able with git apply."
+        "test_command (string), decision_frame (object). decision_frame must include: "
+        "stage='plan', summary, hypotheses (array of objects with id, claim, evidence, "
+        "score), selected_hypothesis_id, evidence, next_checks, "
+        "recommended_action='execute' when patch is present, 'collect_more_context' "
+        "when more repository context is needed before deciding on a patch, "
+        "'ask_user' when a human product decision, risk authorization, or external fact is required, "
+        "otherwise 'stop', "
+        "risk (low|medium|high|unknown), confidence (number 0.0 to 1.0). "
+        "The patch should be apply-able with git apply."
     )
     user = (
         f"Issue URL: {state.issue_url}\n"
@@ -52,20 +87,31 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     )
 
     try:
-        print(f"  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
+        print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
         response = _extract_json_object(await llm_call(system, user))
     except Exception as exc:
         state.failure_reason = f"Failed to generate fix plan: {exc}"
         state.current_phase = Phase.FAILURE
         return state
 
-    state.fix_plan = response.get("plan", "")
-    state.patch_content = response.get("patch", "")
-    state.test_command = response.get("test_command", "")
+    decision = _normalize_plan_decision(response)
+    state.fix_plan = decision.plan
+    state.patch_content = decision.patch
+    state.test_command = decision.test_command
     print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars)", file=sys.stderr, flush=True)
     state.token_usage += _estimate_tokens(system, user, json.dumps(response))
     _remember(state, "assistant", state.fix_plan[:2000])
-    state.current_phase = Phase.EXECUTE if state.patch_content else Phase.FAILURE
-    if not state.patch_content:
+    frame = decision.decision_frame
+    frame.parent_frame_id = state.decision_frame.frame_id if state.decision_frame else None
+    if not frame.trace_notes:
+        frame.trace_notes = json.dumps({"files": decision.files})
+    _record_decision_frame(state, frame)
+    if state.patch_content:
+        state.current_phase = Phase.EXECUTE
+    elif frame.recommended_action in {"ask_user", "collect_more_context"}:
+        state.current_phase = Phase.PLAN
+    else:
+        frame.recommended_action = "stop"
+        state.current_phase = Phase.FAILURE
         state.failure_reason = "Planner did not produce a patch."
     return state

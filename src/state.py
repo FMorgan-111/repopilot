@@ -6,7 +6,7 @@ import json
 import re
 from enum import Enum
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +19,7 @@ class Phase(str, Enum):
     EXECUTE = "EXECUTE"
     VERIFY = "VERIFY"
     COMMIT = "COMMIT"
+    WAITING_FOR_USER = "WAITING_FOR_USER"
     FAILURE = "FAILURE"
     DONE = "DONE"
     FAILED = "FAILED"
@@ -43,6 +44,37 @@ class FixAttempt(BaseModel):
     test_result: str = ""
     error_log: str = ""
     success: bool = False
+
+
+class Hypothesis(BaseModel):
+    id: str
+    claim: str
+    evidence: list[str] = Field(default_factory=list)
+    score: float = Field(default=0.0, ge=0.0, le=1.0)
+    why_selected: str = ""
+    why_not_selected: str = ""
+
+
+class DecisionFrame(BaseModel):
+    frame_id: str = ""
+    stage: Literal["diagnose", "plan", "reflect"]
+    summary: str = ""
+    hypotheses: list[Hypothesis] = Field(default_factory=list)
+    selected_hypothesis_id: str | None = None
+    evidence: list[str] = Field(default_factory=list)
+    next_checks: list[str] = Field(default_factory=list)
+    recommended_action: Literal[
+        "collect_more_context",
+        "plan",
+        "execute",
+        "reflect",
+        "stop",
+        "ask_user",
+    ] = "stop"
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    risk: Literal["low", "medium", "high", "unknown"] = "unknown"
+    parent_frame_id: str | None = None
+    trace_notes: str = ""
 
 
 class ToolCall(BaseModel):
@@ -89,6 +121,13 @@ class AgentState(BaseModel):
     failure_reason: str = ""
     trace_id: str = ""
     reflection_notes: str = ""
+    decision_frame: DecisionFrame | None = None
+    frame_history: list[DecisionFrame] = Field(default_factory=list)
+    decision_warnings: list[dict[str, Any]] = Field(default_factory=list)
+    decision_route_checked_frame_id: str = ""
+    route_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    pending_human_input: bool = False
+    human_input_request: dict[str, Any] = Field(default_factory=dict)
 
 
 NodeFn = Callable[[AgentState], Awaitable[AgentState]]
@@ -122,6 +161,13 @@ def _record_tool(
     state.tool_calls.append(
         ToolCall(tool_name=tool_name, args=args, result=result, error=error)
     )
+
+
+def _record_decision_frame(state: AgentState, frame: DecisionFrame) -> None:
+    if not frame.frame_id:
+        frame.frame_id = f"df_{len(state.frame_history) + 1:04d}"
+    state.decision_frame = frame
+    state.frame_history.append(frame)
 
 
 def _is_budget_exceeded(state: AgentState) -> bool:

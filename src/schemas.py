@@ -1,6 +1,9 @@
 """Pydantic schemas for structured LLM outputs — enforce contracts, not hope."""
-from pydantic import BaseModel, Field
 from typing import Optional
+
+from pydantic import BaseModel, Field, model_validator
+
+from .state import DecisionFrame
 
 
 class Classification(BaseModel):
@@ -36,3 +39,31 @@ class AgentResult(BaseModel):
     summary: str = ""
     files: list[str] = Field(default_factory=list)
     fix_plan: str = ""
+
+
+class PlanDecision(BaseModel):
+    plan: str
+    patch: str
+    files: list[str] = Field(default_factory=list)
+    test_command: str = ""
+    decision_frame: DecisionFrame
+
+    @model_validator(mode="after")
+    def _require_plan_frame(self):
+        if self.decision_frame.stage != "plan":
+            raise ValueError("PlanDecision.decision_frame.stage must be 'plan'")
+        return self
+
+
+class ReflectDecision(BaseModel):
+    root_cause: str
+    what_went_wrong: str
+    suggested_fix_approach: str
+    files_that_also_need_changes: list[str] = Field(default_factory=list)
+    decision_frame: DecisionFrame
+
+    @model_validator(mode="after")
+    def _require_reflect_frame(self):
+        if self.decision_frame.stage != "reflect":
+            raise ValueError("ReflectDecision.decision_frame.stage must be 'reflect'")
+        return self

@@ -28,8 +28,10 @@ def load_results() -> list[dict]:
 def compute_metrics(results: list[dict]) -> dict[str, Any]:
     """Compute aggregate metrics from eval results."""
     total = len(results)
-    errors = [r for r in results if r.get("error")]
-    clean = [r for r in results if not r.get("error")]
+    legacy_results = [r for r in results if not _is_agent_v2_result(r)]
+    agent_v2_results = [r for r in results if _is_agent_v2_result(r)]
+    errors = [r for r in legacy_results if r.get("error")]
+    clean = [r for r in legacy_results if not r.get("error")]
 
     # file_recall@k
     k1_vals = [r["file_recall"]["k1"] for r in clean]
@@ -52,6 +54,9 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
     total_input = sum(r["token_usage"]["input"] for r in clean)
     total_output = sum(r["token_usage"]["output"] for r in clean)
 
+    agent_v2_successes = len([r for r in agent_v2_results if r.get("success")])
+    agent_v2_samples = len(agent_v2_results)
+
     return {
         "total_samples": total,
         "clean_runs": len(clean),
@@ -73,11 +78,26 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
             "total_input_tokens": total_input,
             "total_output_tokens": total_output,
         },
+        "agent_v2": {
+            "samples": agent_v2_samples,
+            "successes": agent_v2_successes,
+            "success_rate": (
+                agent_v2_successes / agent_v2_samples
+                if agent_v2_samples
+                else 0.0
+            ),
+            "waiting_for_user": len(
+                [r for r in agent_v2_results if r.get("waiting_for_user")]
+            ),
+            "failures": len([r for r in agent_v2_results if not r.get("success")]),
+        },
     }
 
 
 def generate_markdown(results: list[dict], metrics: dict) -> str:
     """Generate eval summary markdown."""
+    legacy_results = [r for r in results if not _is_agent_v2_result(r)]
+    agent_v2_results = [r for r in results if _is_agent_v2_result(r)]
     lines: list[str] = []
     lines.append("# RepoPilot Eval Summary\n")
     lines.append(f"**Date**: {Path(RESULTS_PATH).stat().st_mtime if RESULTS_PATH.exists() else 'N/A'}\n")
@@ -107,11 +127,16 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
     lines.append(f"| total cost | ${c['total']:.6f} |\n")
     lines.append(f"| total input tokens | {c['total_input_tokens']:,} |\n")
     lines.append(f"| total output tokens | {c['total_output_tokens']:,} |\n")
+    agent_v2 = metrics.get("agent_v2", {})
+    if agent_v2.get("samples"):
+        lines.append(f"| agent_v2_samples | {agent_v2['samples']} |\n")
+        lines.append(f"| agent_v2_success_rate | {agent_v2['success_rate']:.3f} |\n")
+        lines.append(f"| agent_v2_waiting_for_user | {agent_v2['waiting_for_user']} |\n")
 
     lines.append("\n## Per-Sample Results\n\n")
     lines.append("| # | Sample ID | file_recall@1 | file_recall@3 | file_recall@5 | patch_apply | test_pass | cost |\n")
     lines.append("|---|-----------|--------------|--------------|--------------|-------------|-----------|------|\n")
-    for i, r in enumerate(results):
+    for i, r in enumerate(legacy_results):
         e = r.get("error")
         if e:
             lines.append(f"| {i+1} | `{r['id'][:60]}` | — | — | — | — | — | error: {e} |\n")
@@ -132,6 +157,10 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
             f"| {pa} | {tp} | ${cost_val:.6f} |\n"
         )
 
+    if agent_v2_results:
+        _append_agent_v2_results(lines, agent_v2_results)
+        _append_replay_diagnostics(lines, agent_v2_results)
+
     lines.append("\n## Notes\n\n")
     lines.append("- **file_recall@k**: fraction of actual changed files found in agent's top-k predictions\n")
     lines.append("- **patch_apply_rate**: fraction of agent-generated patches that cleanly apply with `git apply`\n")
@@ -140,6 +169,81 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
     lines.append("- **model**: deepseek-v4-flash (fallback during peak hours)\n")
 
     return "".join(lines)
+
+
+def _is_agent_v2_result(result: dict[str, Any]) -> bool:
+    return result.get("mode") == "agent_v2"
+
+
+def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) -> None:
+    lines.append("\n## Agent V2 Results\n\n")
+    lines.append("| Sample ID | Run ID | Final Phase | Waiting | Turns | Tokens | Error |\n")
+    lines.append("|-----------|--------|-------------|---------|-------|--------|-------|\n")
+    for result in results:
+        waiting = "yes" if result.get("waiting_for_user") else "no"
+        error = result.get("error") or ""
+        lines.append(
+            f"| `{result.get('id', '')[:60]}` "
+            f"| `{result.get('run_id', '')}` "
+            f"| {result.get('final_phase', '')} "
+            f"| {waiting} "
+            f"| {result.get('turns_taken', 0)} "
+            f"| {result.get('token_used', 0)} "
+            f"| {error} |\n"
+        )
+
+
+def _append_replay_diagnostics(
+    lines: list[str], results: list[dict[str, Any]]
+) -> None:
+    lines.append("\n## Replay Diagnostics\n\n")
+    for result in results:
+        run_id = result.get("run_id", "")
+        lines.append(f"### {result.get('id', '')} (`{run_id}`)\n\n")
+        replay = result.get("replay")
+        if not replay:
+            lines.append(f"- Replay unavailable: {result.get('replay_error') or 'missing'}\n")
+            continue
+
+        lines.append(f"- Final phase: {replay.get('current_phase', '')}\n")
+        latest_frame = _latest_decision_frame(replay)
+        if latest_frame is None:
+            lines.append("- Latest frame: none\n")
+            continue
+
+        stage = latest_frame.get("stage", "")
+        frame_id = latest_frame.get("frame_id", "")
+        lines.append(f"- Latest frame: {stage} `{frame_id}`\n")
+        if latest_frame.get("selected_hypothesis_id"):
+            lines.append(
+                f"- Selected hypothesis: {latest_frame['selected_hypothesis_id']}\n"
+            )
+        selected = latest_frame.get("selected_hypothesis") or {}
+        if selected.get("claim"):
+            lines.append(f"- Hypothesis claim: {selected['claim']}\n")
+        if latest_frame.get("recommended_action"):
+            lines.append(
+                f"- Recommended action: {latest_frame['recommended_action']}\n"
+            )
+        route = latest_frame.get("route") or {}
+        if route.get("route"):
+            lines.append(f"- Actual route: {route['route']}\n")
+        for warning in latest_frame.get("warnings", []):
+            lines.append(
+                "- Warning: "
+                f"expected {warning.get('expected_phase', '')} "
+                f"but actual {warning.get('actual_phase', '')}\n"
+            )
+        for check in latest_frame.get("next_checks", []):
+            lines.append(f"- Next check: {check}\n")
+        lines.append("\n")
+
+
+def _latest_decision_frame(replay: dict[str, Any]) -> dict[str, Any] | None:
+    for item in reversed(replay.get("timeline", [])):
+        if item.get("type") == "decision_frame":
+            return item
+    return None
 
 
 def print_summary(metrics: dict) -> None:
@@ -162,6 +266,10 @@ def print_summary(metrics: dict) -> None:
     print(f"avg cost:     ${c['avg_per_sample']:.6f}")
     print(f"total cost:   ${c['total']:.6f}")
     print(f"total tokens: {c['total_input_tokens']:,} in / {c['total_output_tokens']:,} out")
+    agent_v2 = metrics.get("agent_v2", {})
+    if agent_v2.get("samples"):
+        print(f"agent_v2:     {agent_v2['successes']}/{agent_v2['samples']} success")
+        print(f"agent_v2 wait:{agent_v2['waiting_for_user']}")
     print(f"{'='*60}")
 
 

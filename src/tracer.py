@@ -1,7 +1,7 @@
 import json
 import logging
-from uuid import uuid4
 from datetime import datetime, timezone
+from uuid import uuid4
 
 logger = logging.getLogger("repopilot.tracer")
 

@@ -11,12 +11,31 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from .graph import (
+    END,
+    FallbackCompiledGraph,
+    FallbackStateGraph,
+    StateGraph,
+    route_from_state,
+    run_graph,
+)
+from .nodes.commit import commit_fix, create_pr, push_files
+from .nodes.execute import apply_patch, execute_fix, git_clone, run_pytest
+from .nodes.failure import handle_failure
+from .nodes.locate import locate_code
+from .nodes.plan import plan_fix
+from .nodes.reflect import reflect_on_failure
+from .nodes.understand import understand_issue
+from .nodes.verify import verify_fix
+from .run_store import load_run, save_run
 from .state import (
     AgentState,
     ConversationTurn,
+    DecisionFrame,
     FileInfo,
     FinalReport,
     FixAttempt,
+    Hypothesis,
     NodeFn,
     Phase,
     ToolCall,
@@ -27,35 +46,75 @@ from .state import (
     _issue_search_terms,
     _primary_patch_file,
     _rank_reason,
+    _record_decision_frame,
     _record_tool,
     _remember,
 )
-from .nodes.understand import understand_issue
-from .nodes.locate import locate_code
-from .nodes.plan import plan_fix
-from .nodes.execute import execute_fix, git_clone, apply_patch, run_pytest
-from .nodes.verify import verify_fix
-from .nodes.reflect import reflect_on_failure
-from .nodes.commit import commit_fix, push_files, create_pr
-from .nodes.failure import handle_failure
-from .graph import (
-    END,
-    FallbackCompiledGraph,
-    FallbackStateGraph,
-    route_from_state,
-    run_graph,
-    StateGraph,
-)
 from .tracer import Tracer
 
+__all__ = [
+    "END",
+    "AgentState",
+    "ConversationTurn",
+    "DecisionFrame",
+    "FallbackCompiledGraph",
+    "FallbackStateGraph",
+    "FileInfo",
+    "FinalReport",
+    "FixAttempt",
+    "Hypothesis",
+    "NodeFn",
+    "Phase",
+    "StateGraph",
+    "ToolCall",
+    "Tracer",
+    "_as_state",
+    "_estimate_tokens",
+    "_extract_json_object",
+    "_is_budget_exceeded",
+    "_issue_search_terms",
+    "_primary_patch_file",
+    "_rank_reason",
+    "_record_decision_frame",
+    "_record_tool",
+    "_remember",
+    "agent_payload_from_state",
+    "agent_v2",
+    "apply_patch",
+    "build_agent_graph",
+    "commit_fix",
+    "create_pr",
+    "execute_fix",
+    "final_report_from_state",
+    "git_clone",
+    "handle_failure",
+    "intelligent_analyze_issue",
+    "locate_code",
+    "plan_fix",
+    "push_files",
+    "reflect_on_failure",
+    "resume_agent_v2",
+    "route_from_state",
+    "run_graph",
+    "run_pytest",
+    "understand_issue",
+    "verify_fix",
+]
 
-def _wrap_node(name: str, fn: Any) -> Any:
+
+def _wrap_node(name: str, fn: Any, *, record_route_decision: bool = False) -> Any:
     """Wrap a node function with progress output and timeout."""
     import sys
     import time as _time
+
     from .graph import PHASE_TIMEOUTS
 
     timeout = PHASE_TIMEOUTS.get(name, 60.0)
+
+    def route_detail(state: AgentState) -> str:
+        if record_route_decision:
+            return route_from_state(state)
+        return state.current_phase.value
 
     async def wrapped(state):
         t0 = _time.monotonic()
@@ -68,6 +127,8 @@ def _wrap_node(name: str, fn: Any) -> Any:
             s = _as_state(state)
             s.failure_reason = f"Phase {name} timed out after {timeout}s"
             s.current_phase = Phase.FAILURE
+            if record_route_decision:
+                route_from_state(s)
             return s
         except Exception as exc:
             elapsed = _time.monotonic() - t0
@@ -75,16 +136,19 @@ def _wrap_node(name: str, fn: Any) -> Any:
             s = _as_state(state)
             s.failure_reason = f"Phase {name} crashed: {exc}"
             s.current_phase = Phase.FAILURE
+            if record_route_decision:
+                route_from_state(s)
             return s
         elapsed = _time.monotonic() - t0
-        next_phase = _as_state(result).current_phase.value if hasattr(_as_state(result), 'current_phase') else '?'
+        result_state = _as_state(result)
+        next_phase = route_detail(result_state)
         print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} DONE → {next_phase} ({elapsed:.1f}s)", file=sys.stderr, flush=True)
-        return result
+        return result_state
 
     return wrapped
 
 
-def build_agent_graph() -> Any:
+def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
     """Build the RepoPilot v2 state graph.
 
     Defined here (not in graph.py) so that monkeypatching the node-function
@@ -92,6 +156,7 @@ def build_agent_graph() -> Any:
     """
     # Wrap all nodes with progress output + timeouts
     _w = _wrap_node
+    entry_point = _entry_point_for_phase(start_phase)
 
     if StateGraph is None:
         graph = FallbackStateGraph()
@@ -106,18 +171,24 @@ def build_agent_graph() -> Any:
             "handle_failure": _w("handle_failure", handle_failure),
         }.items():
             graph.add_node(name, fn)
-        graph.set_entry_point("understand_issue")
+        graph.set_entry_point(entry_point)
         return graph.compile()
 
+    async def route_from_recorded_decision(state: AgentState | dict[str, Any]) -> str:
+        state = _as_state(state)
+        if state.route_decisions:
+            return state.route_decisions[-1]["route"]
+        return route_from_state(state)
+
     graph = StateGraph(AgentState)
-    graph.add_node("understand_issue", _w("understand_issue", understand_issue))
-    graph.add_node("locate_code", _w("locate_code", locate_code))
-    graph.add_node("plan_fix", _w("plan_fix", plan_fix))
-    graph.add_node("execute_fix", _w("execute_fix", execute_fix))
-    graph.add_node("verify_fix", _w("verify_fix", verify_fix))
-    graph.add_node("reflect_on_failure", _w("reflect_on_failure", reflect_on_failure))
-    graph.add_node("commit_fix", _w("commit_fix", commit_fix))
-    graph.add_node("handle_failure", _w("handle_failure", handle_failure))
+    graph.add_node("understand_issue", _w("understand_issue", understand_issue, record_route_decision=True))
+    graph.add_node("locate_code", _w("locate_code", locate_code, record_route_decision=True))
+    graph.add_node("plan_fix", _w("plan_fix", plan_fix, record_route_decision=True))
+    graph.add_node("execute_fix", _w("execute_fix", execute_fix, record_route_decision=True))
+    graph.add_node("verify_fix", _w("verify_fix", verify_fix, record_route_decision=True))
+    graph.add_node("reflect_on_failure", _w("reflect_on_failure", reflect_on_failure, record_route_decision=True))
+    graph.add_node("commit_fix", _w("commit_fix", commit_fix, record_route_decision=True))
+    graph.add_node("handle_failure", _w("handle_failure", handle_failure, record_route_decision=True))
     for node in [
         "understand_issue",
         "locate_code",
@@ -130,7 +201,7 @@ def build_agent_graph() -> Any:
     ]:
         graph.add_conditional_edges(
             node,
-            route_from_state,
+            route_from_recorded_decision,
             {
                 "understand_issue": "understand_issue",
                 "locate_code": "locate_code",
@@ -143,8 +214,24 @@ def build_agent_graph() -> Any:
                 END: END,
             },
         )
-    graph.set_entry_point("understand_issue")
+    graph.set_entry_point(entry_point)
     return graph.compile()
+
+
+def _entry_point_for_phase(phase: Phase) -> str:
+    route = {
+        Phase.UNDERSTAND: "understand_issue",
+        Phase.LOCATE: "locate_code",
+        Phase.PLAN: "plan_fix",
+        Phase.REFLECT: "reflect_on_failure",
+        Phase.EXECUTE: "execute_fix",
+        Phase.VERIFY: "verify_fix",
+        Phase.COMMIT: "commit_fix",
+        Phase.FAILURE: "handle_failure",
+    }.get(phase)
+    if route is None:
+        raise ValueError(f"Cannot start graph from phase {phase.value}.")
+    return route
 
 
 def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
@@ -158,7 +245,38 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
     )
 
 
-async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 50000) -> dict:
+def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
+    report = final_report_from_state(state, turns_taken)
+    payload = report.model_dump()
+    payload.update(
+        {
+            "done": state.current_phase in {Phase.DONE, Phase.FAILED},
+            "success": state.current_phase == Phase.DONE,
+            "waiting_for_user": state.current_phase == Phase.WAITING_FOR_USER,
+            "final_phase": state.current_phase.value,
+            "trace_id": state.trace_id,
+            "relevant_files": [file.model_dump() for file in state.relevant_files],
+            "fix_attempts": [attempt.model_dump() for attempt in state.fix_attempts],
+            "decision_frame": (
+                state.decision_frame.model_dump() if state.decision_frame else None
+            ),
+            "frame_history": [frame.model_dump() for frame in state.frame_history],
+            "decision_warnings": state.decision_warnings,
+            "route_decisions": state.route_decisions,
+            "human_input_request": state.human_input_request,
+            "error": state.failure_reason or None,
+        }
+    )
+    payload["run_id"] = state.trace_id
+    return payload
+
+
+async def agent_v2(
+    issue_url: str,
+    max_retries: int = 3,
+    token_budget: int = 50000,
+    save_final_run: bool = False,
+) -> dict:
     """Run the full RepoPilot v2 graph with progress output and trace saving."""
     import sys
     import time as _time
@@ -172,7 +290,7 @@ async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 500
         token_budget=token_budget,
         trace_id=tracer.trace_id,
     )
-    print(f"[agent_v2] Building agent graph...", file=sys.stderr, flush=True)
+    print("[agent_v2] Building agent graph...", file=sys.stderr, flush=True)
     graph = build_agent_graph()
     print(f"[agent_v2] Running graph (trace={tracer.trace_id})...", file=sys.stderr, flush=True)
 
@@ -188,17 +306,19 @@ async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 500
             error=str(exc),
         )
         # Save partial trace
-        _save_trace(tracer, "examples/traces/case_1.json")
+        _save_trace(tracer, "examples/traces/case_1.json", state)
         return {
             "error": f"Graph crashed: {type(exc).__name__}: {exc}",
             "trace_id": tracer.trace_id,
+            "run_id": tracer.trace_id,
             "done": True,
             "success": False,
+            "waiting_for_user": False,
             "final_phase": "CRASHED",
+            "human_input_request": {},
         }
 
     elapsed = _time.monotonic() - t_start
-    report = final_report_from_state(final_state, len(final_state.tool_calls))
     tracer.log(
         "agent_v2_done",
         {"issue_url": issue_url},
@@ -207,32 +327,79 @@ async def agent_v2(issue_url: str, max_retries: int = 3, token_budget: int = 500
     )
     print(f"[agent_v2] Done in {elapsed:.1f}s → {final_state.current_phase.value}", file=sys.stderr, flush=True)
 
-    payload = report.model_dump()
-    payload.update(
-        {
-            "done": final_state.current_phase in {Phase.DONE, Phase.FAILED},
-            "success": final_state.current_phase == Phase.DONE,
-            "final_phase": final_state.current_phase.value,
-            "trace_id": tracer.trace_id,
-            "relevant_files": [file.model_dump() for file in final_state.relevant_files],
-            "fix_attempts": [attempt.model_dump() for attempt in final_state.fix_attempts],
-            "error": final_state.failure_reason or None,
-        }
-    )
+    payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
+
+    if save_final_run or final_state.current_phase == Phase.WAITING_FOR_USER:
+        save_run(final_state)
 
     # Save trace to file
-    _save_trace(tracer, "examples/traces/case_1.json")
+    _save_trace(tracer, "examples/traces/case_1.json", final_state)
     return payload
 
 
-def _save_trace(tracer: Tracer, path: str) -> None:
-    """Save trace steps to a JSON file."""
+async def resume_agent_v2(run_id: str, human_answer: str) -> dict:
+    """Resume a paused RepoPilot v2 run with a human answer."""
+    state = load_run(run_id)
+    if (
+        state.current_phase != Phase.WAITING_FOR_USER
+        or not state.pending_human_input
+        or not state.human_input_request
+    ):
+        payload = agent_payload_from_state(state, len(state.tool_calls))
+        payload["success"] = False
+        payload["error"] = f"Run {run_id} is not waiting for user input."
+        return payload
+
+    _remember(
+        state,
+        "user",
+        f"Human answer for paused run {run_id}:\n{human_answer}",
+    )
+    state.pending_human_input = False
+    state.human_input_request = {}
+    state.current_phase = Phase.PLAN
+    if state.decision_frame and not state.decision_route_checked_frame_id:
+        state.decision_route_checked_frame_id = state.decision_frame.frame_id
+
+    graph = build_agent_graph(start_phase=Phase.PLAN)
+    final_state = await run_graph(graph, state)
+    payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
+
+    if final_state.current_phase == Phase.WAITING_FOR_USER:
+        save_run(final_state)
+
+    tracer = Tracer()
+    tracer.trace_id = state.trace_id
+    _save_trace(tracer, "examples/traces/case_1.json", final_state)
+    return payload
+
+
+def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> None:
+    """Save trace steps and decision frames to a JSON file."""
     import json
     from pathlib import Path
     try:
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(tracer.steps, indent=2, default=str), encoding="utf-8")
+        payload = {
+            "trace_id": tracer.trace_id,
+            "steps": tracer.steps,
+            "decision_frame": (
+                state.decision_frame.model_dump()
+                if state and state.decision_frame
+                else None
+            ),
+            "frame_history": (
+                [frame.model_dump() for frame in state.frame_history]
+                if state
+                else []
+            ),
+            "decision_warnings": state.decision_warnings if state else [],
+            "route_decisions": state.route_decisions if state else [],
+            "pending_human_input": state.pending_human_input if state else False,
+            "human_input_request": state.human_input_request if state else {},
+        }
+        p.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         import sys
         print(f"[agent_v2] Trace saved to {p.resolve()}", file=sys.stderr, flush=True)
     except Exception as exc:
