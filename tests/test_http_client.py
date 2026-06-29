@@ -6,7 +6,10 @@ import httpx
 import pytest
 
 from src.http_client import (
+    LLM_CALL_WALLCLOCK_TIMEOUT,
     LLM_MAX_ATTEMPTS,
+    LLM_REQUEST_TIMEOUT,
+    LLM_RETRY_BACKOFF_MAX_SECONDS,
     MAX_RETRIES,
     RETRYABLE_GITHUB_STATUS,
     RETRYABLE_LLM_STATUS,
@@ -15,8 +18,8 @@ from src.http_client import (
     _reset_llm_client,
     github_request,
     llm_request,
+    llm_retry_budget_seconds,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -26,6 +29,27 @@ from src.http_client import (
 async def _noop_sleep(*args, **kwargs):
     """Async no-op to replace asyncio.sleep in tests, avoiding real waits."""
     pass
+
+
+async def test_close_llm_client_closes_cached_client_and_clears_global():
+    from src import http_client
+
+    client = http_client._get_llm_client()
+
+    await http_client.close_llm_client()
+
+    assert client.is_closed is True
+    assert http_client._llm_client is None
+
+
+def test_llm_timeout_budget_is_explicit():
+    assert LLM_REQUEST_TIMEOUT == 60.0
+    assert LLM_CALL_WALLCLOCK_TIMEOUT == 200.0
+    assert LLM_MAX_ATTEMPTS == 2
+    assert LLM_RETRY_BACKOFF_MAX_SECONDS == 20.0
+    # One slow attempt is killed at the wall-clock ceiling (non-retryable), so
+    # the worst case is a fast transient fail + backoff + one slow attempt.
+    assert llm_retry_budget_seconds() == 220.0
 
 
 @pytest.fixture(autouse=True)
@@ -354,6 +378,32 @@ async def test_llm_request_retries_on_timeout(monkeypatch):
 
     assert result["choices"][0]["message"]["content"] == '{"ok":true}'
     assert call_count == 2
+
+
+async def test_llm_request_wallclock_timeout_is_not_retried(monkeypatch):
+    """A call exceeding the wall-clock ceiling fails fast without a retry.
+
+    asyncio.TimeoutError is deliberately absent from the LLM retry set, so a
+    genuinely-slow generation does not double the wait by retrying.
+    """
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+
+    call_count = 0
+    RealAsyncClient = httpx.AsyncClient
+
+    async def timeout_post(self, url, **kwargs):
+        # Simulate asyncio.wait_for's ceiling firing on this attempt.
+        nonlocal call_count
+        call_count += 1
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(RealAsyncClient, "post", timeout_post)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await llm_request([{"role": "user", "content": "hello"}])
+
+    assert call_count == 1  # NOT retried
+
 
 
 async def test_llm_request_respects_custom_model(httpx_mock, monkeypatch):

@@ -144,6 +144,7 @@ class RepoStore:
 
 # Module-level singleton (optional convenience).
 _store: RepoStore | None = None
+_pending_background_tasks: set[asyncio.Task] = set()
 
 
 def get_store() -> RepoStore:
@@ -152,6 +153,34 @@ def get_store() -> RepoStore:
     if _store is None:
         _store = RepoStore()
     return _store
+
+
+async def close_store() -> None:
+    """Close and reset the shared RepoStore singleton."""
+    global _store
+    await _drain_background_tasks()
+    if _store is None:
+        return
+
+    store = _store
+    try:
+        await store.close()
+    finally:
+        _store = None
+
+
+async def _drain_background_tasks() -> None:
+    """Wait for pending fire-and-forget writes before cleanup closes DBs."""
+    current_task = asyncio.current_task()
+    while True:
+        pending = [
+            task
+            for task in _pending_background_tasks
+            if not task.done() and task is not current_task
+        ]
+        if not pending:
+            return
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 def _fire_and_forget(coro):
@@ -166,7 +195,9 @@ def _fire_and_forget(coro):
             )
 
     try:
-        asyncio.ensure_future(_wrapper())
+        task = asyncio.ensure_future(_wrapper())
+        _pending_background_tasks.add(task)
+        task.add_done_callback(_pending_background_tasks.discard)
     except RuntimeError:
         # No event loop running — this is fine in test contexts.
         pass

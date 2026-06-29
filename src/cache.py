@@ -27,12 +27,22 @@ import time
 from functools import wraps
 from pathlib import Path
 
-CACHE_DIR = Path.home() / ".repopilot" / "cache"
 CACHE_TTL = int(os.getenv("REPOPILOT_CACHE_TTL", "600"))
 
 
+def _repopilot_home() -> Path:
+    configured = os.getenv("REPOPILOT_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".repopilot"
+
+
+def cache_dir() -> Path:
+    return _repopilot_home() / "cache"
+
+
 def _ensure_dir() -> None:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_dir().mkdir(parents=True, exist_ok=True)
 
 
 def _cache_key(func_name: str, *args, **kwargs) -> str:
@@ -46,7 +56,7 @@ def _cache_key(func_name: str, *args, **kwargs) -> str:
 
 
 def _cache_path(key: str) -> Path:
-    return CACHE_DIR / f"{key}.json"
+    return cache_dir() / f"{key}.json"
 
 
 def _load(key: str) -> dict | None:
@@ -86,7 +96,10 @@ def cached(func):
         if hit is not None:
             return hit
         result = await func(*args, **kwargs)
-        _save(key, result)
+        try:
+            _save(key, result)
+        except OSError:
+            pass
         return result
 
     return wrapper

@@ -6,6 +6,8 @@
 
 import os
 
+import asyncio
+
 import httpx
 from dotenv import load_dotenv
 from tenacity import (
@@ -24,6 +26,16 @@ load_dotenv(override=True)
 # ---------------------------------------------------------------------------
 
 _llm_client: httpx.AsyncClient | None = None
+# Per-socket-operation timeout (connect / gap between received bytes). NOT a
+# total-request bound: httpx has no "whole request <= N seconds" option, so a
+# slow-but-steady token stream can run far past this. The real total bound is
+# LLM_CALL_WALLCLOCK_TIMEOUT below, enforced via asyncio.wait_for.
+LLM_REQUEST_TIMEOUT = 60.0
+# Hard wall-clock ceiling for a single LLM call. DeepSeek generation latency
+# varies widely for large planning prompts (observed 25s-143s). 200s clears the
+# slow tail; exceeding it raises asyncio.TimeoutError, which is deliberately
+# absent from the retry set so a genuinely-slow call fails fast without doubling.
+LLM_CALL_WALLCLOCK_TIMEOUT = 200.0
 
 
 def _get_llm_client() -> httpx.AsyncClient:
@@ -31,7 +43,7 @@ def _get_llm_client() -> httpx.AsyncClient:
     global _llm_client
     if _llm_client is None:
         _llm_client = httpx.AsyncClient(
-            timeout=30.0,
+            timeout=LLM_REQUEST_TIMEOUT,
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
     return _llm_client
@@ -43,6 +55,15 @@ def _reset_llm_client() -> None:
     _llm_client = None
 
 
+async def close_llm_client() -> None:
+    """Close and clear the shared LLM client."""
+    global _llm_client
+    client = _llm_client
+    _llm_client = None
+    if client is not None:
+        await client.aclose()
+
+
 # ---------------------------------------------------------------------------
 # Retry configuration
 # ---------------------------------------------------------------------------
@@ -51,6 +72,18 @@ RETRYABLE_GITHUB_STATUS = {429, 502, 503, 504}
 RETRYABLE_LLM_STATUS = {502, 503, 504}
 MAX_RETRIES = 3
 LLM_MAX_ATTEMPTS = 2  # 1 initial + 1 retry (was 4 with MAX_RETRIES+1)
+LLM_RETRY_BACKOFF_MAX_SECONDS = 20.0
+
+
+def llm_retry_budget_seconds() -> float:
+    """Worst-case wall-clock for one LLM call including a possible retry.
+
+    A slow attempt is killed at the wall-clock ceiling with a non-retryable
+    asyncio.TimeoutError, so two slow attempts can't stack. The true worst case
+    is one fast transient failure + backoff + one slow attempt:
+    LLM_CALL_WALLCLOCK_TIMEOUT + LLM_RETRY_BACKOFF_MAX_SECONDS.
+    """
+    return LLM_CALL_WALLCLOCK_TIMEOUT + LLM_RETRY_BACKOFF_MAX_SECONDS
 
 
 def _is_retryable_github(exc: BaseException) -> bool:
@@ -152,12 +185,18 @@ async def llm_request(
 
 @retry(
     stop=stop_after_attempt(LLM_MAX_ATTEMPTS),
-    wait=wait_exponential(multiplier=2, min=2, max=20),
+    wait=wait_exponential(multiplier=2, min=2, max=LLM_RETRY_BACKOFF_MAX_SECONDS),
     retry=retry_if_exception(_is_retryable_llm),
     reraise=True,
 )
 async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dict:
     client = _get_llm_client()
-    resp = await client.post(url, json=payload, headers=headers)
+    # asyncio.wait_for is the only real total-request bound (httpx can't cap it).
+    # On timeout it raises asyncio.TimeoutError, which is intentionally NOT in
+    # _is_retryable_llm — a genuinely-slow generation fails fast, no retry.
+    resp = await asyncio.wait_for(
+        client.post(url, json=payload, headers=headers),
+        timeout=LLM_CALL_WALLCLOCK_TIMEOUT,
+    )
     resp.raise_for_status()
     return resp.json()

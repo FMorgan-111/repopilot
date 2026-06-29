@@ -1,11 +1,11 @@
 """Tests for RepoStore — per-repo SQLite strategy memory."""
 
+import asyncio
 import tempfile
-from pathlib import Path
 
 import pytest
 
-from src.memory import RepoStore
+from src.memory import RepoStore, _fire_and_forget, close_store, get_store
 
 
 @pytest.fixture
@@ -80,3 +80,48 @@ async def test_get_issue_history_empty_repo(store):
     """An unrecorded repo returns an empty list."""
     history = await store.get_issue_history("nobody", "norepo")
     assert history == []
+
+
+@pytest.mark.asyncio
+async def test_close_store_closes_and_resets_singleton(tmp_path, monkeypatch):
+    """close_store closes cached connections and resets the singleton."""
+    await close_store()
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    old_store = get_store()
+    await old_store.record_issue("alice", "demo", 42, success=True)
+
+    try:
+        await close_store()
+
+        assert old_store._db_cache == {}
+        assert get_store() is not old_store
+    finally:
+        await close_store()
+
+
+@pytest.mark.asyncio
+async def test_close_store_waits_for_pending_background_writes(monkeypatch):
+    """close_store drains fire-and-forget memory writes before closing."""
+    from src.memory import repo_store
+
+    await close_store()
+    events: list[str] = []
+
+    class FakeStore:
+        async def close(self):
+            events.append("close")
+
+    async def background_write():
+        await asyncio.sleep(0.01)
+        events.append("background")
+
+    monkeypatch.setattr(repo_store, "_store", FakeStore())
+
+    _fire_and_forget(background_write())
+
+    try:
+        await close_store()
+        assert events == ["background", "close"]
+    finally:
+        await close_store()
