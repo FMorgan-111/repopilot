@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 .env
 .venv/
+
+# Regenerable eval outputs (run `python eval/harness.py` to recreate)
+eval/eval_results.json
+eval/eval_summary.md
+examples/traces/case_1.json
