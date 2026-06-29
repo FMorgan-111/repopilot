@@ -3,30 +3,256 @@
 from __future__ import annotations
 
 import json
+import time
+from collections.abc import Sequence
 from typing import Any
 
 from ..llm import llm_call
 from ..schemas import PlanDecision
 from ..state import (
     AgentState,
+    DecisionFrame,
+    Hypothesis,
     Phase,
     _as_state,
+    _describe_exception,
     _estimate_tokens,
     _extract_json_object,
+    _human_answer_context,
     _is_budget_exceeded,
     _record_decision_frame,
+    _record_frame_health_warning,
+    _record_node_diagnostic,
     _remember,
 )
 
+PLAN_ISSUE_BODY_LIMIT = 2500
+# The planner needs to see real function bodies, not just import headers. At
+# 1200 chars it only saw ~3% of a file (the imports) and kept asking for more
+# context forever. 6000 chars surfaces the logic the fix actually touches.
+PLAN_FILE_CONTENT_LIMIT = 6000
+PLAN_MAX_FILES = 4
+PLAN_FAILURE_LOG_LIMIT = 1000
+
+# Hard cap on consecutive collect_more_context rounds before we give up.
+# The first MAX_CONTEXT_COLLECTION_ROUNDS recommendations still route back to
+# LOCATE so the agent can genuinely expand its context; the next one is forced
+# to stop instead of burning the entire token budget on an unproductive loop.
+MAX_CONTEXT_COLLECTION_ROUNDS = 3
+
+
+def _is_patch_apply_failure(attempt: Any) -> bool:
+    return (
+        getattr(attempt, "failure_kind", "") == "patch_apply_failed"
+        or getattr(attempt, "test_result", "") == "patch_apply_failed"
+    )
+
+
+def _selected_hypothesis(frame: DecisionFrame | None) -> Hypothesis | None:
+    if frame is None or not frame.selected_hypothesis_id:
+        return None
+    return next(
+        (
+            hypothesis
+            for hypothesis in frame.hypotheses
+            if hypothesis.id == frame.selected_hypothesis_id
+        ),
+        None,
+    )
+
+
+def _patch_apply_hypothesis_anchor(
+    state: AgentState,
+) -> tuple[DecisionFrame, Hypothesis] | None:
+    if not state.fix_attempts or not _is_patch_apply_failure(state.fix_attempts[-1]):
+        return None
+
+    for frame in reversed(state.frame_history):
+        if frame.stage != "plan":
+            continue
+        selected = _selected_hypothesis(frame)
+        if selected is not None:
+            return frame, selected
+    return None
+
+
+def _truncate_prompt_text(value: str, limit: int = 500) -> str:
+    value = value.strip()
+    if len(value) <= limit:
+        return value
+    return f"{value[:limit].rstrip()}..."
+
+
+def _context_pressure_instructions(state: AgentState) -> str:
+    """Escalating pressure to commit a patch as context-collection rounds mount.
+
+    The planner tends to treat each round as a fresh investigation — reinventing
+    its hypotheses and asking for yet more context while never committing. This
+    nudges it to converge: mild at first, then a hard "produce patch_edits now"
+    on the final round before the collect_more_context cap forces a stop.
+    """
+    count = state.context_collection_count
+    if count <= 0:
+        return ""
+
+    is_final = count >= MAX_CONTEXT_COLLECTION_ROUNDS
+    lines = [
+        "Context Budget Instructions:",
+        f"- You have already collected repository context {count} time(s).",
+        "- Build on your previous strongest hypothesis instead of re-deriving new "
+        "ones each round; reuse the same hypothesis ids when the claim is unchanged.",
+    ]
+    if is_final:
+        lines.extend(
+            [
+                "- This is your FINAL context round. You MUST set "
+                "recommended_action='execute' and return concrete patch_edits now, "
+                "using the best hypothesis supported by the files you already have.",
+                "- Do NOT recommend collect_more_context again — it will be rejected "
+                "and the run will fail without a patch.",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "- You now have substantial source context. Strongly prefer producing "
+                "patch_edits this round.",
+                "- Only recommend collect_more_context if a SPECIFIC file you have not "
+                "yet seen is essential — name it exactly in next_checks. Do not ask for "
+                "more context to keep exploring generally.",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _hypothesis_continuity_context(state: AgentState) -> str:
+    anchor = _patch_apply_hypothesis_anchor(state)
+    latest_attempt = state.fix_attempts[-1] if state.fix_attempts else None
+    has_patch_apply_failure = latest_attempt is not None and _is_patch_apply_failure(
+        latest_attempt
+    )
+    if anchor is None and not has_patch_apply_failure:
+        return ""
+
+    lines = [
+        "Hypothesis Continuity Instructions:",
+        "- Tests did not run; the patch failed before tests ran and only patch formatting/path/hunk context failed.",
+        "- If the error says patch preflight check failed, git rejected the old diff during `git apply --check`; switch to exact search/replace edits before consuming semantic retries.",
+        "- Treat the next LLM action as exact patch_edits repair, not root-cause exploration.",
+        "- Repair the previous patch's file paths and search blocks before changing semantics.",
+        "- Prefer patch_edits over unified diffs. Each edit must include file, search, replace, and optional replace_all.",
+        "- Search blocks must be copied exactly from the current file context and large enough to match uniquely.",
+    ]
+
+    if anchor is not None:
+        anchor_frame, hypothesis = anchor
+        lines.extend(
+            [
+                "- Preserve "
+                f"selected_hypothesis_id='{hypothesis.id}' from plan frame "
+                f"{anchor_frame.frame_id or '(unrecorded)'} unless the apply error "
+                "proves the target file or hunk context is impossible.",
+                f"- Root-cause anchor: {_truncate_prompt_text(hypothesis.claim, 500)}",
+            ]
+        )
+        if hypothesis.evidence:
+            lines.append(
+                "- Anchor evidence: "
+                f"{_truncate_prompt_text('; '.join(hypothesis.evidence[:3]), 500)}"
+            )
+    elif has_patch_apply_failure:
+        lines.append(
+            "- No preserved hypothesis anchor is available; keep the root-cause "
+            "search constrained to repair the malformed patch before expanding scope."
+        )
+
+    latest_reflect = next(
+        (frame for frame in reversed(state.frame_history) if frame.stage == "reflect"),
+        None,
+    )
+    if latest_reflect is not None:
+        lines.append(
+            "- Latest reflection summary: "
+            f"{_truncate_prompt_text(latest_reflect.summary, 500)}"
+        )
+    if has_patch_apply_failure:
+        lines.append(
+            "- Previous patch apply error: "
+            f"{_truncate_prompt_text(latest_attempt.error_log or latest_attempt.test_result or 'patch_apply_failed', 500)}"
+        )
+    return "\n".join(lines)
+
+
+def _preserve_patch_apply_hypothesis_anchor(
+    state: AgentState,
+    frame: DecisionFrame,
+) -> dict[str, Any] | None:
+    anchor = _patch_apply_hypothesis_anchor(state)
+    if anchor is None:
+        return None
+
+    anchor_frame, hypothesis = anchor
+    selected_before = frame.selected_hypothesis_id or ""
+    has_anchor_hypothesis = any(
+        candidate.id == hypothesis.id for candidate in frame.hypotheses
+    )
+    if selected_before == hypothesis.id and has_anchor_hypothesis:
+        return None
+
+    hypothesis_copy = hypothesis.model_copy(deep=True)
+    for idx, candidate in enumerate(frame.hypotheses):
+        if candidate.id == hypothesis_copy.id:
+            frame.hypotheses[idx] = hypothesis_copy
+            break
+    else:
+        frame.hypotheses.insert(0, hypothesis_copy)
+
+    frame.selected_hypothesis_id = hypothesis_copy.id
+    for evidence in hypothesis_copy.evidence:
+        if evidence not in frame.evidence:
+            frame.evidence.append(evidence)
+
+    return {
+        "warning_type": "hypothesis_consistency",
+        "node": "plan_fix",
+        "reason": "preserved_selected_hypothesis_after_patch_apply_failure",
+        "previous_frame_id": anchor_frame.frame_id,
+        "previous_selected_hypothesis_id": hypothesis_copy.id,
+        "llm_selected_hypothesis_id": selected_before,
+    }
+
+
+def _normalize_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise TypeError("Expected a sequence of strings")
+            normalized.append(item)
+        return normalized
+    raise TypeError("Expected None, a string, or a sequence of strings")
+
 
 def _normalize_plan_decision(response: dict[str, Any]) -> PlanDecision:
+    files = _normalize_string_list(response.get("files"))
+    patch_edits = response.get("patch_edits") or response.get("edits") or []
     if "decision_frame" in response:
-        return PlanDecision.model_validate(response)
+        return PlanDecision.model_validate(
+            {**response, "files": files, "patch_edits": patch_edits}
+        )
+    has_executable_patch = bool(response.get("patch") or patch_edits)
     return PlanDecision.model_validate(
         {
             "plan": response.get("plan", ""),
             "patch": response.get("patch", ""),
-            "files": response.get("files", []),
+            "patch_edits": patch_edits,
+            "files": files,
             "test_command": response.get("test_command", ""),
             "decision_frame": {
                 "stage": "plan",
@@ -35,10 +261,10 @@ def _normalize_plan_decision(response: dict[str, Any]) -> PlanDecision:
                 "selected_hypothesis_id": response.get("selected_hypothesis_id"),
                 "evidence": response.get("evidence", []),
                 "next_checks": response.get("next_checks", []),
-                "recommended_action": "execute" if response.get("patch") else "stop",
+                "recommended_action": "execute" if has_executable_patch else "stop",
                 "confidence": response.get("confidence", 0.0),
                 "risk": response.get("risk", "unknown"),
-                "trace_notes": json.dumps({"files": response.get("files", [])}),
+                "trace_notes": json.dumps({"files": files}),
             },
         }
     )
@@ -54,22 +280,40 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     previous_failures = "\n\n".join(
-        f"Attempt {idx + 1}: {attempt.test_result}\n{attempt.error_log[:2000]}"
+        f"Attempt {idx + 1}: {attempt.test_result}\n"
+        f"{_truncate_prompt_text(attempt.error_log, PLAN_FAILURE_LOG_LIMIT)}"
         for idx, attempt in enumerate(state.fix_attempts)
     )
     reflection_context = ""
     if state.reflection_notes:
         reflection_context = f"\n\nREFLECTION ANALYSIS:\n{state.reflection_notes}"
+    hypothesis_continuity_context = ""
+    continuity_context = _hypothesis_continuity_context(state)
+    if continuity_context:
+        hypothesis_continuity_context = f"\n\n{continuity_context}"
+    human_context = ""
+    resumed_answer_context = _human_answer_context(state)
+    if resumed_answer_context:
+        human_context = f"\n\n{resumed_answer_context}"
+    context_pressure_context = ""
+    pressure = _context_pressure_instructions(state)
+    if pressure:
+        context_pressure_context = f"\n\n{pressure}"
 
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
-        f"CONTENT:\n{file.content[:2000]}"
-        for file in state.relevant_files[:2]
+        f"CONTENT:\n{_truncate_prompt_text(file.content, PLAN_FILE_CONTENT_LIMIT)}"
+        for file in state.relevant_files[:PLAN_MAX_FILES]
     )
     system = (
         "You are RepoPilot's planning node. Return ONLY JSON with keys: "
-        "plan (markdown string), patch (unified diff string), files (array of paths), "
-        "test_command (string), decision_frame (object). decision_frame must include: "
+        "plan (markdown string), patch_edits (array), patch (legacy unified diff string, usually empty), "
+        "files (array of paths), test_command (string), decision_frame (object). "
+        "Each patch_edits item must include file (path string), search (exact existing text), "
+        "replace (replacement text), and optional replace_all (boolean, default false). "
+        "Prefer patch_edits over unified diff: the executor performs deterministic exact string replacement, "
+        "so search text must be copied exactly from the file content and should match uniquely unless replace_all is true. "
+        "decision_frame must include: "
         "stage='plan', summary, hypotheses (array of objects with id, claim, evidence, "
         "score), selected_hypothesis_id, evidence, next_checks, "
         "recommended_action='execute' when patch is present, 'collect_more_context' "
@@ -77,38 +321,112 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         "'ask_user' when a human product decision, risk authorization, or external fact is required, "
         "otherwise 'stop', "
         "risk (low|medium|high|unknown), confidence (number 0.0 to 1.0). "
-        "The patch should be apply-able with git apply."
+        "Use patch only for backward-compatible unified diff output when patch_edits cannot express the change."
     )
+    if state.fix_attempts and _is_patch_apply_failure(state.fix_attempts[-1]):
+        system = (
+            f"{system} After a patch_apply_failed attempt, the next plan must "
+            "repair the previous patch as exact patch_edits with correct file paths and search blocks "
+            "before changing semantics. Do not shift the selected hypothesis "
+            "unless the apply error proves the target file or hunk context is impossible."
+        )
     user = (
         f"Issue URL: {state.issue_url}\n"
-        f"Title: {state.issue_title}\n\nBody:\n{state.issue_body[:4000]}\n\n"
+        f"Title: {state.issue_title}\n\nBody:\n"
+        f"{_truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)}\n\n"
         f"Relevant files:\n{files_context}\n\nPrevious failures:\n{previous_failures}"
         f"{reflection_context}"
+        f"{hypothesis_continuity_context}"
+        f"{context_pressure_context}"
+        f"{human_context}"
+    )
+    prompt_tokens_estimate = _estimate_tokens(system, user)
+    _record_node_diagnostic(
+        state,
+        node="plan_fix",
+        event="prompt_built",
+        status="success",
+        elapsed_seconds=0.0,
+        prompt_tokens_estimate=prompt_tokens_estimate,
+        relevant_file_count=len(state.relevant_files[:PLAN_MAX_FILES]),
+        issue_body_chars=len(
+            _truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)
+        ),
+        previous_failure_count=len(state.fix_attempts),
+        has_reflection_context=bool(reflection_context),
+        has_hypothesis_continuity_context=bool(hypothesis_continuity_context),
+        context_collection_count=state.context_collection_count,
+        has_context_pressure=bool(context_pressure_context),
     )
 
+    t0 = time.monotonic()
     try:
         print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
         response = _extract_json_object(await llm_call(system, user))
     except Exception as exc:
-        state.failure_reason = f"Failed to generate fix plan: {exc}"
+        _record_node_diagnostic(
+            state,
+            node="plan_fix",
+            event="llm_call",
+            status="error",
+            elapsed_seconds=time.monotonic() - t0,
+            error=exc,
+            prompt_tokens_estimate=prompt_tokens_estimate,
+        )
+        state.failure_reason = f"Failed to generate fix plan: {_describe_exception(exc)}"
         state.current_phase = Phase.FAILURE
         return state
 
+    response_text = json.dumps(response)
+    _record_node_diagnostic(
+        state,
+        node="plan_fix",
+        event="llm_call",
+        status="success",
+        elapsed_seconds=time.monotonic() - t0,
+        prompt_tokens_estimate=prompt_tokens_estimate,
+        response_tokens_estimate=_estimate_tokens(response_text),
+    )
+    has_explicit_frame = "decision_frame" in response
     decision = _normalize_plan_decision(response)
     state.fix_plan = decision.plan
     state.patch_content = decision.patch
+    state.patch_edits = decision.patch_edits
     state.test_command = decision.test_command
-    print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars)", file=sys.stderr, flush=True)
-    state.token_usage += _estimate_tokens(system, user, json.dumps(response))
+    print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars, edits={len(state.patch_edits)})", file=sys.stderr, flush=True)
+    state.token_usage += _estimate_tokens(system, user, response_text)
     _remember(state, "assistant", state.fix_plan[:2000])
     frame = decision.decision_frame
     frame.parent_frame_id = state.decision_frame.frame_id if state.decision_frame else None
     if not frame.trace_notes:
         frame.trace_notes = json.dumps({"files": decision.files})
+    hypothesis_warning = _preserve_patch_apply_hypothesis_anchor(state, frame)
     _record_decision_frame(state, frame)
-    if state.patch_content:
+    if hypothesis_warning is not None:
+        hypothesis_warning["frame_id"] = frame.frame_id
+        state.decision_warnings.append(hypothesis_warning)
+    if not has_explicit_frame:
+        _record_frame_health_warning(
+            state,
+            node="plan_fix",
+            expected_stage="plan",
+            frame=frame,
+            reason="missing_explicit_decision_frame",
+        )
+    if state.patch_content or state.patch_edits:
         state.current_phase = Phase.EXECUTE
-    elif frame.recommended_action in {"ask_user", "collect_more_context"}:
+    elif frame.recommended_action == "collect_more_context":
+        state.context_collection_count += 1
+        if state.context_collection_count > MAX_CONTEXT_COLLECTION_ROUNDS:
+            frame.recommended_action = "stop"
+            state.current_phase = Phase.FAILURE
+            state.failure_reason = (
+                "Context collection made no progress after "
+                f"{MAX_CONTEXT_COLLECTION_ROUNDS} attempts."
+            )
+        else:
+            state.current_phase = Phase.PLAN
+    elif frame.recommended_action == "ask_user":
         state.current_phase = Phase.PLAN
     else:
         frame.recommended_action = "stop"

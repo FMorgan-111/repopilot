@@ -8,7 +8,7 @@ import sys
 import time
 from typing import Any
 
-from .state import AgentState, NodeFn, Phase, _as_state
+from .state import AgentState, NodeFn, Phase, _as_state, _record_node_diagnostic
 
 try:  # pragma: no cover - exercised only when langgraph is installed.
     from langgraph.graph import END, StateGraph
@@ -17,15 +17,19 @@ except ImportError:  # pragma: no cover - fallback is covered by tests.
     StateGraph = None
 
 # ── per-phase timeouts (seconds) ──────────────────────────────────────────
+# plan_fix / reflect_on_failure are 300s (not 180s): a single LLM call can hit
+# the full ~140s retry path, and DeepSeek latency varies widely for the larger
+# ~6K-token planning prompts (observed 25s–143s for near-identical sizes). 180s
+# was tuned for the old ~1.6K prompts and the slow tail blew through it.
 PHASE_TIMEOUTS: dict[str, float] = {
-    "understand_issue": 15.0,
-    "locate_code": 30.0,
-    "plan_fix": 40.0,
-    "execute_fix": 120.0,
+    "understand_issue": 240.0,
+    "locate_code": 180.0,
+    "plan_fix": 300.0,
+    "execute_fix": 600.0,
     "verify_fix": 15.0,
-    "reflect_on_failure": 35.0,
-    "commit_fix": 30.0,
-    "handle_failure": 5.0,
+    "reflect_on_failure": 300.0,
+    "commit_fix": 600.0,
+    "handle_failure": 60.0,
 }
 
 logger = logging.getLogger("repopilot.graph")
@@ -77,6 +81,15 @@ class FallbackCompiledGraph:
                     f"Phase {current} timed out after {timeout}s (elapsed {elapsed:.1f}s)"
                 )
                 working.current_phase = Phase.FAILURE
+                _record_node_diagnostic(
+                    working,
+                    node=current,
+                    event="phase",
+                    status="timeout",
+                    elapsed_seconds=elapsed,
+                    error=asyncio.TimeoutError(),
+                    phase_timeout_seconds=timeout,
+                )
                 self._progress_fn(
                     current, "TIMEOUT",
                     f"{timeout}s limit exceeded"
@@ -88,6 +101,15 @@ class FallbackCompiledGraph:
                     f"Phase {current} crashed: {exc}"
                 )
                 working.current_phase = Phase.FAILURE
+                _record_node_diagnostic(
+                    working,
+                    node=current,
+                    event="phase",
+                    status="error",
+                    elapsed_seconds=elapsed,
+                    error=exc,
+                    phase_timeout_seconds=timeout,
+                )
                 self._progress_fn(
                     current, "ERROR",
                     f"{type(exc).__name__}: {exc}"

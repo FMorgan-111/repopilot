@@ -1,7 +1,10 @@
+import asyncio
 import functools
+import subprocess
 
+import src.nodes.execute as execute_node
 import src.run_store as run_store
-from src import new_agent
+from src import graph, http_client, new_agent
 
 
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
@@ -87,6 +90,70 @@ def test_langgraph_conditional_router_uses_native_async_callable():
     )
 
 
+def test_llm_phase_timeouts_cover_retry_window():
+    llm_retry_window = http_client.llm_retry_budget_seconds()
+    planner_margin = 30.0
+
+    assert graph.PHASE_TIMEOUTS["understand_issue"] >= llm_retry_window
+    assert graph.PHASE_TIMEOUTS["locate_code"] >= 180.0
+    assert graph.PHASE_TIMEOUTS["plan_fix"] >= llm_retry_window + planner_margin
+    assert graph.PHASE_TIMEOUTS["execute_fix"] >= 600.0
+    assert graph.PHASE_TIMEOUTS["reflect_on_failure"] >= llm_retry_window + planner_margin
+    assert graph.PHASE_TIMEOUTS["commit_fix"] >= 600.0
+    assert graph.PHASE_TIMEOUTS["handle_failure"] >= 60.0
+
+
+async def test_fallback_graph_records_phase_timeout_diagnostic(monkeypatch):
+    async def slow_node(state):
+        await asyncio.sleep(1)
+        return state
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "plan_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph({"plan_fix": slow_node}, "plan_fix")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert final_state.node_diagnostics[-1]["node"] == "plan_fix"
+    assert final_state.node_diagnostics[-1]["event"] == "phase"
+    assert final_state.node_diagnostics[-1]["status"] == "timeout"
+    assert final_state.node_diagnostics[-1]["error_type"] == "TimeoutError"
+    assert final_state.node_diagnostics[-1]["phase_timeout_seconds"] == 0.01
+
+
+async def test_phase_timeout_preserves_existing_node_diagnostics(monkeypatch):
+    async def slow_node(state):
+        state.node_diagnostics.append(
+            {
+                "node": "plan_fix",
+                "event": "prompt_built",
+                "status": "success",
+                "prompt_tokens_estimate": 3456,
+                "relevant_file_count": 2,
+            }
+        )
+        await asyncio.sleep(1)
+        return state
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "plan_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph({"plan_fix": slow_node}, "plan_fix")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    assert final_state.node_diagnostics[-2]["event"] == "prompt_built"
+    assert final_state.node_diagnostics[-2]["prompt_tokens_estimate"] == 3456
+    assert final_state.node_diagnostics[-1]["event"] == "phase"
+    assert final_state.node_diagnostics[-1]["status"] == "timeout"
+
+
 async def test_agent_v2_crash_payload_exposes_human_input_defaults(monkeypatch):
     saved_traces = []
 
@@ -156,6 +223,29 @@ async def test_agent_v2_saves_waiting_for_user_run(monkeypatch, tmp_path):
     assert payload["run_id"] == payload["trace_id"]
     assert payload["waiting_for_user"] is True
     assert (tmp_path / ".repopilot" / "runs" / f"{payload['trace_id']}.json").exists()
+
+
+async def test_agent_v2_ignores_final_run_persistence_errors(monkeypatch):
+    async def fake_run_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        state.pr_url = "https://github.com/acme/widget/pull/42"
+        return state
+
+    def failing_save_run(state):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(new_agent, "save_run", failing_save_run)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
+
+    assert payload["success"] is True
+    assert payload["final_phase"] == "DONE"
+    assert payload["run_id"] == payload["trace_id"]
 
 
 async def test_agent_v2_saves_final_run_when_requested(monkeypatch, tmp_path):
@@ -397,3 +487,491 @@ async def test_verify_fix_replans_failed_attempt_once():
 
     assert next_state.current_phase == new_agent.Phase.REFLECT
     assert next_state.retry_count == 1
+
+
+async def test_execute_fix_marks_patch_apply_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=False,
+            output="error: corrupt patch at line 3",
+            patch_content=patch_content,
+        )
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="malformed diff",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "patch_apply_failed"
+    assert next_state.fix_attempts[-1].failure_kind == "patch_apply_failed"
+    assert next_state.fix_attempts[-1].error_log == "error: corrupt patch at line 3"
+
+
+async def test_execute_fix_marks_test_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=True,
+            output="",
+            patch_content=patch_content,
+        )
+
+    async def fake_run_pytest(repo_path, command=None):
+        return {
+            "command": "pytest tests/test_auth.py -q",
+            "returncode": 1,
+            "stdout": "FAILED tests/test_auth.py",
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+        test_command="pytest tests/test_auth.py -q",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].success is False
+    assert next_state.fix_attempts[-1].failure_kind == "test_failed"
+    assert "FAILED tests/test_auth.py" in next_state.fix_attempts[-1].error_log
+
+
+async def test_execute_fix_marks_execution_error_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        raise RuntimeError("git apply crashed")
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "execution_error"
+    assert next_state.fix_attempts[-1].error_log == "git apply crashed"
+
+
+async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    (cache_path / ".git").mkdir(parents=True)
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+    )
+
+    repo_path = await execute_node.git_clone(state)
+
+    assert commands == [
+        [
+            "git",
+            "clone",
+            "--local",
+            "--no-hardlinks",
+            str(cache_path),
+            repo_path,
+        ]
+    ]
+    assert all(
+        "github.com" not in part for command in commands for part in command
+    )
+
+
+async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        if cmd[:2] == ["git", "clone"] and cmd[-1] == str(cache_path):
+            (cache_path / ".git").mkdir(parents=True)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+    )
+
+    repo_path = await execute_node.git_clone(state)
+
+    assert commands[0][:2] == ["git", "clone"]
+    assert commands[0][-1] == str(cache_path)
+    assert any(
+        "https://x-access-token:gho_cachetoken@github.com/acme/widget.git" == part
+        for part in commands[0]
+    )
+    assert commands[1] == [
+        "git",
+        "-C",
+        str(cache_path),
+        "remote",
+        "set-url",
+        "origin",
+        "https://github.com/acme/widget.git",
+    ]
+    assert commands[2] == [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ]
+
+
+async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        return subprocess.CompletedProcess(
+            cmd,
+            128,
+            stdout="",
+            stderr=(
+                "fatal: unable to access "
+                "'https://x-access-token:gho_cachetoken@github.com/acme/widget.git/'"
+            ),
+        )
+
+    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+    )
+
+    try:
+        await execute_node.git_clone(state)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("git_clone should fail when all cache population fails")
+
+    assert len(commands) == 3
+    assert "gho_cachetoken" not in message
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in message
+    assert not cache_path.exists()
+
+
+async def test_execute_fix_redacts_github_token_from_execution_error(monkeypatch):
+    token = "gho_secret123"
+    tokenized_url = f"https://x-access-token:{token}@github.com/acme/widget.git"
+
+    async def fake_git_clone(state):
+        raise subprocess.TimeoutExpired(
+            cmd=[
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                tokenized_url,
+                "/tmp/repopilot-acme-widget",
+            ],
+            timeout=180,
+        )
+
+    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert tokenized_url not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_marks_clone_network_failure_as_infra_error(monkeypatch):
+    async def fake_git_clone(state):
+        raise RuntimeError(
+            "fatal: unable to access 'https://github.com/acme/widget.git/': "
+            "Failed to connect to github.com port 443"
+        )
+
+    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert "Failed to connect to github.com port 443" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_redacts_github_token_from_patch_apply_failure(monkeypatch):
+    token = "gho_patchsecret"
+
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=False,
+            output=(
+                "fatal: unable to access "
+                f"'https://x-access-token:{token}@github.com/acme/widget.git/'"
+            ),
+            patch_content=patch_content,
+        )
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="malformed diff",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_redacts_github_token_from_test_output(monkeypatch):
+    token = "gho_testsecret"
+
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=True,
+            output="",
+            patch_content=patch_content,
+        )
+
+    async def fake_run_pytest(repo_path, command=None):
+        return {
+            "command": "pytest tests/test_auth.py -q",
+            "returncode": 1,
+            "stdout": (
+                "failed cloning "
+                f"https://x-access-token:{token}@github.com/acme/widget.git"
+            ),
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+        test_command="pytest tests/test_auth.py -q",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_verify_fix_first_patch_apply_failure_does_not_increment_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_legacy_patch_apply_failure_does_not_increment_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_second_consecutive_patch_apply_failure_consumes_retry():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            ),
+            new_agent.FixAttempt(
+                patch_content="still malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 1
+
+
+async def test_verify_fix_same_patch_apply_failure_twice_routes_to_failure():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=2,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.FAILURE
+    assert next_state.failure_reason == "Same patch produced the same failure twice."
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_test_failure_still_increments_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="diff --git a/src/auth.py b/src/auth.py",
+                file_path="src/auth.py",
+                test_result="failed",
+                failure_kind="test_failed",
+                error_log="assert False",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 1
+
+
+async def test_verify_fix_infra_error_routes_to_failure_without_retry():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="diff --git a/src/auth.py b/src/auth.py",
+                file_path="src/auth.py",
+                test_result="execution_error",
+                failure_kind="infra_error",
+                error_log="fatal: unable to access github.com",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.FAILURE
+    assert next_state.retry_count == 0
+    assert next_state.failure_reason == (
+        "Infrastructure error during execution: fatal: unable to access github.com"
+    )

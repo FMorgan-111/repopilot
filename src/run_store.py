@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,8 @@ from .state import AgentState
 
 
 def default_runs_dir() -> Path:
+    if repopilot_home := os.getenv("REPOPILOT_HOME"):
+        return Path(repopilot_home).expanduser()
     return Path.home() / ".repopilot"
 
 
@@ -115,6 +118,15 @@ def summarize_replay(state: AgentState) -> dict[str, Any]:
             }
         )
 
+    for diagnostic in state.node_diagnostics:
+        timeline.append(
+            {
+                "index": len(timeline) + 1,
+                "type": "node_diagnostic",
+                "diagnostic": diagnostic,
+            }
+        )
+
     return {
         "run_id": state.trace_id,
         "issue_url": state.issue_url,
@@ -150,6 +162,8 @@ def format_replay_markdown(replay: dict[str, Any]) -> str:
             _append_frame_markdown(lines, item)
         elif item.get("type") == "route_decision":
             _append_route_markdown(lines, item)
+        elif item.get("type") == "node_diagnostic":
+            _append_node_diagnostic_markdown(lines, item)
 
     return "\n".join(lines)
 
@@ -201,6 +215,27 @@ def _append_route_markdown(lines: list[str], item: dict[str, Any]) -> None:
         lines.append(f"- Source: {route['source']}")
     if route.get("fallback_reason"):
         lines.append(f"- Fallback reason: {route['fallback_reason']}")
+
+
+def _append_node_diagnostic_markdown(
+    lines: list[str], item: dict[str, Any]
+) -> None:
+    lines.append(f"### {item.get('index')}. Node Diagnostic")
+    lines.append("")
+    diagnostic = item.get("diagnostic") or {}
+    for key, label in [
+        ("node", "Node"),
+        ("event", "Event"),
+        ("status", "Status"),
+        ("elapsed_seconds", "Elapsed seconds"),
+        ("error_type", "Error type"),
+        ("error", "Error"),
+        ("phase_timeout_seconds", "Phase timeout seconds"),
+        ("prompt_tokens_estimate", "Prompt tokens estimate"),
+        ("response_tokens_estimate", "Response tokens estimate"),
+    ]:
+        if key in diagnostic:
+            lines.append(f"- {label}: {diagnostic[key]}")
 
 
 def _route_for_frame(

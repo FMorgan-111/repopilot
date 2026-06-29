@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Sequence
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class Phase(str, Enum):
@@ -38,12 +39,51 @@ class FileInfo(BaseModel):
     sha: str = ""
 
 
+class PatchEdit(BaseModel):
+    file_path: str = Field(min_length=1)
+    search: str = Field(min_length=1)
+    replace: str = ""
+    replace_all: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_file_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        normalized = dict(value)
+        if "file_path" not in normalized:
+            for alias in ["file", "path"]:
+                if alias in normalized:
+                    normalized["file_path"] = normalized[alias]
+                    break
+        return normalized
+
+
 class FixAttempt(BaseModel):
     patch_content: str = ""
+    patch_edits: list[PatchEdit] = Field(default_factory=list)
     file_path: str = ""
     test_result: str = ""
+    failure_kind: str = ""
     error_log: str = ""
     success: bool = False
+
+
+def _normalize_string_list(value: Any) -> Any:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        normalized: list[str] = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ValueError("Expected a sequence of strings")
+            normalized.append(item)
+        return normalized
+    raise ValueError("Expected None, a string, or a sequence of strings")
 
 
 class Hypothesis(BaseModel):
@@ -53,6 +93,25 @@ class Hypothesis(BaseModel):
     score: float = Field(default=0.0, ge=0.0, le=1.0)
     why_selected: str = ""
     why_not_selected: str = ""
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def _coerce_id_to_str(cls, value: Any) -> Any:
+        if isinstance(value, (int, float)):
+            return str(value)
+        return value
+
+    @field_validator("evidence", mode="before")
+    @classmethod
+    def _normalize_evidence(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
+
+    @field_validator("score", mode="before")
+    @classmethod
+    def _normalize_score(cls, value: Any) -> Any:
+        if isinstance(value, (int, float)) and 1.0 < float(value) <= 10.0:
+            return float(value) / 10.0
+        return value
 
 
 class DecisionFrame(BaseModel):
@@ -75,6 +134,18 @@ class DecisionFrame(BaseModel):
     risk: Literal["low", "medium", "high", "unknown"] = "unknown"
     parent_frame_id: str | None = None
     trace_notes: str = ""
+
+    @field_validator("selected_hypothesis_id", mode="before")
+    @classmethod
+    def _coerce_selected_hypothesis_id_to_str(cls, value: Any) -> Any:
+        if isinstance(value, (int, float)):
+            return str(value)
+        return value
+
+    @field_validator("evidence", "next_checks", mode="before")
+    @classmethod
+    def _normalize_string_lists(cls, value: Any) -> Any:
+        return _normalize_string_list(value)
 
 
 class ToolCall(BaseModel):
@@ -113,6 +184,7 @@ class AgentState(BaseModel):
     severity: str = "unknown"
     fix_plan: str = ""
     patch_content: str = ""
+    patch_edits: list[PatchEdit] = Field(default_factory=list)
     test_command: str = ""
     repo_path: str = ""
     branch_name: str = ""
@@ -123,11 +195,17 @@ class AgentState(BaseModel):
     reflection_notes: str = ""
     decision_frame: DecisionFrame | None = None
     frame_history: list[DecisionFrame] = Field(default_factory=list)
+    context_collection_count: int = 0
+    last_locate_signature: str = ""
     decision_warnings: list[dict[str, Any]] = Field(default_factory=list)
     decision_route_checked_frame_id: str = ""
     route_decisions: list[dict[str, Any]] = Field(default_factory=list)
+    node_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     pending_human_input: bool = False
     human_input_request: dict[str, Any] = Field(default_factory=dict)
+    # Benchmark/eval mode: a verified test pass routes straight to DONE instead
+    # of opening a PR (we have no write access to upstream repos under eval).
+    skip_commit: bool = False
 
 
 NodeFn = Callable[[AgentState], Awaitable[AgentState]]
@@ -168,6 +246,72 @@ def _record_decision_frame(state: AgentState, frame: DecisionFrame) -> None:
         frame.frame_id = f"df_{len(state.frame_history) + 1:04d}"
     state.decision_frame = frame
     state.frame_history.append(frame)
+
+
+def _record_frame_health_warning(
+    state: AgentState,
+    *,
+    node: str,
+    expected_stage: str,
+    frame: DecisionFrame | None,
+    reason: str,
+) -> None:
+    state.decision_warnings.append(
+        {
+            "warning_type": "frame_health",
+            "node": node,
+            "frame_id": frame.frame_id if frame else "",
+            "expected_stage": expected_stage,
+            "actual_stage": frame.stage if frame else "",
+            "reason": reason,
+        }
+    )
+
+
+def _describe_exception(exc: BaseException) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{type(exc).__name__}: {message}"
+    return type(exc).__name__
+
+
+def _record_node_diagnostic(
+    state: AgentState,
+    *,
+    node: str,
+    event: str,
+    status: str,
+    elapsed_seconds: float,
+    error: BaseException | None = None,
+    **details: Any,
+) -> None:
+    diagnostic: dict[str, Any] = {
+        "node": node,
+        "event": event,
+        "status": status,
+        "elapsed_seconds": round(max(elapsed_seconds, 0.0), 3),
+    }
+    if error is not None:
+        diagnostic["error_type"] = type(error).__name__
+        diagnostic["error"] = str(error).strip() or type(error).__name__
+    for key, value in details.items():
+        if value is not None:
+            diagnostic[key] = value
+    state.node_diagnostics.append(diagnostic)
+
+
+def _human_answer_context(state: AgentState, *, max_answers: int = 3) -> str:
+    answers = [
+        turn.content.strip()
+        for turn in state.conversation_history
+        if turn.role == "user"
+        and turn.content.strip().startswith("Human answer for paused run")
+    ]
+    if not answers:
+        return ""
+
+    recent_answers = answers[-max_answers:]
+    return "Human answer since resume:\n" + "\n\n".join(recent_answers)
 
 
 def _is_budget_exceeded(state: AgentState) -> bool:
@@ -243,6 +387,7 @@ def _same_failure_seen_twice(state: AgentState) -> bool:
     for previous in state.fix_attempts[:-1]:
         if (
             previous.patch_content == last.patch_content
+            and previous.patch_edits == last.patch_edits
             and previous.error_log == last.error_log
             and not previous.success
             and not last.success

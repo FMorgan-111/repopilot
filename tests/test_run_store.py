@@ -124,6 +124,22 @@ def replay_state(trace_id: str = "abc123def456"):
     )
 
 
+def diagnostic_state(trace_id: str = "diag123"):
+    state = replay_state(trace_id)
+    state.node_diagnostics.append(
+        {
+            "node": "plan_fix",
+            "event": "phase",
+            "status": "timeout",
+            "elapsed_seconds": 90.0,
+            "error_type": "TimeoutError",
+            "error": "TimeoutError",
+            "phase_timeout_seconds": 90.0,
+        }
+    )
+    return state
+
+
 def test_save_and_load_paused_run_preserves_pause_state(tmp_path):
     root_dir = tmp_path / ".repopilot"
     state = paused_state()
@@ -138,6 +154,18 @@ def test_save_and_load_paused_run_preserves_pause_state(tmp_path):
     assert loaded.human_input_request == state.human_input_request
     assert loaded.frame_history == state.frame_history
     assert loaded.route_decisions == state.route_decisions
+
+
+def test_save_run_uses_repopilot_home_by_default(tmp_path, monkeypatch):
+    repopilot_home = tmp_path / "custom-repopilot-home"
+    state = paused_state()
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+
+    saved_path = run_store.save_run(state)
+
+    assert run_store.default_runs_dir() == repopilot_home
+    assert saved_path == repopilot_home / "runs" / f"{state.trace_id}.json"
+    assert saved_path.exists()
 
 
 def test_inspect_run_returns_stable_summary(tmp_path):
@@ -247,6 +275,28 @@ def test_replay_run_returns_white_box_timeline(tmp_path):
     ]
 
 
+def test_replay_run_includes_node_diagnostics(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    state = diagnostic_state()
+    run_store.save_run(state, root_dir=root_dir)
+
+    replay = run_store.replay_run(state.trace_id, root_dir=root_dir)
+
+    assert replay["timeline"][-1] == {
+        "index": 4,
+        "type": "node_diagnostic",
+        "diagnostic": {
+            "node": "plan_fix",
+            "event": "phase",
+            "status": "timeout",
+            "elapsed_seconds": 90.0,
+            "error_type": "TimeoutError",
+            "error": "TimeoutError",
+            "phase_timeout_seconds": 90.0,
+        },
+    }
+
+
 def test_format_replay_markdown_summarizes_timeline():
     replay = run_store.summarize_replay(replay_state())
 
@@ -293,3 +343,16 @@ def test_format_replay_markdown_summarizes_timeline():
             "- Fallback reason: already_consumed",
         ]
     )
+
+
+def test_format_replay_markdown_includes_node_diagnostics():
+    replay = run_store.summarize_replay(diagnostic_state())
+
+    markdown = run_store.format_replay_markdown(replay)
+
+    assert "### 4. Node Diagnostic" in markdown
+    assert "- Node: plan_fix" in markdown
+    assert "- Event: phase" in markdown
+    assert "- Status: timeout" in markdown
+    assert "- Error: TimeoutError" in markdown
+    assert "- Phase timeout seconds: 90.0" in markdown
