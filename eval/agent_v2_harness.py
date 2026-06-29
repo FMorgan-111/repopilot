@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,13 +17,76 @@ if str(REPO_ROOT) not in sys.path:
 
 agent_v2 = importlib.import_module("src.new_agent").agent_v2
 replay_run = importlib.import_module("src.run_store").replay_run
+close_llm_client = importlib.import_module("src.http_client").close_llm_client
+close_store = importlib.import_module("src.memory").close_store
 
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 MAX_SAMPLES = 5
 
 
-def load_samples(n: int = MAX_SAMPLES) -> list[dict[str, Any]]:
+def _fallback_results_path() -> Path:
+    configured_home = os.getenv("REPOPILOT_HOME")
+    if configured_home:
+        return Path(configured_home) / "eval" / "eval_results.json"
+    return Path("/tmp") / "repopilot" / "eval_results.json"
+
+
+def _write_results_with_fallback(
+    results: list[dict[str, Any]],
+    requested_path: Path | str,
+) -> Path:
+    path = Path(requested_path)
+    contents = json.dumps(results, indent=2, ensure_ascii=False)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents, encoding="utf-8")
+        return path
+    except OSError as exc:
+        fallback_path = _fallback_results_path()
+        fallback_path.parent.mkdir(parents=True, exist_ok=True)
+        fallback_path.write_text(contents, encoding="utf-8")
+        print(
+            "Warning: failed to write agent v2 eval results to "
+            f"{path}: {type(exc).__name__}: {exc}; wrote fallback to {fallback_path}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return fallback_path
+
+
+async def _close_shared_resources() -> None:
+    cleanup_steps = [
+        ("shared LLM client", close_llm_client),
+        ("shared memory store", close_store),
+    ]
+    for resource_name, close_resource in cleanup_steps:
+        try:
+            await close_resource()
+        except Exception as exc:
+            print(
+                f"Warning: failed to close {resource_name}: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+
+def load_samples(
+    n: int = MAX_SAMPLES, sample_id: str | None = None
+) -> list[dict[str, Any]]:
+    # When a specific sample_id is requested, scan the whole file for it and
+    # return just that one (ignores n). Otherwise take the first n lines.
+    if sample_id:
+        with SAMPLES_PATH.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                if record.get("id") == sample_id:
+                    return [record]
+        raise ValueError(f"sample_id not found in dataset: {sample_id}")
+
     samples: list[dict[str, Any]] = []
     with SAMPLES_PATH.open(encoding="utf-8") as f:
         for i, line in enumerate(f):
@@ -51,6 +115,7 @@ async def evaluate_agent_v2_sample(
         max_retries=max_retries,
         token_budget=token_budget,
         save_final_run=True,
+        skip_commit=True,
     )
     run_id = payload.get("run_id") or payload.get("trace_id") or ""
 
@@ -89,28 +154,30 @@ async def run_agent_v2_eval(
     max_retries: int = 3,
     token_budget: int = 50000,
     results_path: Path | str = RESULTS_PATH,
+    sample_id: str | None = None,
 ) -> list[dict[str, Any]]:
-    samples = load_samples(n_samples)
-    results: list[dict[str, Any]] = []
+    try:
+        samples = load_samples(n_samples, sample_id=sample_id)
+        results: list[dict[str, Any]] = []
 
-    for i, sample in enumerate(samples):
-        print(f"\n{'='*60}", flush=True)
-        print(f"Agent v2 sample {i + 1}/{len(samples)}: {sample['id']}", flush=True)
-        print(f"{'='*60}", flush=True)
-        results.append(
-            await evaluate_agent_v2_sample(
-                sample,
-                i,
-                max_retries=max_retries,
-                token_budget=token_budget,
+        for i, sample in enumerate(samples):
+            print(f"\n{'='*60}", flush=True)
+            print(f"Agent v2 sample {i + 1}/{len(samples)}: {sample['id']}", flush=True)
+            print(f"{'='*60}", flush=True)
+            results.append(
+                await evaluate_agent_v2_sample(
+                    sample,
+                    i,
+                    max_retries=max_retries,
+                    token_budget=token_budget,
+                )
             )
-        )
 
-    path = Path(results_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(f"\nAgent v2 eval results saved to {path}", flush=True)
-    return results
+        path = _write_results_with_fallback(results, results_path)
+        print(f"\nAgent v2 eval results saved to {path}", flush=True)
+        return results
+    finally:
+        await _close_shared_resources()
 
 
 def main(argv: list[str] | None = None) -> None:

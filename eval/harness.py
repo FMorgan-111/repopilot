@@ -1065,12 +1065,14 @@ async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
     max_retries: int = 3,
     token_budget: int = 50000,
+    sample_id: str | None = None,
 ) -> list[dict[str, Any]]:
     module = importlib.import_module("eval.agent_v2_harness")
     return await module.run_agent_v2_eval(
         n_samples=n_samples,
         max_retries=max_retries,
         token_budget=token_budget,
+        sample_id=sample_id,
     )
 
 
@@ -1088,6 +1090,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--model", default="deepseek-v4-flash")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--token-budget", type=int, default=50000)
+    parser.add_argument(
+        "--sample-id",
+        default=None,
+        help="Run only this dataset sample id (e.g. 'scrapy/scrapy#6195:7095'), "
+        "scanning the whole file instead of taking the first --samples lines.",
+    )
     args = parser.parse_args(argv)
 
     if args.agent_v2:
@@ -1096,6 +1104,7 @@ def main(argv: list[str] | None = None) -> None:
                 n_samples=args.samples,
                 max_retries=args.max_retries,
                 token_budget=args.token_budget,
+                sample_id=args.sample_id,
             )
         )
         return

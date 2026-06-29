@@ -93,3 +93,86 @@ def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     assert "- Actual route: plan_fix" in markdown
     assert "- Warning: expected PLAN but actual REFLECT" in markdown
     assert "- Next check: Inspect session refresh middleware." in markdown
+
+
+def test_generate_markdown_includes_agent_v2_node_diagnostics_without_decision_frame():
+    result = agent_v2_result()
+    result["id"] = "acme/widget#9:10"
+    result["run_id"] = "node123"
+    result["trace_id"] = "node123"
+    result["final_phase"] = "FAILED"
+    result["error"] = "Replay failed during validation."
+    result["replay"] = {
+        "run_id": "node123",
+        "issue_url": "https://github.com/acme/widget/issues/9",
+        "current_phase": "FAILED",
+        "timeline": [
+            {
+                "index": 1,
+                "type": "node_diagnostic",
+                "diagnostic": {
+                    "node": "plan_fix",
+                    "event": "llm_call",
+                    "status": "success",
+                    "elapsed_seconds": 88.647,
+                    "prompt_tokens_estimate": 2286,
+                    "response_tokens_estimate": 1226,
+                },
+            },
+            {
+                "index": 2,
+                "type": "node_diagnostic",
+                "diagnostic": {
+                    "node": "phase",
+                    "event": "advance",
+                    "status": "error",
+                    "error_type": "ValidationError",
+                    "error": "Invalid phase transition.",
+                },
+            },
+        ],
+    }
+
+    metrics = report.compute_metrics([result])
+    markdown = report.generate_markdown([result], metrics)
+
+    assert "### acme/widget#9:10 (`node123`)" in markdown
+    assert "- Latest frame: none" in markdown
+    assert "#### Node Diagnostics" in markdown
+    assert "| Node | Event | Status | Error Type | Error |" in markdown
+    assert "| `plan_fix` | llm_call | success |  |  |" in markdown
+    assert "| `phase` | advance | error | ValidationError | Invalid phase transition. |" in markdown
+
+
+def test_generate_markdown_surfaces_plan_fix_phase_timeout():
+    result = agent_v2_result()
+    result["id"] = "tox-dev/tox#3075:3748"
+    result["run_id"] = "abc123"
+    result["trace_id"] = "abc123"
+    result["error"] = "Phase plan_fix timed out after 150.0s"
+    result["token_used"] = 5601
+    result["turns_taken"] = 14
+    result["replay"] = {
+        "current_phase": "FAILED",
+        "timeline": [
+            {
+                "type": "node_diagnostic",
+                "diagnostic": {
+                    "node": "plan_fix",
+                    "event": "phase",
+                    "status": "timeout",
+                    "error_type": "TimeoutError",
+                    "error": "TimeoutError",
+                    "phase_timeout_seconds": 150.0,
+                },
+            }
+        ],
+    }
+
+    markdown = report.generate_markdown(
+        [result],
+        report.compute_metrics([result]),
+    )
+
+    assert "Planner timeout" in markdown
+    assert "plan_fix exceeded 150.0s" in markdown

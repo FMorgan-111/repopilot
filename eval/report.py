@@ -182,6 +182,7 @@ def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) ->
     for result in results:
         waiting = "yes" if result.get("waiting_for_user") else "no"
         error = result.get("error") or ""
+        error = _markdown_table_cell(error)
         lines.append(
             f"| `{result.get('id', '')[:60]}` "
             f"| `{result.get('run_id', '')}` "
@@ -209,33 +210,35 @@ def _append_replay_diagnostics(
         latest_frame = _latest_decision_frame(replay)
         if latest_frame is None:
             lines.append("- Latest frame: none\n")
-            continue
-
-        stage = latest_frame.get("stage", "")
-        frame_id = latest_frame.get("frame_id", "")
-        lines.append(f"- Latest frame: {stage} `{frame_id}`\n")
-        if latest_frame.get("selected_hypothesis_id"):
-            lines.append(
-                f"- Selected hypothesis: {latest_frame['selected_hypothesis_id']}\n"
-            )
-        selected = latest_frame.get("selected_hypothesis") or {}
-        if selected.get("claim"):
-            lines.append(f"- Hypothesis claim: {selected['claim']}\n")
-        if latest_frame.get("recommended_action"):
-            lines.append(
-                f"- Recommended action: {latest_frame['recommended_action']}\n"
-            )
-        route = latest_frame.get("route") or {}
-        if route.get("route"):
-            lines.append(f"- Actual route: {route['route']}\n")
-        for warning in latest_frame.get("warnings", []):
-            lines.append(
-                "- Warning: "
-                f"expected {warning.get('expected_phase', '')} "
-                f"but actual {warning.get('actual_phase', '')}\n"
-            )
-        for check in latest_frame.get("next_checks", []):
-            lines.append(f"- Next check: {check}\n")
+        else:
+            stage = latest_frame.get("stage", "")
+            frame_id = latest_frame.get("frame_id", "")
+            lines.append(f"- Latest frame: {stage} `{frame_id}`\n")
+            if latest_frame.get("selected_hypothesis_id"):
+                lines.append(
+                    f"- Selected hypothesis: {latest_frame['selected_hypothesis_id']}\n"
+                )
+            selected = latest_frame.get("selected_hypothesis") or {}
+            if selected.get("claim"):
+                lines.append(f"- Hypothesis claim: {selected['claim']}\n")
+            if latest_frame.get("recommended_action"):
+                lines.append(
+                    f"- Recommended action: {latest_frame['recommended_action']}\n"
+                )
+            route = latest_frame.get("route") or {}
+            if route.get("route"):
+                lines.append(f"- Actual route: {route['route']}\n")
+            for warning in latest_frame.get("warnings", []):
+                lines.append(
+                    "- Warning: "
+                    f"expected {warning.get('expected_phase', '')} "
+                    f"but actual {warning.get('actual_phase', '')}\n"
+                )
+            for check in latest_frame.get("next_checks", []):
+                lines.append(f"- Next check: {check}\n")
+        for summary in _diagnostic_summary(replay):
+            lines.append(f"- Diagnostic summary: {summary}\n")
+        _append_node_diagnostics(lines, replay)
         lines.append("\n")
 
 
@@ -244,6 +247,57 @@ def _latest_decision_frame(replay: dict[str, Any]) -> dict[str, Any] | None:
         if item.get("type") == "decision_frame":
             return item
     return None
+
+
+def _diagnostic_summary(replay: dict[str, Any]) -> list[str]:
+    summaries: list[str] = []
+    for item in replay.get("timeline", []):
+        if item.get("type") != "node_diagnostic":
+            continue
+        diagnostic = item.get("diagnostic") or item
+        if (
+            diagnostic.get("node") == "plan_fix"
+            and diagnostic.get("event") == "phase"
+            and diagnostic.get("status") == "timeout"
+        ):
+            timeout = diagnostic.get("phase_timeout_seconds", "")
+            summaries.append(f"Planner timeout: plan_fix exceeded {timeout}s.")
+    return summaries
+
+
+def _append_node_diagnostics(lines: list[str], replay: dict[str, Any]) -> None:
+    diagnostics = [
+        item
+        for item in replay.get("timeline", [])
+        if item.get("type") == "node_diagnostic"
+    ]
+    if not diagnostics:
+        return
+
+    lines.append("\n#### Node Diagnostics\n\n")
+    lines.append("| Node | Event | Status | Error Type | Error |\n")
+    lines.append("|------|-------|--------|------------|-------|\n")
+    for item in diagnostics:
+        diagnostic = item.get("diagnostic") or item
+        node = _markdown_table_cell(diagnostic.get("node", ""))
+        event = _markdown_table_cell(diagnostic.get("event", ""))
+        status = _markdown_table_cell(diagnostic.get("status", ""))
+        error_type = _markdown_table_cell(diagnostic.get("error_type", ""))
+        error = _markdown_table_cell(diagnostic.get("error", ""))
+        lines.append(
+            f"| `{node}` | {event} | {status} | {error_type} | {error} |\n"
+        )
+
+
+def _markdown_table_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    text = str(value)
+    text = text.replace("\\", "\\\\")
+    text = text.replace("|", "\\|")
+    text = text.replace("\r", " ")
+    text = text.replace("\n", "<br>")
+    return text
 
 
 def print_summary(metrics: dict) -> None:
