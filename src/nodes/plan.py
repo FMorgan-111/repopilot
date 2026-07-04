@@ -83,6 +83,123 @@ def _truncate_prompt_text(value: str, limit: int = 500) -> str:
     return f"{value[:limit].rstrip()}..."
 
 
+def _normalized_edit_key(file_path: str, search: str) -> str:
+    """Whitespace-insensitive identity for a search/replace edit target."""
+    return f"{file_path}::{' '.join(search.split())}"
+
+
+def _failed_edit_keys(state: AgentState) -> set[str]:
+    """Signatures of every search/replace edit tried in a failed attempt."""
+    keys: set[str] = set()
+    for attempt in state.fix_attempts:
+        if getattr(attempt, "success", False):
+            continue
+        for edit in getattr(attempt, "patch_edits", []) or []:
+            keys.add(_normalized_edit_key(edit.file_path, edit.search))
+    return keys
+
+
+def _prior_failed_edits_context(state: AgentState) -> str:
+    """List already-tried-and-failed edits so the planner is forced to diversify
+    instead of re-emitting a known-failing search/replace pair."""
+    seen: dict[str, Any] = {}
+    for attempt in state.fix_attempts:
+        if getattr(attempt, "success", False):
+            continue
+        for edit in getattr(attempt, "patch_edits", []) or []:
+            key = _normalized_edit_key(edit.file_path, edit.search)
+            seen.setdefault(key, edit)
+    if not seen:
+        return ""
+    lines = [
+        "ALREADY-TRIED EDITS THAT FAILED — do NOT re-emit these exact "
+        "search/replace pairs. If your best fix matches one, you MUST change the "
+        "target (different file or hunk) or the root-cause approach:",
+    ]
+    for edit in seen.values():
+        lines.append(
+            f"- file: {edit.file_path}\n"
+            f"  search (verbatim):\n{_truncate_prompt_text(edit.search, 300)}"
+        )
+    return "\n".join(lines)
+
+
+def _planned_edits_repeat_failure(state: AgentState) -> bool:
+    """True when the freshly planned edits merely repeat edits that already
+    failed (no diversification happened)."""
+    if not state.patch_edits:
+        return False
+    failed_keys = _failed_edit_keys(state)
+    if not failed_keys:
+        return False
+    return all(
+        _normalized_edit_key(edit.file_path, edit.search) in failed_keys
+        for edit in state.patch_edits
+    )
+
+
+def _is_final_attempt(state: AgentState) -> bool:
+    """The retry budget is spent: this plan is the last one that can execute."""
+    return state.retry_count >= state.max_retries
+
+
+def _final_attempt_instructions() -> str:
+    return (
+        " This is the FINAL planning attempt (retry budget is spent). You MUST "
+        "return concrete patch_edits now and set recommended_action='execute'. "
+        "Do NOT request more context: 'collect_more_context' is not allowed on "
+        "the final attempt."
+    )
+
+
+def _format_recalled_episodes(episodes: list[Any]) -> str:
+    lines = [
+        "RELATED PAST FIX EPISODES (semantic recall across repositories — learn "
+        "from prior outcomes; adapt to the current code, do NOT copy verbatim):",
+    ]
+    for ep in episodes:
+        tag = "✅ SUCCESS" if ep.success else "❌ FAILURE"
+        role = (
+            "working approach to reuse as a template"
+            if ep.success
+            else "approach that FAILED here — treat as a pitfall to avoid"
+        )
+        lines.append(
+            f"\n{tag} — {ep.owner}/{ep.repo}: "
+            f"{_truncate_prompt_text(ep.issue_title, 160)}"
+        )
+        keyframe = _truncate_prompt_text(ep.keyframe, 300)
+        if keyframe:
+            lines.append(f"  error signature: {keyframe}")
+        patch = _truncate_prompt_text(ep.patch, 500)
+        if patch:
+            lines.append(f"  {role}:\n{patch}")
+    return "\n".join(lines)
+
+
+async def _semantic_recall_context(state: AgentState) -> str:
+    """Best-effort cross-repo recall of similar past fixes. Never raises: if the
+    episode store or embedding model is unavailable, planning proceeds without
+    recall."""
+    try:
+        from ..memory.error_episode_store import get_episode_store
+
+        store = get_episode_store()
+        if store is None:
+            return ""
+        episodes = await store.arecall(
+            issue_title=state.issue_title,
+            issue_body=state.issue_body,
+            k=3,
+            exclude_issue_url=state.issue_url,
+        )
+    except Exception:
+        return ""
+    if not episodes:
+        return ""
+    return _format_recalled_episodes(episodes)
+
+
 def _context_pressure_instructions(state: AgentState) -> str:
     """Escalating pressure to commit a patch as context-collection rounds mount.
 
@@ -299,6 +416,14 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     pressure = _context_pressure_instructions(state)
     if pressure:
         context_pressure_context = f"\n\n{pressure}"
+    diversity_context = ""
+    prior_failed_edits = _prior_failed_edits_context(state)
+    if prior_failed_edits:
+        diversity_context = f"\n\n{prior_failed_edits}"
+    recall_context = ""
+    recall = await _semantic_recall_context(state)
+    if recall:
+        recall_context = f"\n\n{recall}"
 
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
@@ -330,14 +455,17 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             "before changing semantics. Do not shift the selected hypothesis "
             "unless the apply error proves the target file or hunk context is impossible."
         )
+    if _is_final_attempt(state):
+        system = f"{system}{_final_attempt_instructions()}"
     user = (
         f"Issue URL: {state.issue_url}\n"
         f"Title: {state.issue_title}\n\nBody:\n"
         f"{_truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)}\n\n"
-        f"Relevant files:\n{files_context}\n\nPrevious failures:\n{previous_failures}"
+        f"Relevant files:\n{files_context}{recall_context}\n\nPrevious failures:\n{previous_failures}"
         f"{reflection_context}"
         f"{hypothesis_continuity_context}"
         f"{context_pressure_context}"
+        f"{diversity_context}"
         f"{human_context}"
     )
     prompt_tokens_estimate = _estimate_tokens(system, user)
@@ -414,18 +542,37 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             reason="missing_explicit_decision_frame",
         )
     if state.patch_content or state.patch_edits:
+        if _planned_edits_repeat_failure(state):
+            state.decision_warnings.append(
+                {
+                    "node": "plan_fix",
+                    "warning": "repeated_failed_patch",
+                    "detail": (
+                        "Planned patch_edits only repeat edits that already "
+                        "failed; the planner did not diversify."
+                    ),
+                    "frame_id": frame.frame_id,
+                }
+            )
         state.current_phase = Phase.EXECUTE
     elif frame.recommended_action == "collect_more_context":
-        state.context_collection_count += 1
-        if state.context_collection_count > MAX_CONTEXT_COLLECTION_ROUNDS:
+        if _is_final_attempt(state):
             frame.recommended_action = "stop"
             state.current_phase = Phase.FAILURE
             state.failure_reason = (
-                "Context collection made no progress after "
-                f"{MAX_CONTEXT_COLLECTION_ROUNDS} attempts."
+                "Final attempt requested more context instead of producing a patch."
             )
         else:
-            state.current_phase = Phase.PLAN
+            state.context_collection_count += 1
+            if state.context_collection_count > MAX_CONTEXT_COLLECTION_ROUNDS:
+                frame.recommended_action = "stop"
+                state.current_phase = Phase.FAILURE
+                state.failure_reason = (
+                    "Context collection made no progress after "
+                    f"{MAX_CONTEXT_COLLECTION_ROUNDS} attempts."
+                )
+            else:
+                state.current_phase = Phase.PLAN
     elif frame.recommended_action == "ask_user":
         state.current_phase = Phase.PLAN
     else:

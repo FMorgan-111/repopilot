@@ -8,7 +8,6 @@ import re
 import shlex
 import shutil
 import subprocess
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -68,6 +67,15 @@ def _repo_cache_path(owner: str, repo: str) -> Path:
     return _repopilot_home() / "repos" / f"{safe_owner}-{safe_repo}"
 
 
+def _repo_work_path(owner: str, repo: str) -> Path:
+    """Stable per-repo work tree, reused across samples of the same repo so the
+    sibling venv and editable install survive instead of being rebuilt each time.
+    """
+    safe_owner = owner.replace("/", "-")
+    safe_repo = repo.replace("/", "-")
+    return _repopilot_home() / "repos" / f"{safe_owner}-{safe_repo}-work"
+
+
 def _repo_url(state: AgentState, *, include_token: bool) -> str:
     token = os.getenv("GITHUB_TOKEN", "") if include_token else ""
     if token:
@@ -85,10 +93,31 @@ def _clone_local_repo(cache_path: Path, target: str) -> None:
     )
 
 
-async def git_clone(state: AgentState) -> str:
-    """Clone the target repository to a temporary directory.
+def _reset_work_tree(work: str) -> None:
+    """Restore a reused work tree to pristine HEAD, dropping a prior sample's
+    applied patch. ``clean -fd`` (no ``-x``) keeps git-ignored build artifacts
+    like ``.egg-info`` so the editable install stays valid across reuse.
+    """
+    subprocess.run(
+        ["git", "-C", work, "reset", "--hard", "HEAD"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    subprocess.run(
+        ["git", "-C", work, "clean", "-fd"],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
 
-    Strategy (best → fallback):
+
+async def git_clone(state: AgentState) -> str:
+    """Clone the target repo, reusing a per-repo work tree across samples.
+
+    - Reuse an existing work tree by resetting it to pristine HEAD — this skips
+      a re-clone AND lets the sibling venv / editable install be reused.
+    - Otherwise local-clone from the git-objects cache under
+      ``repos/<owner-repo>`` (the network clone happens once); download to that
+      cache on first sight.
+
+    Initial-download fallbacks (best → fallback):
     1. --depth 1 --filter=blob:none --single-branch  (fastest, Git 2.19+)
     2. --depth 1  (shallow clone, no filter)
     3. full clone  (no flags)
@@ -96,11 +125,17 @@ async def git_clone(state: AgentState) -> str:
     repo_url = _repo_url(state, include_token=True)
     safe_repo_url = _repo_url(state, include_token=False)
     cache_path = _repo_cache_path(state.owner, state.repo)
-    target = tempfile.mkdtemp(prefix=f"repopilot-{state.owner}-{state.repo}-")
+    work = str(_repo_work_path(state.owner, state.repo))
 
+    # Reuse an existing work tree: reset instead of re-clone + re-install.
+    if (Path(work) / ".git").exists():
+        _reset_work_tree(work)
+        return work
+
+    # Git objects already cached: fast local clone into the work tree.
     if (cache_path / ".git").exists():
-        _clone_local_repo(cache_path, target)
-        return target
+        _clone_local_repo(cache_path, work)
+        return work
 
     strategies = [
         ["git", "clone", "--depth", "1", "--filter=blob:none", "--single-branch", repo_url, str(cache_path)],
@@ -125,8 +160,8 @@ async def git_clone(state: AgentState) -> str:
                 timeout=60,
                 check=False,
             )
-            _clone_local_repo(cache_path, target)
-            return target
+            _clone_local_repo(cache_path, work)
+            return work
         last_error = _redact_sensitive_error_text(
             (result.stderr or result.stdout).strip()
         )
@@ -570,9 +605,15 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 state, "create_venv", {"repo_path": state.repo_path}, venv_record
             )
             install_python = venv_record.get("python") or "python3"
-            install_record = _pip_install_editable(
-                state.repo_path, python_exe=install_python
-            )
+            # Skip the (minutes-long) editable install when the venv was already
+            # built for this repo on a prior sample — the reused work tree keeps
+            # the editable install valid.
+            if venv_record.get("reason") == "exists":
+                install_record = {"attempted": False, "reason": "venv_cached"}
+            else:
+                install_record = _pip_install_editable(
+                    state.repo_path, python_exe=install_python
+                )
             _record_tool(
                 state,
                 "pip_install_editable",

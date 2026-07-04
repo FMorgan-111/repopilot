@@ -56,6 +56,36 @@ def _failure_kind(attempt: FixAttempt) -> str:
     return ""
 
 
+async def _record_episode_best_effort(state: AgentState, latest: FixAttempt) -> None:
+    """Persist this attempt's (issue, outcome, patch) as a cross-repo episode.
+    Never raises: if the episode store or embedding model is unavailable, the
+    agent proceeds unaffected."""
+    try:
+        from ..memory.error_episode_store import get_episode_store
+
+        store = get_episode_store()
+        if store is None:
+            return
+        patch = latest.patch_content
+        if not patch and latest.patch_edits:
+            patch = "\n".join(
+                f"{e.file_path}: {e.search[:80]} -> {e.replace[:80]}"
+                for e in latest.patch_edits
+            )
+        await store.arecord(
+            owner=state.owner,
+            repo=state.repo,
+            issue_url=state.issue_url,
+            issue_title=state.issue_title,
+            issue_body=state.issue_body,
+            error_log=latest.error_log or "",
+            patch=patch or "",
+            success=bool(latest.success),
+        )
+    except Exception:
+        return
+
+
 async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
     """Parse test output and route to COMMIT, retry PLAN, or FAILED."""
     state = _as_state(state)
@@ -65,6 +95,7 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     latest = state.fix_attempts[-1]
+    await _record_episode_best_effort(state, latest)
     if latest.success:
         # In benchmark/eval mode we have no write access to upstream repos, so a
         # verified test pass is the terminal success — skip the PR step.

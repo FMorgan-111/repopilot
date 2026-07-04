@@ -9,6 +9,7 @@ from typing import Any
 
 from ..llm import llm_call
 from ..schemas import ReflectDecision
+from .plan import _prior_failed_edits_context
 from ..state import (
     AgentState,
     Phase,
@@ -248,6 +249,14 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     resumed_answer_context = _human_answer_context(state)
     if resumed_answer_context:
         user = f"{user}\n\n{resumed_answer_context}"
+    diversity_context = _prior_failed_edits_context(state)
+    if diversity_context:
+        user = (
+            f"{user}\n\n{diversity_context}\n\n"
+            "Your suggested_fix_approach MUST propose a DIFFERENT edit than the "
+            "already-failed ones above — target a different location, hunk, or "
+            "root cause rather than repeating a failed search/replace."
+        )
     if patch_apply_failure:
         user = f"{user}\n\n{_patch_apply_failure_prompt(state, test_output)}"
     prompt_tokens_estimate = _estimate_tokens(system, user)
