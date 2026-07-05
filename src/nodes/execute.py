@@ -148,6 +148,26 @@ async def _clone_local_repo_async(cache_path: Path, target: str) -> None:
         raise subprocess.CalledProcessError(
             res.returncode, "git clone --local", res.stdout, res.stderr
         )
+    if not await _worktree_is_healthy(target):
+        # A "successful" clone that produced no checkout (empty/broken cache) —
+        # treat as failure so the caller discards it and re-downloads.
+        raise subprocess.CalledProcessError(
+            1, "git clone --local", "", "clone produced an empty work tree"
+        )
+
+
+async def _worktree_is_healthy(work: str) -> bool:
+    """A usable work tree resolves HEAD and has checked-out files. Guards against
+    reusing an empty/broken clone (0 files, no HEAD) — which silently made every
+    patch fail with 'target file was not found', masquerading as the model
+    picking wrong paths."""
+    if not (Path(work) / ".git").exists():
+        return False
+    head = await _run_git_async(["git", "-C", work, "rev-parse", "HEAD"], timeout=30)
+    if head.returncode != 0:
+        return False
+    listed = await _run_git_async(["git", "-C", work, "ls-files"], timeout=60)
+    return listed.returncode == 0 and bool(listed.stdout.strip())
 
 
 async def _reset_work_tree_async(work: str) -> None:
@@ -183,10 +203,14 @@ async def git_clone(state: AgentState) -> str:
     cache_path = _repo_cache_path(state.owner, state.repo)
     work = str(_repo_work_path(state.owner, state.repo))
 
-    # Reuse an existing work tree: reset instead of re-clone + re-install.
+    # Reuse an existing work tree ONLY if it is healthy (resolves HEAD, has
+    # files). A broken/empty reuse is what made every patch fail with "target
+    # file was not found" for whole repos. Discard an unhealthy tree and rebuild.
     if (Path(work) / ".git").exists():
-        await _reset_work_tree_async(work)
-        return work
+        if await _worktree_is_healthy(work):
+            await _reset_work_tree_async(work)
+            return work
+        shutil.rmtree(work, ignore_errors=True)
 
     # Git objects already cached: fast local clone into the work tree.
     if (cache_path / ".git").exists():
@@ -194,8 +218,9 @@ async def git_clone(state: AgentState) -> str:
             await _clone_local_repo_async(cache_path, work)
             return work
         except (subprocess.CalledProcessError, asyncio.TimeoutError):
-            # Corrupt/partial cache (e.g. an older blobless clone that cannot
-            # serve a local work tree). Discard it and re-download from scratch.
+            # Corrupt/partial/empty cache (e.g. an older blobless clone that
+            # cannot serve a local work tree, or one that checks out nothing).
+            # Discard it and re-download from scratch.
             shutil.rmtree(cache_path, ignore_errors=True)
             shutil.rmtree(work, ignore_errors=True)
 

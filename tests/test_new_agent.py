@@ -583,6 +583,47 @@ async def test_run_git_async_kills_process_on_timeout():
     assert time.monotonic() - t0 < 5
 
 
+async def test_worktree_is_healthy_detects_empty_and_valid(monkeypatch, tmp_path):
+    # Empty/broken work tree (no HEAD, no files) → unhealthy; a real one with
+    # HEAD + files → healthy. This is the guard that stops reusing a broken
+    # clone (which made every patch fail "target file was not found").
+    work = tmp_path / "wt"
+    (work / ".git").mkdir(parents=True)
+
+    async def fake_run_git(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(0, "abc123\n", "")  # HEAD resolves
+        if "ls-files" in args:
+            return execute_node._ProcResult(0, "a.py\nb.py\n", "")  # has files
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    assert await execute_node._worktree_is_healthy(str(work)) is True
+
+    async def fake_empty(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(128, "", "fatal: Needed a single revision")
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_empty)
+    assert await execute_node._worktree_is_healthy(str(work)) is False
+
+
+async def test_worktree_is_healthy_false_when_head_ok_but_no_files(monkeypatch, tmp_path):
+    work = tmp_path / "wt2"
+    (work / ".git").mkdir(parents=True)
+
+    async def fake_no_files(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(0, "abc\n", "")
+        if "ls-files" in args:
+            return execute_node._ProcResult(0, "", "")  # HEAD ok but empty checkout
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_no_files)
+    assert await execute_node._worktree_is_healthy(str(work)) is False
+
+
 async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_path):
     repopilot_home = tmp_path / ".repopilot"
     cache_path = repopilot_home / "repos" / "acme-widget"
@@ -595,6 +636,10 @@ async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_
         return execute_node._ProcResult(0, "", "")
 
     monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    # Health check has its own test; here we exercise the clone path only.
+    async def _healthy(_w):
+        return True
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
@@ -632,6 +677,9 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
         return execute_node._ProcResult(0, "", "")
 
     monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    async def _healthy(_w):
+        return True
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
