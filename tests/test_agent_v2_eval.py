@@ -151,7 +151,7 @@ async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):
             "success": True,
         }
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: samples[:n])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: samples[:n])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
 
     results_path = tmp_path / "agent_v2_results.json"
@@ -193,7 +193,7 @@ async def test_run_agent_v2_eval_closes_memory_store_after_success(
     async def fake_close_store():
         calls.append("memory")
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: [sample_record()])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: [sample_record()])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     monkeypatch.setattr(agent_v2_harness, "close_store", fake_close_store, raising=False)
@@ -231,7 +231,7 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
     async def fake_close_llm_client():
         return None
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: samples[:n])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: samples[:n])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     repopilot_home = tmp_path / "home"
@@ -280,7 +280,7 @@ async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
     async def fake_close_store():
         calls.append("memory")
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: [sample_record()])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: [sample_record()])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     monkeypatch.setattr(agent_v2_harness, "close_store", fake_close_store, raising=False)
@@ -309,7 +309,7 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
     async def fake_close_llm_client():
         raise RuntimeError("cleanup failed")
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: [sample_record()])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: [sample_record()])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
 
@@ -348,7 +348,7 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_memory_cleanup_raise
     async def fake_close_store():
         raise RuntimeError("memory cleanup failed")
 
-    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None: [sample_record()])
+    monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: [sample_record()])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     monkeypatch.setattr(agent_v2_harness, "close_store", fake_close_store, raising=False)

@@ -36,6 +36,7 @@ CATEGORIES = [
     "resolved",
     "wrong_file_path",
     "invalid_diff",
+    "empty_patch",
     "search_not_found",
     "test_failed",
     "infra",
@@ -59,12 +60,19 @@ def classify_attempt(failure_kind: str, error_log: str) -> str:
     if kind == "patch_apply_failed" or kind == "":
         if "target file was not found" in low or "no such file" in low:
             return "wrong_file_path"
-        if "no valid patches" in low or "corrupt patch" in low or "diff --git" in low:
-            return "invalid_diff"
         if "search block was not found" in low or "was not found in" in low:
             return "search_not_found"
+        if "no valid patches in input" in low:
+            # git apply on an EMPTY patch — the model produced no diff (its
+            # search/replace was cleared by a gate, or nothing was emitted).
+            # This is NOT the model emitting a bad unified diff; keeping it
+            # separate stops it inflating invalid_diff (which it did before,
+            # making search-hallucination look like a diff-format problem).
+            return "empty_patch"
+        if "corrupt patch" in low or "diff --git" in low or "@@ " in low:
+            return "invalid_diff"
         if "preflight check failed" in low:
-            # Preflight rejects a unified diff that didn't apply; treat as diff.
+            # Preflight rejected a real diff (has hunks but they don't apply).
             return "invalid_diff"
         if kind == "patch_apply_failed":
             return "search_not_found"  # generic apply failure ≈ anchor miss

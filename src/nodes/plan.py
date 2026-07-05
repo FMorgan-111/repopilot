@@ -847,6 +847,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     f"({dead_reason})."
                 )
             else:
+                # The router selects the phase from frame.recommended_action, not
+                # current_phase — so reroute the frame too, else it stays
+                # 'execute' and the (now-empty) patch leaks to EXECUTE.
+                frame.recommended_action = "reflect"
                 state.current_phase = Phase.REFLECT
         else:
             missing = _unlocatable_edits(state)
@@ -877,6 +881,11 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                         "the target files."
                     )
                 else:
+                    # Reroute the frame too (router reads recommended_action, not
+                    # current_phase) — otherwise it stays 'execute' and the empty
+                    # patch leaks to EXECUTE, producing a misleading "No valid
+                    # patches in input" diff error instead of a real replan.
+                    frame.recommended_action = "plan"
                     state.current_phase = Phase.PLAN
             else:
                 state.search_correction_context = ""  # resolved; stop feeding it

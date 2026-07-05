@@ -72,12 +72,17 @@ async def _close_shared_resources() -> None:
 
 
 def load_samples(
-    n: int = MAX_SAMPLES, sample_id: str | None = None
+    n: int = MAX_SAMPLES, sample_id: str | None = None,
+    samples_path: Path | None = None,
 ) -> list[dict[str, Any]]:
+    # Resolve at call time (not as a default arg) so tests that monkeypatch the
+    # module SAMPLES_PATH take effect, while an explicit path still overrides.
+    if samples_path is None:
+        samples_path = SAMPLES_PATH
     # When a specific sample_id is requested, scan the whole file for it and
     # return just that one (ignores n). Otherwise take the first n lines.
     if sample_id:
-        with SAMPLES_PATH.open(encoding="utf-8") as f:
+        with samples_path.open(encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -88,7 +93,7 @@ def load_samples(
         raise ValueError(f"sample_id not found in dataset: {sample_id}")
 
     samples: list[dict[str, Any]] = []
-    with SAMPLES_PATH.open(encoding="utf-8") as f:
+    with samples_path.open(encoding="utf-8") as f:
         for i, line in enumerate(f):
             if i >= n:
                 break
@@ -213,9 +218,10 @@ async def run_agent_v2_eval(
     results_path: Path | str = RESULTS_PATH,
     sample_id: str | None = None,
     seed_gold_files: bool = False,
+    samples_path: Path | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        samples = load_samples(n_samples, sample_id=sample_id)
+        samples = load_samples(n_samples, sample_id=sample_id, samples_path=samples_path)
         results: list[dict[str, Any]] = []
 
         for i, sample in enumerate(samples):
@@ -247,13 +253,20 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--token-budget", type=int, default=50000)
+    parser.add_argument("--seed-gold-files", action="store_true",
+                        help="Seed relevant_files from dataset gold changed files")
+    parser.add_argument("--samples-file", type=str, default=None,
+                        help="Path to custom samples JSONL file")
     args = parser.parse_args(argv)
 
+    samples_path = Path(args.samples_file) if args.samples_file else SAMPLES_PATH
     asyncio.run(
         run_agent_v2_eval(
             n_samples=args.samples,
             max_retries=args.max_retries,
             token_budget=args.token_budget,
+            seed_gold_files=args.seed_gold_files,
+            samples_path=samples_path,
         )
     )
 

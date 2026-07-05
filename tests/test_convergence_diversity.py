@@ -321,6 +321,10 @@ async def test_plan_fix_blocks_identical_patch_and_routes_to_reflect(monkeypatch
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.REFLECT
+    # Router keys off recommended_action — must be rerouted too, else the empty
+    # patch leaks to EXECUTE.
+    assert next_state.decision_frame.recommended_action == "reflect"
+    assert new_agent.route_from_state(next_state) == "reflect_on_failure"
     assert next_state.patch_edits == []
     assert next_state.repeated_patch_block_count == 1
     assert any(

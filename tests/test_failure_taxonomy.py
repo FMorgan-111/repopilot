@@ -15,10 +15,19 @@ def test_wrong_file_path():
     ) == "wrong_file_path"
 
 
-def test_invalid_diff():
+def test_empty_patch_not_invalid_diff():
+    # "No valid patches in input" is git apply on an EMPTY patch (a gate cleared
+    # the edits), NOT the model emitting a bad diff. Must not inflate invalid_diff.
     assert classify_attempt(
         "patch_apply_failed",
         "Patch preflight check failed:\nerror: No valid patches in input",
+    ) == "empty_patch"
+
+
+def test_invalid_diff_real_hunks():
+    assert classify_attempt(
+        "patch_apply_failed",
+        "Patch preflight check failed:\ndiff --git a/x b/x\n@@ -1,3 +1,4 @@\ncorrupt",
     ) == "invalid_diff"
 
 

@@ -104,6 +104,12 @@ async def test_hallucinated_search_routes_to_plan_with_correction(monkeypatch):
     assert any(
         w.get("warning") == "hallucinated_search_block" for w in nxt.decision_warnings
     )
+    # The router keys off frame.recommended_action, not current_phase — the gate
+    # must reroute the frame or the empty patch leaks to EXECUTE (the "No valid
+    # patches in input" bug). Verify the frame agrees with current_phase.
+    assert nxt.decision_frame.recommended_action == "plan"
+    from src import new_agent
+    assert new_agent.route_from_state(nxt) == "plan_fix"
 
 
 async def test_hallucinated_search_fails_fast_when_budget_exhausted(monkeypatch):
