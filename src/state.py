@@ -61,13 +61,18 @@ class PatchEdit(BaseModel):
                 if alias in normalized:
                     normalized["file_path"] = normalized[alias]
                     break
+        # Tolerate the model supplying BOTH search and node_target: prefer the
+        # exact search path (node_target is only a rescue). Never raise here — a
+        # malformed edit must not crash the whole plan phase.
+        if normalized.get("search") and normalized.get("node_target"):
+            normalized["node_target"] = ""
         return normalized
 
     @model_validator(mode="after")
     def _require_anchor(self) -> "PatchEdit":
-        if bool(self.search) == bool(self.node_target):
+        if not self.search and not self.node_target:
             raise ValueError(
-                "PatchEdit requires exactly one of `search` or `node_target`."
+                "PatchEdit requires either `search` or `node_target`."
             )
         return self
 

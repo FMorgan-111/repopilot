@@ -114,8 +114,37 @@ def test_node_target_missing_node_fails(tmp_path):
     assert "could not locate" in result.output
 
 
-def test_patch_edit_requires_exactly_one_anchor():
+def test_patch_edit_requires_an_anchor():
     with pytest.raises(ValueError):
         PatchEdit(file_path="a.py")  # neither search nor node_target
-    with pytest.raises(ValueError):
-        PatchEdit(file_path="a.py", search="x", node_target="f")  # both
+
+
+def test_patch_edit_both_anchors_prefers_search():
+    # The model sometimes supplies both; tolerate it (prefer search) rather than
+    # crashing the whole plan phase with a validation error.
+    edit = PatchEdit(file_path="a.py", search="x", node_target="f")
+    assert edit.search == "x"
+    assert edit.node_target == ""
+
+
+def test_normalize_plan_decision_drops_malformed_edit():
+    from src.nodes.plan import _normalize_plan_decision
+
+    resp = {
+        "plan": "p",
+        "patch": "",
+        "patch_edits": [
+            {"file": "a.py", "search": "x", "replace": "y"},  # valid
+            {"file": "b.py"},  # malformed: no anchor → dropped, not a crash
+        ],
+        "files": ["a.py"],
+        "test_command": "pytest",
+        "decision_frame": {
+            "stage": "plan", "summary": "p",
+            "recommended_action": "execute", "risk": "low", "confidence": 0.7,
+        },
+    }
+    decision = _normalize_plan_decision(resp)
+    assert len(decision.patch_edits) == 1
+    assert decision.patch_edits[0].file_path == "a.py"
+

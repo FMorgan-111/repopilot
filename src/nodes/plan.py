@@ -596,9 +596,28 @@ def _normalize_string_list(value: Any) -> list[str]:
     raise TypeError("Expected None, a string, or a sequence of strings")
 
 
+def _drop_invalid_edits(patch_edits: Any) -> list[Any]:
+    """Keep only edit dicts that have a file and at least one anchor. A single
+    malformed edit (e.g. neither search nor node_target) must not crash the
+    whole plan phase — drop it and keep the rest."""
+    if not isinstance(patch_edits, list):
+        return patch_edits
+    kept = []
+    for e in patch_edits:
+        if not isinstance(e, dict):
+            kept.append(e)
+            continue
+        has_file = any(e.get(k) for k in ("file_path", "file", "path"))
+        has_anchor = bool(e.get("search") or e.get("node_target"))
+        if has_file and has_anchor:
+            kept.append(e)
+    return kept
+
+
 def _normalize_plan_decision(response: dict[str, Any]) -> PlanDecision:
     files = _normalize_string_list(response.get("files"))
     patch_edits = response.get("patch_edits") or response.get("edits") or []
+    patch_edits = _drop_invalid_edits(patch_edits)
     if "decision_frame" in response:
         return PlanDecision.model_validate(
             {**response, "files": files, "patch_edits": patch_edits}
