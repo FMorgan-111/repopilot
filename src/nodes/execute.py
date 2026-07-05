@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..patch_repair import repair_unified_diff
+from ..patch_match import find_normalized_span, reindent
 from ..state import (
     AgentState,
     FixAttempt,
@@ -197,65 +198,6 @@ def _combined_process_output(result: subprocess.CompletedProcess) -> str:
     return "\n".join(part for part in [result.stdout, result.stderr] if part)
 
 
-def _leading_spaces(line: str) -> int:
-    """Count of leading spaces (tab-free indentation only)."""
-    return len(line) - len(line.lstrip(" "))
-
-
-def _reindent(text: str, delta: int) -> str:
-    """Shift every non-blank line of `text` by `delta` spaces.
-
-    Guarded: a negative delta is applied only when every non-blank line has at
-    least `-delta` leading spaces, so we never eat significant characters."""
-    if delta == 0:
-        return text
-    lines = text.split("\n")
-    if delta < 0:
-        removable = -delta
-        if any(line.strip() and _leading_spaces(line) < removable for line in lines):
-            return text
-        return "\n".join(line[removable:] if line.strip() else line for line in lines)
-    pad = " " * delta
-    return "\n".join(pad + line if line.strip() else line for line in lines)
-
-
-def _find_normalized_span(content: str, search: str) -> tuple[int, int, int] | None:
-    """Locate `search` in `content` ignoring per-line leading/trailing whitespace.
-
-    Returns (start_offset, end_offset, indent_delta) of the ORIGINAL span in
-    `content`, or None. Requires exactly one normalized match — an ambiguous
-    block is treated as not found so we never fuzzy-replace the wrong site.
-    `indent_delta` is how many spaces the matched block is indented relative to
-    the search block's first line (for reindenting the replacement)."""
-    content_lines = content.split("\n")
-    search_lines = search.split("\n")
-    if search_lines and search_lines[-1] == "":
-        search_lines = search_lines[:-1]  # drop trailing-newline artifact
-    if not search_lines:
-        return None
-    norm_search = [line.strip() for line in search_lines]
-    n = len(search_lines)
-
-    offsets: list[int] = []
-    pos = 0
-    for line in content_lines:
-        offsets.append(pos)
-        pos += len(line) + 1  # +1 for the stripped "\n"
-
-    matches: list[tuple[int, int, int]] = []
-    for i in range(len(content_lines) - n + 1):
-        window = content_lines[i : i + n]
-        if [line.strip() for line in window] != norm_search:
-            continue
-        start = offsets[i]
-        end = offsets[i + n - 1] + len(content_lines[i + n - 1])  # exclude trailing \n
-        delta = _leading_spaces(content_lines[i]) - _leading_spaces(search_lines[0])
-        matches.append((start, end, delta))
-    if len(matches) == 1:
-        return matches[0]
-    return None
-
-
 def _apply_patch_edits(
     repo_path: str, patch_edits: list[PatchEdit]
 ) -> PatchEditApplyResult:
@@ -320,7 +262,7 @@ def _apply_patch_edits(
             # drift (indent / trailing space). Retry with a normalized, unique
             # line match before giving up, reindenting the replacement to match.
             span = (
-                None if edit.replace_all else _find_normalized_span(content, edit.search)
+                None if edit.replace_all else find_normalized_span(content, edit.search)
             )
             if span is None:
                 return PatchEditApplyResult(
@@ -331,7 +273,7 @@ def _apply_patch_edits(
                     ),
                 )
             start, end, indent_delta = span
-            updated = content[:start] + _reindent(edit.replace, indent_delta) + content[end:]
+            updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
 
         pending_writes[file_path] = updated
         if edit.file_path not in changed_files:

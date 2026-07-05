@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..llm import llm_call
+from ..patch_match import closest_region, locate_search_block
 from ..schemas import PlanDecision
 from ..state import (
     AgentState,
@@ -21,6 +22,7 @@ from ..state import (
     _extract_json_object,
     _human_answer_context,
     _is_budget_exceeded,
+    _issue_search_terms,
     _record_decision_frame,
     _record_frame_health_warning,
     _record_node_diagnostic,
@@ -82,6 +84,51 @@ def _truncate_prompt_text(value: str, limit: int = 500) -> str:
     if len(value) <= limit:
         return value
     return f"{value[:limit].rstrip()}..."
+
+
+def _relevance_window(content: str, terms: Sequence[str], limit: int) -> str:
+    """Return up to ~`limit` chars of `content` centered on the line most
+    relevant to the issue terms, instead of blindly taking the head.
+
+    The fix site is often far below a file's imports; head-truncation hides it
+    and the planner then hallucinates a search block for code it never saw.
+    Centering on the best term match surfaces the actual lines to copy — at the
+    same token cost. Falls back to the head when nothing matches."""
+    if len(content) <= limit:
+        return content
+    lines = content.split("\n")
+    lowered = [line.lower() for line in lines]
+    lowered_terms = [t.lower() for t in terms if t.strip()]
+
+    best_idx, best_score = -1, 0
+    for i, line in enumerate(lowered):
+        score = sum(1 for t in lowered_terms if t in line)
+        if score > best_score:
+            best_score, best_idx = score, i
+    if best_idx < 0:
+        return f"{content[:limit].rstrip()}..."  # no match → old head behavior
+
+    lo = hi = best_idx
+    size = len(lines[best_idx])
+    while True:
+        moved = False
+        if lo > 0 and size + len(lines[lo - 1]) + 1 < limit:
+            lo -= 1
+            size += len(lines[lo]) + 1
+            moved = True
+        if hi < len(lines) - 1 and size + len(lines[hi + 1]) + 1 < limit:
+            hi += 1
+            size += len(lines[hi]) + 1
+            moved = True
+        if not moved:
+            break
+
+    window = "\n".join(lines[lo : hi + 1])
+    if lo > 0:
+        window = f"... [{lo} lines above truncated] ...\n{window}"
+    if hi < len(lines) - 1:
+        window = f"{window}\n... [{len(lines) - 1 - hi} lines below truncated] ..."
+    return window
 
 
 def _normalized_edit_key(file_path: str, search: str) -> str:
@@ -198,6 +245,51 @@ def _dead_plan_reason(state: AgentState) -> str | None:
     ):
         return "reuses_unappliable_anchor"
     return None
+
+
+# How many times we let the planner emit a search block that does not exist in
+# the target file before failing fast (each round feeds the real lines back).
+MAX_SEARCH_CORRECTIONS = 2
+
+
+def _relevant_file_content(state: AgentState, file_path: str) -> str | None:
+    for file in state.relevant_files:
+        if file.path == file_path:
+            return file.content
+    return None
+
+
+def _unlocatable_edits(state: AgentState) -> list[Any]:
+    """Planned edits whose search block does not exist in the target file's real
+    content (a hallucinated anchor). Edits whose file we don't hold are skipped
+    — the executor's fuzzy apply is the backstop there."""
+    missing: list[Any] = []
+    for edit in state.patch_edits:
+        content = _relevant_file_content(state, edit.file_path)
+        if content is None:
+            continue  # cannot validate here; let EXECUTE handle it
+        if not locate_search_block(content, edit.search):
+            missing.append(edit)
+    return missing
+
+
+def _build_search_correction(state: AgentState, missing: list[Any]) -> str:
+    """Feed the planner the ACTUAL nearby file lines so it can copy a real
+    search block instead of re-hallucinating one (bypasses head-truncation)."""
+    lines = [
+        "YOUR PREVIOUS SEARCH BLOCK(S) DO NOT EXIST IN THE FILE — they can never "
+        "apply. Copy your next search block VERBATIM from these ACTUAL file "
+        "lines (do not paraphrase; keep exact indentation):",
+    ]
+    for edit in missing:
+        content = _relevant_file_content(state, edit.file_path) or ""
+        region = closest_region(content, edit.search)
+        lines.append(
+            f"\nfile: {edit.file_path}\n"
+            f"your (nonexistent) search was:\n{_truncate_prompt_text(edit.search, 300)}\n"
+            f"ACTUAL lines nearest your intent:\n{region}"
+        )
+    return "\n".join(lines)
 
 
 def _is_final_attempt(state: AgentState) -> bool:
@@ -506,9 +598,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if recall:
         recall_context = f"\n\n{recall}"
 
+    files_terms = _issue_search_terms(state.issue_title, state.issue_body)
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
-        f"CONTENT:\n{_truncate_prompt_text(file.content, PLAN_FILE_CONTENT_LIMIT)}"
+        f"CONTENT:\n{_relevance_window(file.content, files_terms, PLAN_FILE_CONTENT_LIMIT)}"
         for file in state.relevant_files[:PLAN_MAX_FILES]
     )
     system = (
@@ -539,6 +632,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if _is_final_attempt(state):
         system = f"{system}{_final_attempt_instructions()}"
     system = f"{system}{_force_patch_instructions(state)}"
+    correction_context = ""
+    if state.search_correction_context:
+        correction_context = f"\n\n{state.search_correction_context}"
     user = (
         f"Issue URL: {state.issue_url}\n"
         f"Title: {state.issue_title}\n\nBody:\n"
@@ -548,6 +644,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         f"{hypothesis_continuity_context}"
         f"{context_pressure_context}"
         f"{diversity_context}"
+        f"{correction_context}"
         f"{human_context}"
     )
     prompt_tokens_estimate = _estimate_tokens(system, user)
@@ -653,19 +750,50 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             else:
                 state.current_phase = Phase.REFLECT
         else:
-            if _planned_edits_repeat_failure(state):
+            missing = _unlocatable_edits(state)
+            if missing:
+                state.hallucinated_search_block_count += 1
+                state.search_correction_context = _build_search_correction(state, missing)
                 state.decision_warnings.append(
                     {
                         "node": "plan_fix",
-                        "warning": "repeated_failed_patch",
+                        "warning": "hallucinated_search_block",
                         "detail": (
-                            "Planned patch_edits only repeat edits that already "
-                            "failed; the planner did not diversify."
+                            f"{len(missing)} planned search block(s) do not exist "
+                            "in the target file; feeding real lines back to replan."
                         ),
                         "frame_id": frame.frame_id,
                     }
                 )
-            state.current_phase = Phase.EXECUTE
+                state.patch_edits = []
+                state.patch_content = ""
+                if (
+                    state.hallucinated_search_block_count > MAX_SEARCH_CORRECTIONS
+                    or _is_final_attempt(state)
+                ):
+                    frame.recommended_action = "stop"
+                    state.current_phase = Phase.FAILURE
+                    state.failure_reason = (
+                        "Planner kept emitting search blocks that do not exist in "
+                        "the target files."
+                    )
+                else:
+                    state.current_phase = Phase.PLAN
+            else:
+                state.search_correction_context = ""  # resolved; stop feeding it
+                if _planned_edits_repeat_failure(state):
+                    state.decision_warnings.append(
+                        {
+                            "node": "plan_fix",
+                            "warning": "repeated_failed_patch",
+                            "detail": (
+                                "Planned patch_edits only repeat edits that already "
+                                "failed; the planner did not diversify."
+                            ),
+                            "frame_id": frame.frame_id,
+                        }
+                    )
+                state.current_phase = Phase.EXECUTE
     elif frame.recommended_action == "collect_more_context":
         if _is_final_attempt(state):
             frame.recommended_action = "stop"

@@ -198,6 +198,8 @@ class AgentState(BaseModel):
     context_collection_count: int = 0
     last_locate_signature: str = ""
     repeated_patch_block_count: int = 0
+    hallucinated_search_block_count: int = 0
+    search_correction_context: str = ""
     decision_warnings: list[dict[str, Any]] = Field(default_factory=list)
     decision_route_checked_frame_id: str = ""
     route_decisions: list[dict[str, Any]] = Field(default_factory=list)
