@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Sequence
 from typing import Any
@@ -31,14 +32,14 @@ PLAN_ISSUE_BODY_LIMIT = 2500
 # 1200 chars it only saw ~3% of a file (the imports) and kept asking for more
 # context forever. 6000 chars surfaces the logic the fix actually touches.
 PLAN_FILE_CONTENT_LIMIT = 6000
-PLAN_MAX_FILES = 4
+PLAN_MAX_FILES = 3
 PLAN_FAILURE_LOG_LIMIT = 1000
 
 # Hard cap on consecutive collect_more_context rounds before we give up.
-# The first MAX_CONTEXT_COLLECTION_ROUNDS recommendations still route back to
-# LOCATE so the agent can genuinely expand its context; the next one is forced
-# to stop instead of burning the entire token budget on an unproductive loop.
-MAX_CONTEXT_COLLECTION_ROUNDS = 3
+# Default 1: eval showed the planner spiralling on collect_more_context instead
+# of committing a patch, so one context round is allowed then the next is forced
+# to stop. Override via REPOPILOT_MAX_CONTEXT_ROUNDS.
+MAX_CONTEXT_COLLECTION_ROUNDS = int(os.getenv("REPOPILOT_MAX_CONTEXT_ROUNDS", "1"))
 
 
 def _is_patch_apply_failure(attempt: Any) -> bool:
@@ -138,6 +139,67 @@ def _planned_edits_repeat_failure(state: AgentState) -> bool:
     )
 
 
+# How many times we let the planner re-emit a known-dead patch before failing
+# fast instead of burning the whole retry budget on guaranteed re-failures.
+MAX_REPEATED_PATCH_BLOCKS = 1
+
+
+def _attempt_failed_to_apply(attempt: Any) -> bool:
+    """The attempt's patch/edits could not be applied at all (bad anchor)."""
+    kind = getattr(attempt, "failure_kind", "") or getattr(attempt, "test_result", "")
+    return kind == "patch_apply_failed"
+
+
+def _unappliable_edit_keys(state: AgentState) -> set[str]:
+    """(file, search) anchors from attempts whose patch could not be applied —
+    re-emitting the same anchor is guaranteed to fail to apply again (the
+    normalized fuzzy fallback already had its chance on the same file)."""
+    keys: set[str] = set()
+    for attempt in state.fix_attempts:
+        if getattr(attempt, "success", False) or not _attempt_failed_to_apply(attempt):
+            continue
+        for edit in getattr(attempt, "patch_edits", []) or []:
+            keys.add(_normalized_edit_key(edit.file_path, edit.search))
+    return keys
+
+
+def _failed_edit_signatures(state: AgentState) -> list[frozenset[tuple[str, str]]]:
+    """Full (anchor, replace) fingerprints of each failed attempt's edit set."""
+    sigs: list[frozenset[tuple[str, str]]] = []
+    for attempt in state.fix_attempts:
+        if getattr(attempt, "success", False):
+            continue
+        edits = getattr(attempt, "patch_edits", []) or []
+        if not edits:
+            continue
+        sigs.append(
+            frozenset(
+                (_normalized_edit_key(e.file_path, e.search), e.replace) for e in edits
+            )
+        )
+    return sigs
+
+
+def _dead_plan_reason(state: AgentState) -> str | None:
+    """Why the freshly planned edits are guaranteed to repeat a known failure —
+    so we should not waste an execute+test cycle on them — or None if fresh."""
+    if not state.patch_edits:
+        return None
+    current_sig = frozenset(
+        (_normalized_edit_key(e.file_path, e.search), e.replace)
+        for e in state.patch_edits
+    )
+    if current_sig in _failed_edit_signatures(state):
+        return "identical_to_failed_patch"
+    unappliable = _unappliable_edit_keys(state)
+    if unappliable and all(
+        _normalized_edit_key(e.file_path, e.search) in unappliable
+        for e in state.patch_edits
+    ):
+        return "reuses_unappliable_anchor"
+    return None
+
+
 def _is_final_attempt(state: AgentState) -> bool:
     """The retry budget is spent: this plan is the last one that can execute."""
     return state.retry_count >= state.max_retries
@@ -150,6 +212,25 @@ def _final_attempt_instructions() -> str:
         "Do NOT request more context: 'collect_more_context' is not allowed on "
         "the final attempt."
     )
+
+
+def _is_first_plan(state: AgentState) -> bool:
+    return not state.fix_attempts and state.context_collection_count == 0
+
+
+def _force_patch_instructions(state: AgentState) -> str:
+    """Push the planner to commit a patch rather than spiral on
+    collect_more_context — the dominant eval failure mode."""
+    text = (
+        " You MUST return at least one patch_edit. If you are unsure, make your "
+        "best guess at the fix rather than deferring."
+    )
+    if _is_first_plan(state):
+        text += (
+            " This is your FIRST plan: do NOT recommend collect_more_context — "
+            "produce a concrete patch from the files already provided."
+        )
+    return text
 
 
 def _format_recalled_episodes(episodes: list[Any]) -> str:
@@ -457,6 +538,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         )
     if _is_final_attempt(state):
         system = f"{system}{_final_attempt_instructions()}"
+    system = f"{system}{_force_patch_instructions(state)}"
     user = (
         f"Issue URL: {state.issue_url}\n"
         f"Title: {state.issue_title}\n\nBody:\n"
@@ -542,19 +624,48 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             reason="missing_explicit_decision_frame",
         )
     if state.patch_content or state.patch_edits:
-        if _planned_edits_repeat_failure(state):
+        dead_reason = _dead_plan_reason(state)
+        if dead_reason is not None:
+            state.repeated_patch_block_count += 1
             state.decision_warnings.append(
                 {
                     "node": "plan_fix",
-                    "warning": "repeated_failed_patch",
+                    "warning": "blocked_dead_patch",
                     "detail": (
-                        "Planned patch_edits only repeat edits that already "
-                        "failed; the planner did not diversify."
+                        "Planned patch_edits repeat a patch that already failed "
+                        f"({dead_reason}); refusing to execute it again."
                     ),
                     "frame_id": frame.frame_id,
                 }
             )
-        state.current_phase = Phase.EXECUTE
+            state.patch_edits = []
+            state.patch_content = ""
+            if (
+                state.repeated_patch_block_count > MAX_REPEATED_PATCH_BLOCKS
+                or _is_final_attempt(state)
+            ):
+                frame.recommended_action = "stop"
+                state.current_phase = Phase.FAILURE
+                state.failure_reason = (
+                    "Planner kept re-emitting patches that already failed "
+                    f"({dead_reason})."
+                )
+            else:
+                state.current_phase = Phase.REFLECT
+        else:
+            if _planned_edits_repeat_failure(state):
+                state.decision_warnings.append(
+                    {
+                        "node": "plan_fix",
+                        "warning": "repeated_failed_patch",
+                        "detail": (
+                            "Planned patch_edits only repeat edits that already "
+                            "failed; the planner did not diversify."
+                        ),
+                        "frame_id": frame.frame_id,
+                    }
+                )
+            state.current_phase = Phase.EXECUTE
     elif frame.recommended_action == "collect_more_context":
         if _is_final_attempt(state):
             frame.recommended_action = "stop"

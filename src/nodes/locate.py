@@ -28,6 +28,10 @@ from ..tools import read_file, search_code
 # free-text next_checks (e.g. "Read src/tox/tox_env/runner.py to find ...").
 _PATH_RE = re.compile(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9_]+")
 
+# Specific-looking identifiers (dotted modules, snake_case, CamelCase) used as
+# fallback search terms when the primary issue-keyword search finds nothing.
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]{3,}")
+
 # Documentation / prose files. They match issue keywords densely (and are huge),
 # so BM25 ranks them above source code — but a patch_edits + pytest agent fixes
 # CODE, never prose. Excluding them keeps the planner's top-N slots on real
@@ -76,6 +80,86 @@ def _frame_candidate_paths(state: AgentState) -> list[str]:
                 paths.append(match)
 
     return paths
+
+
+def _issue_fallback_paths(state: AgentState) -> list[str]:
+    """Repo-relative paths named verbatim in the issue/traceback text."""
+    text = f"{state.issue_title}\n{state.issue_body}"
+    out: list[str] = []
+    for match in _PATH_RE.findall(text):
+        if "/" in match and not _is_doc_file(match) and match not in out:
+            out.append(match)
+    return out[:6]
+
+
+def _issue_fallback_terms(state: AgentState, exclude: set[str]) -> list[str]:
+    """Specific identifiers (dotted/snake_case/CamelCase) from the issue text,
+    used as extra code-search terms when the primary search returns nothing."""
+    text = f"{state.issue_title} {state.issue_body[:1500]}"
+    out: list[str] = []
+    for match in _IDENT_RE.findall(text):
+        if match in exclude or match in out:
+            continue
+        is_specific = (
+            "." in match
+            or "_" in match
+            or (match[0].isupper() and any(c.islower() for c in match))
+        )
+        if is_specific:
+            out.append(match)
+        if len(out) >= 5:
+            break
+    return out
+
+
+async def _locate_fallback(state: AgentState) -> list[FileInfo]:
+    """Last-ditch location when the normal search found nothing: read file paths
+    named directly in the issue (tracebacks list them) and search for specific
+    identifiers pulled from the issue text. Bounded to a few reads."""
+    candidates: dict[str, FileInfo] = {}
+    for path in _issue_fallback_paths(state):
+        candidates.setdefault(
+            path,
+            FileInfo(
+                path=path,
+                relevance_score=0.85,
+                reason="path named directly in issue text",
+                sha="",
+            ),
+        )
+
+    exclude = set(_issue_search_terms(state.issue_title, state.issue_body))
+    for term in _issue_fallback_terms(state, exclude):
+        try:
+            results = await search_code(term, state.owner, state.repo)
+        except Exception:
+            continue
+        for result in results:
+            path = result.get("path", "")
+            if not path or path in candidates or _is_doc_file(path):
+                continue
+            score, reason = _rank_reason(path, state.issue_title, state.issue_body)
+            candidates[path] = FileInfo(
+                path=path,
+                relevance_score=score,
+                reason=f"fallback search '{term}': {reason}",
+                sha=result.get("sha", ""),
+            )
+
+    ranked = sorted(
+        candidates.values(), key=lambda item: item.relevance_score, reverse=True
+    )[:4]
+    hydrated: list[FileInfo] = []
+    for info in ranked:
+        try:
+            file_data = await read_file(state.owner, state.repo, info.path)
+        except Exception:
+            continue
+        info.content = file_data.get("content", "")
+        info.sha = file_data.get("sha", info.sha)
+        if info.content:
+            hydrated.append(info)
+    return hydrated
 
 
 async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
@@ -276,6 +360,25 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
         state.issue_body,
         "\n".join(f"{f.path}\n{f.content[:2000]}" for f in newly_hydrated),
     )
+
+    # ── fallback location: if the normal search located nothing, mine the issue
+    # text directly (paths in tracebacks + specific identifiers) before giving
+    # up. Attacks the "No relevant files could be located" failure mode. ──
+    if not hydrated:
+        fallback = await _locate_fallback(state)
+        if fallback:
+            hydrated = fallback
+            state.relevant_files = hydrated
+            state.token_usage += _estimate_tokens(
+                state.issue_title,
+                state.issue_body,
+                "\n".join(f"{f.path}\n{f.content[:2000]}" for f in hydrated),
+            )
+            print(
+                f"  [locate] fallback located {len(hydrated)} file(s)",
+                file=sys.stderr,
+                flush=True,
+            )
 
     # ── no-progress guard: if this round located the exact same files as the
     # previous one, collecting more context is futile — stop early instead of

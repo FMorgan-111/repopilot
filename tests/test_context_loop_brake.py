@@ -296,6 +296,9 @@ async def test_plan_prompt_adds_soft_pressure_mid_collection(monkeypatch):
         captured["user"] = user
         return _collect_more_context_response()
 
+    # Soft/hard pressure escalation only has a "middle" round when the cap >= 2;
+    # the default cap is 1, so pin it to 3 to exercise the soft-pressure branch.
+    monkeypatch.setattr(plan_node, "MAX_CONTEXT_COLLECTION_ROUNDS", 3)
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
