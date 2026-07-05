@@ -263,3 +263,23 @@ def _resolve_unique_qualname(source: str, name: str) -> str | None:
     walk(tree, [])
     return hits[0] if len(hits) == 1 else None
 
+
+
+def diagnose_node_upgrade(content: str, search: str, replace: str) -> str:
+    """Human-readable reason the converter declined — diagnostic only."""
+    rn = _sole_def_name(replace)
+    if rn is None:
+        return "replace_not_single_def"
+    sn = _sole_def_name(search)
+    if sn != rn:
+        return f"search_name={sn!r}!=replace_name={rn!r}"
+    q = _resolve_unique_qualname(content, rn)
+    if q is None:
+        return f"name_{rn!r}_absent_or_ambiguous"
+    real = _node_line_count(content, q)
+    rep = _nonblank_line_count(replace)
+    ratio = (rep / real) if real else 0.0
+    return (
+        f"size_gate replace={rep} real={real} ratio={ratio:.2f} "
+        f"(need>={NODE_UPGRADE_MIN_SIZE_RATIO})"
+    )

@@ -361,6 +361,16 @@ def _apply_patch_edits(
                         locate_node_span(content, qualname) if qualname else None
                     )
                     if node_span is None:
+                        # Diagnostic: why did the converter decline? (helps tune
+                        # the gate). Reports the shape of this apply-failure.
+                        if edit.file_path.endswith(".py") and not edit.replace_all:
+                            from ..patch_match import diagnose_node_upgrade
+                            print(
+                                f"  [execute] node-upgrade declined edit {index} "
+                                f"{edit.file_path}: {diagnose_node_upgrade(content, edit.search, edit.replace)}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
                         return PatchEditApplyResult(
                             applied=False,
                             output=(
