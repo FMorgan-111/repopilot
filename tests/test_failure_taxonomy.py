@@ -84,6 +84,17 @@ def test_sample_no_attempts_prepatch_locate_failure():
     assert classify_sample(sample)["decisive"] == "other"
 
 
+def test_sample_no_attempts_hallucination_gate_is_search_not_found():
+    # The gate clears the patch in PLAN (no fix_attempt recorded), but the
+    # failure_reason names it — must classify as search_not_found, not "other".
+    sample = {
+        "id": "a", "success": False,
+        "error": "Planner kept emitting search blocks that do not exist in the target files.",
+        "agent_payload": {"fix_attempts": []},
+    }
+    assert classify_sample(sample)["decisive"] == "search_not_found"
+
+
 def test_summarize_distribution():
     results = [
         {"id": "1", "success": True, "agent_payload": {"fix_attempts": []}},

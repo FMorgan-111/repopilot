@@ -99,10 +99,14 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
     if per_attempt:
         decisive = per_attempt[-1]
     else:
-        # No attempt recorded — classify from the top-level error (locate/plan
-        # died before any patch, or infra).
+        # No attempt recorded — the gate cleared the patch in PLAN before it
+        # reached EXECUTE. Classify from the top-level failure_reason.
         err = (sample.get("error") or "").lower()
-        if "no relevant files" in err or "locate" in err or "context collection" in err:
+        if "search blocks that do not exist" in err or "search block" in err:
+            decisive = "search_not_found"  # search-content hallucination
+        elif "re-emitting patches that already failed" in err:
+            decisive = "search_not_found"  # dead-patch (repeated bad anchor)
+        elif "no relevant files" in err or "locate" in err or "context collection" in err:
             decisive = "other"  # pre-patch (localization) failure
         elif "readtimeout" in err or "timed out" in err or "infrastructure" in err:
             decisive = "infra"
