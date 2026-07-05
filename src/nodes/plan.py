@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import time
@@ -325,6 +326,78 @@ def _build_search_correction(state: AgentState, missing: list[Any]) -> str:
 def _is_final_attempt(state: AgentState) -> bool:
     """The retry budget is spent: this plan is the last one that can execute."""
     return state.retry_count >= state.max_retries
+
+
+def _enclosing_node_names(content: str, search: str) -> list[str]:
+    """Dotted names of the def/method/class that CONTAIN the failed search
+    block's location — candidates the planner can re-target via node_target."""
+    if not content or not search:
+        return []
+    anchor = max((ln for ln in search.split("\n") if ln.strip()), key=len, default="")
+    if not anchor.strip():
+        return []
+    try:
+        idx = content.index(anchor.strip())
+    except ValueError:
+        return []
+    target_line = content.count("\n", 0, idx) + 1  # 1-based
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return []
+
+    names: list[str] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                child_stack = stack + [child.name]
+                start = child.lineno
+                end = child.end_lineno or start
+                if start <= target_line <= end:
+                    names.append(".".join(child_stack))
+                walk(child, child_stack)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return names
+
+
+def _force_node_target_instructions(state: AgentState) -> str:
+    """After a patch failed to APPLY (search text never matched), stop retrying
+    the same text-anchoring tool: instruct the planner to re-target the fix by
+    node_target (AST-located), which cannot suffer the same anchor miss. Only
+    fires for Python files and names the enclosing node when we can find it."""
+    if not (state.fix_attempts and _is_patch_apply_failure(state.fix_attempts[-1])):
+        return ""
+    last = state.fix_attempts[-1]
+    py_edits = [
+        e for e in getattr(last, "patch_edits", []) or []
+        if e.file_path.endswith(".py") and getattr(e, "search", "")
+    ]
+    if not py_edits:
+        return ""
+    suggestions: list[str] = []
+    for edit in py_edits:
+        content = _relevant_file_content(state, edit.file_path)
+        if content is None:
+            continue
+        for name in _enclosing_node_names(content, edit.search):
+            entry = f"{edit.file_path}:{name}"
+            if entry not in suggestions:
+                suggestions.append(entry)
+    text = (
+        " The previous patch FAILED TO APPLY: its search text did not match the "
+        "file. Do NOT retry search/replace for the same location — it will miss "
+        "again. Instead re-express the fix with node_target: set node_target to "
+        "the dotted name of the enclosing function/method/class, leave search "
+        "empty, and put the FULL new definition in replace (the executor locates "
+        "the node by AST, so no verbatim surrounding text is needed)."
+    )
+    if suggestions:
+        text += " Likely node_target(s): " + "; ".join(suggestions[:4]) + "."
+    return text
 
 
 def _final_attempt_instructions() -> str:
@@ -657,12 +730,18 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         "Use patch only for backward-compatible unified diff output when patch_edits cannot express the change."
     )
     if state.fix_attempts and _is_patch_apply_failure(state.fix_attempts[-1]):
-        system = (
-            f"{system} After a patch_apply_failed attempt, the next plan must "
-            "repair the previous patch as exact patch_edits with correct file paths and search blocks "
-            "before changing semantics. Do not shift the selected hypothesis "
-            "unless the apply error proves the target file or hunk context is impossible."
-        )
+        node_instr = _force_node_target_instructions(state)
+        if node_instr:
+            # Search anchoring already failed to apply; push to AST-anchored
+            # node_target instead of retrying the same text match.
+            system = f"{system}{node_instr}"
+        else:
+            system = (
+                f"{system} After a patch_apply_failed attempt, the next plan must "
+                "repair the previous patch as exact patch_edits with correct file paths and search blocks "
+                "before changing semantics. Do not shift the selected hypothesis "
+                "unless the apply error proves the target file or hunk context is impossible."
+            )
     if _is_final_attempt(state):
         system = f"{system}{_final_attempt_instructions()}"
     system = f"{system}{_force_patch_instructions(state)}"
