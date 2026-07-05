@@ -421,6 +421,7 @@ async def _semantic_recall_context(state: AgentState) -> str:
     """Best-effort cross-repo recall of similar past fixes. Never raises: if the
     episode store or embedding model is unavailable, planning proceeds without
     recall."""
+    import sys
     try:
         from ..memory.error_episode_store import get_episode_store
 
@@ -433,8 +434,13 @@ async def _semantic_recall_context(state: AgentState) -> str:
             k=3,
             exclude_issue_url=state.issue_url,
         )
-    except Exception:
+    except Exception as exc:
+        # Observability: recall was enabled but failed — surface it instead of
+        # hiding behind a silent best-effort (the memory system had zero
+        # visibility, so we couldn't tell "off" from "on-but-broken").
+        print(f"  [recall] failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return ""
+    print(f"  [recall] {len(episodes)} episode(s) injected", file=sys.stderr, flush=True)
     if not episodes:
         return ""
     return _format_recalled_episodes(episodes)
