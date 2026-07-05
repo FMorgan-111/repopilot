@@ -156,3 +156,110 @@ def locate_node_span(source: str, qualname: str) -> tuple[int, int, int] | None:
     end_off = sum(len(line) for line in lines[:end_line])
     return (start_off, end_off, target.col_offset)
 
+
+def _sole_def_name(code: str) -> str | None:
+    """If `code` (dedented) parses to exactly one top-level function/class def,
+    return its name, else None. Used to detect a whole-definition replacement."""
+    import textwrap
+
+    try:
+        tree = ast.parse(textwrap.dedent(code))
+    except SyntaxError:
+        return None
+    body = [n for n in tree.body if not isinstance(n, ast.Expr)]
+    if len(body) == 1 and isinstance(body[0], _DEF_NODES):
+        return body[0].name
+    return None
+
+
+def _node_line_count(source: str, qualname: str) -> int:
+    """Line count of the located node (0 if not uniquely found)."""
+    if not qualname:
+        return 0
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return 0
+    found: list[ast.AST] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEF_NODES):
+                cs = stack + [child.name]
+                if ".".join(cs) == qualname:
+                    found.append(child)
+                walk(child, cs)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    if len(found) != 1:
+        return 0
+    n = found[0]
+    return (n.end_lineno or n.lineno) - n.lineno + 1
+
+
+def _nonblank_line_count(text: str) -> int:
+    return sum(1 for ln in text.split("\n") if ln.strip())
+
+
+# Replace must be at least this fraction of the located function's real size
+# before we upgrade search->node_target. A much smaller replace means the model
+# intended a PARTIAL edit (its search was the def line + a few lines); upgrading
+# would replace the whole function with those few lines and silently delete the
+# rest. The size gate is the safety core of the converter.
+NODE_UPGRADE_MIN_SIZE_RATIO = 0.6
+
+
+def try_upgrade_to_node_target(
+    content: str, search: str, replace: str
+) -> str | None:
+    """If a search/replace edit is really a whole-definition rewrite, return the
+    qualname to re-anchor it via AST (node_target); else None (keep search).
+
+    Fires only when ALL hold, so it never truncates a partial edit:
+      1. `replace` is exactly one function/class def named N.
+      2. `search` is also a single def named N (same intent, whole def).
+      3. N resolves to a unique node in `content`.
+      4. `replace` is >= 60% the size of that real node (not a stub that would
+         delete the body).
+    """
+    replace_name = _sole_def_name(replace)
+    if replace_name is None:
+        return None
+    if _sole_def_name(search) != replace_name:
+        return None
+    # Resolve N to a unique qualname in the file (top-level or nested method).
+    qualname = _resolve_unique_qualname(content, replace_name)
+    if qualname is None:
+        return None
+    real_len = _node_line_count(content, qualname)
+    if real_len <= 0:
+        return None
+    if _nonblank_line_count(replace) < NODE_UPGRADE_MIN_SIZE_RATIO * real_len:
+        return None
+    return qualname
+
+
+def _resolve_unique_qualname(source: str, name: str) -> str | None:
+    """Find the single def/class whose *last* name component is `name`, return
+    its dotted qualname, or None if absent or ambiguous."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    hits: list[str] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEF_NODES):
+                cs = stack + [child.name]
+                if child.name == name:
+                    hits.append(".".join(cs))
+                walk(child, cs)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    return hits[0] if len(hits) == 1 else None
+

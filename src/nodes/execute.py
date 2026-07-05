@@ -9,12 +9,19 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..patch_repair import repair_unified_diff
-from ..patch_match import find_normalized_span, leading_spaces, locate_node_span, reindent
+from ..patch_match import (
+    find_normalized_span,
+    leading_spaces,
+    locate_node_span,
+    reindent,
+    try_upgrade_to_node_target,
+)
 from ..state import (
     AgentState,
     FixAttempt,
@@ -341,15 +348,43 @@ def _apply_patch_edits(
                     None if edit.replace_all else find_normalized_span(content, edit.search)
                 )
                 if span is None:
-                    return PatchEditApplyResult(
-                        applied=False,
-                        output=(
-                            "Search/replace edit failed: "
-                            f"edit {index} search block was not found in {edit.file_path}."
-                        ),
+                    # Last resort: if this is really a whole-function rewrite whose
+                    # search text drifted too far to match, re-anchor by AST node
+                    # (the model won't do this itself). Size-gated so it can never
+                    # truncate a partial edit. Python files only.
+                    qualname = (
+                        None
+                        if edit.replace_all or not edit.file_path.endswith(".py")
+                        else try_upgrade_to_node_target(content, edit.search, edit.replace)
                     )
-                start, end, indent_delta = span
-                updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
+                    node_span = (
+                        locate_node_span(content, qualname) if qualname else None
+                    )
+                    if node_span is None:
+                        return PatchEditApplyResult(
+                            applied=False,
+                            output=(
+                                "Search/replace edit failed: "
+                                f"edit {index} search block was not found in {edit.file_path}."
+                            ),
+                        )
+                    n_start, n_end, node_indent = node_span
+                    first = next(
+                        (ln for ln in edit.replace.split("\n") if ln.strip()), ""
+                    )
+                    body = reindent(edit.replace, node_indent - leading_spaces(first))
+                    if not body.endswith("\n"):
+                        body += "\n"
+                    print(
+                        f"  [execute] upgraded search->node_target {edit.file_path}:"
+                        f"{qualname} (edit {index})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    updated = content[:n_start] + body + content[n_end:]
+                else:
+                    start, end, indent_delta = span
+                    updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
 
         pending_writes[file_path] = updated
         if edit.file_path not in changed_files:
