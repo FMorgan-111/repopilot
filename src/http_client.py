@@ -35,13 +35,15 @@ LLM_CONNECT_TIMEOUT = 15.0
 # generation of ANY length stays under it — unlike a buffered response, whose
 # whole generation had to finish within a single read timeout (the bug that
 # made large prompts like tox time out at 60s / retry-double).
-LLM_STREAM_IDLE_TIMEOUT = 60.0
+# 120s (not 60s): reasoning models (e.g. gpt-5.5) pause to think before emitting
+# tokens, so the gap before/between chunks can exceed 60s and trip a ReadTimeout.
+LLM_STREAM_IDLE_TIMEOUT = 120.0
 # Hard wall-clock backstop for one streamed call. The idle timeout is the real
 # bound; this only stops a pathologically long stream. Non-retryable on expiry.
-# Set above the observed slow tail (~200s for large planning prompts) so a
-# progressing stream is not cut, while keeping the retry budget within the
-# per-phase timeouts (see test_llm_phase_timeouts_cover_retry_window).
-LLM_CALL_WALLCLOCK_TIMEOUT = 240.0
+# 300s covers the slow reasoning tail (gpt-5.5 single calls observed 100-123s)
+# while the retry budget (320s) stays within the per-phase timeouts (see
+# test_llm_phase_timeouts_cover_retry_window).
+LLM_CALL_WALLCLOCK_TIMEOUT = 300.0
 
 
 def _get_llm_client() -> httpx.AsyncClient:
@@ -150,15 +152,15 @@ async def _github_request_with_retry(method: str, url: str, **kwargs) -> httpx.R
 # ---------------------------------------------------------------------------
 
 def _get_llm_api_key() -> str:
-    return os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
+    return os.getenv("LINOAPI_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY", "")
 
 
 def _get_llm_base_url() -> str:
-    return os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+    return os.getenv("OPENAI_BASE_URL", "https://linoapi.com.cn/v1").rstrip("/")
 
 
 def _get_llm_model() -> str:
-    return os.getenv("LLM_MODEL", "deepseek-v4-pro")
+    return os.getenv("LLM_MODEL", "gpt-5.5:stable")
 
 
 async def llm_request(

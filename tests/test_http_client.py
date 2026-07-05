@@ -93,14 +93,14 @@ async def test_close_llm_client_closes_cached_client_and_clears_global():
 
 
 def test_llm_timeout_budget_is_explicit():
-    assert LLM_STREAM_IDLE_TIMEOUT == 60.0
+    assert LLM_STREAM_IDLE_TIMEOUT == 120.0
     assert LLM_CONNECT_TIMEOUT == 15.0
-    assert LLM_CALL_WALLCLOCK_TIMEOUT == 240.0
+    assert LLM_CALL_WALLCLOCK_TIMEOUT == 300.0
     assert LLM_MAX_ATTEMPTS == 2
     assert LLM_RETRY_BACKOFF_MAX_SECONDS == 20.0
     # One slow attempt is killed at the wall-clock ceiling (non-retryable), so
     # the worst case is a fast transient fail + backoff + one slow attempt.
-    assert llm_retry_budget_seconds() == 260.0
+    assert llm_retry_budget_seconds() == 320.0
 
 
 @pytest.fixture(autouse=True)

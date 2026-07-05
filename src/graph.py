@@ -17,17 +17,17 @@ except ImportError:  # pragma: no cover - fallback is covered by tests.
     StateGraph = None
 
 # ── per-phase timeouts (seconds) ──────────────────────────────────────────
-# plan_fix / reflect_on_failure are 300s (not 180s): a single LLM call can hit
-# the full ~140s retry path, and DeepSeek latency varies widely for the larger
-# ~6K-token planning prompts (observed 25s–143s for near-identical sizes). 180s
-# was tuned for the old ~1.6K prompts and the slow tail blew through it.
+# plan_fix / reflect_on_failure must cover the full LLM retry budget (wall-clock
+# + backoff = 320s) plus margin. Reasoning models (gpt-5.5) push single calls to
+# 100-123s, and the retry path can stack; 360s clears it. understand also makes
+# an LLM call so it must cover the retry window too.
 PHASE_TIMEOUTS: dict[str, float] = {
-    "understand_issue": 270.0,
+    "understand_issue": 360.0,
     "locate_code": 180.0,
-    "plan_fix": 300.0,
+    "plan_fix": 360.0,
     "execute_fix": 600.0,
     "verify_fix": 15.0,
-    "reflect_on_failure": 300.0,
+    "reflect_on_failure": 360.0,
     "commit_fix": 600.0,
     "handle_failure": 60.0,
 }
