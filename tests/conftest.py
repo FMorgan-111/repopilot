@@ -21,6 +21,19 @@ def _reset_llm_global():
     _reset_llm_client()
 
 
+@pytest.fixture(autouse=True)
+def _pin_llm_env(monkeypatch):
+    """Pin the LLM endpoint/model to deterministic test defaults so httpx_mock's
+    hard-coded api.deepseek.com URL matches. Without this, a developer's .env
+    pointing OPENAI_BASE_URL at a real gateway (e.g. the Gemini proxy) makes the
+    request URL mismatch every mock and the whole http_client/llm suite goes red.
+    """
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+
+
 class HTTPXMock:
     def __init__(self):
         self._responses = []
