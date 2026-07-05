@@ -371,7 +371,7 @@ async def agent_v2(
             error=str(exc),
         )
         # Save partial trace
-        _save_trace(tracer, "examples/traces/case_1.json", state)
+        _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", state)
         return {
             "error": f"Graph crashed: {type(exc).__name__}: {exc}",
             "trace_id": tracer.trace_id,
@@ -391,6 +391,16 @@ async def agent_v2(
         {"phase": final_state.current_phase.value, "pr_url": final_state.pr_url},
         error=final_state.failure_reason or None,
     )
+    # Per-attempt failure classification — the raw signal for diagnosing WHY a
+    # run failed (apply vs test vs path), one line per fix attempt.
+    for i, att in enumerate(final_state.fix_attempts, start=1):
+        kind = att.failure_kind or ("success" if att.success else att.test_result or "?")
+        err = (att.error_log or "").replace("\n", " ")[:160]
+        print(
+            f"  [classify] attempt {i}: kind={kind} err={err}",
+            file=sys.stderr,
+            flush=True,
+        )
     print(f"[agent_v2] Done in {elapsed:.1f}s → {final_state.current_phase.value}", file=sys.stderr, flush=True)
 
     payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
@@ -399,7 +409,7 @@ async def agent_v2(
         _best_effort_save_run(final_state)
 
     # Save trace to file
-    _save_trace(tracer, "examples/traces/case_1.json", final_state)
+    _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", final_state)
     return payload
 
 
@@ -436,7 +446,7 @@ async def resume_agent_v2(run_id: str, human_answer: str) -> dict:
 
     tracer = Tracer()
     tracer.trace_id = state.trace_id
-    _save_trace(tracer, "examples/traces/case_1.json", final_state)
+    _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", final_state)
     return payload
 
 

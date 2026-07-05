@@ -32,6 +32,9 @@ def _pin_llm_env(monkeypatch):
     monkeypatch.setenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1")
     monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    # Higher-priority keys must be cleared too, else a real .env key leaks into
+    # the auth header and breaks the "Bearer test-key" assertion.
+    monkeypatch.delenv("LINOAPI_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
 
 
