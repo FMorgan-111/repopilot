@@ -98,11 +98,65 @@ def load_samples(
     return samples
 
 
+def _is_doc_path(path: str) -> bool:
+    lower = path.lower()
+    return (
+        lower.endswith((".rst", ".md", ".txt"))
+        or "/docs/" in lower
+        or lower.startswith("docs/")
+        or "changelog" in lower
+        or "/news/" in lower
+    )
+
+
+def _build_gold_seed(sample: dict[str, Any]) -> dict[str, Any] | None:
+    """Seed relevant_files from the dataset's known changed files, fetching each
+    file's content via the GitHub Contents API (single-file, NOT the flaky code
+    search). Removes locate from the critical path so eval measures the patch
+    stage, not GitHub search rate-limiting. Returns None if no code file could
+    be seeded (fall back to the normal locate path)."""
+    from eval.harness import _gh_get, fetch_file_content
+
+    repo = sample["repo"]
+    issue = sample["issue"]
+    owner, name = repo["owner"], repo["name"]
+    meta = _gh_get(f"https://api.github.com/repos/{owner}/{name}")
+    ref = (meta or {}).get("default_branch") or "main"
+
+    files: list[dict[str, Any]] = []
+    for entry in sample.get("patch", {}).get("files", []):
+        path = entry.get("path", "")
+        if not path or _is_doc_path(path):
+            continue
+        content = fetch_file_content(owner, name, path, ref)
+        if not content:  # added file with no pre-image, or fetch failed → skip
+            continue
+        files.append(
+            {
+                "path": path,
+                "content": content,
+                "relevance_score": 1.0,
+                "reason": "seeded from gold changed files (offline eval)",
+            }
+        )
+    if not files:
+        return None
+    return {
+        "owner": owner,
+        "repo": name,
+        "issue_number": issue.get("number", 0),
+        "issue_title": issue["title"],
+        "issue_body": issue["body"],
+        "relevant_files": files,
+    }
+
+
 async def evaluate_agent_v2_sample(
     sample: dict[str, Any],
     idx: int,
     max_retries: int = 3,
     token_budget: int = 50000,
+    seed_gold_files: bool = False,
 ) -> dict[str, Any]:
     issue = sample["issue"]
     repo = sample["repo"]
@@ -110,12 +164,15 @@ async def evaluate_agent_v2_sample(
     signals = sample.get("signals", {})
     issue_url = issue["url"]
 
+    seed = _build_gold_seed(sample) if seed_gold_files else None
+
     payload = await agent_v2(
         issue_url,
         max_retries=max_retries,
         token_budget=token_budget,
         save_final_run=True,
         skip_commit=True,
+        seed=seed,
     )
     run_id = payload.get("run_id") or payload.get("trace_id") or ""
 
@@ -155,6 +212,7 @@ async def run_agent_v2_eval(
     token_budget: int = 50000,
     results_path: Path | str = RESULTS_PATH,
     sample_id: str | None = None,
+    seed_gold_files: bool = False,
 ) -> list[dict[str, Any]]:
     try:
         samples = load_samples(n_samples, sample_id=sample_id)
@@ -170,6 +228,7 @@ async def run_agent_v2_eval(
                     i,
                     max_retries=max_retries,
                     token_budget=token_budget,
+                    seed_gold_files=seed_gold_files,
                 )
             )
 

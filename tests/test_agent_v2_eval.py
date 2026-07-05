@@ -30,6 +30,7 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
         token_budget=50000,
         save_final_run=False,
         skip_commit=False,
+        seed=None,
     ):
         calls.append(
             {
@@ -141,7 +142,8 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
 async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):
     samples = [sample_record()]
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         return {
             "id": sample["id"],
             "mode": "agent_v2",
@@ -176,7 +178,8 @@ async def test_run_agent_v2_eval_closes_memory_store_after_success(
 ):
     calls = []
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         return {
             "id": sample["id"],
             "mode": "agent_v2",
@@ -216,7 +219,8 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
 ):
     samples = [sample_record()]
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         return {
             "id": sample["id"],
             "mode": "agent_v2",
@@ -266,7 +270,8 @@ async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
 ):
     calls = []
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         raise RuntimeError("sample failed after partial work")
 
     async def fake_close_llm_client():
@@ -292,7 +297,8 @@ async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
 async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
     monkeypatch, tmp_path
 ):
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         return {
             "id": sample["id"],
             "mode": "agent_v2",
@@ -327,7 +333,8 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
 async def test_run_agent_v2_eval_does_not_mask_results_when_memory_cleanup_raises(
     monkeypatch, tmp_path, capsys
 ):
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000):
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+                            seed_gold_files=False):
         return {
             "id": sample["id"],
             "mode": "agent_v2",
@@ -375,6 +382,7 @@ def test_harness_main_dispatches_agent_v2_mode(monkeypatch):
         max_retries=3,
         token_budget=50000,
         sample_id=None,
+        seed_gold_files=False,
     ):
         calls.append(
             {
@@ -422,6 +430,7 @@ async def test_harness_run_agent_v2_eval_forwards_sample_id(monkeypatch):
             max_retries=3,
             token_budget=50000,
             sample_id=None,
+            seed_gold_files=False,
         ):
             calls.append(
                 {

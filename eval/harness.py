@@ -1066,6 +1066,7 @@ async def run_agent_v2_eval(
     max_retries: int = 3,
     token_budget: int = 50000,
     sample_id: str | None = None,
+    seed_gold_files: bool = False,
 ) -> list[dict[str, Any]]:
     module = importlib.import_module("eval.agent_v2_harness")
     return await module.run_agent_v2_eval(
@@ -1073,6 +1074,7 @@ async def run_agent_v2_eval(
         max_retries=max_retries,
         token_budget=token_budget,
         sample_id=sample_id,
+        seed_gold_files=seed_gold_files,
     )
 
 
@@ -1096,6 +1098,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Run only this dataset sample id (e.g. 'scrapy/scrapy#6195:7095'), "
         "scanning the whole file instead of taking the first --samples lines.",
     )
+    parser.add_argument(
+        "--seed-gold-files",
+        action="store_true",
+        help="Offline locate: seed relevant_files from the dataset's gold changed "
+        "files (fetched via the Contents API, not code search) and start at PLAN. "
+        "Removes GitHub code-search rate-limiting from the critical path.",
+    )
     args = parser.parse_args(argv)
 
     if args.agent_v2:
@@ -1105,6 +1114,7 @@ def main(argv: list[str] | None = None) -> None:
                 max_retries=args.max_retries,
                 token_budget=args.token_budget,
                 sample_id=args.sample_id,
+                seed_gold_files=args.seed_gold_files,
             )
         )
         return

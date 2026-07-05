@@ -319,8 +319,13 @@ async def agent_v2(
     token_budget: int = 50000,
     save_final_run: bool = False,
     skip_commit: bool = False,
+    seed: dict | None = None,
 ) -> dict:
-    """Run the full RepoPilot v2 graph with progress output and trace saving."""
+    """Run the full RepoPilot v2 graph with progress output and trace saving.
+
+    When `seed` is provided (offline eval), pre-populate the issue text and
+    relevant files and start at PLAN — skipping UNDERSTAND/LOCATE so a flaky
+    GitHub code search cannot starve the run before the patch stage."""
     import sys
     import time as _time
     t_start = _time.monotonic()
@@ -334,8 +339,24 @@ async def agent_v2(
         trace_id=tracer.trace_id,
         skip_commit=skip_commit,
     )
+    start_phase = Phase.UNDERSTAND
+    if seed:
+        state.owner = seed.get("owner", "")
+        state.repo = seed.get("repo", "")
+        state.issue_number = seed.get("issue_number", 0)
+        state.issue_title = seed.get("issue_title", "")
+        state.issue_body = seed.get("issue_body", "")
+        state.relevant_files = [FileInfo(**f) for f in seed.get("relevant_files", [])]
+        state.current_phase = Phase.PLAN
+        start_phase = Phase.PLAN
+        print(
+            f"[agent_v2] Seeded {len(state.relevant_files)} file(s) for "
+            f"{state.owner}/{state.repo}; starting at PLAN",
+            file=sys.stderr,
+            flush=True,
+        )
     print("[agent_v2] Building agent graph...", file=sys.stderr, flush=True)
-    graph = build_agent_graph()
+    graph = build_agent_graph(start_phase=start_phase)
     print(f"[agent_v2] Running graph (trace={tracer.trace_id})...", file=sys.stderr, flush=True)
 
     try:
