@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -84,7 +85,8 @@ def _repo_url(state: AgentState, *, include_token: bool) -> str:
     return f"https://github.com/{state.owner}/{state.repo}.git"
 
 
-def _clone_local_repo(cache_path: Path, target: str) -> None:
+def _clone_local_repo(cache_path: Path, target: str) -> None:  # pragma: no cover
+    # Retained for backward-compat imports; the live path is the async variant.
     subprocess.run(
         ["git", "clone", "--local", "--no-hardlinks", str(cache_path), target],
         capture_output=True,
@@ -94,19 +96,62 @@ def _clone_local_repo(cache_path: Path, target: str) -> None:
     )
 
 
-def _reset_work_tree(work: str) -> None:
+class _ProcResult:
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+async def _run_git_async(
+    args: list[str], timeout: float, cwd: str | None = None
+) -> _ProcResult:
+    """Run git via an async subprocess so a hung clone does NOT pin the event
+    loop. The subprocess is killed both on its own timeout and when the caller
+    is cancelled (e.g. the execute_fix phase timeout), so neither can leave a
+    git process running unbounded — the bug that made a stuck clone hang the
+    whole run."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.wait()
+        raise
+    return _ProcResult(
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def _clone_local_repo_async(cache_path: Path, target: str) -> None:
+    res = await _run_git_async(
+        ["git", "clone", "--local", "--no-hardlinks", str(cache_path), target],
+        timeout=180,
+    )
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(
+            res.returncode, "git clone --local", res.stdout, res.stderr
+        )
+
+
+async def _reset_work_tree_async(work: str) -> None:
     """Restore a reused work tree to pristine HEAD, dropping a prior sample's
     applied patch. ``clean -fd`` (no ``-x``) keeps git-ignored build artifacts
-    like ``.egg-info`` so the editable install stays valid across reuse.
-    """
-    subprocess.run(
+    like ``.egg-info`` so the editable install stays valid across reuse."""
+    for args in (
         ["git", "-C", work, "reset", "--hard", "HEAD"],
-        capture_output=True, text=True, timeout=120, check=False,
-    )
-    subprocess.run(
         ["git", "-C", work, "clean", "-fd"],
-        capture_output=True, text=True, timeout=120, check=False,
-    )
+    ):
+        await _run_git_async(args, timeout=120)
 
 
 async def git_clone(state: AgentState) -> str:
@@ -119,9 +164,12 @@ async def git_clone(state: AgentState) -> str:
       cache on first sight.
 
     Initial-download fallbacks (best → fallback):
-    1. --depth 1 --filter=blob:none --single-branch  (fastest, Git 2.19+)
-    2. --depth 1  (shallow clone, no filter)
+    1. --depth 1 --single-branch  (fast, blobful so it can serve --local)
+    2. --depth 1  (shallow, all branches)
     3. full clone  (no flags)
+
+    All git subprocesses run async (``_run_git_async``) so a hung clone is
+    killable by its own timeout and by the execute_fix phase timeout.
     """
     repo_url = _repo_url(state, include_token=True)
     safe_repo_url = _repo_url(state, include_token=False)
@@ -130,15 +178,15 @@ async def git_clone(state: AgentState) -> str:
 
     # Reuse an existing work tree: reset instead of re-clone + re-install.
     if (Path(work) / ".git").exists():
-        _reset_work_tree(work)
+        await _reset_work_tree_async(work)
         return work
 
     # Git objects already cached: fast local clone into the work tree.
     if (cache_path / ".git").exists():
         try:
-            _clone_local_repo(cache_path, work)
+            await _clone_local_repo_async(cache_path, work)
             return work
-        except subprocess.CalledProcessError:
+        except (subprocess.CalledProcessError, asyncio.TimeoutError):
             # Corrupt/partial cache (e.g. an older blobless clone that cannot
             # serve a local work tree). Discard it and re-download from scratch.
             shutil.rmtree(cache_path, ignore_errors=True)
@@ -157,28 +205,20 @@ async def git_clone(state: AgentState) -> str:
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     for cmd in strategies:
         try:
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                # One-time per-repo download; a blobful depth-1 clone of a large
-                # repo can exceed the old 180s. Generous ceiling, cached after.
-                timeout=600,
-            )
-        except subprocess.TimeoutExpired:
+            # 300s per strategy; async so the execute_fix phase timeout can also
+            # cancel a hung clone (a blocking subprocess.run could not be).
+            result = await _run_git_async(cmd, timeout=300)
+        except asyncio.TimeoutError:
             last_error = f"clone timed out: {' '.join(cmd[:4])}..."
             if cache_path.exists():
                 shutil.rmtree(cache_path, ignore_errors=True)
             continue
         if result.returncode == 0:
-            subprocess.run(
+            await _run_git_async(
                 ["git", "-C", str(cache_path), "remote", "set-url", "origin", safe_repo_url],
-                capture_output=True,
-                text=True,
                 timeout=60,
-                check=False,
             )
-            _clone_local_repo(cache_path, work)
+            await _clone_local_repo_async(cache_path, work)
             return work
         last_error = _redact_sensitive_error_text(
             (result.stderr or result.stdout).strip()

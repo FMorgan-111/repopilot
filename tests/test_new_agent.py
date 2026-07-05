@@ -568,6 +568,21 @@ async def test_execute_fix_marks_execution_error_failure_kind(monkeypatch):
     assert next_state.fix_attempts[-1].error_log == "git apply crashed"
 
 
+async def test_run_git_async_kills_process_on_timeout():
+    import time
+
+    t0 = time.monotonic()
+    # A sleep far longer than the timeout must be killed promptly, not waited
+    # out — this is what lets the phase timeout reclaim a hung clone.
+    try:
+        await execute_node._run_git_async(["sleep", "30"], timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        raise AssertionError("expected TimeoutError")
+    assert time.monotonic() - t0 < 5
+
+
 async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_path):
     repopilot_home = tmp_path / ".repopilot"
     cache_path = repopilot_home / "repos" / "acme-widget"
@@ -575,11 +590,11 @@ async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_
     monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
     commands = []
 
-    def fake_run(cmd, **kwargs):
-        commands.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        return execute_node._ProcResult(0, "", "")
 
-    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
@@ -610,13 +625,13 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
     monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
     commands = []
 
-    def fake_run(cmd, **kwargs):
-        commands.append(cmd)
-        if cmd[:2] == ["git", "clone"] and cmd[-1] == str(cache_path):
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        if args[:2] == ["git", "clone"] and args[-1] == str(cache_path):
             (cache_path / ".git").mkdir(parents=True)
-        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return execute_node._ProcResult(0, "", "")
 
-    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
@@ -657,19 +672,18 @@ async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_
     monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
     commands = []
 
-    def fake_run(cmd, **kwargs):
-        commands.append(cmd)
-        return subprocess.CompletedProcess(
-            cmd,
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        return execute_node._ProcResult(
             128,
-            stdout="",
-            stderr=(
+            "",
+            (
                 "fatal: unable to access "
                 "'https://x-access-token:gho_cachetoken@github.com/acme/widget.git/'"
             ),
         )
 
-    monkeypatch.setattr(execute_node.subprocess, "run", fake_run)
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
