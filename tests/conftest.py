@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -57,12 +58,31 @@ class HTTPXMock:
             if response["url"] is not None and response["url"] != str(request.url):
                 continue
             self._responses.pop(index)
-            return httpx.Response(
-                status_code=response["status_code"],
-                json=response["json"],
-                request=request,
-            )
+            return self._make_response(request, response)
         raise AssertionError(f"No mocked response for {request.method} {request.url}")
+
+    def _make_response(self, request, response) -> httpx.Response:
+        status = response["status_code"]
+        body = response["json"]
+        # The LLM client streams (stream=True). Re-serve the mocked completion as
+        # Server-Sent Events so the streaming parser reconstructs it — keeps the
+        # existing json= mocks working without per-test changes.
+        wants_stream = False
+        try:
+            wants_stream = bool(json.loads(request.content or b"{}").get("stream"))
+        except Exception:
+            wants_stream = False
+        if wants_stream and status == 200 and isinstance(body, dict) and body.get("choices"):
+            content = body["choices"][0].get("message", {}).get("content", "")
+            sse = (
+                "data: "
+                + json.dumps({"choices": [{"delta": {"content": content}}]})
+                + "\n\ndata: [DONE]\n"
+            )
+            return httpx.Response(
+                status_code=status, content=sse.encode(), request=request
+            )
+        return httpx.Response(status_code=status, json=body, request=request)
 
 
 @pytest.fixture

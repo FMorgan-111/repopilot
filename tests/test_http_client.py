@@ -9,8 +9,8 @@ from src.http_client import (
     LLM_CALL_WALLCLOCK_TIMEOUT,
     LLM_CONNECT_TIMEOUT,
     LLM_MAX_ATTEMPTS,
-    LLM_READ_TIMEOUT,
     LLM_RETRY_BACKOFF_MAX_SECONDS,
+    LLM_STREAM_IDLE_TIMEOUT,
     MAX_RETRIES,
     RETRYABLE_GITHUB_STATUS,
     RETRYABLE_LLM_STATUS,
@@ -32,6 +32,55 @@ async def _noop_sleep(*args, **kwargs):
     pass
 
 
+def _sse(content: str) -> str:
+    """One-chunk Server-Sent-Events body carrying `content`, terminated by DONE."""
+    import json as _json
+
+    return (
+        "data: "
+        + _json.dumps({"choices": [{"delta": {"content": content}}]})
+        + "\n\ndata: [DONE]\n"
+    )
+
+
+class _FakeStreamCM:
+    """Stand-in for httpx AsyncClient.stream()'s async context manager, so the
+    streaming LLM path can be tested without a real SSE server."""
+
+    def __init__(self, *, raise_exc=None, status=200, sse=""):
+        self._raise = raise_exc
+        self._status = status
+        self._sse = sse
+
+    async def __aenter__(self):
+        if self._raise is not None:
+            raise self._raise
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    @property
+    def status_code(self):
+        return self._status
+
+    async def aread(self):
+        return b""
+
+    def raise_for_status(self):
+        if self._status >= 400:
+            request = httpx.Request(
+                "POST", "https://api.deepseek.com/v1/chat/completions"
+            )
+            raise httpx.HTTPStatusError(
+                "err", request=request, response=httpx.Response(self._status, request=request)
+            )
+
+    async def aiter_lines(self):
+        for line in self._sse.split("\n"):
+            yield line
+
+
 async def test_close_llm_client_closes_cached_client_and_clears_global():
     from src import http_client
 
@@ -44,14 +93,14 @@ async def test_close_llm_client_closes_cached_client_and_clears_global():
 
 
 def test_llm_timeout_budget_is_explicit():
-    assert LLM_READ_TIMEOUT == LLM_CALL_WALLCLOCK_TIMEOUT
+    assert LLM_STREAM_IDLE_TIMEOUT == 60.0
     assert LLM_CONNECT_TIMEOUT == 15.0
-    assert LLM_CALL_WALLCLOCK_TIMEOUT == 200.0
+    assert LLM_CALL_WALLCLOCK_TIMEOUT == 240.0
     assert LLM_MAX_ATTEMPTS == 2
     assert LLM_RETRY_BACKOFF_MAX_SECONDS == 20.0
     # One slow attempt is killed at the wall-clock ceiling (non-retryable), so
     # the worst case is a fast transient fail + backoff + one slow attempt.
-    assert llm_retry_budget_seconds() == 220.0
+    assert llm_retry_budget_seconds() == 260.0
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +158,26 @@ def test_is_retryable_llm_non_retryable_status():
 # ---------------------------------------------------------------------------
 # GitHub request retry tests (using httpx_mock for HTTP-level mocking)
 # ---------------------------------------------------------------------------
+
+
+async def test_llm_request_accumulates_streamed_chunks(monkeypatch):
+    """Multiple SSE delta chunks are concatenated into the final content."""
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    RealAsyncClient = httpx.AsyncClient
+
+    body = (
+        'data: {"choices":[{"delta":{"content":"{\\"a\\":"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" 1}"}}]}\n\n'
+        "data: [DONE]\n"
+    )
+
+    def fake_stream(self, method, url, **kwargs):
+        return _FakeStreamCM(sse=body)
+
+    monkeypatch.setattr(RealAsyncClient, "stream", fake_stream)
+
+    result = await llm_request([{"role": "user", "content": "hi"}])
+    assert result["choices"][0]["message"]["content"] == '{"a": 1}'
 
 
 async def test_github_request_retries_on_429(httpx_mock, monkeypatch):
@@ -333,20 +402,14 @@ async def test_llm_request_retries_on_network_error(monkeypatch):
     call_count = 0
     RealAsyncClient = httpx.AsyncClient
 
-    async def mock_post(self, url, **kwargs):
+    def fake_stream(self, method, url, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count <= 1:
-            raise httpx.NetworkError("connection reset")
-        # _llm_request_with_retry calls client.post() not client.request()
-        req = httpx.Request("POST", url)
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
-            request=req,
-        )
+            return _FakeStreamCM(raise_exc=httpx.NetworkError("connection reset"))
+        return _FakeStreamCM(sse=_sse('{"ok":true}'))
 
-    monkeypatch.setattr(RealAsyncClient, "post", mock_post)
+    monkeypatch.setattr(RealAsyncClient, "stream", fake_stream)
 
     result = await llm_request([{"role": "user", "content": "hello"}])
 
@@ -362,19 +425,14 @@ async def test_llm_request_retries_on_timeout(monkeypatch):
     call_count = 0
     RealAsyncClient = httpx.AsyncClient
 
-    async def mock_post(self, url, **kwargs):
+    def fake_stream(self, method, url, **kwargs):
         nonlocal call_count
         call_count += 1
         if call_count <= 1:
-            raise httpx.TimeoutException("timed out")
-        req = httpx.Request("POST", url)
-        return httpx.Response(
-            200,
-            json={"choices": [{"message": {"content": '{"ok":true}'}}]},
-            request=req,
-        )
+            return _FakeStreamCM(raise_exc=httpx.TimeoutException("timed out"))
+        return _FakeStreamCM(sse=_sse('{"ok":true}'))
 
-    monkeypatch.setattr(RealAsyncClient, "post", mock_post)
+    monkeypatch.setattr(RealAsyncClient, "stream", fake_stream)
 
     result = await llm_request([{"role": "user", "content": "hello"}])
 
@@ -393,13 +451,13 @@ async def test_llm_request_wallclock_timeout_is_not_retried(monkeypatch):
     call_count = 0
     RealAsyncClient = httpx.AsyncClient
 
-    async def timeout_post(self, url, **kwargs):
+    def timeout_stream(self, method, url, **kwargs):
         # Simulate asyncio.wait_for's ceiling firing on this attempt.
         nonlocal call_count
         call_count += 1
-        raise asyncio.TimeoutError()
+        return _FakeStreamCM(raise_exc=asyncio.TimeoutError())
 
-    monkeypatch.setattr(RealAsyncClient, "post", timeout_post)
+    monkeypatch.setattr(RealAsyncClient, "stream", timeout_stream)
 
     with pytest.raises(asyncio.TimeoutError):
         await llm_request([{"role": "user", "content": "hello"}])

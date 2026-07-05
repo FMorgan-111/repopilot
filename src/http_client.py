@@ -7,6 +7,7 @@
 import os
 
 import asyncio
+import json
 
 import httpx
 from dotenv import load_dotenv
@@ -29,19 +30,18 @@ _llm_client: httpx.AsyncClient | None = None
 # Connect timeout — establishing the TCP/TLS connection should be quick even
 # when generation is slow.
 LLM_CONNECT_TIMEOUT = 15.0
-# Hard wall-clock ceiling for a single LLM call. DeepSeek/Gemini generation
-# latency varies widely for large planning prompts (observed 25s-143s). 200s
-# clears the slow tail; exceeding it raises asyncio.TimeoutError, which is
-# deliberately absent from the retry set so a genuinely-slow call fails fast
-# without doubling.
-LLM_CALL_WALLCLOCK_TIMEOUT = 200.0
-# Per-socket read timeout (gap between received bytes). The gateway is
-# non-streaming — it buffers the whole completion and sends the first byte only
-# after generation finishes — so this must cover a full slow generation, NOT a
-# short 60s gap (which fired mid-generation and, being < the wall-clock, caused
-# slow calls to retry-double). Aligned to the wall-clock so a genuinely slow
-# call hits the non-retryable wall-clock ceiling instead.
-LLM_READ_TIMEOUT = LLM_CALL_WALLCLOCK_TIMEOUT
+# Per-CHUNK idle timeout for the streamed response: a gap between SSE chunks
+# longer than this means the gateway stalled. Because we stream, a progressing
+# generation of ANY length stays under it — unlike a buffered response, whose
+# whole generation had to finish within a single read timeout (the bug that
+# made large prompts like tox time out at 60s / retry-double).
+LLM_STREAM_IDLE_TIMEOUT = 60.0
+# Hard wall-clock backstop for one streamed call. The idle timeout is the real
+# bound; this only stops a pathologically long stream. Non-retryable on expiry.
+# Set above the observed slow tail (~200s for large planning prompts) so a
+# progressing stream is not cut, while keeping the retry budget within the
+# per-phase timeouts (see test_llm_phase_timeouts_cover_retry_window).
+LLM_CALL_WALLCLOCK_TIMEOUT = 240.0
 
 
 def _get_llm_client() -> httpx.AsyncClient:
@@ -49,7 +49,7 @@ def _get_llm_client() -> httpx.AsyncClient:
     global _llm_client
     if _llm_client is None:
         _llm_client = httpx.AsyncClient(
-            timeout=httpx.Timeout(LLM_READ_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
+            timeout=httpx.Timeout(LLM_STREAM_IDLE_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
     return _llm_client
@@ -179,6 +179,7 @@ async def llm_request(
         "model": model or _get_llm_model(),
         "messages": messages,
         "temperature": temperature,
+        "stream": True,
     }
     payload.update(kwargs)
     headers = {
@@ -197,12 +198,31 @@ async def llm_request(
 )
 async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dict:
     client = _get_llm_client()
-    # asyncio.wait_for is the only real total-request bound (httpx can't cap it).
-    # On timeout it raises asyncio.TimeoutError, which is intentionally NOT in
-    # _is_retryable_llm — a genuinely-slow generation fails fast, no retry.
-    resp = await asyncio.wait_for(
-        client.post(url, json=payload, headers=headers),
-        timeout=LLM_CALL_WALLCLOCK_TIMEOUT,
-    )
-    resp.raise_for_status()
-    return resp.json()
+
+    async def _consume() -> str:
+        parts: list[str] = []
+        async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            if resp.status_code >= 400:
+                await resp.aread()
+                resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:") :].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                choices = obj.get("choices") or [{}]
+                piece = (choices[0].get("delta") or {}).get("content")
+                if piece:
+                    parts.append(piece)
+        return "".join(parts)
+
+    # The per-chunk idle timeout (client read timeout) bounds a stall; this
+    # wall-clock is a generous total backstop. On expiry asyncio.TimeoutError is
+    # raised, which is intentionally NOT retryable — no doubling on a slow call.
+    content = await asyncio.wait_for(_consume(), timeout=LLM_CALL_WALLCLOCK_TIMEOUT)
+    return {"choices": [{"message": {"content": content}}]}

@@ -22,7 +22,7 @@ except ImportError:  # pragma: no cover - fallback is covered by tests.
 # ~6K-token planning prompts (observed 25s–143s for near-identical sizes). 180s
 # was tuned for the old ~1.6K prompts and the slow tail blew through it.
 PHASE_TIMEOUTS: dict[str, float] = {
-    "understand_issue": 240.0,
+    "understand_issue": 270.0,
     "locate_code": 180.0,
     "plan_fix": 300.0,
     "execute_fix": 600.0,
