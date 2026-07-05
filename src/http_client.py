@@ -26,16 +26,22 @@ load_dotenv(override=True)
 # ---------------------------------------------------------------------------
 
 _llm_client: httpx.AsyncClient | None = None
-# Per-socket-operation timeout (connect / gap between received bytes). NOT a
-# total-request bound: httpx has no "whole request <= N seconds" option, so a
-# slow-but-steady token stream can run far past this. The real total bound is
-# LLM_CALL_WALLCLOCK_TIMEOUT below, enforced via asyncio.wait_for.
-LLM_REQUEST_TIMEOUT = 60.0
-# Hard wall-clock ceiling for a single LLM call. DeepSeek generation latency
-# varies widely for large planning prompts (observed 25s-143s). 200s clears the
-# slow tail; exceeding it raises asyncio.TimeoutError, which is deliberately
-# absent from the retry set so a genuinely-slow call fails fast without doubling.
+# Connect timeout — establishing the TCP/TLS connection should be quick even
+# when generation is slow.
+LLM_CONNECT_TIMEOUT = 15.0
+# Hard wall-clock ceiling for a single LLM call. DeepSeek/Gemini generation
+# latency varies widely for large planning prompts (observed 25s-143s). 200s
+# clears the slow tail; exceeding it raises asyncio.TimeoutError, which is
+# deliberately absent from the retry set so a genuinely-slow call fails fast
+# without doubling.
 LLM_CALL_WALLCLOCK_TIMEOUT = 200.0
+# Per-socket read timeout (gap between received bytes). The gateway is
+# non-streaming — it buffers the whole completion and sends the first byte only
+# after generation finishes — so this must cover a full slow generation, NOT a
+# short 60s gap (which fired mid-generation and, being < the wall-clock, caused
+# slow calls to retry-double). Aligned to the wall-clock so a genuinely slow
+# call hits the non-retryable wall-clock ceiling instead.
+LLM_READ_TIMEOUT = LLM_CALL_WALLCLOCK_TIMEOUT
 
 
 def _get_llm_client() -> httpx.AsyncClient:
@@ -43,7 +49,7 @@ def _get_llm_client() -> httpx.AsyncClient:
     global _llm_client
     if _llm_client is None:
         _llm_client = httpx.AsyncClient(
-            timeout=LLM_REQUEST_TIMEOUT,
+            timeout=httpx.Timeout(LLM_READ_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
     return _llm_client

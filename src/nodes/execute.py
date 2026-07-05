@@ -135,11 +135,20 @@ async def git_clone(state: AgentState) -> str:
 
     # Git objects already cached: fast local clone into the work tree.
     if (cache_path / ".git").exists():
-        _clone_local_repo(cache_path, work)
-        return work
+        try:
+            _clone_local_repo(cache_path, work)
+            return work
+        except subprocess.CalledProcessError:
+            # Corrupt/partial cache (e.g. an older blobless clone that cannot
+            # serve a local work tree). Discard it and re-download from scratch.
+            shutil.rmtree(cache_path, ignore_errors=True)
+            shutil.rmtree(work, ignore_errors=True)
 
     strategies = [
-        ["git", "clone", "--depth", "1", "--filter=blob:none", "--single-branch", repo_url, str(cache_path)],
+        # NB: no --filter=blob:none — a blobless cache cannot serve a `git clone
+        # --local` work tree (its blobs are missing and lazy-fetch is disabled),
+        # which fails with "could not fetch ... from promisor remote".
+        ["git", "clone", "--depth", "1", "--single-branch", repo_url, str(cache_path)],
         ["git", "clone", "--depth", "1", repo_url, str(cache_path)],
         ["git", "clone", repo_url, str(cache_path)],
     ]
@@ -147,12 +156,20 @@ async def git_clone(state: AgentState) -> str:
     last_error = ""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     for cmd in strategies:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                # One-time per-repo download; a blobful depth-1 clone of a large
+                # repo can exceed the old 180s. Generous ceiling, cached after.
+                timeout=600,
+            )
+        except subprocess.TimeoutExpired:
+            last_error = f"clone timed out: {' '.join(cmd[:4])}..."
+            if cache_path.exists():
+                shutil.rmtree(cache_path, ignore_errors=True)
+            continue
         if result.returncode == 0:
             subprocess.run(
                 ["git", "-C", str(cache_path), "remote", "set-url", "origin", safe_repo_url],

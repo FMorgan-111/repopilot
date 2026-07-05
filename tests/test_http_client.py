@@ -7,8 +7,9 @@ import pytest
 
 from src.http_client import (
     LLM_CALL_WALLCLOCK_TIMEOUT,
+    LLM_CONNECT_TIMEOUT,
     LLM_MAX_ATTEMPTS,
-    LLM_REQUEST_TIMEOUT,
+    LLM_READ_TIMEOUT,
     LLM_RETRY_BACKOFF_MAX_SECONDS,
     MAX_RETRIES,
     RETRYABLE_GITHUB_STATUS,
@@ -43,7 +44,8 @@ async def test_close_llm_client_closes_cached_client_and_clears_global():
 
 
 def test_llm_timeout_budget_is_explicit():
-    assert LLM_REQUEST_TIMEOUT == 60.0
+    assert LLM_READ_TIMEOUT == LLM_CALL_WALLCLOCK_TIMEOUT
+    assert LLM_CONNECT_TIMEOUT == 15.0
     assert LLM_CALL_WALLCLOCK_TIMEOUT == 200.0
     assert LLM_MAX_ATTEMPTS == 2
     assert LLM_RETRY_BACKOFF_MAX_SECONDS == 20.0
