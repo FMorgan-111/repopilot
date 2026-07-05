@@ -136,6 +136,25 @@ def _normalized_edit_key(file_path: str, search: str) -> str:
     return f"{file_path}::{' '.join(search.split())}"
 
 
+def _budget_scaled_file_limits(state: AgentState) -> tuple[int, int]:
+    """Shrink the file context as the token budget depletes.
+
+    A single global budget gates how many plan/retry attempts can run; a full-
+    size prompt on every attempt can exhaust it before a late retry produces a
+    patch. As the remaining balance drops we trade context breadth for more
+    surviving attempts. PLAN quality is protected — the file window never
+    shrinks below half, and at least one file is always shown."""
+    budget = state.token_budget
+    if budget <= 0:
+        return PLAN_FILE_CONTENT_LIMIT, PLAN_MAX_FILES
+    remaining = max(0.0, (budget - state.token_usage) / budget)
+    if remaining >= 0.5:
+        return PLAN_FILE_CONTENT_LIMIT, PLAN_MAX_FILES
+    if remaining >= 0.25:
+        return PLAN_FILE_CONTENT_LIMIT * 2 // 3, PLAN_MAX_FILES
+    return PLAN_FILE_CONTENT_LIMIT // 2, max(1, PLAN_MAX_FILES - 1)
+
+
 def _edit_key(edit: Any) -> str:
     """Identity of any edit — node-anchored edits key on their node_target,
     search/replace edits on their normalized search."""
@@ -610,10 +629,11 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         recall_context = f"\n\n{recall}"
 
     files_terms = _issue_search_terms(state.issue_title, state.issue_body)
+    file_limit, max_files = _budget_scaled_file_limits(state)
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
-        f"CONTENT:\n{_relevance_window(file.content, files_terms, PLAN_FILE_CONTENT_LIMIT)}"
-        for file in state.relevant_files[:PLAN_MAX_FILES]
+        f"CONTENT:\n{_relevance_window(file.content, files_terms, file_limit)}"
+        for file in state.relevant_files[:max_files]
     )
     system = (
         "You are RepoPilot's planning node. Return ONLY JSON with keys: "
