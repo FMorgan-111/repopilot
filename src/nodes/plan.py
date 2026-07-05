@@ -136,6 +136,15 @@ def _normalized_edit_key(file_path: str, search: str) -> str:
     return f"{file_path}::{' '.join(search.split())}"
 
 
+def _edit_key(edit: Any) -> str:
+    """Identity of any edit — node-anchored edits key on their node_target,
+    search/replace edits on their normalized search."""
+    node_target = getattr(edit, "node_target", "") or ""
+    if node_target:
+        return f"{edit.file_path}::node::{node_target}"
+    return _normalized_edit_key(edit.file_path, edit.search)
+
+
 def _failed_edit_keys(state: AgentState) -> set[str]:
     """Signatures of every search/replace edit tried in a failed attempt."""
     keys: set[str] = set()
@@ -143,7 +152,7 @@ def _failed_edit_keys(state: AgentState) -> set[str]:
         if getattr(attempt, "success", False):
             continue
         for edit in getattr(attempt, "patch_edits", []) or []:
-            keys.add(_normalized_edit_key(edit.file_path, edit.search))
+            keys.add(_edit_key(edit))
     return keys
 
 
@@ -155,7 +164,7 @@ def _prior_failed_edits_context(state: AgentState) -> str:
         if getattr(attempt, "success", False):
             continue
         for edit in getattr(attempt, "patch_edits", []) or []:
-            key = _normalized_edit_key(edit.file_path, edit.search)
+            key = _edit_key(edit)
             seen.setdefault(key, edit)
     if not seen:
         return ""
@@ -181,7 +190,7 @@ def _planned_edits_repeat_failure(state: AgentState) -> bool:
     if not failed_keys:
         return False
     return all(
-        _normalized_edit_key(edit.file_path, edit.search) in failed_keys
+        _edit_key(edit) in failed_keys
         for edit in state.patch_edits
     )
 
@@ -206,7 +215,7 @@ def _unappliable_edit_keys(state: AgentState) -> set[str]:
         if getattr(attempt, "success", False) or not _attempt_failed_to_apply(attempt):
             continue
         for edit in getattr(attempt, "patch_edits", []) or []:
-            keys.add(_normalized_edit_key(edit.file_path, edit.search))
+            keys.add(_edit_key(edit))
     return keys
 
 
@@ -221,7 +230,7 @@ def _failed_edit_signatures(state: AgentState) -> list[frozenset[tuple[str, str]
             continue
         sigs.append(
             frozenset(
-                (_normalized_edit_key(e.file_path, e.search), e.replace) for e in edits
+                (_edit_key(e), e.replace) for e in edits
             )
         )
     return sigs
@@ -233,14 +242,14 @@ def _dead_plan_reason(state: AgentState) -> str | None:
     if not state.patch_edits:
         return None
     current_sig = frozenset(
-        (_normalized_edit_key(e.file_path, e.search), e.replace)
+        (_edit_key(e), e.replace)
         for e in state.patch_edits
     )
     if current_sig in _failed_edit_signatures(state):
         return "identical_to_failed_patch"
     unappliable = _unappliable_edit_keys(state)
     if unappliable and all(
-        _normalized_edit_key(e.file_path, e.search) in unappliable
+        _edit_key(e) in unappliable
         for e in state.patch_edits
     ):
         return "reuses_unappliable_anchor"
@@ -265,6 +274,8 @@ def _unlocatable_edits(state: AgentState) -> list[Any]:
     — the executor's fuzzy apply is the backstop there."""
     missing: list[Any] = []
     for edit in state.patch_edits:
+        if getattr(edit, "node_target", ""):
+            continue  # node-anchored: validated by AST at EXECUTE, not by search
         content = _relevant_file_content(state, edit.file_path)
         if content is None:
             continue  # cannot validate here; let EXECUTE handle it
@@ -612,6 +623,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         "replace (replacement text), and optional replace_all (boolean, default false). "
         "Prefer patch_edits over unified diff: the executor performs deterministic exact string replacement, "
         "so search text must be copied exactly from the file content and should match uniquely unless replace_all is true. "
+        "To replace an ENTIRE function, method, or class, you may instead set node_target to its dotted "
+        "name (e.g. 'MyClass.my_method' or 'my_function'), leave search empty, and put the full new "
+        "definition in replace — the executor locates the node by AST, so you need not copy surrounding text. "
         "decision_frame must include: "
         "stage='plan', summary, hypotheses (array of objects with id, claim, evidence, "
         "score), selected_hypothesis_id, evidence, next_checks, "

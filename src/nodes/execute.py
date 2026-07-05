@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ..patch_repair import repair_unified_diff
-from ..patch_match import find_normalized_span, reindent
+from ..patch_match import find_normalized_span, leading_spaces, locate_node_span, reindent
 from ..state import (
     AgentState,
     FixAttempt,
@@ -259,38 +259,57 @@ def _apply_patch_edits(
         if content is None:
             content = file_path.read_text(encoding="utf-8")
 
-        match_count = content.count(edit.search)
-        if match_count == 1:
-            updated = content.replace(edit.search, edit.replace, 1)
-        elif match_count > 1:
-            if not edit.replace_all:
-                return PatchEditApplyResult(
-                    applied=False,
-                    output=(
-                        "Search/replace edit failed: "
-                        f"edit {index} search block matched {match_count} times in "
-                        f"{edit.file_path}; set replace_all=true only when all matches "
-                        "should change."
-                    ),
-                )
-            updated = content.replace(edit.search, edit.replace)
-        else:
-            # Exact search not found — the dominant Gemini failure is whitespace
-            # drift (indent / trailing space). Retry with a normalized, unique
-            # line match before giving up, reindenting the replacement to match.
-            span = (
-                None if edit.replace_all else find_normalized_span(content, edit.search)
-            )
+        if edit.node_target:
+            # AST-anchored replacement: locate the named def/class and replace
+            # its whole span. No verbatim text anchoring, no line drift.
+            span = locate_node_span(content, edit.node_target)
             if span is None:
                 return PatchEditApplyResult(
                     applied=False,
                     output=(
-                        "Search/replace edit failed: "
-                        f"edit {index} search block was not found in {edit.file_path}."
+                        f"Node-target edit failed: edit {index} could not locate a "
+                        f"unique definition {edit.node_target!r} in {edit.file_path}."
                     ),
                 )
-            start, end, indent_delta = span
-            updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
+            start, end, node_indent = span
+            first = next((ln for ln in edit.replace.split("\n") if ln.strip()), "")
+            replacement = reindent(edit.replace, node_indent - leading_spaces(first))
+            if not replacement.endswith("\n"):
+                replacement += "\n"
+            updated = content[:start] + replacement + content[end:]
+        else:
+            match_count = content.count(edit.search)
+            if match_count == 1:
+                updated = content.replace(edit.search, edit.replace, 1)
+            elif match_count > 1:
+                if not edit.replace_all:
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=(
+                            "Search/replace edit failed: "
+                            f"edit {index} search block matched {match_count} times in "
+                            f"{edit.file_path}; set replace_all=true only when all matches "
+                            "should change."
+                        ),
+                    )
+                updated = content.replace(edit.search, edit.replace)
+            else:
+                # Exact search not found — the dominant Gemini failure is whitespace
+                # drift (indent / trailing space). Retry with a normalized, unique
+                # line match before giving up, reindenting the replacement to match.
+                span = (
+                    None if edit.replace_all else find_normalized_span(content, edit.search)
+                )
+                if span is None:
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=(
+                            "Search/replace edit failed: "
+                            f"edit {index} search block was not found in {edit.file_path}."
+                        ),
+                    )
+                start, end, indent_delta = span
+                updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
 
         pending_writes[file_path] = updated
         if edit.file_path not in changed_files:

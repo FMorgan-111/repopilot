@@ -41,9 +41,14 @@ class FileInfo(BaseModel):
 
 class PatchEdit(BaseModel):
     file_path: str = Field(min_length=1)
-    search: str = Field(min_length=1)
+    search: str = ""
     replace: str = ""
     replace_all: bool = False
+    # Alternative to search/replace: dotted name of a function/method/class
+    # (e.g. "MyClass.method") whose ENTIRE definition is replaced by `replace`.
+    # The executor locates the node via AST — no verbatim text anchoring, no
+    # line drift. When set, `search` must be empty.
+    node_target: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -57,6 +62,14 @@ class PatchEdit(BaseModel):
                     normalized["file_path"] = normalized[alias]
                     break
         return normalized
+
+    @model_validator(mode="after")
+    def _require_anchor(self) -> "PatchEdit":
+        if bool(self.search) == bool(self.node_target):
+            raise ValueError(
+                "PatchEdit requires exactly one of `search` or `node_target`."
+            )
+        return self
 
 
 class FixAttempt(BaseModel):

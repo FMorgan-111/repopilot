@@ -7,6 +7,7 @@ functions, no I/O — safe to import from any node without cycles.
 
 from __future__ import annotations
 
+import ast
 import difflib
 
 
@@ -106,3 +107,52 @@ def closest_region(
     if len(snippet) > max_chars:
         snippet = snippet[:max_chars].rstrip() + "\n... [truncated] ..."
     return snippet
+
+
+_DEF_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def locate_node_span(source: str, qualname: str) -> tuple[int, int, int] | None:
+    """Locate the function/method/class named by the dotted `qualname`
+    (e.g. "MyClass.method") and return (start_offset, end_offset, indent) of its
+    full source span — including any decorators — over complete lines, or None.
+
+    Semantic addressing for AST-anchored edits: the model names a node instead
+    of copying verbatim text, so there is no whitespace/line-drift anchoring to
+    hallucinate. Returns None if the source does not parse, the name is not
+    found, or it is ambiguous (defined more than once)."""
+    if not qualname:
+        return None
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+
+    matches: list[ast.AST] = []
+
+    def walk(node: ast.AST, stack: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, _DEF_NODES):
+                child_stack = stack + [child.name]
+                if ".".join(child_stack) == qualname:
+                    matches.append(child)
+                walk(child, child_stack)
+            else:
+                walk(child, stack)
+
+    walk(tree, [])
+    if len(matches) != 1:
+        return None
+    target = matches[0]
+
+    start_line = target.lineno
+    decorators = getattr(target, "decorator_list", [])
+    if decorators:
+        start_line = min(start_line, min(d.lineno for d in decorators))
+    end_line = target.end_lineno or start_line
+
+    lines = source.splitlines(keepends=True)
+    start_off = sum(len(line) for line in lines[: start_line - 1])
+    end_off = sum(len(line) for line in lines[:end_line])
+    return (start_off, end_off, target.col_offset)
+
