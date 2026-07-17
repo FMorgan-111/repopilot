@@ -6,13 +6,17 @@ download is required; real embedding is exercised only in production.
 
 import hashlib
 import json
+import sqlite3
 
 import numpy as np
+import pytest
 
 from src import new_agent
 from src.memory import error_episode_store as eps
 from src.memory.error_episode_store import ErrorEpisodeStore
 from src.memory.keyframe import extract_keyframe
+from src.memory.numpy_vector_index import NumpyVectorIndex
+from src.memory import vector_backend
 from src.memory.sqlite_vec_index import SqliteVecIndex
 from src.nodes import plan as plan_node
 from src.nodes import verify as verify_node
@@ -99,15 +103,62 @@ def test_extract_keyframe_empty_and_fallback():
 # ---- vector index -----------------------------------------------------------
 
 def test_sqlite_vec_index_cosine_knn():
-    import sqlite3
-
-    idx = SqliteVecIndex(sqlite3.connect(":memory:"), dim=4)
+    try:
+        idx = SqliteVecIndex(sqlite3.connect(":memory:"), dim=4)
+    except AttributeError:
+        pytest.skip("this Python build cannot load SQLite extensions")
     idx.add(1, [1, 0, 0, 0])
     idx.add(2, [0, 1, 0, 0])
     idx.add(3, [0.9, 0.1, 0, 0])
     hits = idx.search([1, 0, 0, 0], k=2)
     assert hits[0].rowid == 1
     assert hits[1].rowid == 3
+
+
+def test_numpy_vector_index_cosine_knn_and_persistence():
+    conn = sqlite3.connect(":memory:")
+    idx = NumpyVectorIndex(conn, dim=3)
+    idx.add(1, [1, 0, 0])
+    idx.add(2, [0, 1, 0])
+    idx.add(3, [0.9, 0.1, 0])
+
+    reopened = NumpyVectorIndex(conn, dim=3)
+    hits = reopened.search([1, 0, 0], k=2)
+
+    assert [hit.rowid for hit in hits] == [1, 3]
+    assert hits[0].distance == pytest.approx(0.0)
+
+
+def test_numpy_vector_index_validates_dimensions():
+    idx = NumpyVectorIndex(sqlite3.connect(":memory:"), dim=3)
+
+    with pytest.raises(ValueError, match="expected dim 3, got 2"):
+        idx.add(1, [1, 0])
+    with pytest.raises(ValueError, match="expected dim 3, got 2"):
+        idx.search([1, 0], k=1)
+
+
+def test_backend_factory_falls_back_when_sqlite_vec_is_unavailable(monkeypatch):
+    class BrokenSqliteVecIndex:
+        def __init__(self, conn, dim):
+            raise AttributeError("extension loading disabled")
+
+    monkeypatch.setattr(vector_backend, "SqliteVecIndex", BrokenSqliteVecIndex)
+    monkeypatch.setattr(vector_backend, "_fallback_warning_emitted", False)
+
+    with pytest.warns(RuntimeWarning, match="falling back to NumPy"):
+        index, backend_name = vector_backend.create_vector_index(
+            sqlite3.connect(":memory:"), 3
+        )
+
+    assert isinstance(index, NumpyVectorIndex)
+    assert backend_name == "numpy"
+
+
+def test_episode_store_exposes_selected_backend():
+    store = ErrorEpisodeStore(db_path=":memory:", embedder=FakeEmbedder())
+
+    assert store.backend_name in {"sqlite_vec", "numpy"}
 
 
 # ---- episode store ----------------------------------------------------------

@@ -24,7 +24,7 @@ from typing import Any
 
 from .embedding import EMBED_DIM, Embedder
 from .keyframe import extract_keyframe
-from .sqlite_vec_index import SqliteVecIndex
+from .vector_backend import create_vector_index
 from .vector_index import VectorIndex
 
 
@@ -72,8 +72,11 @@ class ErrorEpisodeStore:
             "owner TEXT, repo TEXT, issue_url TEXT, issue_title TEXT, "
             "keyframe TEXT, patch TEXT, success INTEGER, created_at TEXT)"
         )
-        factory = index_factory or (lambda conn, d: SqliteVecIndex(conn, d))
-        self.index: VectorIndex = factory(self.conn, dim)
+        if index_factory is None:
+            self.index, self.backend_name = create_vector_index(self.conn, dim)
+        else:
+            self.index = index_factory(self.conn, dim)
+            self.backend_name = "custom"
 
     # -- write -----------------------------------------------------------------
 
