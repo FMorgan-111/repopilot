@@ -192,6 +192,7 @@ async def evaluate_agent_v2_sample(
     return {
         "id": sample["id"],
         "mode": "agent_v2",
+        "evaluation_mode": "oracle_files" if seed_gold_files else "end_to_end",
         "repo": f"{repo['owner']}/{repo['name']}",
         "issue_url": issue_url,
         "issue_title": issue["title"],

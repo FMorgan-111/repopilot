@@ -94,6 +94,7 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
     assert result == {
         "id": "acme/widget#7:8",
         "mode": "agent_v2",
+        "evaluation_mode": "end_to_end",
         "repo": "acme/widget",
         "issue_url": "https://github.com/acme/widget/issues/7",
         "issue_title": "Login crash",
@@ -137,6 +138,33 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
         },
         "replay_error": None,
     }
+
+
+async def test_seeded_eval_is_labeled_oracle_even_when_gold_seed_is_unavailable(
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_agent_v2(issue_url, **kwargs):
+        captured.update(kwargs)
+        return {
+            "success": False,
+            "final_phase": "FAILED",
+            "trace_id": "trace-1",
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent_v2)
+    monkeypatch.setattr(agent_v2_harness, "_build_gold_seed", lambda sample: None)
+    monkeypatch.setattr(
+        agent_v2_harness, "replay_run", lambda run_id: {"run_id": run_id}
+    )
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        sample_record(), idx=0, seed_gold_files=True
+    )
+
+    assert result["evaluation_mode"] == "oracle_files"
+    assert captured["seed"] is None
 
 
 async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):

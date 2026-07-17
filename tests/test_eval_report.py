@@ -82,7 +82,7 @@ def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     assert "| agent_v2_success_rate | 0.000 |" in markdown
     assert "| agent_v2_waiting_for_user | 0 |" in markdown
     assert "## Agent V2 Results" in markdown
-    assert "| `acme/widget#7:8` | `abc123def456` | FAILED | no | 4 | 1234 | Patch failed tests. |" in markdown
+    assert "| `acme/widget#7:8` | end_to_end | `abc123def456` | FAILED | no | 4 | 1234 | Patch failed tests. |" in markdown
     assert "## Replay Diagnostics" in markdown
     assert "### acme/widget#7:8 (`abc123def456`)" in markdown
     assert "- Final phase: FAILED" in markdown
@@ -176,3 +176,34 @@ def test_generate_markdown_surfaces_plan_fix_phase_timeout():
 
     assert "Planner timeout" in markdown
     assert "plan_fix exceeded 150.0s" in markdown
+
+
+def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
+    legacy = agent_v2_result()
+    explicit_end_to_end = agent_v2_result()
+    explicit_end_to_end.update(
+        {"id": "acme/widget#8:9", "evaluation_mode": "end_to_end", "success": True}
+    )
+    oracle = agent_v2_result()
+    oracle.update(
+        {"id": "acme/widget#10:11", "evaluation_mode": "oracle_files", "success": True}
+    )
+    results = [legacy, explicit_end_to_end, oracle]
+
+    metrics = report.compute_metrics(results)
+    markdown = report.generate_markdown(results, metrics)
+
+    by_mode = metrics["agent_v2"]["by_evaluation_mode"]
+    assert by_mode["end_to_end"] == {
+        "samples": 2,
+        "successes": 1,
+        "success_rate": 0.5,
+    }
+    assert by_mode["oracle_files"] == {
+        "samples": 1,
+        "successes": 1,
+        "success_rate": 1.0,
+    }
+    assert "| agent_v2_end_to_end_success_rate | 0.500 |" in markdown
+    assert "| agent_v2_oracle_files_success_rate | 1.000 |" in markdown
+    assert "| Sample ID | Evaluation Mode | Run ID |" in markdown

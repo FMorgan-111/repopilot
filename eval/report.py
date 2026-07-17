@@ -56,6 +56,19 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
 
     agent_v2_successes = len([r for r in agent_v2_results if r.get("success")])
     agent_v2_samples = len(agent_v2_results)
+    by_evaluation_mode = {}
+    for evaluation_mode in ("end_to_end", "oracle_files"):
+        mode_results = [
+            result
+            for result in agent_v2_results
+            if _evaluation_mode(result) == evaluation_mode
+        ]
+        mode_successes = len([result for result in mode_results if result.get("success")])
+        by_evaluation_mode[evaluation_mode] = {
+            "samples": len(mode_results),
+            "successes": mode_successes,
+            "success_rate": mode_successes / len(mode_results) if mode_results else 0.0,
+        }
 
     return {
         "total_samples": total,
@@ -90,6 +103,7 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
                 [r for r in agent_v2_results if r.get("waiting_for_user")]
             ),
             "failures": len([r for r in agent_v2_results if not r.get("success")]),
+            "by_evaluation_mode": by_evaluation_mode,
         },
     }
 
@@ -132,6 +146,18 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
         lines.append(f"| agent_v2_samples | {agent_v2['samples']} |\n")
         lines.append(f"| agent_v2_success_rate | {agent_v2['success_rate']:.3f} |\n")
         lines.append(f"| agent_v2_waiting_for_user | {agent_v2['waiting_for_user']} |\n")
+        for evaluation_mode, mode_metrics in agent_v2.get(
+            "by_evaluation_mode", {}
+        ).items():
+            if not mode_metrics["samples"]:
+                continue
+            lines.append(
+                f"| agent_v2_{evaluation_mode}_samples | {mode_metrics['samples']} |\n"
+            )
+            lines.append(
+                f"| agent_v2_{evaluation_mode}_success_rate "
+                f"| {mode_metrics['success_rate']:.3f} |\n"
+            )
 
     lines.append("\n## Per-Sample Results\n\n")
     lines.append("| # | Sample ID | file_recall@1 | file_recall@3 | file_recall@5 | patch_apply | test_pass | cost |\n")
@@ -175,16 +201,26 @@ def _is_agent_v2_result(result: dict[str, Any]) -> bool:
     return result.get("mode") == "agent_v2"
 
 
+def _evaluation_mode(result: dict[str, Any]) -> str:
+    mode = result.get("evaluation_mode", "end_to_end")
+    return mode if mode in {"end_to_end", "oracle_files"} else "end_to_end"
+
+
 def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) -> None:
     lines.append("\n## Agent V2 Results\n\n")
-    lines.append("| Sample ID | Run ID | Final Phase | Waiting | Turns | Tokens | Error |\n")
-    lines.append("|-----------|--------|-------------|---------|-------|--------|-------|\n")
+    lines.append(
+        "| Sample ID | Evaluation Mode | Run ID | Final Phase | Waiting | Turns | Tokens | Error |\n"
+    )
+    lines.append(
+        "|-----------|-----------------|--------|-------------|---------|-------|--------|-------|\n"
+    )
     for result in results:
         waiting = "yes" if result.get("waiting_for_user") else "no"
         error = result.get("error") or ""
         error = _markdown_table_cell(error)
         lines.append(
             f"| `{result.get('id', '')[:60]}` "
+            f"| {_evaluation_mode(result)} "
             f"| `{result.get('run_id', '')}` "
             f"| {result.get('final_phase', '')} "
             f"| {waiting} "
