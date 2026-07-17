@@ -44,8 +44,9 @@ Set your tokens:
 
 ```bash
 export GITHUB_TOKEN=ghp_...
-export LLM_API_KEY=sk-...         # or DEEPSEEK_API_KEY
-export LLM_MODEL=deepseek-v4-pro  # optional, defaults to deepseek-v4-pro
+export LLM_API_KEY=sk-...
+export OPENAI_BASE_URL=https://linoapi.com.cn/v1
+export LLM_MODEL=claude-sonnet-5:stable  # optional; this is the default
 ```
 
 Run it:

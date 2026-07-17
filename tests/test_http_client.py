@@ -9,11 +9,13 @@ from src.http_client import (
     LLM_CALL_WALLCLOCK_TIMEOUT,
     LLM_CONNECT_TIMEOUT,
     LLM_MAX_ATTEMPTS,
+    LLMResponseError,
     LLM_RETRY_BACKOFF_MAX_SECONDS,
     LLM_STREAM_IDLE_TIMEOUT,
     MAX_RETRIES,
     RETRYABLE_GITHUB_STATUS,
     RETRYABLE_LLM_STATUS,
+    _get_llm_model,
     _is_retryable_github,
     _is_retryable_llm,
     _reset_llm_client,
@@ -47,10 +49,20 @@ class _FakeStreamCM:
     """Stand-in for httpx AsyncClient.stream()'s async context manager, so the
     streaming LLM path can be tested without a real SSE server."""
 
-    def __init__(self, *, raise_exc=None, status=200, sse=""):
+    def __init__(
+        self,
+        *,
+        raise_exc=None,
+        status=200,
+        sse="",
+        json_body=None,
+        content_type="text/event-stream",
+    ):
         self._raise = raise_exc
         self._status = status
         self._sse = sse
+        self._json_body = json_body
+        self.headers = {"content-type": content_type}
 
     async def __aenter__(self):
         if self._raise is not None:
@@ -65,7 +77,11 @@ class _FakeStreamCM:
         return self._status
 
     async def aread(self):
-        return b""
+        if self._json_body is not None:
+            import json as _json
+
+            return _json.dumps(self._json_body).encode()
+        return self._sse.encode()
 
     def raise_for_status(self):
         if self._status >= 400:
@@ -101,6 +117,12 @@ def test_llm_timeout_budget_is_explicit():
     # One slow attempt is killed at the wall-clock ceiling (non-retryable), so
     # the worst case is a fast transient fail + backoff + one slow attempt.
     assert llm_retry_budget_seconds() == 320.0
+
+
+def test_default_llm_model_is_claude_sonnet_5(monkeypatch):
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+
+    assert _get_llm_model() == "claude-sonnet-5:stable"
 
 
 @pytest.fixture(autouse=True)
@@ -178,6 +200,105 @@ async def test_llm_request_accumulates_streamed_chunks(monkeypatch):
 
     result = await llm_request([{"role": "user", "content": "hi"}])
     assert result["choices"][0]["message"]["content"] == '{"a": 1}'
+
+
+async def test_llm_request_preserves_stream_usage_and_finish_reason(monkeypatch):
+    body = (
+        'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        '"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}\n\n'
+        "data: [DONE]\n"
+    )
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(sse=body),
+    )
+
+    result = await llm_request([{"role": "user", "content": "hi"}])
+
+    assert result["choices"][0]["finish_reason"] == "stop"
+    assert result["usage"] == {
+        "prompt_tokens": 3,
+        "completion_tokens": 1,
+        "total_tokens": 4,
+    }
+
+
+async def test_llm_request_accepts_non_stream_json_completion(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 7},
+    }
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(
+            json_body=payload, content_type="application/json"
+        ),
+    )
+
+    result = await llm_request([{"role": "user", "content": "hi"}])
+
+    assert result == payload
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ('data: {"error":{"message":"provider denied request"}}\n\n', "provider denied"),
+        ("data: {not-json}\n\ndata: [DONE]\n", "malformed SSE JSON"),
+        ("data: [DONE]\n", "empty chat completion"),
+    ],
+)
+async def test_llm_request_rejects_invalid_successful_streams(
+    monkeypatch, body, message
+):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(sse=body),
+    )
+
+    with pytest.raises(LLMResponseError, match=message):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+async def test_llm_request_accepts_tool_call_only_stream(monkeypatch):
+    body = (
+        'data: {"choices":[{"delta":{"role":"assistant","tool_calls":['
+        '{"index":0,"id":"call_1","type":"function","function":'
+        '{"name":"lookup","arguments":"{\\"x\\":"}}]}}]}\n\n'
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":'
+        '{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}\n\n'
+        "data: [DONE]\n"
+    )
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(sse=body),
+    )
+
+    result = await llm_request([{"role": "user", "content": "hi"}])
+
+    choice = result["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"x":1}'},
+        }
+    ]
 
 
 async def test_github_request_retries_on_429(httpx_mock, monkeypatch):

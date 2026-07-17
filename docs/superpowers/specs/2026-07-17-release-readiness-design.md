@@ -56,10 +56,10 @@ warning, not silent.
 
 Configuration stays compatible with the existing environment variables:
 `LLM_API_KEY`, `DEEPSEEK_API_KEY`, `LINOAPI_API_KEY`, `OPENAI_BASE_URL`, and
-`LLM_MODEL`. The neutral defaults are the documented DeepSeek-compatible
-settings already presented by the project: `https://api.deepseek.com/v1` and
-`deepseek-chat`. A custom gateway must be selected explicitly through
-environment variables.
+`LLM_MODEL`. The project defaults to the user-selected LinoAPI configuration:
+`https://linoapi.com.cn/v1` and `claude-sonnet-5:stable`. Other
+OpenAI-compatible gateways and models remain selectable through environment
+variables.
 
 The HTTP client requests streaming by default. Its response adapter:
 

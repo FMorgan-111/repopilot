@@ -11,7 +11,7 @@ RepoPilot 是把 GitHub Issue 自动修成 PR 的 agent,基于 LangGraph 的白�
 - 全量 eval(会真实 clone 仓库 + 跑测试 + 打 LLM API):
   `.venv/bin/python eval/harness.py --agent-v2 --samples <N> --max-retries 2 --token-budget 100000`
   样本集:`data/samples/issues_fixes.jsonl`(现 150 条);更大的池子在 `data/dataset-merged.jsonl`(1493 条)。
-- `.env` 需 `DEEPSEEK_API_KEY` / `GITHUB_TOKEN`。模型经 `LLM_MODEL`(默认 `deepseek-v4-pro`)、端点经 `OPENAI_BASE_URL` 可配;`llm_call(system,user,model=)` 支持按节点传模型。
+- `.env` 需 `LLM_API_KEY` / `GITHUB_TOKEN`。模型经 `LLM_MODEL`(默认 `claude-sonnet-5:stable`)、端点经 `OPENAI_BASE_URL` 可配（默认 `https://linoapi.com.cn/v1`）；`llm_call(system,user,model=)` 支持按节点传模型。
 
 ## 关键模块
 

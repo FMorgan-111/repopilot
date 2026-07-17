@@ -46,6 +46,10 @@ LLM_STREAM_IDLE_TIMEOUT = 120.0
 LLM_CALL_WALLCLOCK_TIMEOUT = 300.0
 
 
+class LLMResponseError(RuntimeError):
+    """The provider returned HTTP 2xx but no usable chat completion."""
+
+
 def _get_llm_client() -> httpx.AsyncClient:
     """Return the shared LLM :class:`httpx.AsyncClient` with connection pooling."""
     global _llm_client
@@ -160,7 +164,7 @@ def _get_llm_base_url() -> str:
 
 
 def _get_llm_model() -> str:
-    return os.getenv("LLM_MODEL", "gpt-5.5:stable")
+    return os.getenv("LLM_MODEL", "claude-sonnet-5:stable")
 
 
 async def llm_request(
@@ -201,30 +205,166 @@ async def llm_request(
 async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dict:
     client = _get_llm_client()
 
-    async def _consume() -> str:
-        parts: list[str] = []
+    async def _consume() -> dict:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code >= 400:
                 await resp.aread()
                 resp.raise_for_status()
-            async for line in resp.aiter_lines():
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:") :].strip()
-                if data == "[DONE]":
-                    break
+            content_type = resp.headers.get("content-type", "").lower()
+            if "application/json" in content_type:
+                raw = await resp.aread()
                 try:
-                    obj = json.loads(data)
-                except json.JSONDecodeError:
-                    continue
-                choices = obj.get("choices") or [{}]
-                piece = (choices[0].get("delta") or {}).get("content")
-                if piece:
-                    parts.append(piece)
-        return "".join(parts)
+                    response = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                    raise LLMResponseError("malformed chat completion JSON") from exc
+                return _parse_chat_completion_json(response)
+            return await _consume_sse_chat_completion(resp)
 
     # The per-chunk idle timeout (client read timeout) bounds a stall; this
     # wall-clock is a generous total backstop. On expiry asyncio.TimeoutError is
     # raised, which is intentionally NOT retryable — no doubling on a slow call.
-    content = await asyncio.wait_for(_consume(), timeout=LLM_CALL_WALLCLOCK_TIMEOUT)
-    return {"choices": [{"message": {"content": content}}]}
+    return await asyncio.wait_for(_consume(), timeout=LLM_CALL_WALLCLOCK_TIMEOUT)
+
+
+def _provider_error_message(error: object) -> str:
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("detail") or error)
+    return str(error)
+
+
+def _parse_chat_completion_json(payload: object) -> dict:
+    if not isinstance(payload, dict):
+        raise LLMResponseError("unsupported chat completion response shape")
+    if payload.get("error"):
+        raise LLMResponseError(_provider_error_message(payload["error"]))
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise LLMResponseError("empty chat completion response")
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        tool_calls = message.get("tool_calls")
+        if (isinstance(content, str) and content) or tool_calls:
+            return payload
+    raise LLMResponseError("empty chat completion response")
+
+
+async def _consume_sse_chat_completion(resp: object) -> dict:
+    choice_states: dict[int, dict] = {}
+    usage: dict | None = None
+
+    async for line in resp.aiter_lines():
+        if not line.startswith("data:"):
+            continue
+        data = line[len("data:") :].strip()
+        if not data:
+            continue
+        if data == "[DONE]":
+            break
+        try:
+            event = json.loads(data)
+        except json.JSONDecodeError as exc:
+            raise LLMResponseError("malformed SSE JSON") from exc
+        if not isinstance(event, dict):
+            raise LLMResponseError("unsupported SSE event shape")
+        if event.get("error"):
+            raise LLMResponseError(_provider_error_message(event["error"]))
+        if isinstance(event.get("usage"), dict):
+            usage = event["usage"]
+        event_choices = event.get("choices") or []
+        if not isinstance(event_choices, list):
+            raise LLMResponseError("unsupported SSE choices shape")
+        for position, choice in enumerate(event_choices):
+            if not isinstance(choice, dict):
+                continue
+            index = int(choice.get("index", position))
+            state = choice_states.setdefault(
+                index,
+                {
+                    "content": [],
+                    "role": "assistant",
+                    "tool_calls": {},
+                    "finish_reason": None,
+                },
+            )
+            delta = choice.get("delta") or {}
+            if not isinstance(delta, dict):
+                raise LLMResponseError("unsupported SSE delta shape")
+            if isinstance(delta.get("role"), str):
+                state["role"] = delta["role"]
+            if isinstance(delta.get("content"), str):
+                state["content"].append(delta["content"])
+            _accumulate_tool_call_deltas(state["tool_calls"], delta.get("tool_calls"))
+            if choice.get("finish_reason") is not None:
+                state["finish_reason"] = choice["finish_reason"]
+
+    choices: list[dict] = []
+    for index, state in sorted(choice_states.items()):
+        content = "".join(state["content"])
+        message: dict[str, object] = {
+            "role": state["role"],
+            "content": content or None,
+        }
+        tool_calls = _finalize_tool_calls(state["tool_calls"])
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        if not content and not tool_calls:
+            continue
+        choices.append(
+            {
+                "index": index,
+                "message": message,
+                "finish_reason": state["finish_reason"],
+            }
+        )
+    if not choices:
+        raise LLMResponseError("empty chat completion response")
+    result: dict[str, object] = {"choices": choices}
+    if usage is not None:
+        result["usage"] = usage
+    return result
+
+
+def _accumulate_tool_call_deltas(states: dict[int, dict], deltas: object) -> None:
+    if deltas is None:
+        return
+    if not isinstance(deltas, list):
+        raise LLMResponseError("unsupported tool call delta shape")
+    for position, delta in enumerate(deltas):
+        if not isinstance(delta, dict):
+            continue
+        index = int(delta.get("index", position))
+        state = states.setdefault(
+            index,
+            {"id": "", "type": "function", "name": "", "arguments": ""},
+        )
+        if isinstance(delta.get("id"), str):
+            state["id"] += delta["id"]
+        if isinstance(delta.get("type"), str):
+            state["type"] = delta["type"]
+        function = delta.get("function") or {}
+        if isinstance(function, dict):
+            if isinstance(function.get("name"), str):
+                state["name"] += function["name"]
+            if isinstance(function.get("arguments"), str):
+                state["arguments"] += function["arguments"]
+
+
+def _finalize_tool_calls(states: dict[int, dict]) -> list[dict]:
+    calls: list[dict] = []
+    for _, state in sorted(states.items()):
+        calls.append(
+            {
+                "id": state["id"],
+                "type": state["type"],
+                "function": {
+                    "name": state["name"],
+                    "arguments": state["arguments"],
+                },
+            }
+        )
+    return calls
