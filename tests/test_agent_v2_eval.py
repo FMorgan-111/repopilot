@@ -74,6 +74,12 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
 
     monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent_v2)
     monkeypatch.setattr(agent_v2_harness, "replay_run", fake_replay_run)
+    monkeypatch.setattr(
+        agent_v2_harness, "_configured_model", lambda: "test-model", raising=False
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "_current_commit_sha", lambda: "deadbeef", raising=False
+    )
 
     result = await agent_v2_harness.evaluate_agent_v2_sample(
         sample_record(),
@@ -95,6 +101,8 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
         "id": "acme/widget#7:8",
         "mode": "agent_v2",
         "evaluation_mode": "end_to_end",
+        "model": "test-model",
+        "commit_sha": "deadbeef",
         "repo": "acme/widget",
         "issue_url": "https://github.com/acme/widget/issues/7",
         "issue_title": "Login crash",

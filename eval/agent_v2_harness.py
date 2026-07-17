@@ -7,6 +7,7 @@ import asyncio
 import importlib
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,11 +19,31 @@ if str(REPO_ROOT) not in sys.path:
 agent_v2 = importlib.import_module("src.new_agent").agent_v2
 replay_run = importlib.import_module("src.run_store").replay_run
 close_llm_client = importlib.import_module("src.http_client").close_llm_client
+get_llm_model = importlib.import_module("src.http_client")._get_llm_model
 close_store = importlib.import_module("src.memory").close_store
 
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 MAX_SAMPLES = 5
+
+
+def _configured_model() -> str:
+    return get_llm_model()
+
+
+def _current_commit_sha() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return ""
+    return result.stdout.strip()
 
 
 def _fallback_results_path() -> Path:
@@ -193,6 +214,8 @@ async def evaluate_agent_v2_sample(
         "id": sample["id"],
         "mode": "agent_v2",
         "evaluation_mode": "oracle_files" if seed_gold_files else "end_to_end",
+        "model": _configured_model(),
+        "commit_sha": _current_commit_sha(),
         "repo": f"{repo['owner']}/{repo['name']}",
         "issue_url": issue_url,
         "issue_title": issue["title"],

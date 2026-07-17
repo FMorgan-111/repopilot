@@ -5,6 +5,8 @@ def agent_v2_result():
     return {
         "id": "acme/widget#7:8",
         "mode": "agent_v2",
+        "model": "claude-sonnet-5:stable",
+        "commit_sha": "deadbeef",
         "repo": "acme/widget",
         "issue_url": "https://github.com/acme/widget/issues/7",
         "issue_title": "Login crash",
@@ -81,6 +83,8 @@ def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     assert "| agent_v2_samples | 1 |" in markdown
     assert "| agent_v2_success_rate | 0.000 |" in markdown
     assert "| agent_v2_waiting_for_user | 0 |" in markdown
+    assert "**Models**: claude-sonnet-5:stable" in markdown
+    assert "**Commits**: deadbeef" in markdown
     assert "## Agent V2 Results" in markdown
     assert "| `acme/widget#7:8` | end_to_end | `abc123def456` | FAILED | no | 4 | 1234 | Patch failed tests. |" in markdown
     assert "## Replay Diagnostics" in markdown

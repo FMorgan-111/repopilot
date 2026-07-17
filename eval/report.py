@@ -117,6 +117,14 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
     lines.append(f"**Date**: {Path(RESULTS_PATH).stat().st_mtime if RESULTS_PATH.exists() else 'N/A'}\n")
     lines.append(f"**Samples evaluated**: {metrics['total_samples']}\n")
     lines.append(f"**Errors**: {metrics['errors']} ({', '.join(metrics['error_ids']) if metrics['error_ids'] else 'none'})\n")
+    models = sorted({r.get("model", "") for r in agent_v2_results if r.get("model")})
+    commits = sorted(
+        {r.get("commit_sha", "") for r in agent_v2_results if r.get("commit_sha")}
+    )
+    if models:
+        lines.append(f"**Models**: {', '.join(models)}\n")
+    if commits:
+        lines.append(f"**Commits**: {', '.join(commits)}\n")
 
     lines.append("\n## Aggregate Metrics\n\n")
     lines.append("| Metric | Value |\n")
@@ -191,8 +199,7 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
     lines.append("- **file_recall@k**: fraction of actual changed files found in agent's top-k predictions\n")
     lines.append("- **patch_apply_rate**: fraction of agent-generated patches that cleanly apply with `git apply`\n")
     lines.append("- **test_pass_rate**: fraction of applied patches where `pytest` passes (only for `has_tests_changed=true` samples)\n")
-    lines.append("- **cost**: estimated DeepSeek API cost ($0.27/M input, $0.36/M output)\n")
-    lines.append("- **model**: deepseek-v4-flash (fallback during peak hours)\n")
+    lines.append("- **cost**: legacy provider estimate; verify against the configured gateway's current billing\n")
 
     return "".join(lines)
 

@@ -40,6 +40,18 @@ RepoPilot is built for **professional developers** who maintain real projects wi
 pip install repopilot
 ```
 
+Cross-repository semantic episode memory is optional:
+
+```bash
+pip install "repopilot[memory]"
+export REPOPILOT_ENABLE_EPISODES=1
+```
+
+The first enabled recall downloads the `BAAI/bge-small-en-v1.5` embedding
+model. RepoPilot prefers `sqlite-vec`; on Python builds that cannot load SQLite
+extensions (including some macOS builds), it emits a warning and uses the
+persistent NumPy cosine-search backend instead.
+
 Set your tokens:
 
 ```bash
@@ -244,9 +256,9 @@ The agent identified that CLI boolean overrides were passed as strings (not bool
 
 ```bash
 # Install dev dependencies
-pip install -e ".[dev]"
+pip install -e ".[memory,dev]"
 
-# Run the test suite (60+ tests, <2s)
+# Run the test suite
 pytest tests/ -q
 ```
 
@@ -268,9 +280,17 @@ Tests cover:
 ```bash
 git clone https://github.com/FMorgan-111/repopilot.git
 cd repopilot
-pip install -e .
+pip install -e ".[memory,dev]"
 pytest tests/ -q
 ```
+
+### Evaluation modes
+
+An ordinary Agent V2 evaluation is labeled `end_to_end`: RepoPilot must locate
+the relevant files and produce a fix. `--seed-gold-files` is labeled
+`oracle_files`: it supplies dataset-known changed files and measures planning
+and patching in isolation. Oracle-file results must not be reported as
+end-to-end success rates.
 
 ### Running the FastAPI server
 
@@ -294,5 +314,5 @@ MIT — see `pyproject.toml`.
 ---
 
 <p align="center">
-  <sub>Built with LangGraph, Pydantic, httpx, and DeepSeek v4-pro. Maintained by <a href="https://github.com/FMorgan-111">FMorgan-111</a>.</sub>
+  <sub>Built with LangGraph, Pydantic, httpx, and OpenAI-compatible model gateways. Maintained by <a href="https://github.com/FMorgan-111">FMorgan-111</a>.</sub>
 </p>
