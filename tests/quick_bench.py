@@ -1,9 +1,12 @@
 """Quick benchmark: 3 samples per schema type."""
-import asyncio, json, sys
+import asyncio
+import sys
+
 sys.path.insert(0, ".")
+from pydantic import ValidationError
+
 from src.llm import llm_call
 from src.schemas import Classification, FileRanking, FixPlan
-from pydantic import ValidationError
 
 CASES = [
     ("Classification", Classification,

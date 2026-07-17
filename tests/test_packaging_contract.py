@@ -46,3 +46,5 @@ def test_generated_editable_install_metadata_is_ignored():
     gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
 
     assert "*.egg-info/" in gitignore
+    assert "build/" in gitignore
+    assert "dist/" in gitignore

@@ -16,7 +16,6 @@ from __future__ import annotations
 import os
 import sqlite3
 import threading
-from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,7 +24,6 @@ from typing import Any
 from .embedding import EMBED_DIM, Embedder
 from .keyframe import extract_keyframe
 from .vector_backend import create_vector_index
-from .vector_index import VectorIndex
 
 
 def _repopilot_home() -> Path:

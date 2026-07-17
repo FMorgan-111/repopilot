@@ -10,10 +10,10 @@ plus prior tool calls and results) as the user message.
 """
 import json
 
-from .tools import read_issue, search_code, read_file
-from .llm import llm_call
-from .tracer import Tracer
 from .agent import parse_issue_url
+from .llm import llm_call
+from .tools import read_file, read_issue, search_code
+from .tracer import Tracer
 
 TOOLS = [
     {"name": "read_issue", "desc": "Read the GitHub issue title and body. args: {}"},

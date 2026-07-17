@@ -108,7 +108,6 @@ async def test_hallucinated_search_routes_to_plan_with_correction(monkeypatch):
     # must reroute the frame or the empty patch leaks to EXECUTE (the "No valid
     # patches in input" bug). Verify the frame agrees with current_phase.
     assert nxt.decision_frame.recommended_action == "plan"
-    from src import new_agent
     assert new_agent.route_from_state(nxt) == "plan_fix"
 
 

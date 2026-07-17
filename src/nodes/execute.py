@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..patch_repair import repair_unified_diff
 from ..patch_match import (
     find_normalized_span,
     leading_spaces,
@@ -22,6 +21,7 @@ from ..patch_match import (
     reindent,
     try_upgrade_to_node_target,
 )
+from ..patch_repair import repair_unified_diff
 from ..state import (
     AgentState,
     FixAttempt,

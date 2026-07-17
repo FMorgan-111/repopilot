@@ -13,10 +13,10 @@ import pytest
 
 from src import new_agent
 from src.memory import error_episode_store as eps
+from src.memory import vector_backend
 from src.memory.error_episode_store import ErrorEpisodeStore
 from src.memory.keyframe import extract_keyframe
 from src.memory.numpy_vector_index import NumpyVectorIndex
-from src.memory import vector_backend
 from src.memory.sqlite_vec_index import SqliteVecIndex
 from src.nodes import plan as plan_node
 from src.nodes import verify as verify_node

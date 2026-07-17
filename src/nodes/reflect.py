@@ -9,7 +9,6 @@ from typing import Any
 
 from ..llm import llm_call
 from ..schemas import ReflectDecision
-from .plan import _prior_failed_edits_context
 from ..state import (
     AgentState,
     Phase,
@@ -24,6 +23,7 @@ from ..state import (
     _record_node_diagnostic,
     _remember,
 )
+from .plan import _prior_failed_edits_context
 
 
 def _normalize_string_list(value: Any) -> list[str]:

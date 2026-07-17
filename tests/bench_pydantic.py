@@ -7,15 +7,15 @@ Reports: first-try pass rate, retry success rate, fallback rate.
 import asyncio
 import sys
 import time
-import warnings
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 # Actual LLM calls, no mocking
-from src.llm import llm_call, _config, _extract_json
-from src.schemas import Classification, FileRanking, FixPlan
 from pydantic import ValidationError
+
+from src.llm import _config, llm_call
+from src.schemas import Classification, FileRanking, FixPlan
 
 # Test data — varied issue titles/descriptions
 CLASSIFY_INPUTS = [
@@ -228,7 +228,7 @@ async def test_fix_plan():
 
         raw = await llm_call(system, user)
         try:
-            validated = FixPlan.model_validate(raw)
+            FixPlan.model_validate(raw)
             # Also check that test_suggestions is a list of strings
             results["first_try"] += 1
             print(f"  [{i+1:2d}] ✓ first try")

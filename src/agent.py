@@ -1,8 +1,10 @@
 """Agent orchestrator — runs the full analysis pipeline."""
 import re
+
 import httpx
+
+from .llm import classify_issue, generate_fix_plan, rank_files
 from .tools import read_issue, search_code
-from .llm import classify_issue, rank_files, generate_fix_plan
 from .tracer import Tracer
 
 

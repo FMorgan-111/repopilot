@@ -4,10 +4,9 @@
 ``llm_request``   — LLM API calls with exponential backoff.
 """
 
-import os
-
 import asyncio
 import json
+import os
 
 import httpx
 from dotenv import load_dotenv

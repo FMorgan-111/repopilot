@@ -2,10 +2,7 @@
 
 import asyncio
 
-import pytest
-
 from src.rate_limiter import RateLimiter, get_github_limiter
-
 
 # ---------------------------------------------------------------------------
 # Unit tests for RateLimiter
