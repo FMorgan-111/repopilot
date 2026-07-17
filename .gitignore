@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 .venv/
+*.egg-info/
 
 # Regenerable eval outputs (run `python eval/harness.py` to recreate)
 eval/eval_results.json
