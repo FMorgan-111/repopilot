@@ -36,6 +36,10 @@ def _pin_llm_env(monkeypatch):
     # the auth header and breaks the "Bearer test-key" assertion.
     monkeypatch.delenv("LINOAPI_API_KEY", raising=False)
     monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_MODEL", raising=False)
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
 
 
 class HTTPXMock:

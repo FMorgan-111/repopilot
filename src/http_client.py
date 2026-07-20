@@ -6,7 +6,6 @@
 
 import asyncio
 import json
-import os
 
 import httpx
 from dotenv import load_dotenv
@@ -17,6 +16,7 @@ from tenacity import (
     wait_exponential,
 )
 
+from .model_provider import ProviderName, get_model_config, sanitize_provider_error
 from .rate_limiter import get_github_limiter
 
 load_dotenv(override=True)
@@ -25,7 +25,7 @@ load_dotenv(override=True)
 # Module-level connection pool (shared across all callers)
 # ---------------------------------------------------------------------------
 
-_llm_client: httpx.AsyncClient | None = None
+_llm_clients: dict[tuple[ProviderName, str], httpx.AsyncClient] = {}
 # Connect timeout — establishing the TCP/TLS connection should be quick even
 # when generation is slow.
 LLM_CONNECT_TIMEOUT = 15.0
@@ -49,29 +49,40 @@ class LLMResponseError(RuntimeError):
     """The provider returned HTTP 2xx but no usable chat completion."""
 
 
-def _get_llm_client() -> httpx.AsyncClient:
+def _get_llm_client(
+    provider: ProviderName = "primary", base_url: str = ""
+) -> httpx.AsyncClient:
     """Return the shared LLM :class:`httpx.AsyncClient` with connection pooling."""
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = httpx.AsyncClient(
+    key = (provider, base_url)
+    client = _llm_clients.get(key)
+    if client is None:
+        client = httpx.AsyncClient(
             timeout=httpx.Timeout(LLM_STREAM_IDLE_TIMEOUT, connect=LLM_CONNECT_TIMEOUT),
             limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
         )
-    return _llm_client
+        _llm_clients[key] = client
+    return client
 
 
 def _reset_llm_client() -> None:
     """Reset the cached LLM client (useful between tests)."""
-    global _llm_client
-    _llm_client = None
+    clients = list(_llm_clients.values())
+    _llm_clients.clear()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        for client in clients:
+            asyncio.run(client.aclose())
+    else:
+        for client in clients:
+            loop.create_task(client.aclose())
 
 
 async def close_llm_client() -> None:
-    """Close and clear the shared LLM client."""
-    global _llm_client
-    client = _llm_client
-    _llm_client = None
-    if client is not None:
+    """Close and clear every shared LLM client."""
+    clients = list(_llm_clients.values())
+    _llm_clients.clear()
+    for client in clients:
         await client.aclose()
 
 
@@ -157,23 +168,21 @@ async def _github_request_with_retry(method: str, url: str, **kwargs) -> httpx.R
 # LLM request
 # ---------------------------------------------------------------------------
 
-def _get_llm_api_key() -> str:
-    return os.getenv("LINOAPI_API_KEY") or os.getenv("LLM_API_KEY") or os.getenv("DEEPSEEK_API_KEY", "")
-
-
 def _get_llm_base_url() -> str:
-    return os.getenv("OPENAI_BASE_URL", "https://linoapi.com.cn/v1").rstrip("/")
+    return get_model_config("primary").base_url
 
 
 def _get_llm_model() -> str:
-    return os.getenv("LLM_MODEL", "gemini-3.5-flash:stable")
+    return get_model_config("primary").model
 
 
 async def llm_request(
     messages: list[dict],
     model: str | None = None,
     temperature: float = 0.2,
-    **kwargs,
+    *,
+    provider: ProviderName = "primary",
+    **kwargs: object,
 ) -> dict:
     """LLM API request with exponential-backoff retry.
 
@@ -182,20 +191,23 @@ async def llm_request(
     Uses a shared connection pool (``_get_llm_client``) to avoid per-call
     TCP handshake overhead.
     """
-    url = f"{_get_llm_base_url()}/chat/completions"
+    config = get_model_config(provider)
+    url = f"{config.base_url}/chat/completions"
     payload: dict[str, object] = {
-        "model": model or _get_llm_model(),
+        "model": model or config.model,
         "messages": messages,
         "temperature": temperature,
         "stream": True,
     }
     payload.update(kwargs)
     headers = {
-        "Authorization": f"Bearer {_get_llm_api_key()}",
+        "Authorization": f"Bearer {config.api_key.get_secret_value()}",
         "Content-Type": "application/json",
     }
 
-    return await _llm_request_with_retry(url, payload, headers)
+    return await _llm_request_with_retry(
+        url, payload, headers, provider, config.base_url
+    )
 
 
 @retry(
@@ -204,8 +216,14 @@ async def llm_request(
     retry=retry_if_exception(_is_retryable_llm),
     reraise=True,
 )
-async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dict:
-    client = _get_llm_client()
+async def _llm_request_with_retry(
+    url: str,
+    payload: dict,
+    headers: dict,
+    provider: ProviderName = "primary",
+    base_url: str = "",
+) -> dict:
+    client = _get_llm_client(provider, base_url)
 
     async def _consume() -> dict:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
@@ -230,8 +248,8 @@ async def _llm_request_with_retry(url: str, payload: dict, headers: dict) -> dic
 
 def _provider_error_message(error: object) -> str:
     if isinstance(error, dict):
-        return str(error.get("message") or error.get("detail") or error)
-    return str(error)
+        error = error.get("message") or error.get("detail") or error
+    return sanitize_provider_error(RuntimeError(str(error)))
 
 
 def _parse_chat_completion_json(payload: object) -> dict:

@@ -42,25 +42,31 @@ def test_extract_json_raises_on_garbage():
 async def test_llm_call_retries_once_on_unparseable(monkeypatch):
     calls = []
 
-    async def fake_llm_request(messages, model=None):
-        calls.append(messages)
+    async def fake_llm_request(
+        messages, model=None, temperature=0.2, *, provider="primary"
+    ):
+        calls.append((messages, provider, temperature))
         content = "I cannot help with that." if len(calls) == 1 else '{"ok": true}'
         return {"choices": [{"message": {"content": content}}]}
 
     monkeypatch.setattr(llm, "llm_request", fake_llm_request)
-    result = await llm_call("sys", "user")
+    result = await llm_call("sys", "user", provider="escalation", temperature=0.4)
 
     assert result == {"ok": True}
     assert len(calls) == 2
     # The retry carries an explicit "valid JSON" instruction.
-    assert "valid JSON" in calls[1][-1]["content"]
+    assert "valid JSON" in calls[1][0][-1]["content"]
+    assert [call[1] for call in calls] == ["escalation", "escalation"]
+    assert [call[2] for call in calls] == [0.4, 0.4]
 
 
 async def test_llm_call_no_retry_when_first_parses(monkeypatch):
     calls = []
 
-    async def fake_llm_request(messages, model=None):
-        calls.append(messages)
+    async def fake_llm_request(
+        messages, model=None, temperature=0.2, *, provider="primary"
+    ):
+        calls.append((messages, provider, temperature))
         return {"choices": [{"message": {"content": '{"ok": true}'}}]}
 
     monkeypatch.setattr(llm, "llm_request", fake_llm_request)

@@ -15,6 +15,7 @@ from src.http_client import (
     RETRYABLE_GITHUB_STATUS,
     RETRYABLE_LLM_STATUS,
     LLMResponseError,
+    _get_llm_client,
     _get_llm_model,
     _is_retryable_github,
     is_retryable_github_error,
@@ -101,12 +102,27 @@ class _FakeStreamCM:
 async def test_close_llm_client_closes_cached_client_and_clears_global():
     from src import http_client
 
-    client = http_client._get_llm_client()
+    primary_client = http_client._get_llm_client(
+        "primary", "https://primary.invalid/v1"
+    )
+    escalation_client = http_client._get_llm_client(
+        "escalation", "https://escalation.invalid/v1"
+    )
 
     await http_client.close_llm_client()
 
-    assert client.is_closed is True
-    assert http_client._llm_client is None
+    assert primary_client.is_closed is True
+    assert escalation_client.is_closed is True
+    assert http_client._llm_clients == {}
+
+
+def test_llm_clients_are_independent_by_provider_and_base_url():
+    primary = _get_llm_client("primary", "https://primary.invalid/v1")
+    same_primary = _get_llm_client("primary", "https://primary.invalid/v1")
+    escalation = _get_llm_client("escalation", "https://escalation.invalid/v1")
+
+    assert same_primary is primary
+    assert escalation is not primary
 
 
 def test_llm_timeout_budget_is_explicit():
@@ -214,6 +230,39 @@ async def test_llm_request_accumulates_streamed_chunks(monkeypatch):
 
     result = await llm_request([{"role": "user", "content": "hi"}])
     assert result["choices"][0]["message"]["content"] == '{"a": 1}'
+
+
+async def test_llm_request_uses_isolated_provider_configuration(monkeypatch):
+    requests = []
+
+    def fake_stream(self, method, url, **kwargs):
+        requests.append((url, kwargs))
+        return _FakeStreamCM(sse=_sse('{"ok": true}'))
+
+    monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
+    monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.setenv("LLM_MODEL", "primary-model")
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
+    monkeypatch.setenv("LLM_ESCALATION_BASE_URL", "https://escalation.invalid/v1")
+    monkeypatch.setenv("LLM_ESCALATION_MODEL", "escalation-model")
+
+    await llm_request([{"role": "user", "content": "primary"}])
+    await llm_request(
+        [{"role": "user", "content": "escalation"}], provider="escalation"
+    )
+
+    primary_url, primary_kwargs = requests[0]
+    escalation_url, escalation_kwargs = requests[1]
+    assert primary_url == "https://primary.invalid/v1/chat/completions"
+    assert primary_kwargs["json"]["model"] == "primary-model"
+    assert primary_kwargs["headers"]["Authorization"] == "Bearer primary-sentinel-key"
+    assert escalation_url == "https://escalation.invalid/v1/chat/completions"
+    assert escalation_kwargs["json"]["model"] == "escalation-model"
+    assert (
+        escalation_kwargs["headers"]["Authorization"]
+        == "Bearer escalation-sentinel-key"
+    )
 
 
 async def test_llm_request_preserves_stream_usage_and_finish_reason(monkeypatch):

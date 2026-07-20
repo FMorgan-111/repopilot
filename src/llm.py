@@ -5,6 +5,7 @@ import warnings
 from pydantic import BaseModel, ValidationError
 
 from .http_client import llm_request
+from .model_provider import ProviderName
 from .schemas import Classification, FileRanking, FixPlan
 
 
@@ -62,7 +63,14 @@ def _extract_json(text: str) -> dict:
     raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
-async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> dict:
+async def llm_call(
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    *,
+    provider: ProviderName = "primary",
+    temperature: float = 0.2,
+) -> dict:
     """Call an OpenAI-compatible chat endpoint and return parsed JSON.
 
     On an unparseable first response, retry once with an explicit instruction to
@@ -71,7 +79,9 @@ async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> d
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    resp_data = await llm_request(messages, model)
+    resp_data = await llm_request(
+        messages, model, temperature, provider=provider
+    )
     content = resp_data["choices"][0]["message"]["content"]
     try:
         return _extract_json(content)
@@ -86,7 +96,9 @@ async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> d
                 ),
             },
         ]
-        resp_data = await llm_request(retry_messages, model)
+        resp_data = await llm_request(
+            retry_messages, model, temperature, provider=provider
+        )
         content = resp_data["choices"][0]["message"]["content"]
         return _extract_json(content)
 

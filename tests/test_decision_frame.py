@@ -731,7 +731,7 @@ async def test_reflect_on_patch_apply_failure_preserves_selected_hypothesis_cont
 ):
     calls = []
 
-    async def fake_llm_request(messages, model=None):
+    async def fake_llm_request(messages, model=None, temperature=0.2, *, provider="primary"):
         calls.append({"messages": messages, "model": model})
         return {
             "choices": [
