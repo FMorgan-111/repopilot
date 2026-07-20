@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel
 
-from .evidence import EvidenceStore
+from .evidence import EvidenceCapacityError, EvidenceStore
 from .local_search import (
     find_local_references,
     list_local_related_tests,
@@ -18,6 +17,7 @@ from .local_search import (
     search_local_text,
 )
 from .model_provider import redact_secrets
+from .safe_subprocess import BoundedProcessResult, run_bounded_process
 from .state import AgentState, ToolAction, ToolInvocation
 from .tool_policy import ToolIntent, ToolPolicy
 
@@ -32,21 +32,26 @@ class ToolRouteResult(BaseModel):
     control_action: str = ""
 
 
-def _completed_content(result: subprocess.CompletedProcess[str]) -> str:
+def _completed_content(result: BoundedProcessResult) -> str:
     return redact_secrets(
         f"returncode: {result.returncode}\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
     )[:8_000]
 
 
-def _run(argv: list[str], root: Path, *, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+def _run(
+    argv: list[str],
+    root: Path,
+    *,
+    input_text: str | None = None,
+    isolate_network: bool = False,
+) -> BoundedProcessResult:
+    return run_bounded_process(
         argv,
         cwd=root,
-        input=input_text,
-        capture_output=True,
-        text=True,
+        input_text=input_text,
         timeout=300,
-        check=False,
+        max_output_bytes=8_000,
+        isolate_network=isolate_network,
     )
 
 
@@ -82,7 +87,7 @@ def _execute_data_tool(
     elif action == "list_related_tests":
         content = "\n".join(list_local_related_tests(state.repo_path, file_path or ""))
     elif action == "run_targeted_test":
-        content = _completed_content(_run(argv, root))
+        content = _completed_content(_run(argv, root, isolate_network=True))
     elif action == "inspect_git_diff":
         content = _completed_content(
             _run(
@@ -94,6 +99,21 @@ def _execute_data_tool(
                     "--unified=3",
                     state.repo_ref,
                     "--",
+                    ".",
+                    ":(glob,exclude)**/.env",
+                    ":(glob,exclude)**/.env.*",
+                    ":(glob,exclude)**/.npmrc",
+                    ":(glob,exclude)**/.pypirc",
+                    ":(glob,exclude)**/.netrc",
+                    ":(glob,exclude)**/credentials",
+                    ":(glob,exclude)**/credentials.json",
+                    ":(glob,exclude)**/id_rsa",
+                    ":(glob,exclude)**/id_ed25519",
+                    ":(glob,exclude)**/*.key",
+                    ":(glob,exclude)**/*.kdbx",
+                    ":(glob,exclude)**/*.pem",
+                    ":(glob,exclude)**/*.p12",
+                    ":(glob,exclude)**/*.pfx",
                 ],
                 root,
             )
@@ -168,7 +188,11 @@ async def route_tool_intent(
             file_path=file_path,
             symbol=symbol,
         )
-        status = "ok" if added.added else "duplicate"
+        if added.disposition == "capacity":
+            raise EvidenceCapacityError("evidence store reached its item limit")
+        if added.evidence is None:  # pragma: no cover - model contract guard
+            raise EvidenceCapacityError("evidence result omitted its persisted item")
+        status = "ok" if added.disposition == "added" else "duplicate"
         state.tool_history.append(
             ToolInvocation(
                 action=intent.action,

@@ -3,6 +3,7 @@
 from src.model_provider import (
     escalation_is_configured,
     get_model_config,
+    redact_secrets,
     sanitize_provider_error,
 )
 
@@ -84,3 +85,12 @@ def test_sanitize_provider_error_redacts_quoted_secret_fields():
     assert "single-quoted-sentinel" not in message
     assert "double-quoted-sentinel" not in message
     assert "[REDACTED]" in message
+
+
+def test_redact_secrets_catches_bare_sk_tokens_without_a_header():
+    token = "sk-adversarial-sentinel-token"
+
+    message = redact_secrets(f"runner printed {token} in plain text")
+
+    assert token not in message
+    assert "runner printed [REDACTED]" in message

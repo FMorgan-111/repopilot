@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from typing import Literal
 
 from pydantic import BaseModel
 
@@ -12,8 +13,13 @@ from .state import AgentState, Evidence
 
 
 class EvidenceAddResult(BaseModel):
-    evidence: Evidence
+    evidence: Evidence | None
     added: bool
+    disposition: Literal["added", "duplicate", "capacity"]
+
+
+class EvidenceCapacityError(RuntimeError):
+    """Raised when a new evidence item cannot be persisted within the cap."""
 
 
 class EvidenceStore:
@@ -53,7 +59,11 @@ class EvidenceStore:
 
         for existing in self.state.evidence:
             if existing.fingerprint == fingerprint:
-                return EvidenceAddResult(evidence=existing, added=False)
+                return EvidenceAddResult(
+                    evidence=existing,
+                    added=False,
+                    disposition="duplicate",
+                )
 
         evidence = Evidence(
             evidence_id=f"ev_{fingerprint[:16]}",
@@ -65,10 +75,18 @@ class EvidenceStore:
             fingerprint=fingerprint,
         )
         if len(self.state.evidence) >= self.max_items:
-            return EvidenceAddResult(evidence=evidence, added=False)
+            return EvidenceAddResult(
+                evidence=None,
+                added=False,
+                disposition="capacity",
+            )
 
         self.state.evidence.append(evidence)
-        return EvidenceAddResult(evidence=evidence, added=True)
+        return EvidenceAddResult(
+            evidence=evidence,
+            added=True,
+            disposition="added",
+        )
 
     def select(
         self,

@@ -4,12 +4,56 @@ from __future__ import annotations
 
 import ast
 import re
-import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+from .safe_subprocess import run_bounded_process
+
 _DOC_SUFFIXES = (".md", ".rst", ".txt", ".rdoc", ".adoc")
 _MAX_TOOL_CONTENT = 8_000
+_VCS_PARTS = frozenset({".git", ".hg", ".svn"})
+_SECRET_NAMES = frozenset(
+    {
+        ".dockercfg",
+        ".netrc",
+        ".npmrc",
+        ".pypirc",
+        "credentials",
+        "credentials.json",
+        "id_ed25519",
+        "id_rsa",
+    }
+)
+
+
+def is_sensitive_repo_path(path: str) -> bool:
+    """Return whether a repository-relative path can expose local credentials."""
+    parts = [part.lower() for part in str(path).replace("\\", "/").split("/") if part]
+    if any(part in _VCS_PARTS or part in {".aws", ".azure", ".gcloud", ".ssh"} for part in parts):
+        return True
+    if not parts:
+        return False
+    name = parts[-1]
+    return (
+        name in _SECRET_NAMES
+        or name == ".env"
+        or name.startswith(".env.")
+        or name.endswith((".key", ".kdbx", ".pem", ".p12", ".pfx"))
+    )
+
+
+def _safe_local_file(root: Path, path: str) -> Path:
+    if is_sensitive_repo_path(path):
+        raise ValueError("sensitive_path")
+    candidate = root / path
+    if candidate.is_symlink():
+        raise ValueError("symlink_path")
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise ValueError("unsafe_path")
+    if is_sensitive_repo_path(resolved.relative_to(root).as_posix()):
+        raise ValueError("sensitive_path")
+    return resolved
 
 
 def _tracked_text_files(
@@ -20,17 +64,26 @@ def _tracked_text_files(
     max_file_bytes: int = 256_000,
 ) -> list[tuple[str, str]]:
     root = Path(repo_path).resolve()
-    scope = (root / relative_to).resolve() if relative_to else root
-    result = subprocess.run(
+    if relative_to and is_sensitive_repo_path(relative_to):
+        raise ValueError("sensitive_path")
+    scope_path = root / relative_to if relative_to else root
+    if scope_path.is_symlink():
+        raise ValueError("symlink_path")
+    scope = scope_path.resolve()
+    if not scope.is_relative_to(root):
+        raise ValueError("unsafe_path")
+    result = run_bounded_process(
         ["git", "-C", str(root), "ls-files", "-z"],
-        capture_output=True,
-        check=True,
+        cwd=root,
+        timeout=30,
+        max_output_bytes=4_000_000,
     )
+    if result.returncode != 0:
+        raise RuntimeError("git ls-files failed")
     files: list[tuple[str, str]] = []
-    for raw_path in result.stdout.split(b"\0")[:max_files]:
-        if not raw_path:
+    for path in result.stdout.split("\0")[:max_files]:
+        if not path or is_sensitive_repo_path(path):
             continue
-        path = raw_path.decode("utf-8", errors="replace")
         file_path = (root / path).resolve()
         if (
             not file_path.is_relative_to(root)
@@ -76,7 +129,7 @@ def read_local_range(
     end_line: int,
 ) -> str:
     root = Path(repo_path).resolve()
-    file_path = (root / path).resolve()
+    file_path = _safe_local_file(root, path)
     content = file_path.read_text(encoding="utf-8").splitlines()
     selected = [
         f"{number}: {content[number - 1]}"
@@ -87,7 +140,7 @@ def read_local_range(
 
 def read_local_symbol(repo_path: str, path: str, symbol: str) -> str:
     root = Path(repo_path).resolve()
-    file_path = (root / path).resolve()
+    file_path = _safe_local_file(root, path)
     content = file_path.read_text(encoding="utf-8")
     try:
         tree = ast.parse(content)

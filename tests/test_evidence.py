@@ -63,7 +63,24 @@ def test_add_bounds_items_and_redacted_content():
     assert len(first.evidence.content) == 32
     assert second.added is True
     assert rejected.added is False
+    assert rejected.disposition == "capacity"
+    assert rejected.evidence is None
     assert [item.summary for item in state.evidence] == ["one", "two"]
+
+
+def test_duplicate_and_capacity_have_distinct_result_contracts():
+    state = make_state()
+    store = EvidenceStore(state, max_items=1)
+    original = store.add(tool="search", summary="one", content="same")
+
+    duplicate = store.add(tool="search", summary="again", content="same")
+    capacity = store.add(tool="search", summary="two", content="different")
+
+    assert original.disposition == "added"
+    assert duplicate.disposition == "duplicate"
+    assert duplicate.evidence == original.evidence
+    assert capacity.disposition == "capacity"
+    assert capacity.evidence is None
 
 
 def test_add_bounds_persisted_summary_as_well_as_content():

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from src.evidence import EvidenceStore
+from src.safe_subprocess import BoundedProcessResult
 from src.state import AgentState
 from src.tool_policy import ToolIntent
 from src.tool_router import route_tool_intent
@@ -75,12 +77,13 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     root, commit = _repo(tmp_path)
     captured: dict[str, object] = {}
 
-    def fake_run(argv, **kwargs):
+    def fake_run(argv, root, **kwargs):
         captured["argv"] = argv
+        captured["root"] = root
         captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0, "one passed", "")
+        return BoundedProcessResult(argv=argv, returncode=0, stdout="one passed", stderr="")
 
-    monkeypatch.setattr("src.tool_router.subprocess.run", fake_run)
+    monkeypatch.setattr("src.tool_router._run", fake_run)
     state = _state(root, commit)
 
     result = await route_tool_intent(
@@ -92,8 +95,8 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     assert result.status == "ok"
     assert isinstance(captured["argv"], list)
     assert captured["argv"][1:3] == ["-m", "pytest"]
-    assert "shell" not in captured or captured["shell"] is False
-    assert captured["cwd"] == root
+    assert captured["root"] == root
+    assert captured["isolate_network"] is True
     assert "one passed" in state.evidence[-1].content
 
 
@@ -140,7 +143,7 @@ async def test_duplicate_evidence_is_recorded_as_no_progress(tmp_path):
 async def test_control_actions_execute_nothing_and_add_no_evidence(tmp_path, monkeypatch, action):
     root, commit = _repo(tmp_path)
     monkeypatch.setattr(
-        "src.tool_router.subprocess.run",
+        "src.tool_router._run",
         lambda *args, **kwargs: pytest.fail("control action executed a command"),
     )
     state = _state(root, commit)
@@ -160,7 +163,7 @@ async def test_errors_store_only_sanitized_exception_class(tmp_path, monkeypatch
     def explode(*args, **kwargs):
         raise RuntimeError(f"failed with {secret}")
 
-    monkeypatch.setattr("src.tool_router.subprocess.run", explode)
+    monkeypatch.setattr("src.tool_router._run", explode)
     state = _state(root, commit)
 
     result = await route_tool_intent(
@@ -173,6 +176,50 @@ async def test_errors_store_only_sanitized_exception_class(tmp_path, monkeypatch
     assert result.error_class == "RuntimeError"
     assert secret not in state.model_dump_json()
     assert state.tool_history[-1].error_class == "RuntimeError"
+
+
+async def test_evidence_capacity_is_an_error_without_nonexistent_id(tmp_path):
+    root, commit = _repo(tmp_path)
+    state = _state(root, commit)
+    store = EvidenceStore(state, max_items=30)
+    for index in range(30):
+        added = store.add(tool="seed", summary=str(index), content=str(index))
+        assert added.added is True
+
+    result = await route_tool_intent(
+        state,
+        _intent("search_text", text="return 'old'"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "error"
+    assert result.error_class == "EvidenceCapacityError"
+    assert result.evidence_id is None
+    assert state.tool_history[-1].evidence_id is None
+
+
+async def test_git_diff_excludes_tracked_dotenv_content(tmp_path):
+    root, commit = _repo(tmp_path)
+    dotenv = root / ".env"
+    dotenv.write_text("TOKEN=old-sentinel\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", ".env"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dotenv.write_text("TOKEN=new-sentinel\n", encoding="utf-8")
+    state = _state(root, commit)
+
+    result = await route_tool_intent(
+        state, _intent("inspect_git_diff"), calls_this_round=0
+    )
+
+    assert result.status == "ok"
+    assert "old-sentinel" not in state.evidence[-1].content
+    assert "new-sentinel" not in state.evidence[-1].content
 
 
 async def test_policy_rejection_is_persisted_without_execution(tmp_path):

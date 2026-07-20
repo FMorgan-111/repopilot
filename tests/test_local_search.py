@@ -95,3 +95,15 @@ def test_read_local_symbol_supports_non_python_source(tmp_path):
     assert "function renderWidget" in result
     assert "return 'ok'" in result
     assert "ignored" not in result
+
+
+def test_search_helpers_skip_tracked_secret_files(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    (tmp_path / "safe.py").write_text("LOOKUP_SENTINEL = 1\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("LOOKUP_SENTINEL=credential\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "safe.py", ".env"], check=True)
+
+    result = search_local_text(str(tmp_path), "LOOKUP_SENTINEL")
+
+    assert "safe.py" in result
+    assert ".env" not in result

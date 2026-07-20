@@ -198,6 +198,14 @@ def test_rejects_missing_or_mismatched_exact_checkout(tmp_path, updates):
 def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
     root, commit = _repo(tmp_path)
     (root / "package.json").write_text('{"scripts":{"test":"pytest"}}', encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     state = _state(root, commit, test_command="npm test")
     policy = ToolPolicy()
 
@@ -244,6 +252,179 @@ def test_rejects_non_test_program_hidden_in_project_command(tmp_path):
         _intent(
             "run_targeted_test",
             {"command": "npm exec echo tests/test_widget.py"},
+        ),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is False
+
+
+@pytest.mark.parametrize(
+    ("state_command", "requested"),
+    [
+        ("npm run contest", "npm run contest -- tests/test_widget.py"),
+        ("npm test -- --runInBand", "npm test -- --runInBand tests/test_widget.py"),
+        ("npm exec pytest", "npm exec pytest tests/test_widget.py"),
+    ],
+)
+def test_rejects_inexact_or_preconfigured_project_commands(
+    tmp_path, state_command, requested
+):
+    root, commit = _repo(tmp_path)
+    (root / "package.json").write_text(
+        '{"scripts":{"test":"pytest","contest":"pytest"}}', encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit, test_command=state_command),
+        _intent("run_targeted_test", {"command": requested}),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is False
+
+
+def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path):
+    root, commit = _repo(tmp_path)
+    (root / "package.json").write_text(
+        '{"scripts":{"test:unit":"pytest"}}', encoding="utf-8"
+    )
+    subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit, test_command="npm run test:unit"),
+        _intent(
+            "run_targeted_test",
+            {"command": "npm run test:unit -- tests/test_widget.py"},
+        ),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is True
+
+
+def test_rejects_modified_or_symlinked_project_manifest(tmp_path):
+    root, commit = _repo(tmp_path)
+    manifest = root / "package.json"
+    manifest.write_text('{"scripts":{"test":"pytest"}}', encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    manifest.write_text('{"scripts":{"test":"curl example.invalid"}}', encoding="utf-8")
+
+    modified = ToolPolicy().authorize(
+        _state(root, commit, test_command="npm test"),
+        _intent("run_targeted_test", {"command": "npm test -- tests/test_widget.py"}),
+        calls_this_round=0,
+    )
+
+    manifest.unlink()
+    outside = tmp_path.parent / "external-package.json"
+    outside.write_text('{"scripts":{"test":"pytest"}}', encoding="utf-8")
+    manifest.symlink_to(outside)
+    symlinked = ToolPolicy().authorize(
+        _state(root, commit, test_command="npm test"),
+        _intent("run_targeted_test", {"command": "npm test -- tests/test_widget.py"}),
+        calls_this_round=0,
+    )
+
+    assert modified.approved is False
+    assert symlinked.approved is False
+
+
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        ("read_range", {"path": ".git/config", "start_line": 1, "end_line": 1}),
+        ("read_range", {"path": ".env", "start_line": 1, "end_line": 1}),
+        ("search_text", {"text": "token", "path": ".git"}),
+        ("search_text", {"text": "token", "path": ".env"}),
+        ("read_range", {"path": "private.pem", "start_line": 1, "end_line": 1}),
+    ],
+)
+def test_rejects_vcs_metadata_and_common_secret_paths(tmp_path, action, args):
+    root, commit = _repo(tmp_path)
+    (root / ".env").write_text("TOKEN=sentinel\n", encoding="utf-8")
+    (root / "private.pem").write_text("sentinel\n", encoding="utf-8")
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit), _intent(action, args), calls_this_round=0
+    )
+
+    assert decision.approved is False
+
+
+def test_untracked_test_selector_requires_explicit_generated_patch_marker(tmp_path):
+    root, commit = _repo(tmp_path)
+    generated = root / "tests" / "test_generated_regression.py"
+    generated.write_text("def test_generated():\n    assert True\n", encoding="utf-8")
+    command = "pytest tests/test_generated_regression.py"
+
+    unmarked = ToolPolicy().authorize(
+        _state(root, commit),
+        _intent("run_targeted_test", {"command": command}),
+        calls_this_round=0,
+    )
+    marked = ToolPolicy().authorize(
+        _state(
+            root,
+            commit,
+            patch_content=(
+                "diff --git a/tests/test_generated_regression.py "
+                "b/tests/test_generated_regression.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/tests/test_generated_regression.py\n"
+            ),
+        ),
+        _intent("run_targeted_test", {"command": command}),
+        calls_this_round=0,
+    )
+
+    assert unmarked.approved is False
+    assert marked.approved is True
+
+
+def test_generated_test_marker_must_belong_to_the_same_new_file_diff(tmp_path):
+    root, commit = _repo(tmp_path)
+    generated = root / "tests" / "test_generated_regression.py"
+    generated.write_text("def test_generated():\n    assert True\n", encoding="utf-8")
+    misleading_patch = (
+        "diff --git a/tests/test_other.py b/tests/test_other.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/tests/test_other.py\n"
+        "diff --git a/tests/test_generated_regression.py "
+        "b/tests/test_generated_regression.py\n"
+        "--- a/tests/test_generated_regression.py\n"
+        "+++ b/tests/test_generated_regression.py\n"
+    )
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit, patch_content=misleading_patch),
+        _intent(
+            "run_targeted_test",
+            {"command": "pytest tests/test_generated_regression.py"},
         ),
         calls_this_round=0,
     )

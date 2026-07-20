@@ -6,13 +6,14 @@ import hashlib
 import json
 import re
 import shlex
-import subprocess
 import sys
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from .local_search import is_sensitive_repo_path
+from .safe_subprocess import run_bounded_process
 from .state import AgentState, ToolAction
 
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
@@ -24,6 +25,8 @@ _NETWORK_COMMANDS = frozenset(
 _SAFE_TEST_OPTION_RE = re.compile(
     r"(?:-[qvxs]+|--disable-warnings|--tb=(?:auto|long|short|line|native|no)|--maxfail=[0-9]+)"
 )
+_PACKAGE_TEST_SCRIPT_RE = re.compile(r"test(?::[A-Za-z0-9_.-]+)?")
+_PACKAGE_EXECUTABLES = frozenset({"npm", "pnpm", "yarn", "bun"})
 
 _ARG_KEYS: dict[ToolAction, frozenset[str]] = {
     "search_symbol": frozenset({"symbol", "path"}),
@@ -99,23 +102,79 @@ def _relative_path(root: Path, value: object, *, require_file: bool = False) -> 
         raise ValueError("absolute_path")
     if ".." in raw.split("/"):
         raise ValueError("path_traversal")
-    resolved = (root / raw).resolve()
+    if is_sensitive_repo_path(raw):
+        raise ValueError("sensitive_path")
+    candidate = root / raw
+    if candidate.is_symlink():
+        raise ValueError("symlink_path")
+    resolved = candidate.resolve()
     if not resolved.is_relative_to(root):
         raise ValueError("path_escape")
+    if is_sensitive_repo_path(resolved.relative_to(root).as_posix()):
+        raise ValueError("sensitive_path")
     if require_file and not resolved.is_file():
         raise ValueError("path_not_file")
     return resolved.relative_to(root).as_posix() or "."
 
 
-def _target_selector(root: Path, token: str) -> bool:
+def _git_result(root: Path, argv: list[str], *, max_output_bytes: int = 256_000) -> str:
+    result = run_bounded_process(
+        argv,
+        cwd=root,
+        timeout=10,
+        max_output_bytes=max_output_bytes,
+    )
+    if result.returncode != 0:
+        raise ValueError("git_query_failed")
+    return result.stdout
+
+
+def _is_tracked(root: Path, path: str) -> bool:
+    result = run_bounded_process(
+        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", path],
+        cwd=root,
+        timeout=10,
+        max_output_bytes=4_096,
+    )
+    return result.returncode == 0
+
+
+def _is_explicit_generated_test(state: AgentState, path: str) -> bool:
+    parts = Path(path).parts
+    name = Path(path).name
+    is_test_name = name.startswith("test_") and name.endswith(".py")
+    is_test_name = is_test_name or name.endswith("_test.py")
+    in_test_root = any(part.lower() in {"test", "tests"} for part in parts[:-1])
+    normalized_patch = state.patch_content.replace("\r\n", "\n")
+    header = f"diff --git a/{path} b/{path}\n"
+    matching_block = next(
+        (
+            block
+            for block in re.split(r"(?=^diff --git )", normalized_patch, flags=re.MULTILINE)
+            if block.startswith(header)
+        ),
+        "",
+    )
+    return (
+        is_test_name
+        and in_test_root
+        and bool(re.search(r"(?m)^new file mode [0-7]{6}$", matching_block))
+        and "--- /dev/null\n" in matching_block
+        and f"+++ b/{path}\n" in matching_block
+    )
+
+
+def _target_selector(root: Path, state: AgentState, token: str) -> bool:
     path_part = token.split("::", 1)[0]
     if not path_part or path_part.startswith("-"):
         return False
     try:
-        _relative_path(root, path_part, require_file=True)
+        normalized = _relative_path(root, path_part, require_file=True)
     except ValueError:
         return False
-    return True
+    return _is_tracked(root, normalized) or _is_explicit_generated_test(
+        state, normalized
+    )
 
 
 def _safe_tokens(command: object) -> list[str]:
@@ -134,54 +193,56 @@ def _safe_tokens(command: object) -> list[str]:
     return tokens
 
 
-def _project_manifest_exists(root: Path, executable: str) -> bool:
-    if executable in {"npm", "pnpm", "yarn", "bun"}:
-        return (root / "package.json").is_file()
-    if executable == "tox":
-        return (root / "tox.ini").is_file() or (root / "pyproject.toml").is_file()
-    if executable == "nox":
-        return (root / "noxfile.py").is_file()
-    if executable == "make":
-        return (root / "Makefile").is_file()
-    return False
+def _committed_package_scripts(root: Path, state: AgentState) -> dict[str, object]:
+    manifest = root / "package.json"
+    if manifest.is_symlink() or not manifest.is_file():
+        raise ValueError("unsafe_manifest")
+    committed = _git_result(
+        root,
+        ["git", "-C", str(root), "show", f"{state.repo_ref}:package.json"],
+    )
+    try:
+        working = manifest.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("unsafe_manifest") from exc
+    if working != committed:
+        raise ValueError("modified_manifest")
+    try:
+        value = json.loads(committed)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid_manifest") from exc
+    scripts = value.get("scripts") if isinstance(value, dict) else None
+    if not isinstance(scripts, dict):
+        raise ValueError("missing_test_script")
+    return scripts
 
 
-def _is_project_test_command(root: Path, tokens: list[str]) -> bool:
-    executable = tokens[0].lower() if tokens else ""
-    if not _project_manifest_exists(root, executable):
-        return False
-    if executable in {"npm", "pnpm", "yarn", "bun"}:
-        return len(tokens) >= 2 and (
-            tokens[1] == "test"
-            or (
-                tokens[1] == "run"
-                and len(tokens) >= 3
-                and "test" in tokens[2].lower()
-            )
-        )
-    if executable == "make":
-        return len(tokens) >= 2 and "test" in tokens[1].lower()
-    if executable == "nox":
-        return any("test" in token.lower() for token in tokens[1:])
-    return executable == "tox"
+def _project_test_prefix(
+    root: Path, state: AgentState, tokens: list[str]
+) -> list[str]:
+    if not tokens or tokens[0].lower() not in _PACKAGE_EXECUTABLES:
+        raise ValueError("unsupported_project_runner")
+    executable = tokens[0].lower()
+    if len(tokens) == 2 and tokens[1] == "test":
+        script = "test"
+    elif len(tokens) == 3 and tokens[1] == "run":
+        script = tokens[2]
+    else:
+        raise ValueError("unsafe_project_options")
+    if not _PACKAGE_TEST_SCRIPT_RE.fullmatch(script):
+        raise ValueError("non_test_script")
+    scripts = _committed_package_scripts(root, state)
+    if not isinstance(scripts.get(script), str) or not str(scripts[script]).strip():
+        raise ValueError("missing_test_script")
+    return [executable, *tokens[1:]]
 
 
 def _checkout_head(root: Path) -> str:
-    process = subprocess.Popen(
+    return _git_result(
+        root,
         ["git", "-C", str(root), "rev-parse", "HEAD"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    try:
-        stdout, _ = process.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.communicate()
-        raise
-    if process.returncode != 0:
-        raise subprocess.CalledProcessError(process.returncode, process.args)
-    return stdout.strip()
+        max_output_bytes=4_096,
+    ).strip()
 
 
 def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str], str]:
@@ -194,15 +255,15 @@ def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str
         argv = [sys.executable, "-m", "pytest", *suffix]
     else:
         configured = _safe_tokens(state.test_command) if state.test_command else []
-        if (
-            not configured
-            or tokens[: len(configured)] != configured
-            or not _is_project_test_command(root, configured)
-        ):
+        prefix = _project_test_prefix(root, state, configured) if configured else []
+        if not prefix or tokens[: len(prefix)] != prefix:
             raise ValueError("test_command_not_allowlisted")
-        suffix = tokens[len(configured) :]
+        suffix = tokens[len(prefix) :]
+        if not suffix or suffix[0] != "--":
+            raise ValueError("target_separator_required")
+        suffix = suffix[1:]
         argv = tokens
-    selectors = [token for token in suffix if _target_selector(root, token)]
+    selectors = [token for token in suffix if _target_selector(root, state, token)]
     if not selectors:
         raise ValueError("target_selector_required")
     for token in suffix:
@@ -278,7 +339,7 @@ class ToolPolicy:
                 head = _checkout_head(root)
                 if head != state.repo_ref.lower():
                     raise ValueError("repo_ref_mismatch")
-        except (OSError, ValueError, subprocess.SubprocessError):
+        except (OSError, RuntimeError, ValueError):
             return _reject(empty_fingerprint, "unsafe_args")
 
         payload = json.dumps(
