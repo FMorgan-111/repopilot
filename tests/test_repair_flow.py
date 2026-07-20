@@ -1,3 +1,4 @@
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -12,6 +13,7 @@ from src.repair_flow import (
     generate_opus_repair,
     verified_edits_to_patch_edits,
 )
+from src.nodes.execute import _apply_patch_edits
 from src.state import AgentState, Evidence, Phase, RepairPlan
 
 
@@ -514,3 +516,65 @@ async def test_verified_edit_conversion_rechecks_preimage_and_marks_exact_only(
     (repo / "src/widget.py").write_text("# late drift\n" + source, encoding="utf-8")
     with pytest.raises(RepairContextError, match="changed|preimage"):
         verified_edits_to_patch_edits(batch, state=state)
+
+
+async def test_crlf_target_uses_lf_semantics_but_keeps_raw_preimage_digest(
+    tmp_path, monkeypatch
+):
+    raw_source = b"def compute(value):\r\n    current = value\r\n    return current\r\n"
+    repo, ref = _git_repo(tmp_path, {"src/widget.py": raw_source.decode("utf-8")})
+    target = repo / "src/widget.py"
+    target.write_bytes(raw_source)
+    subprocess.run(["git", "-C", str(repo), "add", "src/widget.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "--amend", "--no-edit", "-q"],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _state(repo, ref)
+    calls = 0
+
+    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _plan(target_symbols=[]).model_dump()
+        payload = json.loads(user)
+        evidence_content = payload["target_evidence"][0]["content"]
+        assert "\r" not in evidence_content
+        copied_search = "def compute(value):\n    current = value\n    return current"
+        assert copied_search in evidence_content
+        return {
+            "edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "node_target": None,
+                    "search": copied_search,
+                    "replace": (
+                        "def compute(value):\n"
+                        "    current = value + 1\n"
+                        "    return current"
+                    ),
+                    "intent": "Apply the offset.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    _repair_plan, batch = await generate_opus_repair(
+        state, build_escalation_packet(state)
+    )
+    patch_edit = verified_edits_to_patch_edits(batch, state=state)[0]
+
+    assert patch_edit.expected_content_sha256 == hashlib.sha256(raw_source).hexdigest()
+    result = _apply_patch_edits(str(repo), [patch_edit])
+    assert result.applied, result.output
+    assert target.read_text(encoding="utf-8") == (
+        "def compute(value):\n    current = value + 1\n    return current\n"
+    )

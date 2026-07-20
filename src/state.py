@@ -24,9 +24,13 @@ from .repo_paths import canonical_repo_path
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
 
 _REPAIR_SMUGGLING_RE = re.compile(
-    r"(?im)(?:^\s*(?:diff --git\b|@@\s|---\s+(?:a/|/dev/null)|"
-    r"\+\+\+\s+(?:b/|/dev/null)|\*\*\*\s+(?:begin|end)\s+patch\b)|"
-    r"[\"']?(?:patch|patch_edits|edits|file_path|search|replace)[\"']?\s*[:=])"
+    r"(?im)(?:"
+    r"^\s*(?:diff --git\b|@@\s|---\s+(?:a/|/dev/null)|"
+    r"\+\+\+\s+(?:b/|/dev/null)|\*\*\*\s+(?:begin|end)\s+patch\b)"
+    r"|[\"'](?:patch|patch_edits|edits|file_path|search|replace)[\"']\s*:"
+    r"|(?:^|[{,])\s*(?:patch|patch_edits|edits|file_path|search|replace)\s*:"
+    r"|^\s*(?:-\s*)?(?:patch|patch_edits|edits|file_path|search|replace)\s*[:=]"
+    r")"
 )
 
 APPROVED_NO_PROGRESS_KINDS = frozenset(

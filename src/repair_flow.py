@@ -138,9 +138,12 @@ def _validate_checkout(state: AgentState) -> Path:
 
 def _decode_utf8(data: bytes) -> str:
     try:
-        return data.decode("utf-8")
+        decoded = data.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise RepairContextError("target file must be readable UTF-8 text") from exc
+    # Match EvidenceStore and Path.read_text() universal-newline semantics while
+    # retaining the raw-byte digest as the immutable checkout preimage.
+    return decoded.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _read_regular_no_follow(root: Path, relative: str) -> bytes:

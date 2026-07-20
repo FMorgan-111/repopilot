@@ -163,6 +163,53 @@ def test_repair_plan_rejects_patch_or_edit_shaped_smuggling(field, value):
         RepairPlan.model_validate(payload)
 
 
+def test_repair_plan_allows_legitimate_url_query_parameters_and_prose():
+    plan = RepairPlan.model_validate(
+        {
+            "root_cause": (
+                "The documented callback URL is "
+                "https://example.invalid/callback?search=old&replace=new."
+            ),
+            "target_files": ["src/widget.py"],
+            "target_symbols": ["Widget.compute"],
+            "required_behavior": (
+                "Search for the current branch and replace only its returned value."
+            ),
+            "regression_test_strategy": "Run the focused regression test.",
+            "rejected_approaches": [
+                "Do not replace unrelated prose containing the word patch."
+            ],
+        }
+    )
+
+    assert "?search=old&replace=new" in plan.root_cause
+    assert plan.required_behavior.startswith("Search for")
+
+
+@pytest.mark.parametrize(
+    "smuggled",
+    [
+        "search: copied source block",
+        "replace = attacker supplied body",
+        "- edits: []",
+        "Use this dict: {'file_path': 'src/other.py'}",
+        "Use this object: {patch_edits: []}",
+    ],
+)
+def test_repair_plan_rejects_structured_or_line_assignment_smuggling(smuggled):
+    with pytest.raises(ValidationError):
+        RepairPlan.model_validate(
+            {
+                "root_cause": smuggled,
+                "target_files": ["src/widget.py"],
+                "target_symbols": ["Widget.compute"],
+                "required_behavior": "Apply the offset.",
+                "regression_test_strategy": "Run the focused regression test.",
+                "rejected_approaches": [],
+            }
+        )
+
+
 def test_plan_decision_accepts_search_replace_patch_edits():
     decision = PlanDecision.model_validate(
         {
