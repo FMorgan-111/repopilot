@@ -465,20 +465,13 @@ def git_diff(repo_path: str) -> str:
     if not repo_path:
         return ""
     try:
-        intent = subprocess.run(
-            ["git", "-C", repo_path, "add", "-N", "--", "."],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        if intent.returncode != 0:
-            return ""
         result = subprocess.run(
             [
                 "git",
                 "-C",
                 repo_path,
                 "diff",
+                "HEAD",
                 "--binary",
                 "--no-ext-diff",
             ],
@@ -486,9 +479,66 @@ def git_diff(repo_path: str) -> str:
             text=True,
             timeout=30,
         )
+        if result.returncode != 0:
+            return ""
+        untracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_path,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        if untracked.returncode != 0:
+            return ""
+        patches = [result.stdout]
+        generated_suffixes = {
+            ".egg",
+            ".gz",
+            ".jar",
+            ".pyc",
+            ".tar",
+            ".tgz",
+            ".whl",
+            ".zip",
+        }
+        for encoded_path in untracked.stdout.split(b"\0"):
+            if not encoded_path:
+                continue
+            relative_path = encoded_path.decode("utf-8", errors="surrogateescape")
+            path = Path(repo_path) / relative_path
+            if path.suffix.lower() in generated_suffixes or not path.is_file():
+                continue
+            if b"\0" in path.read_bytes()[:8192]:
+                continue
+            untracked_diff = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_path,
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    relative_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if untracked_diff.returncode not in {0, 1}:
+                return ""
+            patches.append(untracked_diff.stdout)
     except (OSError, subprocess.SubprocessError):
         return ""
-    return result.stdout if result.returncode == 0 else ""
+    return "".join(patches)
 
 
 def _combined_process_output(result: subprocess.CompletedProcess) -> str:

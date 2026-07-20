@@ -10,6 +10,7 @@ dist/
 
 # Regenerable eval outputs (run `python eval/harness.py` to recreate)
 eval/eval_results.json
+eval/swe_bench_predictions.jsonl
 eval/eval_summary.md
 eval/baseline_*.json
 examples/traces/case_1.json

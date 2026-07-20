@@ -1756,3 +1756,27 @@ Operator flow:
 3. Score the resulting JSONL with `swebench.harness.run_evaluation`. Docker or
    image failures are infrastructure failures and must not be reported as
    model failures.
+
+### Ten-sample Gemini run
+
+Ran the documented deterministic selection (`dataset_seed=17`, 10 samples)
+with `gemini-3.5-flash:stable` at RepoPilot commit
+`60ac4dd75c5fdf9e5f05bb5a83c78389f7811bf2`:
+
+- RepoPilot internal result: 1 `resolved`, 4 `search_not_found`, 4
+  `test_failed`, and 1 model/API `infra` failure (empty completion).
+- Three predictions had empty patches. Ten unique instance IDs and ten
+  prediction rows were written using only the official prediction keys.
+- Exact-secret and tokenized-GitHub-URL scans were clean. Gold/test fields were
+  absent from the prediction file.
+- The official harness could not score resolved/unresolved counts because no
+  Docker socket or CLI was available. This is scoring-infrastructure-blocked,
+  not ten model failures.
+- The live run exposed generated archive contamination in one prediction:
+  environment setup created `setuptools-33.1.1.zip`. Prediction diff export now
+  includes untracked text/source files but excludes untracked generated
+  archives and binary files; predictions were regenerated from the retained
+  exact-commit work trees.
+- The run also exposed two follow-ups: per-repository memory still defaults to
+  `~/.repopilot` instead of `REPOPILOT_HOME`, and plan/reflect self-loops need a
+  tighter independent no-progress bound. Neither changed inference results.

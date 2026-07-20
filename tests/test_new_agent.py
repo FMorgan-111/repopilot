@@ -133,6 +133,37 @@ def test_agent_payload_exports_untracked_files(tmp_path):
     assert "+enabled = True" in payload["model_patch"]
 
 
+def test_agent_payload_excludes_untracked_generated_archives(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "new_file.py").write_text("enabled = True\n", encoding="utf-8")
+    (tmp_path / "setuptools-33.1.1.zip").write_bytes(b"PK\x03\x04\x00generated")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert "new_file.py" in payload["model_patch"]
+    assert "setuptools-33.1.1.zip" not in payload["model_patch"]
+
+
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
     visited = []
 
