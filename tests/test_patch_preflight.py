@@ -5,6 +5,64 @@ from src import new_agent
 from src.patch_repair import repair_unified_diff
 
 
+async def test_execute_fix_prepares_environment_for_precloned_benchmark_repo(
+    monkeypatch, tmp_path
+):
+    source = tmp_path / "src" / "auth.py"
+    source.parent.mkdir()
+    source.write_text("enabled = False\n", encoding="utf-8")
+    calls = []
+
+    def fake_create_venv(repo_path):
+        calls.append(("venv", repo_path))
+        return {"python": "/tmp/benchmark-venv/bin/python", "reason": "created"}
+
+    def fake_install(repo_path, python_exe):
+        calls.append(("install", repo_path, python_exe))
+        return {"attempted": True, "success": True}
+
+    def fake_ensure(python_exe):
+        calls.append(("pytest", python_exe))
+        return {"available": True}
+
+    async def fake_run_pytest(repo_path, command=None):
+        return {
+            "command": command or "pytest -q",
+            "returncode": 0,
+            "stdout": "",
+            "stderr": "",
+            "success": True,
+        }
+
+    monkeypatch.setattr(execute_node, "_create_venv", fake_create_venv)
+    monkeypatch.setattr(execute_node, "_pip_install_editable", fake_install)
+    monkeypatch.setattr(execute_node, "_ensure_pytest_available", fake_ensure)
+    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        repo_path=str(tmp_path),
+        repo_ref="a" * 40,
+        patch_edits=[
+            new_agent.PatchEdit(
+                file_path="src/auth.py",
+                search="enabled = False\n",
+                replace="enabled = True\n",
+            )
+        ],
+    )
+
+    result = await execute_node.execute_fix(state)
+
+    assert result.fix_attempts[-1].success is True
+    assert calls == [
+        ("venv", str(tmp_path)),
+        ("install", str(tmp_path), "/tmp/benchmark-venv/bin/python"),
+        ("pytest", "/tmp/benchmark-venv/bin/python"),
+    ]
+
+
 async def test_execute_fix_applies_search_replace_patch_edits_without_git_apply(
     monkeypatch, tmp_path
 ):

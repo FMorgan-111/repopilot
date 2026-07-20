@@ -684,10 +684,12 @@ async def test_worktree_is_healthy_false_when_head_ok_but_no_files(monkeypatch, 
     assert await execute_node._worktree_is_healthy(str(work)) is False
 
 
-async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_path):
+async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tmp_path):
     repopilot_home = tmp_path / ".repopilot"
     cache_path = repopilot_home / "repos" / "acme-widget"
+    work_path = repopilot_home / "repos" / "acme-widget-work"
     (cache_path / ".git").mkdir(parents=True)
+    (work_path / ".git").mkdir(parents=True)
     monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
     commands = []
 
@@ -708,19 +710,80 @@ async def test_git_clone_uses_cached_repo_without_remote_clone(monkeypatch, tmp_
 
     repo_path = await execute_node.git_clone(state)
 
-    assert commands == [
-        [
-            "git",
-            "clone",
-            "--local",
-            "--no-hardlinks",
-            str(cache_path),
-            repo_path,
-        ]
-    ]
-    assert all(
-        "github.com" not in part for command in commands for part in command
+    assert ["git", "-C", str(cache_path), "fetch", "--prune", "origin"] in commands
+    assert [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ] in commands
+    assert [
+        "git",
+        "-C",
+        str(work_path),
+        "reset",
+        "--hard",
+        "HEAD",
+    ] not in commands
+
+
+async def test_git_clone_fetches_exact_ref_into_commit_keyed_cache(
+    monkeypatch, tmp_path
+):
+    repopilot_home = tmp_path / ".repopilot"
+    repo_ref = "a" * 40
+    cache_path = repopilot_home / "repos" / f"acme-widget-{repo_ref}"
+    work_path = repopilot_home / "repos" / f"acme-widget-{repo_ref}-work"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    commands = []
+
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        if args[:2] == ["git", "init"]:
+            (cache_path / ".git").mkdir(parents=True)
+        if args[:4] == ["git", "clone", "--local", "--no-hardlinks"]:
+            (work_path / ".git").mkdir(parents=True)
+        return execute_node._ProcResult(0, "", "")
+
+    async def healthy(_work):
+        return True
+
+    async def matching_head(_work):
+        return repo_ref
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
+    monkeypatch.setattr(execute_node, "_worktree_head", matching_head, raising=False)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        repo_ref=repo_ref,
     )
+
+    repo_path = await execute_node.git_clone(state)
+
+    assert repo_path == str(work_path)
+    assert [
+        "git",
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        repo_ref,
+    ] in commands
+    assert [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ] in commands
 
 
 async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_path):

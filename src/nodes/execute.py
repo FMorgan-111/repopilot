@@ -37,6 +37,7 @@ from ..state import (
 _TOKENIZED_GITHUB_URL_RE = re.compile(
     r"https://x-access-token:[^@\s'\"\]]+@github[.]com/"
 )
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -70,19 +71,46 @@ def _repopilot_home() -> Path:
     return Path.home() / ".repopilot"
 
 
-def _repo_cache_path(owner: str, repo: str) -> Path:
+def _repo_key(owner: str, repo: str, repo_ref: str = "") -> str:
     safe_owner = owner.replace("/", "-")
     safe_repo = repo.replace("/", "-")
-    return _repopilot_home() / "repos" / f"{safe_owner}-{safe_repo}"
+    base = f"{safe_owner}-{safe_repo}"
+    return f"{base}-{repo_ref}" if repo_ref else base
 
 
-def _repo_work_path(owner: str, repo: str) -> Path:
+def _repo_cache_path(owner: str, repo: str, repo_ref: str = "") -> Path:
+    return _repopilot_home() / "repos" / _repo_key(owner, repo, repo_ref)
+
+
+def _repo_work_path(owner: str, repo: str, repo_ref: str = "") -> Path:
     """Stable per-repo work tree, reused across samples of the same repo so the
     sibling venv and editable install survive instead of being rebuilt each time.
     """
-    safe_owner = owner.replace("/", "-")
-    safe_repo = repo.replace("/", "-")
-    return _repopilot_home() / "repos" / f"{safe_owner}-{safe_repo}-work"
+    return _repopilot_home() / "repos" / f"{_repo_key(owner, repo, repo_ref)}-work"
+
+
+def _validated_repo_ref(state: AgentState) -> str:
+    if not state.repo_ref:
+        return ""
+    if not _COMMIT_RE.fullmatch(state.repo_ref):
+        raise ValueError("repo_ref must be a 40-character hexadecimal Git commit")
+    return state.repo_ref.lower()
+
+
+def _repo_cache_event(
+    event: str, state: AgentState, **details: object
+) -> None:
+    payload = {
+        "event": event,
+        "repo": f"{state.owner}/{state.repo}",
+        "ref": state.repo_ref[:12] if state.repo_ref else "latest",
+        **details,
+    }
+    print(
+        f"[repo-cache] {json.dumps(payload, sort_keys=True)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _repo_url(state: AgentState, *, include_token: bool) -> str:
@@ -170,6 +198,13 @@ async def _worktree_is_healthy(work: str) -> bool:
     return listed.returncode == 0 and bool(listed.stdout.strip())
 
 
+async def _worktree_head(work: str) -> str:
+    result = await _run_git_async(
+        ["git", "-C", work, "rev-parse", "HEAD"], timeout=30
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
 async def _reset_work_tree_async(work: str) -> None:
     """Restore a reused work tree to pristine HEAD, dropping a prior sample's
     applied patch. ``clean -fd`` (no ``-x``) keeps git-ignored build artifacts
@@ -181,84 +216,226 @@ async def _reset_work_tree_async(work: str) -> None:
         await _run_git_async(args, timeout=120)
 
 
-async def git_clone(state: AgentState) -> str:
-    """Clone the target repo, reusing a per-repo work tree across samples.
+async def _checked_git(args: list[str], timeout: float) -> _ProcResult:
+    result = await _run_git_async(args, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(
+            _redact_sensitive_error_text((result.stderr or result.stdout).strip())
+        )
+    return result
 
-    - Reuse an existing work tree by resetting it to pristine HEAD — this skips
-      a re-clone AND lets the sibling venv / editable install be reused.
-    - Otherwise local-clone from the git-objects cache under
-      ``repos/<owner-repo>`` (the network clone happens once); download to that
-      cache on first sight.
 
-    Initial-download fallbacks (best → fallback):
-    1. --depth 1 --single-branch  (fast, blobful so it can serve --local)
-    2. --depth 1  (shallow, all branches)
-    3. full clone  (no flags)
+async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
+    tokenized_url = _repo_url(state, include_token=True)
+    safe_url = _repo_url(state, include_token=False)
+    await _checked_git(
+        [
+            "git",
+            "-C",
+            str(cache_path),
+            "remote",
+            "set-url",
+            "origin",
+            tokenized_url,
+        ],
+        60,
+    )
+    try:
+        await _checked_git(
+            ["git", "-C", str(cache_path), "fetch", "--prune", "origin"],
+            300,
+        )
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "remote",
+                "set-head",
+                "origin",
+                "-a",
+            ],
+            60,
+        )
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "reset",
+                "--hard",
+                "refs/remotes/origin/HEAD",
+            ],
+            60,
+        )
+    finally:
+        await _run_git_async(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "remote",
+                "set-url",
+                "origin",
+                safe_url,
+            ],
+            timeout=60,
+        )
 
-    All git subprocesses run async (``_run_git_async``) so a hung clone is
-    killable by its own timeout and by the execute_fix phase timeout.
-    """
+
+async def _populate_ref_cache(
+    state: AgentState, cache_path: Path, repo_ref: str
+) -> None:
+    await _checked_git(["git", "init", str(cache_path)], 60)
+    await _checked_git(
+        [
+            "git",
+            "-C",
+            str(cache_path),
+            "remote",
+            "add",
+            "origin",
+            _repo_url(state, include_token=True),
+        ],
+        60,
+    )
+    try:
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                repo_ref,
+            ],
+            300,
+        )
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "checkout",
+                "--detach",
+                "FETCH_HEAD",
+            ],
+            60,
+        )
+    finally:
+        await _run_git_async(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "remote",
+                "set-url",
+                "origin",
+                _repo_url(state, include_token=False),
+            ],
+            timeout=60,
+        )
+
+
+async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
     repo_url = _repo_url(state, include_token=True)
     safe_repo_url = _repo_url(state, include_token=False)
-    cache_path = _repo_cache_path(state.owner, state.repo)
-    work = str(_repo_work_path(state.owner, state.repo))
-
-    # Reuse an existing work tree ONLY if it is healthy (resolves HEAD, has
-    # files). A broken/empty reuse is what made every patch fail with "target
-    # file was not found" for whole repos. Discard an unhealthy tree and rebuild.
-    if (Path(work) / ".git").exists():
-        if await _worktree_is_healthy(work):
-            await _reset_work_tree_async(work)
-            return work
-        shutil.rmtree(work, ignore_errors=True)
-
-    # Git objects already cached: fast local clone into the work tree.
-    if (cache_path / ".git").exists():
-        try:
-            await _clone_local_repo_async(cache_path, work)
-            return work
-        except (subprocess.CalledProcessError, asyncio.TimeoutError):
-            # Corrupt/partial/empty cache (e.g. an older blobless clone that
-            # cannot serve a local work tree, or one that checks out nothing).
-            # Discard it and re-download from scratch.
-            shutil.rmtree(cache_path, ignore_errors=True)
-            shutil.rmtree(work, ignore_errors=True)
-
     strategies = [
-        # NB: no --filter=blob:none — a blobless cache cannot serve a `git clone
-        # --local` work tree (its blobs are missing and lazy-fetch is disabled),
-        # which fails with "could not fetch ... from promisor remote".
         ["git", "clone", "--depth", "1", "--single-branch", repo_url, str(cache_path)],
         ["git", "clone", "--depth", "1", repo_url, str(cache_path)],
         ["git", "clone", repo_url, str(cache_path)],
     ]
-
     last_error = ""
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    for cmd in strategies:
+    for command in strategies:
         try:
-            # 300s per strategy; async so the execute_fix phase timeout can also
-            # cancel a hung clone (a blocking subprocess.run could not be).
-            result = await _run_git_async(cmd, timeout=300)
+            result = await _run_git_async(command, timeout=300)
         except asyncio.TimeoutError:
-            last_error = f"clone timed out: {' '.join(cmd[:4])}..."
-            if cache_path.exists():
-                shutil.rmtree(cache_path, ignore_errors=True)
+            last_error = f"clone timed out: {' '.join(command[:4])}..."
+            shutil.rmtree(cache_path, ignore_errors=True)
             continue
         if result.returncode == 0:
             await _run_git_async(
-                ["git", "-C", str(cache_path), "remote", "set-url", "origin", safe_repo_url],
+                [
+                    "git",
+                    "-C",
+                    str(cache_path),
+                    "remote",
+                    "set-url",
+                    "origin",
+                    safe_repo_url,
+                ],
                 timeout=60,
             )
-            await _clone_local_repo_async(cache_path, work)
-            return work
+            return
         last_error = _redact_sensitive_error_text(
             (result.stderr or result.stdout).strip()
         )
-
-    if cache_path.exists():
         shutil.rmtree(cache_path, ignore_errors=True)
     raise RuntimeError(last_error)
+
+
+async def git_clone(state: AgentState) -> str:
+    """Prepare a fresh live checkout or an immutable benchmark checkout."""
+    repo_ref = _validated_repo_ref(state)
+    cache_path = _repo_cache_path(state.owner, state.repo, repo_ref)
+    work = str(_repo_work_path(state.owner, state.repo, repo_ref))
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if repo_ref and (Path(work) / ".git").exists():
+        if (
+            await _worktree_is_healthy(work)
+            and await _worktree_head(work) == repo_ref
+        ):
+            _repo_cache_event("worktree_hit", state)
+            await _reset_work_tree_async(work)
+            return work
+        _repo_cache_event("ref_mismatch", state, target="worktree")
+        shutil.rmtree(work, ignore_errors=True)
+
+    if repo_ref and (cache_path / ".git").exists():
+        if (
+            await _worktree_is_healthy(str(cache_path))
+            and await _worktree_head(str(cache_path)) == repo_ref
+        ):
+            _repo_cache_event("object_hit", state)
+        else:
+            _repo_cache_event("ref_mismatch", state, target="object_cache")
+            shutil.rmtree(cache_path, ignore_errors=True)
+
+    if repo_ref and not (cache_path / ".git").exists():
+        _repo_cache_event("remote_fetch", state)
+        try:
+            await _populate_ref_cache(state, cache_path, repo_ref)
+        except Exception:
+            shutil.rmtree(cache_path, ignore_errors=True)
+            raise
+
+    if not repo_ref:
+        if (cache_path / ".git").exists():
+            _repo_cache_event("object_hit", state)
+            await _refresh_live_cache(state, cache_path)
+        else:
+            _repo_cache_event("remote_fetch", state)
+            await _populate_live_cache(state, cache_path)
+
+    shutil.rmtree(work, ignore_errors=True)
+    try:
+        await _clone_local_repo_async(cache_path, work)
+        if repo_ref and await _worktree_head(work) != repo_ref:
+            raise RuntimeError("local benchmark clone did not resolve requested repo_ref")
+        return work
+    except (subprocess.CalledProcessError, asyncio.TimeoutError):
+        _repo_cache_event("rebuild", state)
+        shutil.rmtree(cache_path, ignore_errors=True)
+        shutil.rmtree(work, ignore_errors=True)
+        if repo_ref:
+            await _populate_ref_cache(state, cache_path, repo_ref)
+        else:
+            await _populate_live_cache(state, cache_path)
+        await _clone_local_repo_async(cache_path, work)
+        return work
 
 
 def _git_apply_check(repo_path: str, patch_content: str) -> subprocess.CompletedProcess:
@@ -740,6 +917,7 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         ),
     )
     try:
+        cloned_during_execute = False
         if not state.repo_path:
             try:
                 state.repo_path = await git_clone(state)
@@ -751,6 +929,8 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 state.fix_attempts.append(attempt)
                 state.current_phase = Phase.VERIFY
                 return state
+            cloned_during_execute = True
+        if cloned_during_execute or state.repo_ref:
             # Build an isolated venv once, right after the fresh clone, then do
             # a best-effort editable install into it so the package and its test
             # deps import when pytest runs. The venv sidesteps PEP 668 on
