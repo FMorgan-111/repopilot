@@ -120,3 +120,55 @@ async def test_read_file_http_error(httpx_mock):
 
     with pytest.raises(httpx.HTTPStatusError):
         await read_file("acme", "widget", "missing.py")
+
+
+async def test_read_issue_uses_stale_cache_for_github_503(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    cache_globals = read_issue.__globals__
+    monkeypatch.setitem(cache_globals, "CACHE_TTL", 10)
+    monkeypatch.setitem(cache_globals, "CACHE_STALE_TTL", 100)
+    now = {"value": 0.0}
+    monkeypatch.setattr(cache_globals["time"], "time", lambda: now["value"])
+    cached_issue = {
+        "title": "Cached title",
+        "body": "Cached body",
+        "state": "open",
+        "labels": ["bug"],
+        "number": 42,
+    }
+    key = cache_globals["_cache_key"]("read_issue", "acme", "widget", 42)
+    cache_globals["_save"](key, cached_issue)
+    now["value"] = 20.0
+
+    async def unavailable(*args, **kwargs):
+        request = httpx.Request("GET", args[1])
+        response = httpx.Response(503, request=request)
+        raise httpx.HTTPStatusError("503", request=request, response=response)
+
+    monkeypatch.setattr("src.tools.github_request", unavailable)
+
+    assert await read_issue("acme", "widget", 42) == cached_issue
+
+
+async def test_read_issue_does_not_use_stale_cache_for_github_404(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    cache_globals = read_issue.__globals__
+    monkeypatch.setitem(cache_globals, "CACHE_TTL", 10)
+    monkeypatch.setitem(cache_globals, "CACHE_STALE_TTL", 100)
+    now = {"value": 0.0}
+    monkeypatch.setattr(cache_globals["time"], "time", lambda: now["value"])
+    key = cache_globals["_cache_key"]("read_issue", "acme", "widget", 404)
+    cache_globals["_save"](key, {"title": "Wrong repository"})
+    now["value"] = 20.0
+
+    async def missing(*args, **kwargs):
+        request = httpx.Request("GET", args[1])
+        response = httpx.Response(404, request=request)
+        raise httpx.HTTPStatusError("404", request=request, response=response)
+
+    monkeypatch.setattr("src.tools.github_request", missing)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await read_issue("acme", "widget", 404)

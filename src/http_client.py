@@ -97,12 +97,15 @@ def llm_retry_budget_seconds() -> float:
     return LLM_CALL_WALLCLOCK_TIMEOUT + LLM_RETRY_BACKOFF_MAX_SECONDS
 
 
-def _is_retryable_github(exc: BaseException) -> bool:
+def is_retryable_github_error(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_GITHUB_STATUS
     return False
+
+
+_is_retryable_github = is_retryable_github_error
 
 
 def _is_retryable_llm(exc: BaseException) -> bool:

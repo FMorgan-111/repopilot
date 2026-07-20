@@ -17,6 +17,7 @@ from src.http_client import (
     LLMResponseError,
     _get_llm_model,
     _is_retryable_github,
+    is_retryable_github_error,
     _is_retryable_llm,
     _reset_llm_client,
     github_request,
@@ -162,6 +163,19 @@ def test_is_retryable_github_non_retryable_status():
 
 def test_is_retryable_github_value_error():
     assert _is_retryable_github(ValueError("not http")) is False
+
+
+def test_github_retry_predicate_distinguishes_503_and_404():
+    request = httpx.Request("GET", "https://api.github.com/repos/acme/widget")
+    transient = httpx.HTTPStatusError(
+        "503", request=request, response=httpx.Response(503, request=request)
+    )
+    missing = httpx.HTTPStatusError(
+        "404", request=request, response=httpx.Response(404, request=request)
+    )
+
+    assert is_retryable_github_error(transient) is True
+    assert is_retryable_github_error(missing) is False
 
 
 def test_is_retryable_llm_retryable_status():
