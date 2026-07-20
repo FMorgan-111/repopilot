@@ -4,7 +4,6 @@ from pathlib import Path
 
 from eval import report
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -199,7 +198,7 @@ def test_generate_markdown_surfaces_plan_fix_phase_timeout():
     assert "plan_fix exceeded 150.0s" in markdown
 
 
-def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
+def test_agent_v2_metrics_and_reports_separate_evaluation_modes(capsys):
     legacy = agent_v2_result()
     legacy.update(
         {
@@ -256,6 +255,8 @@ def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
 
     metrics = report.compute_metrics(results)
     markdown = report.generate_markdown(results, metrics)
+    report.print_summary(metrics)
+    terminal = capsys.readouterr().out
 
     by_mode = metrics["agent_v2"]["by_evaluation_mode"]
     assert by_mode["end_to_end"] == {
@@ -282,3 +283,15 @@ def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
     assert "agent_v2_success_rate" not in markdown
     assert "agent_v2_combined_all_modes_resolved_rate" in markdown
     assert "| Sample ID | Evaluation Mode | Run ID |" in markdown
+    assert "agent_v2 all modes combined: 2/4 resolved (50.0%)" in terminal
+    assert (
+        "agent_v2 end_to_end: samples=2 | models=a-model, z-model | "
+        "commits=commit-1, commit-2 | resolved=1/2 (50.0%) | "
+        "decisive taxonomy=resolved: 1; test_failed: 1"
+    ) in terminal
+    assert (
+        "agent_v2 oracle_files: samples=2 | models=oracle-a, oracle-b | "
+        "commits=oracle-1, oracle-2 | resolved=1/2 (50.0%) | "
+        "decisive taxonomy=resolved: 1; wrong_file_path: 1"
+    ) in terminal
+    assert "agent_v2:     2/4 success" not in terminal

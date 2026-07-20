@@ -216,3 +216,83 @@ tested sqlite-vec-to-NumPy fallback warning.
   demonstrates the required NumPy fallback path rather than a failure.
 - The worktree has a pre-existing untracked `.venv` link; it was not modified or
   committed.
+
+## Re-review Follow-up (2026-07-20)
+
+Two additional Important findings from the final re-review were addressed.
+
+### Exact CI import-order failure
+
+Implementation:
+
+- Removed the extra blank line between the first-party import and module
+  constant in `tests/test_eval_report.py`, matching Ruff/isort's exact expected
+  import-block layout.
+
+Evidence:
+
+- RED: `.venv/bin/python -m ruff check src/ tests/ eval/ --select=E,F,I --ignore=E501`
+  reported one `I001` at `tests/test_eval_report.py:1` and exited 1.
+- GREEN: the exact same CI command reported `All checks passed!` and exited 0.
+
+### Ambiguous terminal summary for mixed evaluation modes
+
+Implementation:
+
+- Extended the existing mixed-mode report test to capture terminal output.
+- Replaced the generic combined terminal line with an explicitly labeled
+  `all modes combined` resolved rate.
+- Added one terminal line for each non-empty mode containing the mode name,
+  sample count, sorted models, sorted commits, resolved count/rate, and decisive
+  failure taxonomy together.
+- Terminal presentation consumes the existing `by_evaluation_mode` metrics and
+  shares taxonomy formatting with Markdown; it does not reclassify samples.
+
+TDD evidence:
+
+- RED: `.venv/bin/python -m pytest tests/test_eval_report.py::test_agent_v2_metrics_and_reports_separate_evaluation_modes -q`
+  failed (`1 failed`) because output still contained the generic
+  `agent_v2: 2/4 success` line and no per-mode terminal summaries.
+- GREEN: the same focused test passed (`1 passed in 0.02s`).
+- Covering suite: `.venv/bin/python -m pytest tests/test_eval_report.py -q`
+  passed (`5 passed in 0.04s`).
+
+### Re-review final verification
+
+```text
+.venv/bin/python -m pytest tests/ -q
+421 passed, 1 skipped, 1 warning in 1.64s
+
+.venv/bin/python -m ruff check src/ tests/ eval/ --select=E,F,I --ignore=E501
+All checks passed!
+
+git diff --check
+exit 0, no output
+```
+
+The skip and warning are the same expected sqlite-vec environment behavior
+documented above.
+
+Files changed in this follow-up:
+
+- `eval/report.py`
+- `tests/test_eval_report.py`
+- `.superpowers/sdd/final-review-fix-report.md`
+
+Follow-up self-review:
+
+- Confirmed the combined terminal rate is explicitly labeled as spanning all
+  modes.
+- Confirmed empty modes are omitted and both populated modes print all required
+  provenance/performance/taxonomy fields on a single line.
+- Confirmed model and commit ordering comes from the already-sorted metric
+  fields.
+- Confirmed terminal rendering reuses computed failure taxonomy and does not
+  duplicate classification logic.
+- Confirmed the exact CI Ruff command, not the narrower default Ruff selection,
+  is clean.
+
+Follow-up concerns:
+
+- No new functional concerns.
+- The pre-existing untracked `.venv` link remains untouched.

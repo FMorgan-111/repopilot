@@ -242,11 +242,9 @@ def _append_evaluation_mode_summary(
             continue
         models = _markdown_table_cell(", ".join(mode_metrics["models"]) or "none")
         commits = _markdown_table_cell(", ".join(mode_metrics["commits"]) or "none")
-        taxonomy = "; ".join(
-            f"{category}: {count}"
-            for category, count in mode_metrics["failure_taxonomy"].items()
+        taxonomy = _markdown_table_cell(
+            _format_failure_taxonomy(mode_metrics["failure_taxonomy"])
         )
-        taxonomy = _markdown_table_cell(taxonomy or "none")
         lines.append(
             f"| {mode} | {samples} | {models} | {commits} "
             f"| {mode_metrics['successes']}/{samples} "
@@ -276,6 +274,12 @@ def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) ->
             f"| {result.get('token_used', 0)} "
             f"| {error} |\n"
         )
+
+
+def _format_failure_taxonomy(taxonomy: dict[str, int]) -> str:
+    return "; ".join(
+        f"{category}: {count}" for category, count in taxonomy.items()
+    ) or "none"
 
 
 def _append_replay_diagnostics(
@@ -406,8 +410,28 @@ def print_summary(metrics: dict) -> None:
     print(f"total tokens: {c['total_input_tokens']:,} in / {c['total_output_tokens']:,} out")
     agent_v2 = metrics.get("agent_v2", {})
     if agent_v2.get("samples"):
-        print(f"agent_v2:     {agent_v2['successes']}/{agent_v2['samples']} success")
+        print(
+            "agent_v2 all modes combined: "
+            f"{agent_v2['successes']}/{agent_v2['samples']} resolved "
+            f"({agent_v2['success_rate']:.1%})"
+        )
         print(f"agent_v2 wait:{agent_v2['waiting_for_user']}")
+        for mode, mode_metrics in agent_v2["by_evaluation_mode"].items():
+            samples = mode_metrics["samples"]
+            if not samples:
+                continue
+            models = ", ".join(mode_metrics["models"]) or "none"
+            commits = ", ".join(mode_metrics["commits"]) or "none"
+            taxonomy = _format_failure_taxonomy(
+                mode_metrics["failure_taxonomy"]
+            )
+            print(
+                f"agent_v2 {mode}: samples={samples} | models={models} | "
+                f"commits={commits} | "
+                f"resolved={mode_metrics['successes']}/{samples} "
+                f"({mode_metrics['resolved_rate']:.1%}) | "
+                f"decisive taxonomy={taxonomy}"
+            )
     print(f"{'='*60}")
 
 
