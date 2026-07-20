@@ -6,6 +6,7 @@ __pycache__/
 build/
 dist/
 .worktrees/
+.superpowers/
 
 # Regenerable eval outputs (run `python eval/harness.py` to recreate)
 eval/eval_results.json
