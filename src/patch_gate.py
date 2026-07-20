@@ -707,6 +707,7 @@ class _TransactionTarget:
     before: bytes | None
     after: bytes
     mode: int
+    ancestor_identities: tuple[tuple[int, int, int], ...]
     target_fd: int | None = None
     stage: str = ""
     backup: str = ""
@@ -731,15 +732,20 @@ def _same_identity(expected: os.stat_result, current: os.stat_result) -> bool:
     )
 
 
+def _directory_identity(info: os.stat_result) -> tuple[int, int, int]:
+    return info.st_dev, info.st_ino, info.st_mode
+
+
 def _open_parent_chain(
     root_fd: int,
     path: str,
     all_fds: list[int],
     created: list[tuple[int, str]],
-) -> tuple[int, str]:
+) -> tuple[int, str, tuple[tuple[int, int, int], ...]]:
     parts = path.split("/")
     current = os.dup(root_fd)
     all_fds.append(current)
+    identities = [_directory_identity(os.fstat(current))]
     flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
     for component in parts[:-1]:
         try:
@@ -750,7 +756,36 @@ def _open_parent_chain(
             child = os.open(component, flags, dir_fd=current)
         all_fds.append(child)
         current = child
-    return current, parts[-1]
+        identities.append(_directory_identity(os.fstat(current)))
+    return current, parts[-1], tuple(identities)
+
+
+def _verify_current_namespace(
+    root: Path,
+    path: str,
+    expected: tuple[tuple[int, int, int], ...],
+) -> None:
+    """Re-anchor held dirfds to the repository's current path namespace."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    opened: list[int] = []
+    try:
+        current = os.open(root, flags)
+        opened.append(current)
+        identities = [_directory_identity(os.fstat(current))]
+        for component in path.split("/")[:-1]:
+            current = os.open(component, flags, dir_fd=current)
+            opened.append(current)
+            identities.append(_directory_identity(os.fstat(current)))
+    except OSError as exc:
+        raise ValueError("PatchGate ancestor namespace is no longer reachable") from exc
+    finally:
+        for fd in reversed(opened):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    if tuple(identities) != expected:
+        raise ValueError("PatchGate ancestor namespace identity changed")
 
 
 def _unlink_if_present(name: str, parent_fd: int) -> None:
@@ -770,7 +805,7 @@ def apply_approved_patch(state: AgentState) -> list[str]:
     targets: list[_TransactionTarget] = []
     try:
         for path in sorted(snapshot.after):
-            parent_fd, leaf = _open_parent_chain(
+            parent_fd, leaf, ancestor_identities = _open_parent_chain(
                 root_fd, path, all_fds, created_dirs
             )
             before = snapshot.before[path]
@@ -781,7 +816,10 @@ def apply_approved_patch(state: AgentState) -> list[str]:
                 before=before,
                 after=snapshot.after[path],
                 mode=0o755 if snapshot.modes[path] == "100755" else 0o644,
+                ancestor_identities=ancestor_identities,
             )
+            target.stage = f".repopilot-stage-{uuid.uuid4().hex}"
+            targets.append(target)
             if before is None:
                 try:
                     os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
@@ -799,23 +837,32 @@ def apply_approved_patch(state: AgentState) -> list[str]:
                 info = os.fstat(target.target_fd)
                 if not stat.S_ISREG(info.st_mode) or _read_fd(target.target_fd) != before:
                     raise ValueError("PatchGate target preimage changed before staging")
-            target.stage = f".repopilot-stage-{uuid.uuid4().hex}"
-            stage_fd = os.open(
-                target.stage,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                target.mode,
-                dir_fd=parent_fd,
-            )
+            staged = False
             try:
-                view = memoryview(target.after)
-                while view:
-                    written = os.write(stage_fd, view)
-                    view = view[written:]
-                os.fchmod(stage_fd, target.mode)
-                os.fsync(stage_fd)
+                stage_fd = os.open(
+                    target.stage,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    target.mode,
+                    dir_fd=parent_fd,
+                )
+                try:
+                    view = memoryview(target.after)
+                    while view:
+                        written = os.write(stage_fd, view)
+                        if written <= 0:
+                            raise OSError("PatchGate stage write made no progress")
+                        view = view[written:]
+                    os.fchmod(stage_fd, target.mode)
+                    os.fsync(stage_fd)
+                finally:
+                    os.close(stage_fd)
+                staged = True
             finally:
-                os.close(stage_fd)
-            targets.append(target)
+                if not staged:
+                    _unlink_if_present(target.stage, target.parent_fd)
 
         # Freeze recoverable backups and validate identities before any target write.
         for target in targets:
@@ -853,6 +900,11 @@ def apply_approved_patch(state: AgentState) -> list[str]:
 
         try:
             for target in targets:
+                _verify_current_namespace(
+                    snapshot.root,
+                    target.path,
+                    target.ancestor_identities,
+                )
                 if target.before is None:
                     try:
                         os.stat(
@@ -907,6 +959,11 @@ def apply_approved_patch(state: AgentState) -> list[str]:
                         raise OSError("PatchGate final write verification failed")
                 finally:
                     os.close(live_fd)
+                _verify_current_namespace(
+                    snapshot.root,
+                    target.path,
+                    target.ancestor_identities,
+                )
         except Exception as original:
             rollback_errors: list[str] = []
             for target in reversed(targets):

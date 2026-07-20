@@ -443,3 +443,84 @@ def test_approved_new_file_failure_rolls_back_prior_existing_write(tmp_path, mon
 
     assert (root / "a.py").read_bytes() == source
     assert not (root / "tests/test_new.py").exists()
+
+
+def test_partial_stage_write_failure_removes_stage_and_created_directories(
+    tmp_path, monkeypatch
+):
+    root, ref = _repo(tmp_path, {"a.py": "value = 1\n"})
+    plan = _plan("generated/deep/test_new.py")
+    state = _state(root, ref, plan)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                _edit(
+                    "generated/deep/test_new.py",
+                    replace="def test_new():\n    assert True\n",
+                )
+            ]
+        ),
+    ).accepted
+    actual_write = __import__("os").write
+    calls = 0
+
+    def partial_then_fail(fd, data):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return actual_write(fd, data[:4])
+        raise OSError("injected partial stage write")
+
+    monkeypatch.setattr("src.patch_gate.os.write", partial_then_fail)
+    with pytest.raises(OSError, match="partial stage"):
+        apply_approved_patch(state)
+
+    assert not (root / "generated").exists()
+    assert not list(root.rglob(".repopilot-stage-*"))
+    assert (root / "a.py").read_text() == "value = 1\n"
+
+
+def test_ancestor_namespace_drift_after_precommit_check_rolls_back_detached_write(
+    tmp_path, monkeypatch
+):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"src/a.py": source.decode()})
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "a.py").write_text("outside = 1\n")
+    plan = _plan("src/a.py")
+    state = _state(root, ref, plan)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                _edit(
+                    "src/a.py",
+                    search="value = 1",
+                    replace="value = 2",
+                    before=source,
+                )
+            ]
+        ),
+    ).accepted
+    actual_replace = __import__("os").replace
+    attacked = False
+
+    def drift_namespace_then_replace(src, dst, *args, **kwargs):
+        nonlocal attacked
+        if dst == "a.py" and not attacked:
+            attacked = True
+            (root / "src").rename(root / "moved-src")
+            (root / "src").symlink_to(outside, target_is_directory=True)
+        return actual_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("src.patch_gate.os.replace", drift_namespace_then_replace)
+    with pytest.raises(ValueError, match="namespace|ancestor|identity"):
+        apply_approved_patch(state)
+
+    assert (outside / "a.py").read_text() == "outside = 1\n"
+    assert (root / "moved-src/a.py").read_bytes() == source
+    assert not list((root / "moved-src").rglob(".repopilot-*"))
