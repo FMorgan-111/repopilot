@@ -45,6 +45,11 @@ precision rather than repository access.
    official evaluator boundaries.
 8. Gold patches, test patches, `FAIL_TO_PASS`, and `PASS_TO_PASS` never enter
    model prompts.
+9. Every completed PLAN-to-REFLECT failure loop produces a rolling, bounded
+   outcome summary for the next PLAN prompt.
+10. A code fix is not successful until an existing or generated test proves
+    the behavioral difference between the base commit and the fixed checkout.
+    Failure to generate such a test after two attempts terminates the task.
 
 ## Alternatives Considered
 
@@ -68,6 +73,20 @@ This is flexible but permits repeated searches, arbitrary commands, uncontrolled
 cost, and difficult-to-debug loops. RepoPilot will instead use constrained
 autonomy: model-selected evidence intent behind a deterministic ToolPolicy.
 
+### Full attempt history in every PLAN prompt
+
+This preserves detail but grows on every retry and repeatedly spends context on
+failed edits. The selected design retains full structured history for replay
+while injecting one rolling 200-character outcome summary into PLAN.
+
+### Static or mixed coverage detection
+
+Static symbol references are fast but do not prove that a test observes the
+reported behavior. A mixed static/dynamic gate reduces execution cost, but the
+static prefilter can miss indirect tests and adds a second definition of
+coverage. The selected design uses dynamic differential behavior only: the same
+targeted test must pass on the fix and fail by assertion on the exact base code.
+
 ## Architecture
 
 The graph keeps the existing high-level phases. Four bounded components are
@@ -86,6 +105,17 @@ ToolRouter <------ ToolIntent from active model
       |
       v
 RepairPlan --> ContextBuilder --> VerifiedEdit --> PatchGate --> EXECUTE
+     ^                                                        |
+     |                                                        v
+OutcomeSummarizer <-- REFLECT <-- failed test <-- VERIFY <-- applied patch
+                                                               |
+                                                               v passed
+                                                        CoverageGate
+                                                               |
+                                    existing proof or generated verified test
+                                                               |
+                                                               v
+                                                        COMMIT / DONE
 ```
 
 Each component has one responsibility:
@@ -96,6 +126,12 @@ Each component has one responsibility:
 - `EvidenceStore`: deduplicated, bounded evidence referenced by stable IDs.
 - `ContextBuilder`: exact symbol and code windows from the prepared checkout.
 - `PatchGate`: proves an edit is scoped and applicable before execution.
+- `OutcomeSummarizer`: rolls completed attempt outcomes into a 200-character
+  PLAN context without replacing structured trace history.
+- `CoverageGate`: proves that targeted tests distinguish base behavior from
+  fixed behavior.
+- `TestGenerator`: creates test-only edits when no existing test proves the
+  fix, then submits them to PatchGate and differential validation.
 
 ## State and Trace Model
 
@@ -112,6 +148,17 @@ last_test_failure_signature: str
 model_history: list[ModelInvocation]
 tool_history: list[ToolInvocation]
 evidence: list[Evidence]
+attempt_outcome_summary: str
+coverage_status: Literal[
+    "pending",
+    "existing_verified",
+    "generated_verified",
+    "failed",
+]
+coverage_test_files: list[str]
+coverage_test_command: str
+coverage_failure_reason: str
+test_generation_attempts: int
 ```
 
 `ModelInvocation` records model name, node, elapsed time, estimated input/output
@@ -131,6 +178,32 @@ Every escalation emits a trace event:
 ```
 
 Saved-run replay must restore the active model and escalation state exactly.
+It must also restore the rolling outcome summary, coverage decision, selected
+test command/files, coverage failure reason, and test-generation attempt count.
+
+## Rolling Attempt Outcome Summary
+
+Each failed repair cycle follows PLAN, EXECUTE, VERIFY, and REFLECT. At the end
+of REFLECT, `OutcomeSummarizer` receives only:
+
+- the previous rolling summary;
+- the current plan and applied edit signatures;
+- a bounded test-result summary; and
+- the new reflection conclusion.
+
+It calls Gemini with temperature zero and asks for a factual summary of at most
+200 Unicode characters. The result replaces `attempt_outcome_summary`; summaries
+do not accumulate as an unbounded list. The next PLAN prompt injects it under a
+single `Completed attempts` section. Full structured attempts, evidence, model
+history, and route history remain in state for trace and replay, but are not
+re-expanded into the PLAN prompt through this summary.
+
+Summary input and output pass through the same secret and evaluator-field
+redaction used by escalation packets. An empty, malformed, or overlong model
+result does not fail the repair. A deterministic local fallback composes the
+latest plan signature, patch outcome, test failure class, and reflection action,
+then truncates the result to 200 characters. Summary calls use the primary
+Gemini provider and do not consume the token budget reserved for Opus.
 
 ## Model Policy
 
@@ -305,6 +378,56 @@ another unchanged failure terminates the sample.
 RepoPilot's internal result remains `agent_success`. Official SWE-bench
 `resolved` and `unresolved` values come only from the official harness.
 
+## Dynamic Coverage Gate and Test Generation
+
+A successful VERIFY routes to a new COVERAGE phase before COMMIT or eval DONE.
+Internal `agent_success` now requires this phase to produce a differential test
+proof; merely passing the repository's existing tests is insufficient.
+
+`CoverageGate` derives changed production files and symbols from the final
+validated diff and locates related tests. It runs the same targeted test command
+against two isolated trees:
+
+1. the fixed checkout, which must pass twice; and
+2. a temporary checkout at the exact `state.repo_ref`, with the same candidate
+   test present, which must fail twice with the same test ID and a stable
+   assertion-failure fingerprint.
+
+The temporary base tree never receives the production fix. Test execution uses
+fixed argv approved by ToolPolicy and cannot contain shell metacharacters,
+environment assignments, network operations, absolute paths, or checkout
+mutations. Temporary trees are removed after validation. Import failures,
+dependency errors, interpreter failures, timeouts, and process crashes are
+`coverage_infra`; they never count as proof that the base behavior is wrong.
+
+If an existing test satisfies the differential condition, coverage becomes
+`existing_verified`. If the base also passes, no related test exists, or the
+failure is not attributable to a stable assertion, RepoPilot invokes
+`TestGenerator`.
+
+The generator receives an allowlisted packet containing the issue, changed
+symbols, exact source windows, the fixed behavior, candidate test conventions,
+and the coverage rejection reason. It returns structured test-only edits. The
+edits may touch only existing test roots or paths that match the repository's
+established test naming layout. They cannot alter production files, fixtures
+outside the approved test scope, generated artifacts, dependencies, CI, or test
+configuration. PatchGate validates the edit before it reaches the checkout.
+
+After application, the generated test must pass the same fixed/base two-run
+differential protocol and the affected fixed-checkout suite must remain green.
+There are at most two generation or correction attempts. The first uses the
+active model. If it is Gemini and the first test fails validation, ModelPolicy
+escalates the second attempt to Opus. If the sample is already on Opus, both
+attempts use Opus. If escalation is disabled or lacks credentials, the second
+attempt remains on the current model. A second failure sets
+`coverage_status="failed"`, classifies the task as `test_generation_failed`, and
+terminates without a PR or internal success.
+
+Once verified, a generated test remains in the worktree and final PR/prediction
+patch. Prediction serialization still includes only the official output fields
+and must not include the SWE-bench-provided test patch or any evaluator-only
+data.
+
 ## Secrets and Provider Configuration
 
 Configuration uses separate environment variables:
@@ -350,6 +473,15 @@ Implementation follows test-driven development. Required coverage includes:
 - independent Gemini and Opus clients, retry behavior, and sanitized errors;
 - Gemini failure followed by Opus repair and passing verification using mocked
   clients;
+- rolling summary replacement, the 200-character limit, deterministic fallback,
+  PLAN injection, and save/replay persistence;
+- fixed/base differential validation with stable assertion fingerprints;
+- existing-test acceptance, base-also-passes rejection, and coverage
+  infrastructure classification;
+- generated test path/scope enforcement and PatchGate validation;
+- Gemini test-generation failure followed by an Opus-generated valid test;
+- hard failure after two invalid test-generation attempts;
+- final PR/prediction patches retaining only verified generated tests;
 - infrastructure failures that do not consume model retries;
 - `RepoStore` honoring `REPOPILOT_HOME`; and
 - all existing tests remaining enabled.
@@ -365,9 +497,11 @@ Implementation order:
 5. add EscalationPacket;
 6. add RepairPlan, ContextBuilder, and VerifiedEdit;
 7. add PatchGate correction rounds;
-8. wire failure taxonomy, replay, and eval reporting;
-9. run a five-sample checkpoint; and
-10. rerun the deterministic ten-sample evaluation and official scoring when
+8. add rolling outcome summarization and PLAN injection;
+9. add the COVERAGE phase, differential runner, and test generation gate;
+10. wire failure taxonomy, replay, and eval reporting;
+11. run a five-sample checkpoint; and
+12. rerun the deterministic ten-sample evaluation and official scoring when
     Docker is available.
 
 The checkpoint uses the previous pytest success as a control plus xarray,
@@ -376,12 +510,18 @@ tool selection operate before spending a full ten-sample budget.
 
 ## Acceptance Criteria
 
-- The deterministic ten-sample internal success count reaches at least 4/10.
+- The deterministic ten-sample internal success count reaches at least 4/10,
+  and every counted success has a stable fixed/base differential test proof.
 - At least two of the four previous `search_not_found` samples are recovered.
 - The empty-Gemini-completion sample escalates rather than immediately failing.
 - No sample has more than two consecutive no-progress PLAN/REFLECT rounds.
+- Every completed failure loop leaves a secret-free summary of at most 200
+  characters, and the next PLAN receives exactly one rolling summary section.
+- A missing coverage proof triggers test generation; two failed generation
+  attempts terminate as `test_generation_failed` without a PR.
 - Predictions contain exactly the official output fields, contain no gold data
-  or credentials, and exclude generated artifacts.
+  or credentials, exclude generated artifacts, and retain only locally
+  generated tests that passed differential validation.
 - Every model/tool decision is replayable from safe structured trace records.
 - The complete unit and integration suite passes without removing or skipping
   existing tests.
