@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import json
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .home import repopilot_home
 from .state import AgentState
 
 
 def default_runs_dir() -> Path:
-    if repopilot_home := os.getenv("REPOPILOT_HOME"):
-        return Path(repopilot_home).expanduser()
-    return Path.home() / ".repopilot"
+    return repopilot_home()
 
 
 def runs_dir(root_dir: Path | str | None = None) -> Path:

@@ -27,6 +27,7 @@ from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
 from .nodes.verify import verify_fix
+from .model_provider import get_model_config
 from .run_store import load_run, save_run
 from .state import (
     AgentState,
@@ -36,7 +37,9 @@ from .state import (
     FinalReport,
     FixAttempt,
     Hypothesis,
+    ModelInvocation,
     NodeFn,
+    NoProgressEvent,
     PatchEdit,
     Phase,
     ToolCall,
@@ -65,7 +68,9 @@ __all__ = [
     "FinalReport",
     "FixAttempt",
     "Hypothesis",
+    "ModelInvocation",
     "NodeFn",
+    "NoProgressEvent",
     "PatchEdit",
     "Phase",
     "StateGraph",
@@ -287,6 +292,22 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
             "decision_warnings": state.decision_warnings,
             "route_decisions": state.route_decisions,
             "node_diagnostics": state.node_diagnostics,
+            "active_model": state.active_model,
+            "active_provider": state.active_provider,
+            "escalated": state.escalated,
+            "escalation_reason": state.escalation_reason,
+            "no_progress_rounds": state.no_progress_rounds,
+            "last_plan_signature": state.last_plan_signature,
+            "last_context_fingerprint": state.last_context_fingerprint,
+            "last_test_failure_signature": state.last_test_failure_signature,
+            "model_history": [
+                invocation.model_dump(mode="json")
+                for invocation in state.model_history
+            ],
+            "no_progress_history": [
+                event.model_dump(mode="json")
+                for event in state.no_progress_history
+            ],
             "human_input_request": state.human_input_request,
             "model_patch": git_diff(state.repo_path),
             "error": state.failure_reason or None,
@@ -318,7 +339,7 @@ def _best_effort_save_run(state: AgentState) -> None:
 async def agent_v2(
     issue_url: str,
     max_retries: int = 3,
-    token_budget: int = 50000,
+    token_budget: int = 100000,
     save_final_run: bool = False,
     skip_commit: bool = False,
     seed: dict | None = None,
@@ -340,6 +361,8 @@ async def agent_v2(
         token_budget=token_budget,
         trace_id=tracer.trace_id,
         skip_commit=skip_commit,
+        active_model=get_model_config("primary").model,
+        active_provider="primary",
     )
     start_phase = Phase.UNDERSTAND
     if seed:
@@ -489,7 +512,7 @@ def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> N
 
 
 async def intelligent_analyze_issue(
-    issue_url: str, max_retries: int = 3, token_budget: int = 50000
+    issue_url: str, max_retries: int = 3, token_budget: int = 100000
 ) -> dict:
     """Backward-compatible alias for the previous experimental endpoint."""
     return await agent_v2(issue_url, max_retries=max_retries, token_budget=token_budget)

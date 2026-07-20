@@ -1,4 +1,7 @@
+import json
+
 from src import new_agent, run_store
+from src.state import ModelInvocation, NoProgressEvent
 
 
 def paused_state(trace_id: str = "abc123def456"):
@@ -154,6 +157,77 @@ def test_save_and_load_paused_run_preserves_pause_state(tmp_path):
     assert loaded.human_input_request == state.human_input_request
     assert loaded.frame_history == state.frame_history
     assert loaded.route_decisions == state.route_decisions
+
+
+def test_save_and_load_preserves_model_routing_state(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    state = paused_state("routing-state")
+    state.active_model = "claude-opus-4-8:stable"
+    state.active_provider = "escalation"
+    state.escalated = True
+    state.escalation_reason = "repeated_edit"
+    state.no_progress_rounds = 2
+    state.last_plan_signature = "plan-sha"
+    state.last_context_fingerprint = "context-sha"
+    state.last_test_failure_signature = "test-sha"
+    state.model_history = [
+        ModelInvocation(
+            model="gemini-3.5-flash:stable",
+            provider="primary",
+            node="plan_fix",
+            elapsed_seconds=1.25,
+            input_tokens=120,
+            output_tokens=35,
+            status="invalid_response",
+            error_class="ValidationError: secret response body",
+        )
+    ]
+    state.no_progress_history = [
+        NoProgressEvent(
+            kind="repeated_edit", fingerprint="edit-sha", node="plan_fix"
+        )
+    ]
+
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+
+    assert loaded.active_model == state.active_model
+    assert loaded.active_provider == state.active_provider
+    assert loaded.escalated is True
+    assert loaded.escalation_reason == "repeated_edit"
+    assert loaded.no_progress_rounds == 2
+    assert loaded.last_plan_signature == "plan-sha"
+    assert loaded.last_context_fingerprint == "context-sha"
+    assert loaded.last_test_failure_signature == "test-sha"
+    assert loaded.model_history == state.model_history
+    assert loaded.model_history[0].error_class == "ValidationError"
+    assert loaded.no_progress_history == state.no_progress_history
+
+
+def test_legacy_saved_state_loads_model_routing_defaults(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    path = run_store.run_path("legacy", root_dir=root_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "issue_url": "https://github.com/acme/widget/issues/7",
+                "trace_id": "legacy",
+                "current_phase": "PLAN",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = run_store.load_run("legacy", root_dir=root_dir)
+
+    assert loaded.active_model == "gemini-3.5-flash:stable"
+    assert loaded.active_provider == "primary"
+    assert loaded.escalated is False
+    assert loaded.escalation_reason == ""
+    assert loaded.no_progress_rounds == 0
+    assert loaded.model_history == []
+    assert loaded.no_progress_history == []
 
 
 def test_save_run_uses_repopilot_home_by_default(tmp_path, monkeypatch):

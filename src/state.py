@@ -182,6 +182,34 @@ class FinalReport(BaseModel):
     token_used: int = 0
 
 
+class ModelInvocation(BaseModel):
+    model: str
+    provider: Literal["primary", "escalation"]
+    node: str
+    elapsed_seconds: float
+    input_tokens: int
+    output_tokens: int
+    status: Literal["ok", "invalid_response", "error"]
+    error_class: str = ""
+
+    @field_validator("error_class", mode="before")
+    @classmethod
+    def _keep_exception_class_only(cls, value: Any) -> str:
+        if isinstance(value, BaseException):
+            return type(value).__name__
+        match = re.match(
+            r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*",
+            str(value or "").strip(),
+        )
+        return match.group(0) if match else ""
+
+
+class NoProgressEvent(BaseModel):
+    kind: str
+    fingerprint: str
+    node: str
+
+
 class AgentState(BaseModel):
     issue_url: str
     issue_title: str = ""
@@ -225,6 +253,16 @@ class AgentState(BaseModel):
     node_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     pending_human_input: bool = False
     human_input_request: dict[str, Any] = Field(default_factory=dict)
+    active_model: str = "gemini-3.5-flash:stable"
+    active_provider: Literal["primary", "escalation"] = "primary"
+    escalated: bool = False
+    escalation_reason: str = ""
+    no_progress_rounds: int = 0
+    last_plan_signature: str = ""
+    last_context_fingerprint: str = ""
+    last_test_failure_signature: str = ""
+    model_history: list[ModelInvocation] = Field(default_factory=list)
+    no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False

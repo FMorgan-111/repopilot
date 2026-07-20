@@ -1,10 +1,82 @@
 import asyncio
 import functools
+import json
 import subprocess
 
 import src.nodes.execute as execute_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
+from src.state import ModelInvocation, NoProgressEvent
+
+
+def test_agent_v2_default_budget_is_100000():
+    assert new_agent.agent_v2.__defaults__[1] == 100_000
+
+
+async def test_agent_v2_initializes_primary_model_from_provider(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    class PrimaryConfig:
+        model = "configured-gemini"
+
+    monkeypatch.setattr(new_agent, "get_model_config", lambda provider: PrimaryConfig())
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+
+    assert captured["state"].active_provider == "primary"
+    assert captured["state"].active_model == "configured-gemini"
+
+
+def test_agent_payload_includes_only_safe_model_routing_history(monkeypatch):
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "never-export-this-key")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        active_model="claude-opus-4-8:stable",
+        active_provider="escalation",
+        escalated=True,
+        escalation_reason="repeated_edit",
+        no_progress_rounds=2,
+        model_history=[
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="plan_fix",
+                elapsed_seconds=1.0,
+                input_tokens=100,
+                output_tokens=20,
+                status="error",
+                error_class="TimeoutError: never-export-this-key",
+            )
+        ],
+        no_progress_history=[
+            NoProgressEvent(
+                kind="repeated_edit", fingerprint="safe-sha", node="plan_fix"
+            )
+        ],
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["active_model"] == "claude-opus-4-8:stable"
+    assert payload["active_provider"] == "escalation"
+    assert payload["escalated"] is True
+    assert payload["escalation_reason"] == "repeated_edit"
+    assert payload["no_progress_rounds"] == 2
+    assert payload["model_history"][0]["error_class"] == "TimeoutError"
+    assert payload["no_progress_history"] == [
+        {"kind": "repeated_edit", "fingerprint": "safe-sha", "node": "plan_fix"}
+    ]
+    serialized = json.dumps(payload)
+    assert "never-export-this-key" not in serialized
+    assert "api_key" not in serialized
 
 
 async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):
