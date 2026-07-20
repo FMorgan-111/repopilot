@@ -18,6 +18,7 @@ from ..escalation import (
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
 from ..patch_match import closest_region, locate_search_block
+from ..repair_flow import generate_opus_repair, verified_edits_to_patch_edits
 from ..schemas import PlanDecision
 from ..state import (
     AgentState,
@@ -792,11 +793,58 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     while True:
         invoked_provider = state.active_provider
         invoked_model = state.active_model
+        two_stage_repair = invoked_provider == "escalation"
         response_text = ""
         t0 = time.monotonic()
         try:
             print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
-            if invoked_provider == "primary":
+            if two_stage_repair:
+                repair_plan, verified_batch = await generate_opus_repair(
+                    state,
+                    build_escalation_packet(state),
+                )
+                patch_edits = verified_edits_to_patch_edits(verified_batch)
+                response_text = json.dumps(
+                    {
+                        "repair_plan": repair_plan.model_dump(mode="json"),
+                        "verified_edits": verified_batch.model_dump(mode="json"),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                decision = PlanDecision(
+                    plan=(
+                        f"Root cause: {repair_plan.root_cause}\n\n"
+                        f"Required behavior: {repair_plan.required_behavior}\n\n"
+                        f"Regression test strategy: "
+                        f"{repair_plan.regression_test_strategy}"
+                    ),
+                    patch="",
+                    patch_edits=patch_edits,
+                    files=repair_plan.target_files,
+                    test_command=state.test_command,
+                    decision_frame=DecisionFrame(
+                        stage="plan",
+                        summary=repair_plan.root_cause,
+                        hypotheses=[
+                            Hypothesis(
+                                id="H1",
+                                claim=repair_plan.root_cause,
+                                evidence=repair_plan.target_files,
+                                score=1.0,
+                                why_selected=repair_plan.required_behavior,
+                            )
+                        ],
+                        selected_hypothesis_id="H1",
+                        evidence=repair_plan.target_files,
+                        next_checks=[repair_plan.regression_test_strategy],
+                        recommended_action="execute",
+                        confidence=1.0,
+                        risk="medium",
+                    ),
+                )
+                has_explicit_frame = True
+            elif invoked_provider == "primary":
                 raw_response = await llm_call(system, user)
             else:
                 raw_response = await llm_call(
@@ -805,29 +853,31 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     model=invoked_model,
                     provider="escalation",
                 )
-            response = _extract_json_object(raw_response)
-            response_text = json.dumps(response)
-            if not response:
-                raise ValueError("Model returned an empty structured response")
-            has_explicit_frame = "decision_frame" in response
-            decision = _normalize_plan_decision(response)
+            if not two_stage_repair:
+                response = _extract_json_object(raw_response)
+                response_text = json.dumps(response)
+                if not response:
+                    raise ValueError("Model returned an empty structured response")
+                has_explicit_frame = "decision_frame" in response
+                decision = _normalize_plan_decision(response)
         except Exception as exc:
             elapsed = time.monotonic() - t0
             immediate_reason = immediate_model_policy_reason(exc)
             response_tokens_estimate = _estimate_tokens(response_text)
             status = "invalid_response" if immediate_reason else "error"
-            record_model_invocation(
-                state,
-                model=invoked_model,
-                provider=invoked_provider,
-                node="plan_fix",
-                elapsed_seconds=elapsed,
-                input_tokens=prompt_tokens_estimate,
-                output_tokens=response_tokens_estimate,
-                status=status,
-                error=exc,
-            )
-            state.token_usage += prompt_tokens_estimate + response_tokens_estimate
+            if not two_stage_repair:
+                record_model_invocation(
+                    state,
+                    model=invoked_model,
+                    provider=invoked_provider,
+                    node="plan_fix",
+                    elapsed_seconds=elapsed,
+                    input_tokens=prompt_tokens_estimate,
+                    output_tokens=response_tokens_estimate,
+                    status=status,
+                    error=exc,
+                )
+                state.token_usage += prompt_tokens_estimate + response_tokens_estimate
             _record_node_diagnostic(
                 state,
                 node="plan_fix",
@@ -855,16 +905,17 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
 
         elapsed = time.monotonic() - t0
         response_tokens_estimate = _estimate_tokens(response_text)
-        record_model_invocation(
-            state,
-            model=invoked_model,
-            provider=invoked_provider,
-            node="plan_fix",
-            elapsed_seconds=elapsed,
-            input_tokens=prompt_tokens_estimate,
-            output_tokens=response_tokens_estimate,
-            status="ok",
-        )
+        if not two_stage_repair:
+            record_model_invocation(
+                state,
+                model=invoked_model,
+                provider=invoked_provider,
+                node="plan_fix",
+                elapsed_seconds=elapsed,
+                input_tokens=prompt_tokens_estimate,
+                output_tokens=response_tokens_estimate,
+                status="ok",
+            )
         _record_node_diagnostic(
             state,
             node="plan_fix",
@@ -881,7 +932,8 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     state.patch_edits = decision.patch_edits
     state.test_command = decision.test_command
     print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars, edits={len(state.patch_edits)})", file=sys.stderr, flush=True)
-    state.token_usage += _estimate_tokens(system, user, response_text)
+    if not two_stage_repair:
+        state.token_usage += _estimate_tokens(system, user, response_text)
     _remember(state, "assistant", state.fix_plan[:2000])
     frame = decision.decision_frame
     frame.parent_frame_id = state.decision_frame.frame_id if state.decision_frame else None

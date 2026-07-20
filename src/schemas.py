@@ -4,7 +4,13 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from .state import DecisionFrame, PatchEdit
+from .state import (
+    DecisionFrame,
+    PatchEdit,
+    RepairPlan as RepairPlan,
+    VerifiedEdit as VerifiedEdit,
+    VerifiedEditBatch as VerifiedEditBatch,
+)
 
 
 def _normalize_string_list(value: Any) -> list[str]:

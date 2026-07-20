@@ -337,6 +337,84 @@ class Evidence(BaseModel):
     fingerprint: str
 
 
+class RepairPlan(BaseModel):
+    """Patch-free repair intent produced by the escalation model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    root_cause: str = Field(min_length=1, max_length=4_000)
+    target_files: list[str] = Field(min_length=1, max_length=8)
+    target_symbols: list[str] = Field(default_factory=list, max_length=16)
+    required_behavior: str = Field(min_length=1, max_length=4_000)
+    regression_test_strategy: str = Field(min_length=1, max_length=4_000)
+    rejected_approaches: list[str] = Field(default_factory=list, max_length=16)
+
+    @field_validator("target_files", mode="before")
+    @classmethod
+    def _validate_target_files(cls, value: Any) -> list[str]:
+        files = _normalize_string_list(value)
+        canonical = [canonical_repo_path(path) for path in files]
+        if any(len(path) > 500 for path in canonical):
+            raise ValueError("RepairPlan target file is too long")
+        if len(canonical) != len(set(canonical)):
+            raise ValueError("RepairPlan target_files must be unique")
+        return canonical
+
+    @field_validator("target_symbols", "rejected_approaches", mode="before")
+    @classmethod
+    def _validate_unique_strings(cls, value: Any, info: Any) -> list[str]:
+        items = [item.strip() for item in _normalize_string_list(value)]
+        if any(not item for item in items):
+            raise ValueError("RepairPlan string lists cannot contain empty values")
+        maximum = 300 if info.field_name == "target_symbols" else 1_000
+        if any(len(item) > maximum for item in items):
+            raise ValueError("RepairPlan list item is too long")
+        if len(items) != len(set(items)):
+            raise ValueError("RepairPlan string lists must contain unique values")
+        return items
+
+
+class VerifiedEdit(BaseModel):
+    """One model edit whose anchors still require checkout validation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_path: str = Field(max_length=500)
+    node_target: str | None = Field(default=None, max_length=300)
+    search: str = Field(max_length=8_000)
+    replace: str = Field(max_length=100_000)
+    intent: str = Field(min_length=1, max_length=2_000)
+
+    @field_validator("file_path", mode="before")
+    @classmethod
+    def _validate_file_path(cls, value: Any) -> str:
+        return canonical_repo_path(value)
+
+    @field_validator("node_target", mode="before")
+    @classmethod
+    def _normalize_node_target(cls, value: Any) -> str | None:
+        if value is None:
+            return None
+        target = str(value).strip()
+        return target or None
+
+    @model_validator(mode="after")
+    def _use_one_anchor(self) -> "VerifiedEdit":
+        if self.node_target and self.search:
+            raise ValueError("VerifiedEdit must use either node_target or search")
+        if not self.replace:
+            raise ValueError("VerifiedEdit replace text cannot be empty")
+        return self
+
+
+class VerifiedEditBatch(BaseModel):
+    """A bounded batch returned by the second escalation-model call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    edits: list[VerifiedEdit] = Field(min_length=1, max_length=16)
+
+
 class ToolSandboxConfig(BaseModel):
     """Persisted immutable OCI boundary for repository-controlled commands."""
 

@@ -345,3 +345,93 @@ async def test_reflect_on_failure_includes_human_answer_context(monkeypatch):
     prompt = f"{calls[0]['system']}\n\n{calls[0]['user']}"
     assert "Human answer since resume" in prompt
     assert "Breaking changes are allowed." in prompt
+
+
+async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkeypatch):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "widget.py").write_text(
+        "def compute(value):\n    return value\n", encoding="utf-8"
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "widget.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=RepoPilot Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    calls = []
+
+    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+        calls.append((system, user, model, provider))
+        if len(calls) == 1:
+            return {
+                "root_cause": "compute omits the offset",
+                "target_files": ["widget.py"],
+                "target_symbols": ["compute"],
+                "required_behavior": "Apply the offset.",
+                "regression_test_strategy": "Run the focused test.",
+                "rejected_approaches": [],
+            }
+        return {
+            "edits": [
+                {
+                    "file_path": "widget.py",
+                    "node_target": "compute",
+                    "search": "",
+                    "replace": "def compute(value):\n    return value + 1\n",
+                    "intent": "Apply the offset.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Wrong result",
+        issue_body="compute must apply an offset",
+        current_phase=new_agent.Phase.PLAN,
+        repo_path=str(repo),
+        repo_ref=ref,
+        owner="acme",
+        repo="widget",
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_no_progress",
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert len(calls) == 2
+    assert result.patch_content == ""
+    assert result.patch_edits == [
+        new_agent.PatchEdit(
+            file_path="widget.py",
+            node_target="compute",
+            replace="def compute(value):\n    return value + 1\n",
+        )
+    ]
+    assert [entry.provider for entry in result.model_history[-2:]] == [
+        "escalation",
+        "escalation",
+    ]

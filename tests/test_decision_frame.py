@@ -171,9 +171,12 @@ async def test_plan_fix_records_successful_llm_diagnostic(monkeypatch):
 
 
 async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
-    monkeypatch,
+    tmp_path, monkeypatch,
 ):
-    calls = []
+    import subprocess
+
+    primary_calls = []
+    escalation_calls = []
 
     monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-test-sentinel")
@@ -182,62 +185,100 @@ async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
     async def fake_llm_call(
         system, user, model=None, *, provider="primary", temperature=0.2
     ):
-        calls.append((system, user, model, provider))
-        if len(calls) == 1:
-            return {
-                "plan": "invalid frame stage",
-                "decision_frame": {
-                    "stage": "reflect",
-                    "summary": "This cannot validate as a plan.",
-                },
-            }
+        primary_calls.append((system, user, model, provider))
         return {
-            "plan": "Guard the missing user.",
-            "patch": "",
-            "patch_edits": [
-                {
-                    "file": "src/auth.py",
-                    "search": "if user is None:\n    submit(user)\n",
-                    "replace": "if user is None:\n    return\n",
-                }
-            ],
-            "files": ["src/auth.py"],
-            "test_command": "pytest tests/test_auth.py -q",
+            "plan": "invalid frame stage",
             "decision_frame": {
-                "stage": "plan",
-                "summary": "Guard missing users.",
-                "recommended_action": "execute",
-                "risk": "low",
-                "confidence": 0.9,
+                "stage": "reflect",
+                "summary": "This cannot validate as a plan.",
             },
         }
 
+    async def fake_escalation_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
+        escalation_calls.append((system, user, model, provider))
+        if len(escalation_calls) == 1:
+            return {
+                "root_cause": "The missing-user branch still calls submit.",
+                "target_files": ["src/auth.py"],
+                "target_symbols": ["submit_if_present"],
+                "required_behavior": "Return before submit for a missing user.",
+                "regression_test_strategy": "Run the focused auth test.",
+                "rejected_approaches": [],
+            }
+        return {
+            "edits": [
+                {
+                    "file_path": "src/auth.py",
+                    "node_target": "submit_if_present",
+                    "search": "",
+                    "replace": (
+                        "def submit_if_present(user):\n"
+                        "    if user is None:\n"
+                        "        return\n"
+                        "    submit(user)\n"
+                    ),
+                    "intent": "Guard the missing user.",
+                }
+            ]
+        }
+
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_escalation_call)
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "auth.py").write_text(
+        "def submit(user):\n    return user\n\n"
+        "def submit_if_present(user):\n"
+        "    if user is None:\n"
+        "        submit(user)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src/auth.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=RepoPilot Tests",
+            "-c", "user.email=tests@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         issue_title="Login crash",
         issue_body="Crashes after submit.",
         owner="acme",
         repo="widget",
-        repo_ref="a" * 40,
+        repo_path=str(repo),
+        repo_ref=ref,
         current_phase=new_agent.Phase.PLAN,
     )
 
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert [call[3] for call in calls] == ["primary", "escalation"]
-    assert calls[1][2] == "claude-opus-4-8:stable"
+    assert [call[3] for call in primary_calls] == ["primary"]
+    assert [call[3] for call in escalation_calls] == ["escalation", "escalation"]
+    assert escalation_calls[0][2] == "claude-opus-4-8:stable"
     assert next_state.escalated is True
     assert next_state.escalation_reason == (
         "invalid_structured_response_after_retries"
     )
-    assert [item.status for item in next_state.model_history[-2:]] == [
+    assert [item.status for item in next_state.model_history[-3:]] == [
         "invalid_response",
         "ok",
+        "ok",
     ]
-    assert [item.provider for item in next_state.model_history[-2:]] == [
+    assert [item.provider for item in next_state.model_history[-3:]] == [
         "primary",
+        "escalation",
         "escalation",
     ]
     assert any(

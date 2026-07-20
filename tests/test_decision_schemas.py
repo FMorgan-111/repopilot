@@ -1,7 +1,13 @@
 import pytest
 from pydantic import ValidationError
 
-from src.schemas import PlanDecision, ReflectDecision
+from src.schemas import (
+    PlanDecision,
+    ReflectDecision,
+    RepairPlan,
+    VerifiedEdit,
+    VerifiedEditBatch,
+)
 
 
 def test_plan_decision_requires_plan_frame():
@@ -33,6 +39,61 @@ def test_plan_decision_requires_plan_frame():
 
     assert decision.decision_frame.stage == "plan"
     assert decision.decision_frame.recommended_action == "execute"
+
+
+def test_repair_plan_and_verified_edit_schemas_are_strict():
+    plan = RepairPlan(
+        root_cause="The calculation omits the offset.",
+        target_files=["src/widget.py"],
+        target_symbols=["Widget.compute"],
+        required_behavior="Apply the offset.",
+        regression_test_strategy="Run the focused regression test.",
+        rejected_approaches=["Do not special-case the sample."],
+    )
+    batch = VerifiedEditBatch(
+        edits=[
+            VerifiedEdit(
+                file_path="src/widget.py",
+                node_target="Widget.compute",
+                search="",
+                replace="def compute(self, value):\n    return value + 1\n",
+                intent="Apply the offset.",
+            )
+        ]
+    )
+
+    assert plan.target_symbols == ["Widget.compute"]
+    assert batch.edits[0].node_target == "Widget.compute"
+
+    with pytest.raises(ValidationError):
+        RepairPlan(
+            root_cause="unknown",
+            target_files=[],
+            target_symbols=[],
+            required_behavior="fix it",
+            regression_test_strategy="test it",
+            rejected_approaches=[],
+        )
+    with pytest.raises(ValidationError):
+        RepairPlan(
+            root_cause="unknown",
+            target_files=["src/widget.py", "src/widget.py"],
+            target_symbols=[],
+            required_behavior="fix it",
+            regression_test_strategy="test it",
+            rejected_approaches=[],
+        )
+    with pytest.raises(ValidationError):
+        RepairPlan(
+            root_cause="unknown",
+            target_files=["../widget.py"],
+            target_symbols=[],
+            required_behavior="fix it",
+            regression_test_strategy="test it",
+            rejected_approaches=[],
+        )
+    with pytest.raises(ValidationError):
+        VerifiedEditBatch(edits=[])
 
 
 def test_plan_decision_accepts_search_replace_patch_edits():

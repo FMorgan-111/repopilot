@@ -495,7 +495,11 @@ async def test_primary_plan_keeps_current_bounded_prompt_and_default_call(monkey
     assert result.model_history[-1].status == "ok"
 
 
-async def test_escalated_plan_uses_only_packet_and_active_escalation_model(monkeypatch):
+async def test_escalated_plan_uses_only_packet_and_active_escalation_model(
+    tmp_path, monkeypatch
+):
+    import subprocess
+
     calls = []
 
     async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
@@ -508,10 +512,59 @@ async def test_escalated_plan_uses_only_packet_and_active_escalation_model(monke
                 "temperature": temperature,
             }
         )
-        return _valid_plan_response()
+        if len(calls) == 1:
+            return {
+                "root_cause": "The missing-user branch still submits.",
+                "target_files": ["src/auth.py"],
+                "target_symbols": ["submit_if_present"],
+                "required_behavior": "Return before submit for missing users.",
+                "regression_test_strategy": "Run the focused auth test.",
+                "rejected_approaches": [],
+            }
+        return {
+            "edits": [
+                {
+                    "file_path": "src/auth.py",
+                    "node_target": "submit_if_present",
+                    "search": "",
+                    "replace": (
+                        "def submit_if_present(user):\n"
+                        "    if user is None:\n"
+                        "        return\n"
+                        "    submit(user)\n"
+                    ),
+                    "intent": "Guard missing users.",
+                }
+            ]
+        }
 
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
     state = _escalated_state()
+    repo = tmp_path / "repo"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src" / "auth.py").write_text(
+        "def submit(user):\n    return user\n\n"
+        "def submit_if_present(user):\n"
+        "    if user is None:\n"
+        "        submit(user)\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src/auth.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=RepoPilot Tests",
+            "-c", "user.email=tests@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    state.repo_path = str(repo)
+    state.repo_ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     state.relevant_files = []
     state.conversation_history = [
         ConversationTurn(role="user", content="unrelated-conversation-sentinel")
@@ -524,19 +577,25 @@ async def test_escalated_plan_uses_only_packet_and_active_escalation_model(monke
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == Phase.EXECUTE
-    assert calls[0]["provider"] == "escalation"
-    assert calls[0]["model"] == "claude-opus-4-8:stable"
+    assert [call["provider"] for call in calls] == ["escalation", "escalation"]
+    assert all(call["model"] == "claude-opus-4-8:stable" for call in calls)
     assert calls[0]["user"] == expected_packet
-    assert "decision_frame" in calls[0]["system"]
-    assert "patch_edits" in calls[0]["system"]
-    assert "tool_intent" in calls[0]["system"]
+    assert "patch" not in calls[0]["system"].lower()
+    assert "edit" not in calls[0]["system"].lower()
+    assert "target_evidence" in calls[1]["user"]
     assert "Issue URL:" not in calls[0]["user"]
     assert "Relevant files:" not in calls[0]["user"]
     assert "unrelated-conversation-sentinel" not in calls[0]["user"]
     assert "raw-http-payload-sentinel" not in calls[0]["user"]
-    assert result.model_history[-1].provider == "escalation"
-    assert result.model_history[-1].model == "claude-opus-4-8:stable"
-    assert result.model_history[-1].node == "plan_fix"
+    assert [item.provider for item in result.model_history[-2:]] == [
+        "escalation",
+        "escalation",
+    ]
+    assert all(
+        item.model == "claude-opus-4-8:stable"
+        and item.node == "plan_fix"
+        for item in result.model_history[-2:]
+    )
 
 
 async def test_escalated_reflect_uses_packet_and_active_escalation_model(monkeypatch):
