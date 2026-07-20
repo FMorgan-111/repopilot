@@ -1,16 +1,20 @@
 from __future__ import annotations
 
-import subprocess
 import hashlib
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from src.state import (
     AgentState,
     GeneratedTestApproval,
+    SnapshotManifestEntry,
     ToolInvocation,
     ToolPatchApproval,
+    ToolSandboxConfig,
 )
 from src.tool_policy import ToolIntent, ToolPolicy
 
@@ -48,9 +52,24 @@ def _state(root: Path, commit: str, **updates: object) -> AgentState:
         "issue_url": "https://github.com/acme/widget/issues/1",
         "repo_path": str(root),
         "repo_ref": commit,
+        "tool_sandbox_config": ToolSandboxConfig(
+            backend="docker",
+            image="registry.example/repopilot-tests@sha256:" + "1" * 64,
+            python_executable="/usr/bin/python3",
+            project_executables={"npm": "/usr/bin/npm"},
+        ),
     }
     values.update(updates)
     return AgentState(**values)
+
+
+def _manifest_fingerprint(entries: list[SnapshotManifestEntry]) -> str:
+    payload = json.dumps(
+        [entry.model_dump(mode="json") for entry in entries],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 
 def _intent(action: str, args: dict[str, object]) -> ToolIntent:
@@ -150,7 +169,7 @@ def test_normalized_key_order_cannot_bypass_duplicate_detection(tmp_path):
 
     duplicate = policy.authorize(
         state,
-        _intent("read_range", {"end_line": 2, "start_line": 1, "path": "./src/widget.py"}),
+        _intent("read_range", {"end_line": 2, "start_line": 1, "path": "src/widget.py"}),
         calls_this_round=1,
     )
 
@@ -201,7 +220,7 @@ def test_rejects_missing_or_mismatched_exact_checkout(tmp_path, updates):
     assert decision.approved is False
 
 
-def test_accepts_python_module_pytest_and_existing_project_command(tmp_path, monkeypatch):
+def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
     root, commit = _repo(tmp_path)
     (root / "package.json").write_text('{"scripts":{"test":"pytest"}}', encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
@@ -214,10 +233,6 @@ def test_accepts_python_module_pytest_and_existing_project_command(tmp_path, mon
     ).stdout.strip()
     state = _state(root, commit, test_command="npm test")
     policy = ToolPolicy()
-    monkeypatch.setattr(
-        "src.tool_policy.trusted_executable",
-        lambda name, required=False: "/usr/bin/npm" if name == "npm" else None,
-    )
 
     python = policy.authorize(
         state,
@@ -232,7 +247,58 @@ def test_accepts_python_module_pytest_and_existing_project_command(tmp_path, mon
 
     assert python.approved is True
     assert project.approved is True
-    assert python.argv[1:3] == ["-m", "pytest"]
+    assert python.argv[:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
+    assert project.argv[0] == "/usr/bin/npm"
+
+
+def test_targeted_test_fails_closed_without_immutable_oci_config(tmp_path):
+    root, commit = _repo(tmp_path)
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit, tool_sandbox_config=None),
+        _intent("run_targeted_test", {"command": "pytest tests/test_widget.py"}),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is False
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        "registry.example/repopilot-tests:latest",
+        "registry.example/repopilot-tests@sha256:short",
+        "--privileged@sha256:" + "1" * 64,
+    ],
+)
+def test_tool_sandbox_image_must_be_digest_pinned(image):
+    with pytest.raises(ValidationError):
+        ToolSandboxConfig(backend="docker", image=image)
+
+
+def test_tool_sandbox_project_executables_are_deeply_immutable():
+    config = ToolSandboxConfig(
+        backend="docker",
+        image="sha256:" + "1" * 64,
+        project_executables={"npm": "/usr/bin/npm"},
+    )
+
+    assert isinstance(config.project_executables, tuple)
+    with pytest.raises(TypeError):
+        config.project_executables[0] = ("npm", "/tmp/npm")
+
+
+@pytest.mark.parametrize("path", ["cafe\u0301/widget.py", "src/control\x01.py"])
+def test_rejects_noncanonical_unicode_or_control_paths(tmp_path, path):
+    root, commit = _repo(tmp_path)
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit),
+        _intent("search_text", {"text": "widget", "path": path}),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is False
 
 
 def test_rejects_network_program_hidden_in_configured_project_command(tmp_path):
@@ -302,7 +368,7 @@ def test_rejects_inexact_or_preconfigured_project_commands(
     assert decision.approved is False
 
 
-def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path, monkeypatch):
+def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path):
     root, commit = _repo(tmp_path)
     (root / "package.json").write_text(
         '{"scripts":{"test:unit":"pytest"}}', encoding="utf-8"
@@ -315,11 +381,6 @@ def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path
         capture_output=True,
         text=True,
     ).stdout.strip()
-    monkeypatch.setattr(
-        "src.tool_policy.trusted_executable",
-        lambda name, required=False: "/usr/bin/npm" if name == "npm" else None,
-    )
-
     decision = ToolPolicy().authorize(
         _state(root, commit, test_command="npm run test:unit"),
         _intent(
@@ -375,6 +436,10 @@ def test_rejects_modified_or_symlinked_project_manifest(tmp_path):
         ("search_text", {"text": "token", "path": ".env"}),
         ("read_range", {"path": "private.pem", "start_line": 1, "end_line": 1}),
         ("read_range", {"path": "credentials.yaml", "start_line": 1, "end_line": 1}),
+        (
+            "read_range",
+            {"path": ".env.production/nested.py", "start_line": 1, "end_line": 1},
+        ),
     ],
 )
 def test_rejects_vcs_metadata_and_common_secret_paths(tmp_path, action, args):
@@ -382,6 +447,10 @@ def test_rejects_vcs_metadata_and_common_secret_paths(tmp_path, action, args):
     (root / ".env").write_text("TOKEN=sentinel\n", encoding="utf-8")
     (root / "private.pem").write_text("sentinel\n", encoding="utf-8")
     (root / "credentials.yaml").write_text("sentinel\n", encoding="utf-8")
+    (root / ".env.production").mkdir(exist_ok=True)
+    (root / ".env.production" / "nested.py").write_text(
+        "sentinel\n", encoding="utf-8"
+    )
 
     decision = ToolPolicy().authorize(
         _state(root, commit), _intent(action, args), calls_this_round=0
@@ -437,6 +506,15 @@ def test_approved_generated_test_requires_exact_current_content(tmp_path):
         "+    assert True\n"
     )
     gate_fingerprint = "a" * 64
+    manifest = [
+        SnapshotManifestEntry(
+            path=path,
+            change="added",
+            mode="100644",
+            content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+            size=len(content.encode()),
+        )
+    ]
     state = _state(
         root,
         commit,
@@ -445,6 +523,8 @@ def test_approved_generated_test_requires_exact_current_content(tmp_path):
             base_ref=commit,
             patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
             patch_gate_fingerprint=gate_fingerprint,
+            changed_manifest=manifest,
+            manifest_fingerprint=_manifest_fingerprint(manifest),
         ),
         generated_test_approvals=[
             GeneratedTestApproval(
@@ -481,6 +561,8 @@ def test_generated_test_approval_round_trips_and_legacy_defaults_empty(tmp_path)
             base_ref=commit,
             patch_sha256="b" * 64,
             patch_gate_fingerprint="c" * 64,
+            changed_manifest=[],
+            manifest_fingerprint=_manifest_fingerprint([]),
         ),
         generated_test_approvals=[
             GeneratedTestApproval(
@@ -498,6 +580,7 @@ def test_generated_test_approval_round_trips_and_legacy_defaults_empty(tmp_path)
     assert loaded.generated_test_approvals == state.generated_test_approvals
     assert legacy.tool_patch_approval is None
     assert legacy.generated_test_approvals == []
+    assert legacy.tool_sandbox_config is None
 
 
 def test_rejects_source_and_index_only_test_selectors(tmp_path):

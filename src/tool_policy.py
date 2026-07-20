@@ -12,8 +12,9 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .local_search import is_sensitive_repo_path
-from .safe_subprocess import run_bounded_process, trusted_executable, trusted_python
-from .state import AgentState, ToolAction
+from .repo_paths import canonical_repo_path
+from .safe_subprocess import run_bounded_process
+from .state import AgentState, ToolAction, tool_manifest_fingerprint
 
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
@@ -94,9 +95,9 @@ def _reject(fingerprint: str, reason: str, *, duplicate: bool = False) -> Policy
 
 
 def _relative_path(root: Path, value: object, *, require_file: bool = False) -> str:
-    if not isinstance(value, str) or not value.strip():
+    if not isinstance(value, str) or not value or value != value.strip():
         raise ValueError("invalid_path")
-    raw = value.strip().replace("\\", "/")
+    raw = canonical_repo_path(value, allow_dot=True)
     if Path(raw).is_absolute() or re.match(r"^[A-Za-z]:/", raw):
         raise ValueError("absolute_path")
     if ".." in raw.split("/"):
@@ -122,6 +123,7 @@ def _git_result(root: Path, argv: list[str], *, max_output_bytes: int = 256_000)
         cwd=root,
         timeout=10,
         max_output_bytes=max_output_bytes,
+        decode_errors="strict",
     )
     if result.returncode != 0:
         raise ValueError("git_query_failed")
@@ -159,17 +161,29 @@ def _is_approved_generated_test(root: Path, state: AgentState, path: str) -> boo
     patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
     if patch_sha != patch_approval.patch_sha256:
         return False
+    if (
+        tool_manifest_fingerprint(patch_approval.changed_manifest)
+        != patch_approval.manifest_fingerprint
+    ):
+        return False
     try:
         current = (root / path).read_bytes()
     except OSError:
         return False
     content_sha = hashlib.sha256(current).hexdigest()
-    return any(
+    generated_is_current = any(
         approval.path == path
         and approval.content_sha256 == content_sha
         and approval.patch_gate_fingerprint == patch_approval.patch_gate_fingerprint
         for approval in state.generated_test_approvals
     )
+    manifest_is_current = any(
+        entry.path == path
+        and entry.change == "added"
+        and entry.content_sha256 == content_sha
+        for entry in patch_approval.changed_manifest
+    )
+    return generated_is_current and manifest_is_current
 
 
 def _target_selector(root: Path, state: AgentState, token: str) -> bool:
@@ -244,9 +258,12 @@ def _project_test_prefix(
     scripts = _committed_package_scripts(root, state)
     if not isinstance(scripts.get(script), str) or not str(scripts[script]).strip():
         raise ValueError("missing_test_script")
-    launcher = trusted_executable(executable, required=False)
+    config = state.tool_sandbox_config
+    if config is None:
+        raise ValueError("missing_tool_sandbox")
+    launcher = config.project_executable(executable)
     if launcher is None:
-        raise ValueError("untrusted_project_runner")
+        raise ValueError("unconfigured_project_runner")
     return launcher
 
 
@@ -259,13 +276,16 @@ def _checkout_head(root: Path) -> str:
 
 
 def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str], str]:
+    config = state.tool_sandbox_config
+    if config is None:
+        raise ValueError("missing_tool_sandbox")
     tokens = _safe_tokens(command)
     if tokens[0] == "pytest":
         suffix = tokens[1:]
-        argv = [trusted_python(), "-m", "pytest", *suffix]
+        argv = [config.python_executable, "-P", "-m", "pytest", *suffix]
     elif tokens[:3] == ["python", "-m", "pytest"]:
         suffix = tokens[3:]
-        argv = [trusted_python(), "-m", "pytest", *suffix]
+        argv = [config.python_executable, "-P", "-m", "pytest", *suffix]
     else:
         configured = _safe_tokens(state.test_command) if state.test_command else []
         launcher = _project_test_prefix(root, state, configured) if configured else ""

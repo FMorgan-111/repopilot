@@ -19,6 +19,7 @@ from .graph import (
     route_from_state,
     run_graph,
 )
+from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.execute import apply_patch, execute_fix, git_clone, git_diff, run_pytest
 from .nodes.failure import handle_failure
@@ -27,8 +28,8 @@ from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
 from .nodes.verify import verify_fix
-from .model_provider import get_model_config
 from .run_store import load_run, save_run
+from .safe_subprocess import tool_sandbox_config_from_env
 from .state import (
     DEFAULT_AGENT_V2_TOKEN_BUDGET,
     AgentState,
@@ -365,6 +366,7 @@ async def agent_v2(
         skip_commit=skip_commit,
         active_model=get_model_config("primary").model,
         active_provider="primary",
+        tool_sandbox_config=tool_sandbox_config_from_env(),
     )
     start_phase = Phase.UNDERSTAND
     if seed:

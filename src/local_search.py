@@ -7,6 +7,7 @@ import re
 from collections.abc import Sequence
 from pathlib import Path
 
+from .repo_paths import canonical_repo_path
 from .safe_subprocess import run_bounded_process
 
 _DOC_SUFFIXES = (".md", ".rst", ".txt", ".rdoc", ".adoc")
@@ -33,8 +34,7 @@ def is_sensitive_repo_path(path: str) -> bool:
         return True
     if not parts:
         return False
-    name = parts[-1]
-    return (
+    return any(
         name in _SECRET_NAMES
         or name == ".env"
         or name.startswith(".env.")
@@ -42,6 +42,7 @@ def is_sensitive_repo_path(path: str) -> bool:
         or name in {".git-credentials", ".gitconfig", "secret", "secrets"}
         or name.startswith("secrets.")
         or name.endswith((".key", ".kdbx", ".pem", ".p12", ".pfx"))
+        for name in parts
     )
 
 
@@ -80,12 +81,17 @@ def _tracked_text_files(
         cwd=root,
         timeout=30,
         max_output_bytes=4_000_000,
+        decode_errors="strict",
     )
     if result.returncode != 0:
         raise RuntimeError("git ls-files failed")
     files: list[tuple[str, str]] = []
     for path in result.stdout.split("\0")[:max_files]:
-        if not path or is_sensitive_repo_path(path):
+        try:
+            path = canonical_repo_path(path)
+        except ValueError:
+            continue
+        if is_sensitive_repo_path(path):
             continue
         file_path = (root / path).resolve()
         if (

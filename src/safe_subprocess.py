@@ -1,21 +1,21 @@
-"""Credential-safe subprocess execution and fail-closed test isolation."""
+"""Credential-safe subprocesses and immutable OCI test execution."""
 
 from __future__ import annotations
 
 import json
 import os
-import platform
 import signal
-import socket
 import stat
 import subprocess
-import sys
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Sequence
+from typing import IO, Literal, Sequence
+
+from .state import ToolSandboxConfig
 
 _TRUSTED_EXECUTABLE_DIRS = (
     Path("/usr/bin"),
@@ -28,38 +28,26 @@ _SAFE_HOST_ENV_KEYS = frozenset(
     {"COMSPEC", "LANG", "LC_ALL", "PATHEXT", "SYSTEMROOT", "TZ", "WINDIR"}
 )
 _SAFE_OVERRIDE_KEYS = frozenset({"HOME", "PYTHONPATH", "TEMP", "TMP", "TMPDIR"})
-_PROBE_ENV_NAME = "REPOPILOT_ISOLATION_PARENT_SENTINEL"
-_PROBE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True)
 class SandboxPaths:
-    """Private host directories mapped into one disposable test sandbox."""
+    """Private host root containing only the disposable workspace and OCI IDs."""
 
     root: Path
     workspace: Path
-    home: Path
-    temp: Path
 
     @classmethod
     def create(cls, root: str | Path) -> SandboxPaths:
         resolved = Path(root).resolve()
         workspace = resolved / "workspace"
-        home = resolved / "home"
-        temp = resolved / "tmp"
-        for path in (resolved, workspace, home, temp):
-            path.mkdir(parents=True, exist_ok=True)
-            path.chmod(0o700)
-        return cls(root=resolved, workspace=workspace, home=home, temp=temp)
-
-
-@dataclass(frozen=True)
-class NetworkIsolation:
-    """A proved OS isolation launcher plus its private environment."""
-
-    capability: str
-    argv_prefix: tuple[str, ...]
-    env_overrides: dict[str, str] = field(default_factory=dict)
+        resolved.mkdir(parents=True, exist_ok=True)
+        resolved.chmod(0o700)
+        workspace.mkdir(parents=True, exist_ok=True)
+        # The configured container user must be able to traverse and mutate the
+        # disposable bind. Its parent and cid files remain private on the host.
+        workspace.chmod(0o777)
+        return cls(root=resolved, workspace=workspace)
 
 
 @dataclass(frozen=True)
@@ -71,10 +59,19 @@ class BoundedProcessResult:
 
 
 class NetworkIsolationUnavailableError(RuntimeError):
-    """Raised instead of executing repository code without proven isolation."""
+    """Raised instead of executing repository code outside a proven OCI boundary."""
 
 
 NetworkIsolationUnavailable = NetworkIsolationUnavailableError
+
+
+class IsolationCleanupError(NetworkIsolationUnavailableError):
+    """A container may still exist; recovery metadata is preserved on disk."""
+
+    def __init__(self, name: str, recovery_path: Path) -> None:
+        super().__init__(f"OCI cleanup could not be verified for {name}")
+        self.container_name = name
+        self.recovery_path = recovery_path
 
 
 class ProcessOutputLimitError(RuntimeError):
@@ -100,12 +97,24 @@ def _is_trusted_executable(path: Path) -> bool:
         info = resolved.stat()
     except OSError:
         return False
-    return (
+    executable_is_trusted = (
         resolved.is_file()
         and bool(info.st_mode & stat.S_IXUSR)
         and info.st_uid == 0
         and not bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
     )
+    if not executable_is_trusted:
+        return False
+    for ancestor in resolved.parents:
+        try:
+            ancestor_info = ancestor.stat()
+        except OSError:
+            return False
+        if ancestor_info.st_uid != 0 or bool(
+            ancestor_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            return False
+    return True
 
 
 def trusted_executable(name: str, *, required: bool = True) -> str | None:
@@ -121,26 +130,17 @@ def trusted_executable(name: str, *, required: bool = True) -> str | None:
     return None
 
 
-def trusted_python() -> str:
-    """Return a canonical root-owned interpreter, never a writable venv shim."""
-    candidate = Path(sys.executable).resolve()
-    if _is_trusted_executable(candidate):
-        return str(candidate)
-    for name in ("python3", "python"):
-        resolved = trusted_executable(name, required=False)
-        if resolved:
-            return resolved
-    raise NetworkIsolationUnavailableError("trusted Python launcher unavailable")
-
-
 def _trusted_path() -> str:
-    directories = [
-        str(path)
-        for path in _TRUSTED_EXECUTABLE_DIRS[:4]
-        if path.is_dir()
-        and path.stat().st_uid == 0
-        and not bool(path.stat().st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-    ]
+    directories = []
+    for path in _TRUSTED_EXECUTABLE_DIRS[:4]:
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        if path.is_dir() and info.st_uid == 0 and not bool(
+            info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            directories.append(str(path))
     return os.pathsep.join(directories)
 
 
@@ -148,11 +148,7 @@ def minimal_subprocess_env(
     overrides: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Build a credential-free environment with a non-shadowable PATH."""
-    env = {
-        key: value
-        for key, value in os.environ.items()
-        if key in _SAFE_HOST_ENV_KEYS
-    }
+    env = {key: value for key, value in os.environ.items() if key in _SAFE_HOST_ENV_KEYS}
     env["PATH"] = _trusted_path()
     if overrides:
         if not set(overrides).issubset(_SAFE_OVERRIDE_KEYS):
@@ -161,272 +157,346 @@ def minimal_subprocess_env(
     return env
 
 
-def _runtime_mounts() -> tuple[Path, ...]:
-    candidates = (
-        Path("/usr"),
-        Path("/bin"),
-        Path("/lib"),
-        Path("/lib64"),
-        Path("/usr/local"),
-        Path("/System/Library"),
-        Path("/Library/Frameworks"),
+def tool_sandbox_config_from_env() -> ToolSandboxConfig | None:
+    """Load operator-owned OCI settings; repository state cannot supply them."""
+    backend = os.getenv("REPOPILOT_TOOL_OCI_BACKEND", "").strip()
+    image = os.getenv("REPOPILOT_TOOL_OCI_IMAGE", "").strip()
+    if not backend and not image:
+        return None
+    if not backend or not image:
+        raise ValueError("both OCI backend and digest-pinned image are required")
+    raw_executables = os.getenv("REPOPILOT_TOOL_PROJECT_EXECUTABLES", "{}").strip()
+    try:
+        project_executables = json.loads(raw_executables)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid OCI project executable configuration") from exc
+    return ToolSandboxConfig(
+        backend=backend,
+        image=image,
+        python_executable=os.getenv(
+            "REPOPILOT_TOOL_PYTHON_EXECUTABLE", "/usr/bin/python3"
+        ).strip(),
+        project_executables=project_executables,
     )
-    trusted: list[Path] = []
-    for path in candidates:
-        try:
-            info = path.stat()
-        except OSError:
-            continue
-        if info.st_uid == 0 and not bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
-            trusted.append(path)
-    return tuple(trusted)
 
 
-def _python_import_paths() -> tuple[Path, ...]:
-    paths: list[Path] = []
-    for entry in sys.path:
-        if not entry:
-            continue
-        path = Path(entry).resolve()
-        try:
-            info = path.stat()
-        except OSError:
-            continue
-        if (
-            path.is_dir()
-            and ("site-packages" in path.parts or "dist-packages" in path.parts)
-            and info.st_uid == 0
-            and not bool(info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
-        ):
-            paths.append(path)
-    return tuple(dict.fromkeys(paths))
-
-
-def build_linux_isolation(
+def build_oci_command(
+    config: ToolSandboxConfig,
     sandbox: SandboxPaths,
+    command: Sequence[str],
     *,
-    launcher: str,
-    runtime_mounts: Sequence[Path],
-    python_path: Sequence[Path],
-) -> NetworkIsolation:
-    """Build a mount+PID+user+network namespace without binding host root."""
-    argv: list[str] = [
-        launcher,
-        "--die-with-parent",
-        "--new-session",
-        "--unshare-user",
-        "--unshare-pid",
-        "--unshare-net",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/run",
-        "--dir",
-        "/runtime",
-        "--dir",
-        "/runtime/pythonpath",
+    backend: str,
+    name: str,
+    cidfile: Path,
+) -> list[str]:
+    """Build one locked-down OCI invocation with exactly one host bind."""
+    if not command or any(not isinstance(token, str) or not token for token in command):
+        raise ValueError("OCI command must contain non-empty strings")
+    try:
+        root = sandbox.root.resolve(strict=True)
+        workspace = sandbox.workspace.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("OCI sandbox paths are unavailable") from exc
+    if (
+        sandbox.root.is_symlink()
+        or sandbox.workspace.is_symlink()
+        or root != sandbox.root
+        or workspace != sandbox.workspace
+        or workspace != root / "workspace"
+        or not root.is_dir()
+        or not workspace.is_dir()
+    ):
+        raise ValueError("OCI workspace is not the exact disposable bind")
+    if not name.startswith("repopilot-") or not name.replace("-", "").isalnum():
+        raise ValueError("invalid OCI container name")
+    if any(character in str(workspace) for character in ",\n\r"):
+        raise ValueError("OCI workspace path cannot be encoded safely")
+    cidfile = cidfile.resolve()
+    if not cidfile.is_relative_to(sandbox.root) or cidfile.parent != sandbox.root:
+        raise ValueError("OCI cidfile escaped private sandbox root")
+    if (
+        Path(command[0]).as_posix() != command[0]
+        or not command[0].startswith("/")
+        or ".." in Path(command[0]).parts
+        or any(character.isspace() or ord(character) < 32 for character in command[0])
+    ):
+        raise ValueError("OCI entrypoint must be an absolute clean path")
+    return [
+        backend,
+        "create",
+        "--pull=never",
+        f"--name={name}",
+        f"--cidfile={cidfile}",
+        "--network=none",
+        "--ipc=private",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        f"--user={config.user}",
+        f"--pids-limit={config.pids_limit}",
+        f"--memory={config.memory}",
+        f"--cpus={config.cpus}",
+        "--workdir=/workspace",
+        "--tmpfs=/tmp:rw,noexec,nosuid,nodev,size=256m,mode=1777",
+        "--tmpfs=/home/repopilot:rw,noexec,nosuid,nodev,size=64m,mode=0700,uid="
+        f"{config.user.partition(':')[0]},gid={config.user.partition(':')[2]}",
+        "--env=HOME=/home/repopilot",
+        "--env=TMPDIR=/tmp",
+        "--env=PYTHONDONTWRITEBYTECODE=1",
+        f"--mount=type=bind,src={workspace},dst=/workspace,ro",
+        f"--entrypoint={command[0]}",
+        config.image,
+        *command[1:],
     ]
-    for path in runtime_mounts:
-        argv.extend(("--ro-bind", str(path), str(path)))
-    mapped_python: list[str] = []
-    for index, path in enumerate(python_path):
-        destination = f"/runtime/pythonpath/{index}"
-        argv.extend(("--ro-bind", str(path), destination))
-        mapped_python.append(destination)
-    argv.extend(
-        (
-            "--bind",
-            str(sandbox.workspace),
-            "/workspace",
-            "--bind",
-            str(sandbox.home),
-            "/home/repopilot",
-            "--bind",
-            str(sandbox.temp),
-            "/tmp",
-            "--chdir",
-            "/workspace",
-            "--",
-        )
-    )
-    return NetworkIsolation(
-        capability="linux-bwrap-namespaces",
-        argv_prefix=tuple(argv),
-        env_overrides={
-            "HOME": "/home/repopilot",
-            "TMPDIR": "/tmp",
-            "TMP": "/tmp",
-            "TEMP": "/tmp",
-            "PYTHONPATH": os.pathsep.join(mapped_python),
-        },
-    )
 
 
-def _sandbox_literal(path: Path) -> str:
-    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+def _container_identity(prefix: str, sandbox: SandboxPaths) -> tuple[str, Path]:
+    token = uuid.uuid4().hex
+    return f"repopilot-{prefix}-{token}", sandbox.root / f"{prefix}-{token}.cid"
 
 
-def build_darwin_profile(
-    sandbox: SandboxPaths,
-    *,
-    runtime_mounts: Sequence[Path],
-    python_path: Sequence[Path],
-) -> str:
-    """Build a deny-default profile scoped to runtime and disposable paths."""
-    read_paths = [*runtime_mounts, *python_path, sandbox.workspace]
-    write_paths = [sandbox.workspace, sandbox.home, sandbox.temp]
-    exec_rules = " ".join(
-        f'(subpath "{_sandbox_literal(path)}")' for path in runtime_mounts
-    )
-    read_rules = " ".join(
-        f'(subpath "{_sandbox_literal(path)}")' for path in read_paths
-    )
-    write_rules = " ".join(
-        f'(subpath "{_sandbox_literal(path)}")' for path in write_paths
-    )
-    return "".join(
-        (
-            "(version 1)",
-            "(deny default)",
-            "(deny network*)",
-            "(allow process-fork)",
-            "(allow signal (target self))",
-            "(allow sysctl-read)",
-            f"(allow process-exec {exec_rules})",
-            f"(allow file-read* {read_rules} (literal \"/dev/null\"))",
-            f"(allow file-write* {write_rules} (literal \"/dev/null\"))",
+def _recovery_path(name: str, cidfile: Path) -> Path:
+    recovery_root = Path(tempfile.gettempdir()).resolve() / "repopilot-oci-recovery"
+    if recovery_root.is_symlink():
+        raise NetworkIsolationUnavailableError("unsafe OCI recovery directory")
+    recovery_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    recovery_root.chmod(0o700)
+    info = recovery_root.stat()
+    if recovery_root.is_symlink() or info.st_uid != os.getuid() or bool(
+        info.st_mode & (stat.S_IRWXG | stat.S_IRWXO)
+    ):
+        raise NetworkIsolationUnavailableError("unsafe OCI recovery directory")
+    return recovery_root / f"{name}.json"
+
+
+def _write_recovery_record(backend: str, name: str, cidfile: Path) -> Path:
+    recovery = _recovery_path(name, cidfile)
+    payload = {
+        "backend": backend,
+        "container_name": name,
+        "cidfile": str(cidfile),
+        "container_id": "",
+    }
+    recovery.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+    recovery.chmod(0o600)
+    return recovery
+
+
+def _known_missing_container(result: BoundedProcessResult) -> bool:
+    message = f"{result.stdout}\n{result.stderr}".casefold()
+    return any(
+        marker in message
+        for marker in (
+            "no such container",
+            "no such object",
+            "no container with",
+            "not found",
+            "does not exist",
         )
     )
 
 
-def _build_darwin_isolation(
-    sandbox: SandboxPaths,
-    launcher: str,
-    runtime_mounts: Sequence[Path],
-    python_path: Sequence[Path],
-) -> NetworkIsolation:
-    profile = build_darwin_profile(
-        sandbox, runtime_mounts=runtime_mounts, python_path=python_path
-    )
-    return NetworkIsolation(
-        capability="darwin-sandbox-exec-deny-default",
-        argv_prefix=(launcher, "-p", profile),
-        env_overrides={
-            "HOME": str(sandbox.home),
-            "TMPDIR": str(sandbox.temp),
-            "TMP": str(sandbox.temp),
-            "TEMP": str(sandbox.temp),
-            "PYTHONPATH": os.pathsep.join(str(path) for path in python_path),
-        },
-    )
-
-
-_PROBE_SCRIPT = r"""
-import json, os, pathlib, socket, sys
-sentinel, env_name, host_pid, port = sys.argv[1:]
-try:
-    pathlib.Path(sentinel).read_text()
-    file_blocked = False
-except Exception:
-    file_blocked = True
-env_blocked = env_name not in os.environ
-proc_private = not pathlib.Path('/proc', host_pid).exists()
-try:
-    sock = socket.create_connection(('127.0.0.1', int(port)), timeout=0.2)
-    sock.close()
-    socket_blocked = False
-except Exception:
-    socket_blocked = True
-print(json.dumps({'file': file_blocked, 'env': env_blocked, 'proc': proc_private, 'socket': socket_blocked}))
-"""
-
-
-def _probe_network_isolation(
-    isolation: NetworkIsolation,
-    sandbox: SandboxPaths,
-) -> bool:
-    """Prove host file/env/proc/socket boundaries, not merely launcher startup."""
-    with _PROBE_LOCK, tempfile.TemporaryDirectory(
-        prefix="repopilot-host-probe-"
-    ) as probe_dir:
-        sentinel = Path(probe_dir) / "host-sentinel"
-        sentinel.write_text("must-not-be-readable", encoding="utf-8")
-        listener: socket.socket | None = None
+def _force_remove_container(backend: str, name: str, cidfile: Path) -> bool:
+    target = name
+    try:
+        raw = cidfile.read_text(encoding="ascii").strip()
+    except OSError:
+        raw = ""
+    if len(raw) in {12, 64} and all(character in "0123456789abcdef" for character in raw):
+        target = raw
+        recovery = _recovery_path(name, cidfile)
         try:
-            listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            listener.bind(("127.0.0.1", 0))
-            listener.listen(1)
-        except OSError:
-            if listener is not None:
-                listener.close()
-            return False
-        previous = os.environ.get(_PROBE_ENV_NAME)
-        os.environ[_PROBE_ENV_NAME] = "must-not-cross"
+            payload = json.loads(recovery.read_text(encoding="utf-8"))
+            payload["container_id"] = raw
+            recovery.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            recovery.chmod(0o600)
+        except (OSError, ValueError, TypeError):
+            pass
+    for _attempt in range(3):
         try:
-            result = run_bounded_process(
-                [
-                    *isolation.argv_prefix,
-                    trusted_python(),
-                    "-c",
-                    _PROBE_SCRIPT,
-                    str(sentinel),
-                    _PROBE_ENV_NAME,
-                    str(os.getpid()),
-                    str(listener.getsockname()[1]),
-                ],
-                cwd=sandbox.workspace,
-                timeout=10,
+            _removed = run_bounded_process(
+                [backend, "rm", "-f", target],
+                cwd=cidfile.parent,
+                timeout=15,
                 max_output_bytes=8_000,
-                env_overrides=isolation.env_overrides,
+            )
+            inspected = run_bounded_process(
+                [backend, "inspect", target],
+                cwd=cidfile.parent,
+                timeout=15,
+                max_output_bytes=8_000,
             )
         except (OSError, RuntimeError, ValueError):
-            return False
-        finally:
-            listener.close()
-            if previous is None:
-                os.environ.pop(_PROBE_ENV_NAME, None)
-            else:
-                os.environ[_PROBE_ENV_NAME] = previous
-        if result.returncode != 0:
-            return False
-        try:
-            payload = json.loads(result.stdout.strip())
-        except (json.JSONDecodeError, TypeError):
-            return False
-        return all(payload.get(key) is True for key in ("file", "env", "proc", "socket"))
+            time.sleep(0.1)
+            continue
+        if inspected.returncode != 0 and _known_missing_container(inspected):
+            for path in (cidfile, _recovery_path(name, cidfile)):
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+            return True
+        time.sleep(0.1)
+    return False
 
 
-def network_isolation(sandbox: SandboxPaths) -> NetworkIsolation:
-    """Resolve and negatively probe a strong platform sandbox or fail closed."""
-    runtime_mounts = _runtime_mounts()
-    python_path = _python_import_paths()
-    system = platform.system()
-    if system == "Darwin":
-        launcher = trusted_executable("sandbox-exec", required=False)
-        if launcher:
-            isolation = _build_darwin_isolation(
-                sandbox, launcher, runtime_mounts, python_path
+def _verify_created_container(
+    backend: str, name: str, sandbox: SandboxPaths, config: ToolSandboxConfig
+) -> None:
+    inspected = run_bounded_process(
+        [backend, "inspect", name],
+        cwd=sandbox.root,
+        timeout=15,
+        max_output_bytes=128_000,
+        decode_errors="strict",
+    )
+    if inspected.returncode != 0:
+        raise NetworkIsolationUnavailableError("OCI created-container inspect failed")
+    try:
+        decoded = json.loads(inspected.stdout)
+        details = decoded[0]
+        host = details["HostConfig"]
+        container_config = details["Config"]
+        mounts = details.get("Mounts", [])
+    except (IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise NetworkIsolationUnavailableError("invalid OCI inspect response") from exc
+    persistent_mounts = [
+        mount for mount in mounts if str(mount.get("Type", "")).lower() != "tmpfs"
+    ]
+    tmpfs = host.get("Tmpfs", {})
+    tmp_size = str(tmpfs.get("/tmp", "")).lower()
+    home_size = str(tmpfs.get("/home/repopilot", "")).lower()
+    expected_source = str(sandbox.workspace)
+    if (
+        len(persistent_mounts) != 1
+        or persistent_mounts[0].get("Type") != "bind"
+        or persistent_mounts[0].get("Source") != expected_source
+        or persistent_mounts[0].get("Destination") != "/workspace"
+        or persistent_mounts[0].get("RW") is not False
+        or str(host.get("NetworkMode", "")).lower() != "none"
+        or host.get("ReadonlyRootfs") is not True
+        or host.get("Privileged") is not False
+        or "all" not in {str(item).lower() for item in host.get("CapDrop", [])}
+        or "no-new-privileges" not in " ".join(
+            str(item).lower() for item in host.get("SecurityOpt", [])
+        )
+        or int(host.get("PidsLimit") or 0) != config.pids_limit
+        or int(host.get("Memory") or 0) <= 0
+        or int(host.get("NanoCpus") or host.get("CpuQuota") or 0) <= 0
+        or set(tmpfs) != {"/tmp", "/home/repopilot"}
+        or not any(value in tmp_size for value in ("size=256m", "size=268435456"))
+        or not any(value in home_size for value in ("size=64m", "size=67108864"))
+        or not str(container_config.get("User", ""))
+        or str(container_config.get("User", "")).split(":", 1)[0] == "0"
+        or str(container_config.get("Image", "")) != config.image
+    ):
+        raise NetworkIsolationUnavailableError("OCI runtime did not preserve isolation")
+
+
+def _run_oci_container(
+    backend: str,
+    config: ToolSandboxConfig,
+    sandbox: SandboxPaths,
+    command: Sequence[str],
+    *,
+    prefix: str,
+    timeout: float,
+    max_output_bytes: int,
+) -> BoundedProcessResult:
+    name, cidfile = _container_identity(prefix, sandbox)
+    argv = build_oci_command(
+        config,
+        sandbox,
+        command,
+        backend=backend,
+        name=name,
+        cidfile=cidfile,
+    )
+    recovery = _write_recovery_record(backend, name, cidfile)
+    result: BoundedProcessResult | None = None
+    operation_error: Exception | None = None
+    try:
+        created = run_bounded_process(
+            argv,
+            cwd=sandbox.root,
+            timeout=min(timeout, 60),
+            max_output_bytes=max_output_bytes,
+        )
+        if created.returncode != 0:
+            result = created
+        else:
+            _verify_created_container(backend, name, sandbox, config)
+            result = run_bounded_process(
+                [backend, "start", "-a", name],
+                cwd=sandbox.root,
+                timeout=timeout,
+                max_output_bytes=max_output_bytes,
             )
-            if _probe_network_isolation(isolation, sandbox):
-                return isolation
-    elif system == "Linux":
-        launcher = trusted_executable("bwrap", required=False)
-        if launcher:
-            isolation = build_linux_isolation(
-                sandbox,
-                launcher=launcher,
-                runtime_mounts=runtime_mounts,
-                python_path=python_path,
+    except Exception as exc:
+        operation_error = exc
+    try:
+        cleaned = _force_remove_container(backend, name, cidfile)
+    except Exception:
+        cleaned = False
+    if not cleaned:
+        raise IsolationCleanupError(name, recovery) from operation_error
+    if operation_error is not None:
+        raise operation_error.with_traceback(operation_error.__traceback__)
+    assert result is not None
+    return result
+
+
+def run_oci_process(
+    command: Sequence[str],
+    *,
+    sandbox: SandboxPaths,
+    config: ToolSandboxConfig,
+    timeout: float = 300,
+    max_output_bytes: int = 8_000,
+) -> BoundedProcessResult:
+    """Probe and execute repository code only in a digest-pinned OCI image."""
+    backend = trusted_executable(config.backend, required=True)
+    if backend is None:
+        raise NetworkIsolationUnavailableError("trusted OCI backend unavailable")
+    probe = _run_oci_container(
+        backend,
+        config,
+        sandbox,
+        [
+            config.python_executable,
+            "-P",
+            "-m",
+            "pytest",
+            "--version",
+        ],
+        prefix="probe",
+        timeout=min(timeout, 30),
+        max_output_bytes=8_000,
+    )
+    if probe.returncode != 0 or "pytest" not in f"{probe.stdout}\n{probe.stderr}".casefold():
+        raise NetworkIsolationUnavailableError("OCI Python/pytest capability probe failed")
+    if command[0] in dict(config.project_executables).values():
+        project_probe = _run_oci_container(
+            backend,
+            config,
+            sandbox,
+            [command[0], "--version"],
+            prefix="project-probe",
+            timeout=min(timeout, 30),
+            max_output_bytes=8_000,
+        )
+        if project_probe.returncode != 0:
+            raise NetworkIsolationUnavailableError(
+                "OCI project executable capability probe failed"
             )
-            if _probe_network_isolation(isolation, sandbox):
-                return isolation
-    raise NetworkIsolationUnavailableError(
-        f"no proven strong network/filesystem isolation capability for {system}"
+    return _run_oci_container(
+        backend,
+        config,
+        sandbox,
+        command,
+        prefix="command",
+        timeout=timeout,
+        max_output_bytes=max_output_bytes,
     )
 
 
@@ -477,7 +547,7 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
             os.killpg(process.pid, signal.SIGKILL)
         except (PermissionError, ProcessLookupError):
             pass
-    else:  # pragma: no cover - Windows has no supported strong test sandbox
+    else:  # pragma: no cover
         try:
             process.send_signal(signal.CTRL_BREAK_EVENT)
         except OSError:
@@ -496,28 +566,24 @@ def run_bounded_process(
     input_text: str | None = None,
     timeout: float = 300,
     max_output_bytes: int = 8_000,
-    isolate_network: bool = False,
-    sandbox: SandboxPaths | None = None,
     env_overrides: dict[str, str] | None = None,
+    watched_output_path: str | Path | None = None,
+    max_watched_output_bytes: int | None = None,
+    decode_errors: Literal["strict", "replace"] = "replace",
 ) -> BoundedProcessResult:
     """Run fixed argv with bounded capture and reap the group on every exit."""
     if not argv or any(not isinstance(token, str) for token in argv):
         raise ValueError("argv must contain strings")
     if timeout <= 0 or max_output_bytes < 0:
         raise ValueError("invalid subprocess bounds")
+    if (watched_output_path is None) != (max_watched_output_bytes is None):
+        raise ValueError("watched output path and bound must be configured together")
+    if max_watched_output_bytes is not None and max_watched_output_bytes < 0:
+        raise ValueError("invalid watched output bound")
     original_argv = list(argv)
-    launched_argv = original_argv
-    merged_overrides = dict(env_overrides or {})
-    if isolate_network:
-        if sandbox is None:
-            raise NetworkIsolationUnavailableError("private sandbox paths are required")
-        isolation = network_isolation(sandbox)
-        launched_argv = [*isolation.argv_prefix, *original_argv]
-        merged_overrides.update(isolation.env_overrides)
-
     kwargs: dict[str, object] = {
         "cwd": Path(cwd),
-        "env": minimal_subprocess_env(merged_overrides),
+        "env": minimal_subprocess_env(env_overrides),
         "stdin": subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
@@ -526,7 +592,7 @@ def run_bounded_process(
         kwargs["start_new_session"] = True
     else:  # pragma: no cover
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    process = subprocess.Popen(launched_argv, **kwargs)  # type: ignore[arg-type]
+    process = subprocess.Popen(original_argv, **kwargs)  # type: ignore[arg-type]
     assert process.stdout is not None and process.stderr is not None
     stdout = bytearray()
     stderr = bytearray()
@@ -534,8 +600,16 @@ def run_bounded_process(
     lock = threading.Lock()
     overflow = threading.Event()
     readers = [
-        threading.Thread(target=_reader, args=(process.stdout, stdout, budget, lock, overflow), daemon=True),
-        threading.Thread(target=_reader, args=(process.stderr, stderr, budget, lock, overflow), daemon=True),
+        threading.Thread(
+            target=_reader,
+            args=(process.stdout, stdout, budget, lock, overflow),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=_reader,
+            args=(process.stderr, stderr, budget, lock, overflow),
+            daemon=True,
+        ),
     ]
     for reader in readers:
         reader.start()
@@ -551,25 +625,43 @@ def run_bounded_process(
 
     deadline = time.monotonic() + timeout
     timed_out = False
+    watched_overflow = False
     group_terminated = False
+    watched = Path(watched_output_path) if watched_output_path is not None else None
     while process.poll() is None:
-        if overflow.is_set() or time.monotonic() >= deadline:
-            timed_out = not overflow.is_set()
+        if watched is not None:
+            try:
+                watched_overflow = watched.stat().st_size > int(max_watched_output_bytes or 0)
+            except FileNotFoundError:
+                pass
+        if overflow.is_set() or watched_overflow or time.monotonic() >= deadline:
+            timed_out = not overflow.is_set() and not watched_overflow
             _terminate_process_group(process)
             group_terminated = True
             break
         time.sleep(0.01)
+    if watched is not None:
+        try:
+            watched_overflow = watched_overflow or watched.stat().st_size > int(
+                max_watched_output_bytes or 0
+            )
+        except FileNotFoundError:
+            pass
     if not group_terminated:
-        # A normal leader may leave descendants holding pipes or mutating the
-        # snapshot. Always end the complete session/namespace before returning.
         _terminate_process_group(process)
+    if watched_overflow and watched is not None and max_watched_output_bytes is not None:
+        try:
+            with watched.open("r+b") as output:
+                output.truncate(max_watched_output_bytes)
+        except OSError:
+            pass
     for reader in readers:
         reader.join(timeout=1)
     if writer is not None:
         writer.join(timeout=1)
-    stdout_text = stdout.decode("utf-8", errors="replace")
-    stderr_text = stderr.decode("utf-8", errors="replace")
-    if overflow.is_set():
+    stdout_text = stdout.decode("utf-8", errors=decode_errors)
+    stderr_text = stderr.decode("utf-8", errors=decode_errors)
+    if overflow.is_set() or watched_overflow:
         raise ProcessOutputLimitError(stdout_text, stderr_text)
     if timed_out:
         raise ProcessTimeoutError(stdout_text, stderr_text)

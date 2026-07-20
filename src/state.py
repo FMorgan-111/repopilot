@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Sequence
@@ -11,6 +12,7 @@ from typing import Any, Awaitable, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .repo_paths import canonical_repo_path
 
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
 
@@ -335,12 +337,118 @@ class Evidence(BaseModel):
     fingerprint: str
 
 
+class ToolSandboxConfig(BaseModel):
+    """Persisted immutable OCI boundary for repository-controlled commands."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    backend: Literal["docker", "podman"]
+    image: str = Field(
+        pattern=(
+            r"^(?:[A-Za-z0-9][A-Za-z0-9._:/-]*@)?sha256:[0-9a-f]{64}$"
+        ),
+        max_length=512,
+    )
+    python_executable: str = "/usr/bin/python3"
+    project_executables: tuple[tuple[str, str], ...] = ()
+    user: str = Field(default="65532:65532", pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")
+    pids_limit: int = Field(default=128, ge=16, le=1024)
+    memory: str = Field(default="1g", pattern=r"^[1-9][0-9]*(?:[kKmMgG])$")
+    cpus: float = Field(default=1.0, gt=0, le=16)
+
+    @staticmethod
+    def _container_executable(value: Any) -> str:
+        candidate = str(value or "")
+        path = Path(candidate)
+        if (
+            not candidate.startswith("/")
+            or "\\" in candidate
+            or any(character.isspace() or ord(character) < 32 for character in candidate)
+            or ".." in path.parts
+            or candidate.endswith("/")
+            or len(candidate) > 256
+        ):
+            raise ValueError("container executable must be an absolute clean path")
+        return candidate
+
+    @field_validator("python_executable", mode="before")
+    @classmethod
+    def _validate_python_executable(cls, value: Any) -> str:
+        return cls._container_executable(value)
+
+    @field_validator("project_executables", mode="before")
+    @classmethod
+    def _validate_project_executables(cls, value: Any) -> tuple[tuple[str, str], ...]:
+        if value is None:
+            return ()
+        pairs = value.items() if isinstance(value, dict) else value
+        if not isinstance(pairs, (Sequence, type({}.items()))):
+            raise ValueError("invalid project executable map")
+        normalized: dict[str, str] = {}
+        for raw_name, raw_path in pairs:
+            name = str(raw_name).lower()
+            if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
+                raise ValueError("invalid project executable name")
+            normalized[name] = cls._container_executable(raw_path)
+        if len(normalized) > 16:
+            raise ValueError("invalid project executable map")
+        return tuple(sorted(normalized.items()))
+
+    def project_executable(self, name: str) -> str | None:
+        return dict(self.project_executables).get(name.lower())
+
+
+class SnapshotManifestEntry(BaseModel):
+    """One canonical changed entry approved for a disposable snapshot."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    path: str
+    change: Literal["added", "modified", "deleted"]
+    mode: Literal["100644", "100755"]
+    content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    size: int = Field(ge=0, le=512_000_000)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _validate_path(cls, value: Any) -> str:
+        return canonical_repo_path(value)
+
+    @model_validator(mode="after")
+    def _validate_content_hash(self) -> "SnapshotManifestEntry":
+        if self.change == "deleted" and self.content_sha256 is not None:
+            raise ValueError("deleted manifest entry must not carry content")
+        if self.change != "deleted" and self.content_sha256 is None:
+            raise ValueError("live manifest entry requires a content hash")
+        return self
+
+
+def tool_manifest_fingerprint(entries: Sequence[SnapshotManifestEntry]) -> str:
+    """Hash a canonical ordered manifest without accepting alternate encodings."""
+    payload = json.dumps(
+        [entry.model_dump(mode="json") for entry in entries],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class ToolPatchApproval(BaseModel):
     """PatchGate authorization for the exact patch exposed to a tool sandbox."""
 
     base_ref: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
     patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    changed_manifest: list[SnapshotManifestEntry] = Field(max_length=20_000)
+    manifest_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def _require_canonical_manifest(self) -> "ToolPatchApproval":
+        paths = [entry.path for entry in self.changed_manifest]
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise ValueError("changed manifest must be sorted and unique")
+        return self
 
 
 class GeneratedTestApproval(BaseModel):
@@ -445,7 +553,10 @@ class AgentState(BaseModel):
     evidence: list[Evidence] = Field(default_factory=list)
     tool_history: list[ToolInvocation] = Field(default_factory=list)
     tool_patch_approval: ToolPatchApproval | None = None
-    generated_test_approvals: list[GeneratedTestApproval] = Field(default_factory=list)
+    generated_test_approvals: list[GeneratedTestApproval] = Field(
+        default_factory=list, max_length=20_000
+    )
+    tool_sandbox_config: ToolSandboxConfig | None = None
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False

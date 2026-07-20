@@ -1,16 +1,39 @@
 from __future__ import annotations
 
-import subprocess
 import hashlib
+import json
+import os
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from src.evidence import EvidenceStore
 from src.safe_subprocess import BoundedProcessResult
-from src.state import AgentState, ToolPatchApproval
+from src.state import (
+    AgentState,
+    SnapshotManifestEntry,
+    ToolPatchApproval,
+    ToolSandboxConfig,
+)
 from src.tool_policy import ToolIntent
-from src.tool_router import route_tool_intent
+from src.tool_router import (
+    _disposable_test_snapshot,
+    _preflight_exact_tree,
+    _scan_snapshot,
+    route_tool_intent,
+)
+
+_IMAGE = "registry.example/repopilot-tests@sha256:" + "1" * 64
+
+
+def _sandbox_config() -> ToolSandboxConfig:
+    return ToolSandboxConfig(
+        backend="docker",
+        image=_IMAGE,
+        python_executable="/usr/bin/python3",
+        project_executables={"npm": "/usr/bin/npm"},
+    )
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:
@@ -40,9 +63,31 @@ def _state(root: Path, commit: str, **updates: object) -> AgentState:
         "issue_url": "https://github.com/acme/widget/issues/1",
         "repo_path": str(root),
         "repo_ref": commit,
+        "tool_sandbox_config": _sandbox_config(),
     }
     values.update(updates)
     return AgentState(**values)
+
+
+def _manifest_fingerprint(entries: list[SnapshotManifestEntry]) -> str:
+    payload = json.dumps(
+        [entry.model_dump(mode="json") for entry in entries],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _approval(
+    commit: str, patch: str, entries: list[SnapshotManifestEntry]
+) -> ToolPatchApproval:
+    return ToolPatchApproval(
+        base_ref=commit,
+        patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+        patch_gate_fingerprint="e" * 64,
+        changed_manifest=entries,
+        manifest_fingerprint=_manifest_fingerprint(entries),
+    )
 
 
 def _intent(action: str, **args: object) -> ToolIntent:
@@ -78,16 +123,18 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     root, commit = _repo(tmp_path)
     captured: dict[str, object] = {}
 
-    def fake_run(argv, root, **kwargs):
+    def fake_oci(argv, *, sandbox, config, **kwargs):
         captured["argv"] = argv
-        captured["root"] = root
+        captured["root"] = sandbox.workspace
+        captured["sandbox"] = sandbox
+        captured["config"] = config
         captured.update(kwargs)
-        assert root != root_repo
-        assert not (root / ".git").exists()
-        assert (root / "tests" / "test_widget.py").is_file()
+        assert sandbox.workspace != root_repo
+        assert not (sandbox.workspace / ".git").exists()
+        assert (sandbox.workspace / "tests" / "test_widget.py").is_file()
         return BoundedProcessResult(argv=argv, returncode=0, stdout="one passed", stderr="")
 
-    monkeypatch.setattr("src.tool_router._run", fake_run)
+    monkeypatch.setattr("src.tool_router.run_oci_process", fake_oci)
     root_repo = root
     state = _state(root, commit)
 
@@ -99,10 +146,24 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
 
     assert result.status == "ok"
     assert isinstance(captured["argv"], list)
-    assert captured["argv"][1:3] == ["-m", "pytest"]
+    assert captured["argv"][:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
     assert captured["root"] != root_repo
     assert captured["sandbox"].workspace == captured["root"]
     assert "one passed" in state.evidence[-1].content
+
+
+async def test_targeted_test_route_fails_closed_when_oci_is_unconfigured(tmp_path):
+    root, commit = _repo(tmp_path)
+    state = _state(root, commit, tool_sandbox_config=None)
+
+    result = await route_tool_intent(
+        state,
+        _intent("run_targeted_test", command="pytest tests/test_widget.py"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "rejected"
+    assert state.evidence == []
 
 
 async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
@@ -121,26 +182,32 @@ async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
         capture_output=True,
         text=True,
     ).stdout
+    changed = source.read_bytes()
+    manifest = [
+        SnapshotManifestEntry(
+            path="src/widget.py",
+            change="modified",
+            mode="100644",
+            content_sha256=hashlib.sha256(changed).hexdigest(),
+            size=len(changed),
+        )
+    ]
     state = _state(
         root,
         commit,
         patch_content=patch,
-        tool_patch_approval=ToolPatchApproval(
-            base_ref=commit,
-            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
-            patch_gate_fingerprint="e" * 64,
-        ),
+        tool_patch_approval=_approval(commit, patch, manifest),
     )
 
-    def fake_run(argv, snapshot, **kwargs):
+    def fake_oci(argv, *, sandbox, config, **kwargs):
+        snapshot = sandbox.workspace
         assert "'approved'" in (snapshot / "src" / "widget.py").read_text()
         assert not (snapshot / "host-only-sentinel").exists()
         assert not (snapshot / ".git").exists()
-        assert kwargs["sandbox"].home != Path.home()
-        assert kwargs["sandbox"].temp != Path("/tmp")
+        assert config.image == _IMAGE
         return BoundedProcessResult(argv=argv, returncode=0, stdout="passed", stderr="")
 
-    monkeypatch.setattr("src.tool_router._run", fake_run)
+    monkeypatch.setattr("src.tool_router.run_oci_process", fake_oci)
 
     result = await route_tool_intent(
         state,
@@ -214,7 +281,7 @@ async def test_errors_store_only_sanitized_exception_class(tmp_path, monkeypatch
     def explode(*args, **kwargs):
         raise RuntimeError(f"failed with {secret}")
 
-    monkeypatch.setattr("src.tool_router._run", explode)
+    monkeypatch.setattr("src.tool_router.run_oci_process", explode)
     state = _state(root, commit)
 
     result = await route_tool_intent(
@@ -318,3 +385,288 @@ async def test_policy_rejection_is_persisted_without_execution(tmp_path):
     assert result.status == "rejected"
     assert state.tool_history[-1].status == "rejected"
     assert state.evidence == []
+
+
+async def test_patch_manifest_fingerprint_tamper_fails_before_oci_run(
+    tmp_path, monkeypatch
+):
+    root, commit = _repo(tmp_path)
+    approval = ToolPatchApproval(
+        base_ref=commit,
+        patch_sha256=hashlib.sha256(b"").hexdigest(),
+        patch_gate_fingerprint="e" * 64,
+        changed_manifest=[],
+        manifest_fingerprint="f" * 64,
+    )
+    state = _state(root, commit, tool_patch_approval=approval)
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process",
+        lambda *args, **kwargs: pytest.fail("tampered manifest reached OCI"),
+    )
+
+    result = await route_tool_intent(
+        state,
+        _intent("run_targeted_test", command="pytest tests/test_widget.py"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "error"
+    assert result.error_class == "ValueError"
+
+
+@pytest.mark.parametrize("protected", [".ENV", "package.json"])
+async def test_postapply_scan_rejects_traditional_sensitive_or_manifest_patch(
+    tmp_path, monkeypatch, protected
+):
+    root, _ = _repo(tmp_path)
+    target = root / protected
+    old = "TOKEN=old\n" if protected == ".ENV" else '{"scripts":{"test":"old"}}\n'
+    new = "TOKEN=new\n" if protected == ".ENV" else '{"scripts":{"test":"new"}}\n'
+    target.write_text(old, encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", protected], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    patch = f"--- {protected}\n+++ {protected}\n@@ -1 +1 @@\n-{old.rstrip()}\n+{new.rstrip()}\n"
+    manifest = [
+        SnapshotManifestEntry(
+            path=protected,
+            change="modified",
+            mode="100644",
+            content_sha256=hashlib.sha256(new.encode()).hexdigest(),
+            size=len(new.encode()),
+        )
+    ]
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, manifest),
+    )
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process",
+        lambda *args, **kwargs: pytest.fail("protected patch reached OCI"),
+    )
+
+    result = await route_tool_intent(
+        state,
+        _intent("run_targeted_test", command="pytest tests/test_widget.py"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "error"
+    assert result.error_class == "ValueError"
+
+
+async def test_postapply_manifest_must_match_exact_snapshot_changes(
+    tmp_path, monkeypatch
+):
+    root, commit = _repo(tmp_path)
+    source = root / "src" / "widget.py"
+    source.write_text(source.read_text().replace("'old'", "'new'"), encoding="utf-8")
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", commit, "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, []),
+    )
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process",
+        lambda *args, **kwargs: pytest.fail("unexpected change reached OCI"),
+    )
+
+    result = await route_tool_intent(
+        state,
+        _intent("run_targeted_test", command="pytest tests/test_widget.py"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "error"
+
+
+def test_exact_tree_preflight_caps_file_count_and_blob_bytes(tmp_path, monkeypatch):
+    root, commit = _repo(tmp_path)
+    monkeypatch.setattr("src.tool_router._MAX_SNAPSHOT_FILES", 1)
+    with pytest.raises(ValueError, match="file count"):
+        _preflight_exact_tree(root, commit)
+
+    monkeypatch.setattr("src.tool_router._MAX_SNAPSHOT_FILES", 100)
+    monkeypatch.setattr("src.tool_router._MAX_SNAPSHOT_BYTES", 1)
+    with pytest.raises(ValueError, match="blob bytes"):
+        _preflight_exact_tree(root, commit)
+
+
+def test_approved_patch_bytes_are_capped_before_apply(tmp_path, monkeypatch):
+    root, commit = _repo(tmp_path)
+    patch = "x" * 32
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, []),
+    )
+    monkeypatch.setattr("src.tool_router._MAX_PATCH_BYTES", 16)
+
+    with pytest.raises(ValueError, match="byte limit"):
+        with _disposable_test_snapshot(state):
+            pytest.fail("oversize patch snapshot was yielded")
+
+
+def test_binary_patch_is_rejected_before_apply(tmp_path):
+    root, commit = _repo(tmp_path)
+    patch = "diff --git a/blob b/blob\nGIT binary patch\nliteral 1000000\n"
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, []),
+    )
+
+    with pytest.raises(ValueError, match="binary patches"):
+        with _disposable_test_snapshot(state):
+            pytest.fail("binary patch snapshot was yielded")
+
+
+def test_manifest_size_preflight_rejects_impossible_text_patch_inflation(tmp_path):
+    root, commit = _repo(tmp_path)
+    source = root / "src" / "widget.py"
+    source.write_text(source.read_text().replace("'old'", "'new'"), encoding="utf-8")
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", commit, "--", "src/widget.py"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    content = source.read_bytes()
+    manifest = [
+        SnapshotManifestEntry(
+            path="src/widget.py",
+            change="modified",
+            mode="100644",
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            size=500_000_000,
+        )
+    ]
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, manifest),
+    )
+
+    with pytest.raises(ValueError, match="impossible size"):
+        with _disposable_test_snapshot(state):
+            pytest.fail("impossible manifest snapshot was yielded")
+
+
+def test_snapshot_scan_rejects_special_files_and_postpatch_size(tmp_path, monkeypatch):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    fifo = workspace / "pipe"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="special"):
+        _scan_snapshot(workspace)
+
+    fifo.unlink()
+    (workspace / "large.py").write_bytes(b"x" * 32)
+    monkeypatch.setattr("src.tool_router._MAX_SNAPSHOT_BYTES", 16)
+    with pytest.raises(ValueError, match="bytes"):
+        _scan_snapshot(workspace)
+
+
+def test_snapshot_scan_rejects_postpatch_symlink(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "escape").symlink_to(tmp_path)
+
+    with pytest.raises(ValueError, match="symlink"):
+        _scan_snapshot(workspace)
+
+
+async def test_sensitive_delete_and_public_add_suppresses_all_diff_evidence(tmp_path):
+    root, _ = _repo(tmp_path)
+    secret = "propagated-secret-sentinel"
+    (root / ".env").write_text(secret + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", ".env"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (root / ".env").unlink()
+    (root / "public.py").write_text(secret + "\n", encoding="utf-8")
+    source = root / "src" / "widget.py"
+    source.write_text(source.read_text().replace("'old'", "'safe-new'"), encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "-A"], check=True)
+    state = _state(root, commit)
+
+    result = await route_tool_intent(
+        state, _intent("inspect_git_diff"), calls_this_round=0
+    )
+
+    assert result.status == "ok"
+    content = state.evidence[-1].content
+    assert secret not in content
+    assert "safe-new" not in content
+    assert "public.py" not in content
+    assert "omitted" in content.lower()
+
+
+async def test_unchanged_sensitive_base_taints_public_copy_diff(tmp_path):
+    root, _ = _repo(tmp_path)
+    secret = "unchanged-sensitive-base-sentinel"
+    (root / ".env").write_text(secret + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", ".env"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    (root / "public.py").write_text(secret + "\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", "public.py"], check=True)
+    state = _state(root, commit)
+
+    result = await route_tool_intent(
+        state, _intent("inspect_git_diff"), calls_this_round=0
+    )
+
+    assert result.status == "ok"
+    assert secret not in state.evidence[-1].content
+    assert "public.py" not in state.evidence[-1].content
+    assert "omitted" in state.evidence[-1].content.lower()
+
+
+async def test_untracked_safe_files_are_conservatively_omitted_from_diff(tmp_path):
+    root, commit = _repo(tmp_path)
+    marker = "untracked-content-must-not-enter-evidence"
+    (root / "notes.py").write_text(marker, encoding="utf-8")
+    source = root / "src" / "widget.py"
+    source.write_text(
+        source.read_text().replace("'old'", "'tracked-new'"), encoding="utf-8"
+    )
+    state = _state(root, commit)
+
+    result = await route_tool_intent(
+        state, _intent("inspect_git_diff"), calls_this_round=0
+    )
+
+    assert result.status == "ok"
+    content = state.evidence[-1].content
+    assert "tracked-new" in content
+    assert marker not in content
+    assert "notes.py" not in content
+    assert "untracked files" in content.lower()
