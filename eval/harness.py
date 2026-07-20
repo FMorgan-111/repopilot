@@ -38,12 +38,15 @@ if str(REPO_ROOT) not in sys.path:
 load_dotenv(REPO_ROOT / ".env", override=True)
 
 DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
-_LLM_BASE = os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 _LLM_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
 _LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
 
 _llm_client: httpx.AsyncClient | None = None
+
+
+def _get_llm_base_url() -> str:
+    return os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -62,7 +65,7 @@ async def llm_request(
     temperature: float = 0.2,
 ) -> dict:
     """Call the LLM API and return the raw response dict (includes usage)."""
-    url = f"{_LLM_BASE}/chat/completions"
+    url = f"{_get_llm_base_url()}/chat/completions"
     payload = {
         "model": model or _LLM_MODEL,
         "messages": messages,

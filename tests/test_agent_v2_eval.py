@@ -11,10 +11,20 @@ def test_legacy_harness_default_model_is_gemini_flash():
     assert harness.DEFAULT_MODEL == "gemini-3.5-flash:stable"
 
 
-def test_legacy_harness_default_base_url_is_linoapi():
+def test_legacy_harness_base_url_falls_back_to_linoapi(monkeypatch):
     from eval import harness
 
-    assert harness.DEFAULT_BASE_URL == "https://linoapi.com.cn/v1"
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    assert harness._get_llm_base_url() == "https://linoapi.com.cn/v1"
+
+
+def test_legacy_harness_base_url_honors_normalized_override(monkeypatch):
+    from eval import harness
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.test/v1/")
+
+    assert harness._get_llm_base_url() == "https://example.test/v1"
 
 
 def sample_record():
