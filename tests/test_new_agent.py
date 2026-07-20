@@ -7,6 +7,66 @@ import src.run_store as run_store
 from src import graph, http_client, new_agent
 
 
+async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["start"] = compiled_graph.start
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={
+            "owner": "acme",
+            "repo": "widget",
+            "issue_number": 7,
+            "issue_title": "Login crash",
+            "issue_body": "ValueError",
+            "repo_ref": "a" * 40,
+            "repo_path": "/tmp/widget",
+        },
+    )
+
+    assert captured["start"] == "locate_code"
+    assert captured["state"].current_phase == new_agent.Phase.LOCATE
+    assert captured["state"].repo_ref == "a" * 40
+    assert captured["state"].repo_path == "/tmp/widget"
+
+
+async def test_oracle_seed_with_files_starts_agent_at_plan(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["start"] = compiled_graph.start
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={
+            "owner": "acme",
+            "repo": "widget",
+            "relevant_files": [
+                {"path": "src/auth.py", "content": "def login(): pass\n"}
+            ],
+        },
+    )
+
+    assert captured["start"] == "plan_fix"
+    assert captured["state"].current_phase == new_agent.Phase.PLAN
+
+
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
     visited = []
 

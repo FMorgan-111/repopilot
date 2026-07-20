@@ -205,6 +205,7 @@ class AgentState(BaseModel):
     patch_edits: list[PatchEdit] = Field(default_factory=list)
     test_command: str = ""
     repo_path: str = ""
+    repo_ref: str = ""
     branch_name: str = ""
     base_branch: str = "main"
     pr_url: str | None = None

@@ -323,9 +323,9 @@ async def agent_v2(
 ) -> dict:
     """Run the full RepoPilot v2 graph with progress output and trace saving.
 
-    When `seed` is provided (offline eval), pre-populate the issue text and
-    relevant files and start at PLAN — skipping UNDERSTAND/LOCATE so a flaky
-    GitHub code search cannot starve the run before the patch stage."""
+    When `seed` is provided (offline eval), pre-populate the issue text. An
+    issue-only seed starts at LOCATE; an oracle seed with hydrated files starts
+    at PLAN. Both skip the live GitHub issue request in UNDERSTAND."""
     import sys
     import time as _time
     t_start = _time.monotonic()
@@ -346,12 +346,14 @@ async def agent_v2(
         state.issue_number = seed.get("issue_number", 0)
         state.issue_title = seed.get("issue_title", "")
         state.issue_body = seed.get("issue_body", "")
+        state.repo_ref = seed.get("repo_ref", "")
+        state.repo_path = seed.get("repo_path", "")
         state.relevant_files = [FileInfo(**f) for f in seed.get("relevant_files", [])]
-        state.current_phase = Phase.PLAN
-        start_phase = Phase.PLAN
+        start_phase = Phase.PLAN if state.relevant_files else Phase.LOCATE
+        state.current_phase = start_phase
         print(
             f"[agent_v2] Seeded {len(state.relevant_files)} file(s) for "
-            f"{state.owner}/{state.repo}; starting at PLAN",
+            f"{state.owner}/{state.repo}; starting at {start_phase.value}",
             file=sys.stderr,
             flush=True,
         )
