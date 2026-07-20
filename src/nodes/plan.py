@@ -17,7 +17,7 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
-from ..patch_gate import validate_patch_batch
+from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
     generate_opus_repair,
@@ -326,6 +326,32 @@ def _unlocatable_edits(state: AgentState) -> list[Any]:
         if not locate_search_block(content, edit.search):
             missing.append(edit)
     return missing
+
+
+def _has_valid_exact_patch_gate_approval(state: AgentState) -> bool:
+    if state.tool_patch_approval is None or not state.patch_edits:
+        return False
+    if not all(edit.exact_only for edit in state.patch_edits):
+        return False
+    try:
+        revalidate_approved_patch(state)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _clear_patch_authorization(
+    state: AgentState,
+    *,
+    clear_active_plan: bool = True,
+) -> None:
+    """Atomically retire an approval whenever its bound edits are discarded."""
+    state.patch_edits = []
+    state.patch_content = ""
+    state.tool_patch_approval = None
+    state.generated_test_approvals = []
+    if clear_active_plan:
+        state.active_repair_plan = None
 
 
 def _build_search_correction(state: AgentState, missing: list[Any]) -> str:
@@ -808,6 +834,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     build_escalation_packet(state),
                     validate_edits=False,
                 )
+                _clear_patch_authorization(state)
                 state.active_repair_plan = repair_plan
                 while True:
                     gate_result = validate_patch_batch(
@@ -819,9 +846,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                         patch_edits = gate_result.edits
                         break
                     if state.patch_correction_count >= 2:
-                        state.patch_edits = []
-                        state.patch_content = ""
-                        state.tool_patch_approval = None
+                        _clear_patch_authorization(state)
                         state.failure_reason = (
                             "PatchGate rejected the initial batch and two local corrections."
                         )
@@ -967,8 +992,14 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         break
 
     state.fix_plan = decision.plan
-    state.patch_content = decision.patch
-    state.patch_edits = decision.patch_edits
+    if not two_stage_repair:
+        _clear_patch_authorization(state)
+        state.patch_content = decision.patch
+        state.patch_edits = decision.patch_edits
+    else:
+        # PatchGate already installed this exact approved pair; do not replace it.
+        if decision.patch != state.patch_content or decision.patch_edits != state.patch_edits:
+            raise ValueError("PatchGate decision diverged from its frozen approval")
     state.test_command = decision.test_command
     print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars, edits={len(state.patch_edits)})", file=sys.stderr, flush=True)
     if not two_stage_repair:
@@ -1006,8 +1037,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     "frame_id": frame.frame_id,
                 }
             )
-            state.patch_edits = []
-            state.patch_content = ""
+            _clear_patch_authorization(state)
             if (
                 state.repeated_patch_block_count > MAX_REPEATED_PATCH_BLOCKS
                 or _is_final_attempt(state)
@@ -1025,7 +1055,11 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 frame.recommended_action = "reflect"
                 state.current_phase = Phase.REFLECT
         else:
-            missing = _unlocatable_edits(state)
+            missing = (
+                []
+                if _has_valid_exact_patch_gate_approval(state)
+                else _unlocatable_edits(state)
+            )
             if missing:
                 state.hallucinated_search_block_count += 1
                 state.search_correction_context = _build_search_correction(state, missing)
@@ -1040,8 +1074,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                         "frame_id": frame.frame_id,
                     }
                 )
-                state.patch_edits = []
-                state.patch_content = ""
+                _clear_patch_authorization(state)
                 if (
                     state.hallucinated_search_block_count > MAX_SEARCH_CORRECTIONS
                     or _is_final_attempt(state)

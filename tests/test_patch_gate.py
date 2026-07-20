@@ -3,8 +3,13 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from src.patch_gate import revalidate_approved_patch, validate_patch_batch
+from src.patch_gate import (
+    apply_approved_patch,
+    revalidate_approved_patch,
+    validate_patch_batch,
+)
 from src.state import AgentState, RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -239,3 +244,202 @@ def test_gate_generated_patch_applies_to_exact_base(tmp_path):
     )
 
     assert checked.returncode == 0, checked.stderr
+
+
+@pytest.mark.parametrize("newline", [b"\r\n", b"\r"])
+def test_gate_preserves_existing_raw_newline_style_and_applies(tmp_path, newline):
+    root, _ = _repo(tmp_path, {"a.py": "value = 1\nother = 2\n"})
+    source = newline.join([b"value = 1", b"other = 2", b""])
+    (root / "a.py").write_bytes(source)
+    subprocess.run(["git", "-C", str(root), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "-qm", "raw-newlines"], check=True)
+    ref = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    batch = VerifiedEditBatch(
+        edits=[_edit("a.py", search="value = 1", replace="value = 3", before=source)]
+    )
+
+    assert validate_patch_batch(state, plan, batch).accepted
+    apply_approved_patch(state)
+
+    assert (root / "a.py").read_bytes() == newline.join(
+        [b"value = 3", b"other = 2", b""]
+    )
+
+
+def test_gate_rejects_when_generated_patch_fails_real_git_apply_check(tmp_path, monkeypatch):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    actual_run = subprocess.run
+
+    def fail_only_apply_check(command, **kwargs):
+        if command[-3:] == ["apply", "--check", "-"]:
+            return subprocess.CompletedProcess(command, 1, stdout=b"", stderr=b"rejected")
+        return actual_run(command, **kwargs)
+
+    monkeypatch.setattr("src.patch_gate.subprocess.run", fail_only_apply_check)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert state.tool_patch_approval is None
+
+
+def _approved_two_edit_state(tmp_path):
+    source = b"first = 1\nsecond = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    batch = VerifiedEditBatch(
+        edits=[
+            _edit("a.py", search="first = 1", replace="first = 2", before=source),
+            _edit("a.py", search="second = 1", replace="second = 2", before=source),
+        ]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+    return root, state
+
+
+def test_approval_is_frozen_and_revalidation_requires_exact_active_plan(tmp_path):
+    _root, state = _approved_two_edit_state(tmp_path)
+    approval = state.tool_patch_approval
+    assert approval is not None
+    with pytest.raises(ValidationError):
+        approval.patch_sha256 = "0" * 64
+
+    state.active_repair_plan = None
+    with pytest.raises(ValueError, match="active RepairPlan"):
+        revalidate_approved_patch(state)
+
+
+@pytest.mark.parametrize("tamper", ["plan", "fingerprint", "edit", "order", "output"])
+def test_revalidation_rejects_every_canonical_approval_binding_tamper(tmp_path, tamper):
+    _root, state = _approved_two_edit_state(tmp_path)
+    approval = state.tool_patch_approval
+    assert approval is not None
+    if tamper == "plan":
+        state.active_repair_plan = state.active_repair_plan.model_copy(
+            update={"root_cause": "different validated plan"}
+        )
+    elif tamper == "fingerprint":
+        state.tool_patch_approval = approval.model_copy(
+            update={"patch_gate_fingerprint": "0" * 64}
+        )
+    elif tamper == "edit":
+        state.patch_edits[0].replace = "first = 9"
+    elif tamper == "order":
+        state.patch_edits.reverse()
+    else:
+        state.patch_content = state.patch_content.replace("second = 2", "second = 9")
+        state.tool_patch_approval = approval.model_copy(
+            update={
+                "patch_sha256": hashlib.sha256(state.patch_content.encode()).hexdigest()
+            }
+        )
+
+    with pytest.raises(ValueError, match="PatchGate|approval|fingerprint|plan"):
+        revalidate_approved_patch(state)
+
+
+def test_approved_multifile_apply_rolls_back_every_target_on_second_replace_error(
+    tmp_path, monkeypatch
+):
+    sources = {"a.py": "a = 1\n", "b.py": "b = 1\n"}
+    root, ref = _repo(tmp_path, sources)
+    plan = _plan("a.py", "b.py")
+    state = _state(root, ref, plan)
+    batch = VerifiedEditBatch(
+        edits=[
+            _edit("a.py", search="a = 1", replace="a = 2", before=b"a = 1\n"),
+            _edit("b.py", search="b = 1", replace="b = 2", before=b"b = 1\n"),
+        ]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+    actual_replace = __import__("os").replace
+    failed = False
+
+    def fail_second_target(src, dst, *args, **kwargs):
+        nonlocal failed
+        if dst == "b.py" and not failed:
+            failed = True
+            raise OSError("injected second target failure")
+        return actual_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("src.patch_gate.os.replace", fail_second_target)
+    with pytest.raises(OSError, match="injected"):
+        apply_approved_patch(state)
+
+    assert (root / "a.py").read_text() == sources["a.py"]
+    assert (root / "b.py").read_text() == sources["b.py"]
+    assert not list(root.glob(".repopilot-*"))
+
+
+def test_approved_apply_detects_target_symlink_swap_before_backup(tmp_path, monkeypatch):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode(), "outside.py": "safe\n"})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    ).accepted
+    actual_link = __import__("os").link
+    swapped = False
+
+    def swap_before_backup(src, dst, *args, **kwargs):
+        nonlocal swapped
+        if src == "a.py" and not swapped:
+            swapped = True
+            (root / "a.py").unlink()
+            (root / "a.py").symlink_to("outside.py")
+        return actual_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("src.patch_gate.os.link", swap_before_backup)
+    with pytest.raises(ValueError, match="identity|symlink|preimage"):
+        apply_approved_patch(state)
+
+    assert (root / "outside.py").read_text() == "safe\n"
+
+
+def test_approved_new_file_failure_rolls_back_prior_existing_write(tmp_path, monkeypatch):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py", "tests/test_new.py")
+    state = _state(root, ref, plan)
+    batch = VerifiedEditBatch(
+        edits=[
+            _edit("a.py", search="value = 1", replace="value = 2", before=source),
+            _edit("tests/test_new.py", replace="def test_new():\n    assert True\n"),
+        ]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+    actual_link = __import__("os").link
+
+    def fail_new_target(src, dst, *args, **kwargs):
+        if dst == "test_new.py":
+            raise OSError("injected new-file link failure")
+        return actual_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("src.patch_gate.os.link", fail_new_target)
+    with pytest.raises(OSError, match="new-file"):
+        apply_approved_patch(state)
+
+    assert (root / "a.py").read_bytes() == source
+    assert not (root / "tests/test_new.py").exists()

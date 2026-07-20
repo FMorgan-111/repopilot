@@ -435,7 +435,7 @@ def _disposable_test_snapshot(state: AgentState) -> Iterator[SandboxPaths]:
             if state.tool_patch_approval is not None
             else []
         )
-        if actual_changes != expected_changes:
+        if tuple(actual_changes) != tuple(expected_changes):
             raise ValueError("snapshot changes do not match approved manifest")
         _validate_generated_snapshot(state, sandbox.workspace)
         yield sandbox

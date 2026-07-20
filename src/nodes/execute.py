@@ -1081,13 +1081,25 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     pytest_record,
                 )
         if state.patch_edits:
-            if state.tool_patch_approval is not None or any(
-                edit.exact_only for edit in state.patch_edits
-            ):
-                from ..patch_gate import revalidate_approved_patch
+            if state.tool_patch_approval is not None:
+                from ..patch_gate import apply_approved_patch
 
-                revalidate_approved_patch(state)
-            edit_result = _apply_patch_edits(state.repo_path, state.patch_edits)
+                changed_files = apply_approved_patch(state)
+                edit_result = PatchEditApplyResult(
+                    applied=True,
+                    output=(
+                        f"Applied {len(state.patch_edits)} exact PatchGate edit(s) "
+                        "transactionally."
+                    ),
+                    changed_files=changed_files,
+                )
+            elif any(edit.exact_only for edit in state.patch_edits):
+                edit_result = PatchEditApplyResult(
+                    applied=False,
+                    output="Exact PatchGate edits require their frozen approval.",
+                )
+            else:
+                edit_result = _apply_patch_edits(state.repo_path, state.patch_edits)
             _record_tool(
                 state,
                 "apply_patch_edits",

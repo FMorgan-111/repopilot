@@ -1,8 +1,10 @@
 import src.new_agent as new_agent
 import subprocess
+from types import SimpleNamespace
 
+from src import repair_flow
 from src.nodes import plan as plan_node
-from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
+from src.state import FileInfo, RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
 def _patch_gate_state(tmp_path):
@@ -95,6 +97,149 @@ async def test_third_invalid_patch_routes_to_reflect_without_third_correction(tm
     assert result.patch_correction_count == 2
     assert result.retry_count == 1
     assert not result.patch_edits
+
+
+async def test_cancelling_pathless_batch_gets_exactly_two_local_corrections(
+    tmp_path, monkeypatch
+):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+    cancelling = VerifiedEditBatch(
+        edits=[
+            VerifiedEdit(
+                file_path="a.py", search="return 1", replace="return 2", intent="change"
+            ),
+            VerifiedEdit(
+                file_path="a.py", search="return 2", replace="return 1", intent="cancel"
+            ),
+        ]
+    )
+    calls = []
+
+    async def generate(*args, **kwargs):
+        return repair_plan, cancelling
+
+    async def correct(_state, _plan, _batch, issues):
+        calls.append(issues)
+        return cancelling
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", generate)
+    monkeypatch.setattr(plan_node, "request_verified_edit_correction", correct)
+
+    result = await plan_node.plan_fix(state)
+
+    assert len(calls) == 2
+    assert all(issues[0].file_path == "" for issues in calls)
+    assert all(len(issues[0].correction_context) <= 1_200 for issues in calls)
+    assert result.current_phase == new_agent.Phase.REFLECT
+    assert result.patch_correction_count == 2
+
+
+async def test_pathless_issue_renders_bounded_correction_payload(monkeypatch, tmp_path):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+    previous = _verified("return 1")
+    captured = {}
+
+    async def fake_call_schema(_state, **kwargs):
+        captured.update(kwargs)
+        return previous
+
+    monkeypatch.setattr(repair_flow, "_call_schema", fake_call_schema)
+    result = await repair_flow.request_verified_edit_correction(
+        state,
+        repair_plan,
+        previous,
+        [
+            SimpleNamespace(
+                code="empty_patch",
+                file_path="",
+                message="cancelled batch",
+                correction_context="x" * 5_000,
+            )
+        ],
+    )
+
+    payload = __import__("json").loads(captured["user"])
+    assert result is previous
+    assert payload["patch_gate_issues"][0]["file_path"] == ""
+    assert len(payload["patch_gate_issues"][0]["real_code_window"]) == 1_200
+
+
+async def test_valid_gate_approval_skips_stale_relevant_file_hallucination_check(
+    tmp_path, monkeypatch
+):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+    state.relevant_files = [
+        FileInfo(path="a.py", content="stale content\n", reason="old snapshot")
+    ]
+
+    async def generate(*args, **kwargs):
+        return repair_plan, _verified("return 1")
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", generate)
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.hallucinated_search_block_count == 0
+    assert result.tool_patch_approval is not None
+
+
+async def test_final_gate_rejection_clears_active_plan_and_approval(tmp_path, monkeypatch):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+
+    async def generate(*args, **kwargs):
+        return repair_plan, _verified("missing zero")
+
+    async def correct(*args):
+        return _verified("still missing")
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", generate)
+    monkeypatch.setattr(plan_node, "request_verified_edit_correction", correct)
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.REFLECT
+    assert result.tool_patch_approval is None
+    assert result.active_repair_plan is None
+
+
+async def test_primary_plan_replacement_atomically_retires_old_gate_approval(
+    tmp_path, monkeypatch
+):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+    state.active_repair_plan = repair_plan
+    from src.patch_gate import validate_patch_batch
+
+    assert validate_patch_batch(state, repair_plan, _verified("return 1")).accepted
+    assert state.tool_patch_approval is not None
+    state.active_provider = "primary"
+    state.active_model = "gemini-3.5-flash:stable"
+
+    async def primary_plan(*args, **kwargs):
+        return __import__("json").dumps(
+            {
+                "plan": "replace through primary planning",
+                "patch": "",
+                "patch_edits": [
+                    {"file": "a.py", "search": "return 1", "replace": "return 3"}
+                ],
+                "files": ["a.py"],
+                "test_command": "pytest -q",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": "new primary plan",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", primary_plan)
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.tool_patch_approval is None
+    assert result.active_repair_plan is None
+    assert result.patch_edits and not result.patch_edits[0].exact_only
 
 
 async def test_patch_apply_failure_routes_to_failure_when_budget_exhausted():

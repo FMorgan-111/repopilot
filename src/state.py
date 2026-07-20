@@ -594,10 +594,12 @@ def tool_manifest_fingerprint(entries: Sequence[SnapshotManifestEntry]) -> str:
 class ToolPatchApproval(BaseModel):
     """PatchGate authorization for the exact patch exposed to a tool sandbox."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     base_ref: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
     patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
-    changed_manifest: list[SnapshotManifestEntry] = Field(max_length=20_000)
+    changed_manifest: tuple[SnapshotManifestEntry, ...] = Field(max_length=20_000)
     manifest_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
     @model_validator(mode="after")

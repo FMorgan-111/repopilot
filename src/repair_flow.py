@@ -699,7 +699,11 @@ async def request_verified_edit_correction(
         safe_issues.append(
             {
                 "code": str(getattr(issue, "code", "apply_failed"))[:64],
-                "file_path": canonical_repo_path(str(getattr(issue, "file_path", ""))),
+                "file_path": (
+                    canonical_repo_path(str(getattr(issue, "file_path", "")))
+                    if str(getattr(issue, "file_path", ""))
+                    else ""
+                ),
                 "message": _safe_generated_text(str(getattr(issue, "message", "")))[:500],
                 "real_code_window": _safe_generated_text(
                     str(getattr(issue, "correction_context", ""))
