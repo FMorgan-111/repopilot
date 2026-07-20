@@ -709,6 +709,10 @@ class AgentState(BaseModel):
     last_test_failure_signature: str = ""
     model_history: list[ModelInvocation] = Field(default_factory=list)
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
+    attempt_outcome_summary: str = Field(
+        default="", max_length=200
+    )
+    summary_token_usage: int = Field(default=0, ge=0)
     evidence: list[Evidence] = Field(default_factory=list)
     tool_history: list[ToolInvocation] = Field(default_factory=list)
     tool_patch_approval: ToolPatchApproval | None = None

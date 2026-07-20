@@ -129,6 +129,8 @@ def summarize_replay(state: AgentState) -> dict[str, Any]:
         "run_id": state.trace_id,
         "issue_url": state.issue_url,
         "current_phase": state.current_phase.value,
+        "attempt_outcome_summary": state.attempt_outcome_summary,
+        "summary_token_usage": state.summary_token_usage,
         "pause": {
             "pending_human_input": state.pending_human_input,
             "question": state.human_input_request.get("question", ""),

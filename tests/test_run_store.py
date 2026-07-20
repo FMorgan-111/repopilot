@@ -230,6 +230,43 @@ def test_legacy_saved_state_loads_model_routing_defaults(tmp_path):
     assert loaded.no_progress_history == []
 
 
+def test_save_load_and_replay_preserve_outcome_summary_state(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    state = paused_state("outcome-summary")
+    state.attempt_outcome_summary = "Guard moved before unsafe submit."
+    state.summary_token_usage = 47
+
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+    replay = run_store.replay_run(state.trace_id, root_dir=root_dir)
+
+    assert loaded.attempt_outcome_summary == state.attempt_outcome_summary
+    assert loaded.summary_token_usage == 47
+    assert replay["attempt_outcome_summary"] == state.attempt_outcome_summary
+    assert replay["summary_token_usage"] == 47
+
+
+def test_legacy_saved_state_loads_outcome_summary_defaults(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    path = run_store.run_path("legacy-summary", root_dir=root_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "issue_url": "https://github.com/acme/widget/issues/7",
+                "trace_id": "legacy-summary",
+                "current_phase": "PLAN",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = run_store.load_run("legacy-summary", root_dir=root_dir)
+
+    assert loaded.attempt_outcome_summary == ""
+    assert loaded.summary_token_usage == 0
+
+
 def test_save_and_load_preserves_evidence_and_legacy_state_defaults_to_empty(tmp_path):
     root_dir = tmp_path / ".repopilot"
     state = paused_state("evidence-state")

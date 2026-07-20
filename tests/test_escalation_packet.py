@@ -628,5 +628,7 @@ async def test_escalated_reflect_uses_packet_and_active_escalation_model(monkeyp
     assert "tool_intent" in system
     assert "Patch Applied:" not in user
     assert "secret-full-patch-sentinel" not in user
-    assert result.model_history[-1].provider == "escalation"
-    assert result.model_history[-1].node == "reflect_on_failure"
+    assert result.model_history[-2].provider == "escalation"
+    assert result.model_history[-2].node == "reflect_on_failure"
+    assert result.model_history[-1].provider == "primary"
+    assert result.model_history[-1].node == "outcome_summary"

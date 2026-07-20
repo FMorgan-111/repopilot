@@ -65,6 +65,55 @@ async def test_plan_fix_records_plan_decision_frame(monkeypatch):
         assert key in calls[0]["system"]
 
 
+async def test_reflect_summarizes_only_after_recording_valid_frame(monkeypatch):
+    async def fake_llm_call(system, user):
+        return {
+            "root_cause": "The guard ran after submit.",
+            "what_went_wrong": "The unsafe call still executed.",
+            "suggested_fix_approach": "Move the guard before submit.",
+            "files_that_also_need_changes": [],
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": "Move the guard before submit.",
+                "recommended_action": "plan",
+                "risk": "low",
+                "confidence": 0.9,
+            },
+        }
+
+    calls = []
+
+    async def fake_summarize(state, **kwargs):
+        assert state.current_phase == new_agent.Phase.REFLECT
+        assert state.decision_frame is not None
+        assert state.decision_frame.stage == "reflect"
+        assert state.frame_history[-1] == state.decision_frame
+        calls.append(state.decision_frame.frame_id)
+        return "attempt outcome"
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summarize)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.REFLECT,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                test_result="failed",
+                failure_kind="assertion_failure",
+                error_log="assert submit was not called",
+            )
+        ],
+    )
+
+    next_state = await reflect_node.reflect_on_failure(state)
+
+    assert calls == [next_state.decision_frame.frame_id]
+    assert next_state.attempt_outcome_summary == "attempt outcome"
+    assert next_state.current_phase == new_agent.Phase.PLAN
+
+
 async def test_plan_fix_records_search_replace_patch_edits(monkeypatch):
     calls = []
 

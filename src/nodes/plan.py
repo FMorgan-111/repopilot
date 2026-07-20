@@ -17,6 +17,10 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
+from ..outcome_summary import (
+    OUTCOME_SUMMARY_SECTION,
+    sanitize_outcome_summary,
+)
 from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
@@ -702,16 +706,12 @@ def _normalize_plan_decision(response: dict[str, Any]) -> PlanDecision:
     )
 
 
-async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
-    """Ask the LLM for a concrete patch-oriented plan."""
-    import sys
-    state = _as_state(state)
-    apply_escalation(state, should_escalate(state))
-    if _is_budget_exceeded(state):
-        state.failure_reason = "Token budget exceeded before planning."
-        state.current_phase = Phase.FAILURE
-        return state
-
+def build_plan_user_prompt(
+    state: AgentState,
+    *,
+    recall_context: str = "",
+) -> str:
+    """Build the primary planner prompt with one bounded outcome-summary section."""
     previous_failures = "\n\n".join(
         f"Attempt {idx + 1}: {attempt.test_result}\n"
         f"{_truncate_prompt_text(attempt.error_log, PLAN_FAILURE_LOG_LIMIT)}"
@@ -736,12 +736,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     prior_failed_edits = _prior_failed_edits_context(state)
     if prior_failed_edits:
         diversity_context = f"\n\n{prior_failed_edits}"
-    recall_context = ""
-    if state.active_provider == "primary":
-        recall = await _semantic_recall_context(state)
-        if recall:
-            recall_context = f"\n\n{recall}"
-
+    correction_context = ""
+    if state.search_correction_context:
+        correction_context = f"\n\n{state.search_correction_context}"
     files_terms = _issue_search_terms(state.issue_title, state.issue_body)
     file_limit, max_files = _budget_scaled_file_limits(state)
     files_context = "\n\n".join(
@@ -749,6 +746,38 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         f"CONTENT:\n{_relevance_window(file.content, files_terms, file_limit)}"
         for file in state.relevant_files[:max_files]
     )
+    summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
+    completed_attempts_context = ""
+    if summary:
+        completed_attempts_context = (
+            f"\n\n{OUTCOME_SUMMARY_SECTION}\n{summary}"
+        )
+    user = (
+        f"Issue URL: {state.issue_url}\n"
+        f"Title: {state.issue_title}\n\nBody:\n"
+        f"{_truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)}\n\n"
+        f"Relevant files:\n{files_context}{recall_context}\n\nPrevious failures:\n{previous_failures}"
+        f"{reflection_context}"
+        f"{hypothesis_continuity_context}"
+        f"{context_pressure_context}"
+        f"{diversity_context}"
+        f"{correction_context}"
+        f"{human_context}"
+    )
+    user = user.replace(OUTCOME_SUMMARY_SECTION, "")
+    return f"{user}{completed_attempts_context}"
+
+
+async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
+    """Ask the LLM for a concrete patch-oriented plan."""
+    import sys
+    state = _as_state(state)
+    apply_escalation(state, should_escalate(state))
+    if _is_budget_exceeded(state):
+        state.failure_reason = "Token budget exceeded before planning."
+        state.current_phase = Phase.FAILURE
+        return state
+
     system = (
         "You are RepoPilot's planning node. Return ONLY JSON with keys: "
         "plan (markdown string), patch_edits (array), patch (legacy unified diff string, usually empty), "
@@ -783,21 +812,12 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if _is_final_attempt(state):
         system = f"{system}{_final_attempt_instructions()}"
     system = f"{system}{_force_patch_instructions(state)}"
-    correction_context = ""
-    if state.search_correction_context:
-        correction_context = f"\n\n{state.search_correction_context}"
-    user = (
-        f"Issue URL: {state.issue_url}\n"
-        f"Title: {state.issue_title}\n\nBody:\n"
-        f"{_truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)}\n\n"
-        f"Relevant files:\n{files_context}{recall_context}\n\nPrevious failures:\n{previous_failures}"
-        f"{reflection_context}"
-        f"{hypothesis_continuity_context}"
-        f"{context_pressure_context}"
-        f"{diversity_context}"
-        f"{correction_context}"
-        f"{human_context}"
-    )
+    recall_context = ""
+    if state.active_provider == "primary":
+        recall = await _semantic_recall_context(state)
+        if recall:
+            recall_context = f"\n\n{recall}"
+    user = build_plan_user_prompt(state, recall_context=recall_context)
     if state.active_provider == "escalation":
         system = ESCALATED_PLAN_SYSTEM
         user = render_escalation_packet(build_escalation_packet(state))
@@ -814,10 +834,12 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             _truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)
         ),
         previous_failure_count=len(state.fix_attempts),
-        has_reflection_context=bool(reflection_context),
-        has_hypothesis_continuity_context=bool(hypothesis_continuity_context),
+        has_reflection_context=bool(state.reflection_notes),
+        has_hypothesis_continuity_context=bool(
+            _hypothesis_continuity_context(state)
+        ),
         context_collection_count=state.context_collection_count,
-        has_context_pressure=bool(context_pressure_context),
+        has_context_pressure=bool(_context_pressure_instructions(state)),
     )
 
     while True:

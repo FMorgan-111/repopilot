@@ -15,6 +15,7 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
+from ..outcome_summary import summarize_attempt_outcome
 from ..schemas import ReflectDecision
 from ..state import (
     AgentState,
@@ -394,6 +395,10 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 frame=frame,
                 reason="missing_explicit_decision_frame",
             )
+        state.attempt_outcome_summary = await summarize_attempt_outcome(
+            state,
+            llm=llm_call,
+        )
         break
 
     state.current_phase = Phase.PLAN
