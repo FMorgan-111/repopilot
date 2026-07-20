@@ -25,7 +25,6 @@ from ..state import (
     Hypothesis,
     Phase,
     _as_state,
-    _describe_exception,
     _estimate_tokens,
     _extract_json_object,
     _human_answer_context,
@@ -835,7 +834,8 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 event="llm_call",
                 status="error",
                 elapsed_seconds=elapsed,
-                error=exc,
+                error_type=type(exc).__name__,
+                policy_reason=immediate_reason or None,
                 prompt_tokens_estimate=prompt_tokens_estimate,
                 response_tokens_estimate=response_tokens_estimate,
             )
@@ -849,9 +849,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     user = render_escalation_packet(build_escalation_packet(state))
                     prompt_tokens_estimate = _estimate_tokens(system, user)
                     continue
-            state.failure_reason = (
-                f"Failed to generate fix plan: {_describe_exception(exc)}"
-            )
+            state.failure_reason = f"Failed to generate fix plan: {type(exc).__name__}"
             state.current_phase = Phase.FAILURE
             return state
 

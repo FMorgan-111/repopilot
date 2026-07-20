@@ -246,6 +246,139 @@ async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
     )
 
 
+async def test_invalid_plan_response_never_persists_response_bearing_error(monkeypatch):
+    hostile_values = (
+        "sk-validation-secret-sentinel",
+        "FAIL_TO_PASS evaluator-validation-sentinel",
+        "HTTP response payload: raw-validation-http-sentinel",
+    )
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+
+    async def fake_llm_call(system, user):
+        return {
+            "plan": " | ".join(hostile_values),
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": " | ".join(hostile_values),
+            },
+        }
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    next_state = await plan_node.plan_fix(state)
+    dumped = next_state.model_dump_json()
+
+    assert next_state.current_phase == new_agent.Phase.FAILURE
+    assert next_state.failure_reason == "Failed to generate fix plan: ValidationError"
+    assert next_state.model_history[-1].error_class == "ValidationError"
+    assert next_state.node_diagnostics[-1]["error_type"] == "ValidationError"
+    assert next_state.node_diagnostics[-1]["policy_reason"] == (
+        "invalid_structured_response_after_retries"
+    )
+    assert "error" not in next_state.node_diagnostics[-1]
+    for forbidden in hostile_values:
+        assert forbidden not in dumped
+
+
+async def test_provider_error_in_reflect_never_persists_provider_message(monkeypatch):
+    from src.http_client import LLMResponseError
+
+    hostile_values = (
+        "sk-provider-secret-sentinel",
+        "PASS_TO_PASS evaluator-provider-sentinel",
+        "raw HTTP response body: raw-provider-http-sentinel",
+    )
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+
+    async def fake_llm_call(system, user):
+        raise LLMResponseError(" | ".join(hostile_values))
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.REFLECT,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                test_result="failed",
+                error_log="AssertionError: safe existing failure",
+            )
+        ],
+    )
+
+    next_state = await reflect_node.reflect_on_failure(state)
+    dumped = next_state.model_dump_json()
+
+    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.reflection_notes == "Reflection failed: LLMResponseError"
+    assert next_state.model_history[-1].error_class == "LLMResponseError"
+    assert next_state.node_diagnostics[-1]["error_type"] == "LLMResponseError"
+    assert "policy_reason" not in next_state.node_diagnostics[-1]
+    assert "error" not in next_state.node_diagnostics[-1]
+    assert next_state.conversation_history[-1].content == (
+        "Reflection error: LLMResponseError"
+    )
+    for forbidden in hostile_values:
+        assert forbidden not in dumped
+
+
+async def test_invalid_reflect_response_never_persists_response_values(monkeypatch):
+    hostile_values = (
+        "sk-reflect-validation-secret",
+        "gold_patch evaluator-reflect-sentinel",
+        "HTTP/1.1 503 raw-reflect-http-sentinel",
+    )
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+
+    async def fake_llm_call(system, user):
+        hostile = " | ".join(hostile_values)
+        return {
+            "root_cause": hostile,
+            "what_went_wrong": hostile,
+            "suggested_fix_approach": hostile,
+            "decision_frame": {
+                "stage": "plan",
+                "summary": hostile,
+            },
+        }
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.REFLECT,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                test_result="failed",
+                error_log="AssertionError: safe existing failure",
+            )
+        ],
+    )
+
+    next_state = await reflect_node.reflect_on_failure(state)
+    dumped = next_state.model_dump_json()
+
+    assert next_state.reflection_notes == "Reflection failed: ValidationError"
+    assert next_state.node_diagnostics[-1]["error_type"] == "ValidationError"
+    assert next_state.node_diagnostics[-1]["policy_reason"] == (
+        "invalid_structured_response_after_retries"
+    )
+    assert "error" not in next_state.node_diagnostics[-1]
+    for forbidden in hostile_values:
+        assert forbidden not in dumped
+
+
 async def test_plan_fix_records_prompt_built_diagnostic(monkeypatch):
     async def fake_llm_call(system, user):
         return json.dumps(
