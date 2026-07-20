@@ -58,7 +58,7 @@ Set your tokens:
 export GITHUB_TOKEN=ghp_...
 export LLM_API_KEY=sk-...
 export OPENAI_BASE_URL=https://linoapi.com.cn/v1
-export LLM_MODEL=claude-sonnet-5:stable  # optional; this is the default
+export LLM_MODEL=gemini-3.5-flash:stable  # optional; this is the default
 ```
 
 Run it:

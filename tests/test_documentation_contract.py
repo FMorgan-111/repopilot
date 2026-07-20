@@ -13,8 +13,16 @@ def test_readme_documents_installation_memory_and_selected_model():
     assert 'pip install "repopilot[memory]"' in readme
     assert 'pip install -e ".[memory,dev]"' in readme
     assert "REPOPILOT_ENABLE_EPISODES=1" in readme
-    assert "claude-sonnet-5:stable" in readme
+    assert "gemini-3.5-flash:stable" in readme
     assert "NumPy" in readme
+
+
+def test_env_example_uses_openai_compatible_gemini_defaults():
+    example = _read(".env.example")
+
+    assert "LLM_API_KEY=***" in example
+    assert "OPENAI_BASE_URL=https://linoapi.com.cn/v1" in example
+    assert "LLM_MODEL=gemini-3.5-flash:stable" in example
 
 
 def test_contributor_guide_uses_package_metadata_instead_of_manual_dependency_fixes():

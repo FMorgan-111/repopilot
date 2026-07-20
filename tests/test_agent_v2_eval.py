@@ -5,6 +5,12 @@ import pytest
 from eval import agent_v2_harness
 
 
+def test_legacy_harness_default_model_is_gemini_flash():
+    from eval import harness
+
+    assert harness.DEFAULT_MODEL == "gemini-3.5-flash:stable"
+
+
 def sample_record():
     return {
         "id": "acme/widget#7:8",

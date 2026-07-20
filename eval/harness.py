@@ -39,7 +39,8 @@ load_dotenv(REPO_ROOT / ".env", override=True)
 
 _LLM_BASE = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
 _LLM_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
-_LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-v4-flash")
+DEFAULT_MODEL = "gemini-3.5-flash:stable"
+_LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
 
 _llm_client: httpx.AsyncClient | None = None
 
@@ -281,7 +282,7 @@ def _extract_search_terms(title: str, body: str, max_terms: int = 15) -> list[st
 
 
 async def _llm_search_context(
-    title: str, body: str, model: str = "deepseek-v4-flash"
+    title: str, body: str, model: str = DEFAULT_MODEL
 ) -> tuple[list[str], list[str]]:
     """Use LLM to generate search terms and likely file paths from the issue.
 
@@ -595,7 +596,7 @@ def estimate_cost(input_tokens: int, output_tokens: int) -> float:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def llm_call_structured(
-    system: str, user: str, model: str = "deepseek-v4-flash"
+    system: str, user: str, model: str = DEFAULT_MODEL
 ) -> tuple[dict, int, int]:
     """Call LLM and return parsed JSON + token counts."""
     messages = [
@@ -821,7 +822,7 @@ def _extract_relevant_sections(
 # single-sample evaluation
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def evaluate_sample(sample: dict, idx: int, model: str = "deepseek-v4-flash") -> dict:
+async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) -> dict:
     """Evaluate one sample. Returns a result dict."""
     sample_id = sample["id"]
     issue = sample["issue"]
@@ -1026,7 +1027,7 @@ async def evaluate_sample(sample: dict, idx: int, model: str = "deepseek-v4-flas
 
 async def run_eval(
     n_samples: int = MAX_SAMPLES,
-    model: str = "deepseek-v4-flash",
+    model: str = DEFAULT_MODEL,
 ) -> list[dict]:
     """Run the full evaluation on n_samples."""
     samples = load_samples(n_samples)
@@ -1089,7 +1090,7 @@ def main(argv: list[str] | None = None) -> None:
         help="Run the state-graph agent eval mode with saved-run replay.",
     )
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--token-budget", type=int, default=50000)
     parser.add_argument(
