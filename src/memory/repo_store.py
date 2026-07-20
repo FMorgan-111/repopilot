@@ -8,6 +8,8 @@ from pathlib import Path
 
 import aiosqlite
 
+from src.home import repopilot_home
+
 logger = logging.getLogger("repopilot.memory")
 
 _DDL_FILE_INDEX = """
@@ -43,8 +45,12 @@ def _db_path(base: Path, owner: str, repo: str) -> Path:
 class RepoStore:
     """Per-repo SQLite memory: file index + issue history."""
 
-    def __init__(self, base_path: str = "~/.repopilot/memory"):
-        self._base = Path(base_path).expanduser()
+    def __init__(self, base_path: str | Path | None = None):
+        self._base = (
+            Path(base_path).expanduser()
+            if base_path is not None
+            else repopilot_home() / "memory"
+        )
         self._db_cache: dict[tuple[str, str], aiosqlite.Connection] = {}
 
     # ------------------------------------------------------------------

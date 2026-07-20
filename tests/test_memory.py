@@ -8,6 +8,19 @@ import pytest
 from src.memory import RepoStore, _fire_and_forget, close_store, get_store
 
 
+@pytest.mark.asyncio
+async def test_repo_store_default_honors_repopilot_home(tmp_path, monkeypatch):
+    """The default database location lives beneath REPOPILOT_HOME/memory."""
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    store = RepoStore()
+
+    try:
+        await store.record_file("alice", "demo", "src/main.py")
+        assert (tmp_path / "memory" / "alice" / "demo" / "memory.db").exists()
+    finally:
+        await store.close()
+
+
 @pytest.fixture
 def store():
     """Return a RepoStore backed by a temp directory, cleaned up after test."""

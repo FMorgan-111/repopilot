@@ -488,7 +488,7 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     repopilot_home = tmp_path / "home"
-    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    monkeypatch.setattr(agent_v2_harness, "repopilot_home", lambda: repopilot_home)
 
     requested_path = tmp_path / "readonly" / "eval_results.json"
     original_write_text = agent_v2_harness.Path.write_text

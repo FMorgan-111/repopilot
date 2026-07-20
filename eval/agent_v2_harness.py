@@ -6,7 +6,6 @@ import argparse
 import asyncio
 import importlib
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +19,7 @@ agent_v2 = importlib.import_module("src.new_agent").agent_v2
 replay_run = importlib.import_module("src.run_store").replay_run
 close_llm_client = importlib.import_module("src.http_client").close_llm_client
 get_llm_model = importlib.import_module("src.http_client")._get_llm_model
+repopilot_home = importlib.import_module("src.home").repopilot_home
 close_store = importlib.import_module("src.memory").close_store
 AgentState = importlib.import_module("src.state").AgentState
 git_clone = importlib.import_module("src.nodes.execute").git_clone
@@ -54,10 +54,7 @@ def _current_commit_sha() -> str:
 
 
 def _fallback_results_path() -> Path:
-    configured_home = os.getenv("REPOPILOT_HOME")
-    if configured_home:
-        return Path(configured_home) / "eval" / "eval_results.json"
-    return Path("/tmp") / "repopilot" / "eval_results.json"
+    return repopilot_home() / "eval" / "eval_results.json"
 
 
 def _write_results_with_fallback(
