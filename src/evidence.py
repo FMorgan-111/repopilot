@@ -25,10 +25,12 @@ class EvidenceStore:
         *,
         max_items: int = 30,
         max_content_chars: int = 8_000,
+        max_summary_chars: int = 1_000,
     ) -> None:
         self.state = state
         self.max_items = max(0, max_items)
         self.max_content_chars = max(0, max_content_chars)
+        self.max_summary_chars = max(0, max_summary_chars)
 
     def add(
         self,
@@ -58,7 +60,7 @@ class EvidenceStore:
             tool=str(tool),
             file_path=normalized_path,
             symbol=normalized_symbol,
-            summary=_normalize_text(summary),
+            summary=_normalize_text(summary)[: self.max_summary_chars],
             content=normalized_content[: self.max_content_chars],
             fingerprint=fingerprint,
         )
@@ -74,16 +76,35 @@ class EvidenceStore:
         *,
         max_total_chars: int = 24_000,
     ) -> list[Evidence]:
-        remaining = max(0, max_total_chars)
+        limit = max(0, max_total_chars)
         by_id = {item.evidence_id: item for item in self.state.evidence}
         selected: list[Evidence] = []
+        seen_ids: set[str] = set()
         for evidence_id in evidence_ids:
-            evidence = by_id.get(evidence_id)
-            if evidence is None or len(evidence.content) > remaining:
+            if evidence_id in seen_ids:
                 continue
-            selected.append(evidence)
-            remaining -= len(evidence.content)
+            seen_ids.add(evidence_id)
+            evidence = by_id.get(evidence_id)
+            if evidence is None:
+                continue
+            candidate = [*selected, evidence]
+            if len(self.render_for_prompt(candidate)) > limit:
+                continue
+            selected = candidate
         return selected
+
+    @staticmethod
+    def render_for_prompt(evidence: list[Evidence]) -> str:
+        """Return the exact deterministic payload that selection budgets cover."""
+        return "\n".join(
+            json.dumps(
+                item.model_dump(),
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            for item in evidence
+        )
 
 
 def _normalize_text(value: object) -> str:

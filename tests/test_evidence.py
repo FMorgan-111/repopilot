@@ -1,3 +1,5 @@
+import json
+
 from src.evidence import EvidenceStore
 from src.state import AgentState
 
@@ -64,6 +66,21 @@ def test_add_bounds_items_and_redacted_content():
     assert [item.summary for item in state.evidence] == ["one", "two"]
 
 
+def test_add_bounds_persisted_summary_as_well_as_content():
+    evidence = EvidenceStore(
+        make_state(),
+        max_content_chars=32,
+        max_summary_chars=12,
+    ).add(
+        tool="search",
+        summary="a summary that must not be persisted without a bound",
+        content="short content",
+    ).evidence
+
+    assert evidence.summary == "a summary th"
+    assert len(evidence.summary) == 12
+
+
 def test_add_redacts_secrets_and_normalizes_traversal_path():
     evidence = EvidenceStore(make_state(), max_content_chars=200).add(
         tool="read_file",
@@ -88,11 +105,37 @@ def test_select_keeps_requested_order_and_total_content_bound():
     first = store.add(tool="search", summary="first", content="12345").evidence
     second = store.add(tool="search", summary="second", content="67890").evidence
     third = store.add(tool="search", summary="third", content="abcde").evidence
+    budget = len(store.render_for_prompt([third, first]))
 
     selected = store.select(
         [third.evidence_id, "missing", first.evidence_id, second.evidence_id],
-        max_total_chars=10,
+        max_total_chars=budget,
     )
 
     assert selected == [third, first]
-    assert sum(len(item.content) for item in selected) <= 10
+    assert len(store.render_for_prompt(selected)) <= budget
+
+
+def test_select_bounds_complete_prompt_payload_and_deduplicates_requested_ids():
+    state = make_state()
+    store = EvidenceStore(state)
+    first = store.add(
+        tool="search",
+        summary="summary that must count toward the prompt budget",
+        content="a",
+    ).evidence
+    second = store.add(tool="search", summary="second", content="b").evidence
+    first_payload = json.dumps(
+        first.model_dump(), ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
+
+    too_small = store.select([first.evidence_id], max_total_chars=len(first.content))
+    selected = store.select(
+        [first.evidence_id, first.evidence_id, second.evidence_id],
+        max_total_chars=len(first_payload),
+    )
+
+    assert too_small == []
+    assert selected == [first]
+    assert store.render_for_prompt(selected) == first_payload
+    assert len(store.render_for_prompt(selected)) <= len(first_payload)
