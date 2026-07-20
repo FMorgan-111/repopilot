@@ -8,6 +8,7 @@ import os
 import re
 from typing import Any
 
+from ..local_search import search_local_checkout
 from ..memory import get_store
 from ..retrieval import bm25_rerank, bm25_scores
 from ..state import (
@@ -162,6 +163,65 @@ async def _locate_fallback(state: AgentState) -> list[FileInfo]:
     return hydrated
 
 
+async def _locate_local_checkout(state: AgentState) -> AgentState:
+    """Locate files only in the prepared historical checkout."""
+    terms = _issue_search_terms(state.issue_title, state.issue_body)
+    rows = await asyncio.to_thread(
+        search_local_checkout,
+        state.repo_path,
+        terms,
+    )
+    _record_tool(
+        state,
+        "search_local_checkout",
+        {"repo_path": state.repo_path, "terms": terms},
+        {"count": len(rows)},
+    )
+    files = [
+        FileInfo(
+            path=row["path"],
+            content=row["content"],
+            sha=row.get("sha", ""),
+            relevance_score=1.0,
+            reason="matched historical local checkout",
+        )
+        for row in rows
+    ]
+    if files:
+        query = f"{state.issue_title}\n{state.issue_body}"
+        scores = bm25_scores(query, files)
+        files = bm25_rerank(query, files)
+        _record_tool(
+            state,
+            "bm25_rerank",
+            {"query": query, "candidate_count": len(files)},
+            {
+                "applied": any(score.bm25_score > 0 for score in scores),
+                "ranked": [
+                    {
+                        "path": score.path,
+                        "bm25_score": round(score.bm25_score, 6),
+                        "normalized_score": round(score.normalized_score, 6),
+                        "matched_terms": score.matched_terms,
+                    }
+                    for score in scores
+                ],
+            },
+        )
+    state.relevant_files = files[:6]
+    state.token_usage += _estimate_tokens(
+        state.issue_title,
+        state.issue_body,
+        "\n".join(
+            f"{item.path}\n{item.content[:2000]}" for item in state.relevant_files
+        ),
+    )
+    state.current_phase = Phase.PLAN if files else Phase.FAILURE
+    if not files:
+        state.failure_reason = "No relevant files could be located in local checkout."
+    return state
+
+
 async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
     """Search code and read the most relevant files into working memory."""
     import sys
@@ -170,6 +230,8 @@ async def locate_code(state: AgentState | dict[str, Any]) -> AgentState:
         state.failure_reason = "Token budget exceeded before code location."
         state.current_phase = Phase.FAILURE
         return state
+    if state.repo_path:
+        return await _locate_local_checkout(state)
 
     by_path: dict[str, FileInfo] = {}
 

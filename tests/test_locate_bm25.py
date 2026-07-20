@@ -1,3 +1,5 @@
+import subprocess
+
 from src import new_agent
 from src.nodes import locate as locate_node
 
@@ -5,6 +7,47 @@ from src.nodes import locate as locate_node
 class EmptyMemoryStore:
     async def get_file_index(self, owner, repo, limit=8):
         return []
+
+
+async def test_locate_code_uses_historical_checkout_without_github(
+    monkeypatch, tmp_path
+):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "target.py").write_text(
+        "def login():\n    raise ValueError('login crash')\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "add", "src/target.py"],
+        check=True,
+    )
+
+    async def no_api(*args, **kwargs):
+        raise AssertionError(
+            "GitHub API must not be used for local benchmark locate"
+        )
+
+    monkeypatch.setattr(locate_node, "search_code", no_api)
+    monkeypatch.setattr(locate_node, "read_file", no_api)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        repo_path=str(tmp_path),
+        repo_ref="a" * 40,
+        issue_title="login crash ValueError",
+        issue_body="login raises ValueError",
+        current_phase=new_agent.Phase.LOCATE,
+    )
+
+    result = await locate_node.locate_code(state)
+
+    assert result.current_phase == new_agent.Phase.PLAN
+    assert result.relevant_files[0].path == "src/target.py"
+    assert any(
+        call.tool_name == "search_local_checkout" for call in result.tool_calls
+    )
 
 
 async def test_locate_code_records_bm25_rerank_and_reorders_hydrated_files(
