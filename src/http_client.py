@@ -16,7 +16,12 @@ from tenacity import (
     wait_exponential,
 )
 
-from .model_provider import ProviderName, get_model_config, sanitize_provider_error
+from .model_provider import (
+    ProviderName,
+    escalation_is_configured,
+    get_model_config,
+    sanitize_provider_error,
+)
 from .rate_limiter import get_github_limiter
 
 load_dotenv(override=True)
@@ -191,6 +196,8 @@ async def llm_request(
     Uses a shared connection pool (``_get_llm_client``) to avoid per-call
     TCP handshake overhead.
     """
+    if provider == "escalation" and not escalation_is_configured():
+        raise LLMResponseError("escalation provider is not configured")
     config = get_model_config(provider)
     url = f"{config.base_url}/chat/completions"
     payload: dict[str, object] = {

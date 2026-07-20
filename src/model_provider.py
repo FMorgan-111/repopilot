@@ -61,6 +61,9 @@ _QUERY_SECRET = re.compile(
 _HEADER_SECRET = re.compile(
     r"(?i)(\b(?:authorization|proxy-authorization|x-api-key|api[-_]?key|token)\s*[:=]\s*)(?:Bearer\s+)?[^\s,;]+"
 )
+_QUOTED_FIELD_SECRET = re.compile(
+    r"(?i)((?:[\"'](?:authorization|proxy-authorization|x-api-key|api[-_]?key|access[-_]?token|token)[\"'])\s*[:=]\s*[\"'])(?:Bearer\s+)?[^\"']*[\"']"
+)
 
 
 def sanitize_provider_error(exc: BaseException) -> str:
@@ -68,4 +71,5 @@ def sanitize_provider_error(exc: BaseException) -> str:
     message = str(exc)
     message = _BEARER_SECRET.sub(r"\1[REDACTED]", message)
     message = _QUERY_SECRET.sub(r"\1[REDACTED]", message)
+    message = _QUOTED_FIELD_SECRET.sub(r"\1[REDACTED]", message)
     return _HEADER_SECRET.sub(r"\1[REDACTED]", message)

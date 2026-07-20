@@ -246,6 +246,7 @@ async def test_llm_request_uses_isolated_provider_configuration(monkeypatch):
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
     monkeypatch.setenv("LLM_ESCALATION_BASE_URL", "https://escalation.invalid/v1")
     monkeypatch.setenv("LLM_ESCALATION_MODEL", "escalation-model")
+    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
 
     await llm_request([{"role": "user", "content": "primary"}])
     await llm_request(
@@ -263,6 +264,36 @@ async def test_llm_request_uses_isolated_provider_configuration(monkeypatch):
         escalation_kwargs["headers"]["Authorization"]
         == "Bearer escalation-sentinel-key"
     )
+
+
+async def test_disabled_escalation_request_never_constructs_an_http_client(monkeypatch):
+    from src import http_client
+
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
+    monkeypatch.setattr(
+        http_client,
+        "_get_llm_client",
+        lambda *args, **kwargs: pytest.fail("HTTP client must not be constructed"),
+    )
+
+    with pytest.raises(LLMResponseError, match="escalation provider is not configured"):
+        await llm_request([{"role": "user", "content": "escalate"}], provider="escalation")
+
+
+async def test_escalation_without_a_key_never_constructs_an_http_client(monkeypatch):
+    from src import http_client
+
+    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+    monkeypatch.setattr(
+        http_client,
+        "_get_llm_client",
+        lambda *args, **kwargs: pytest.fail("HTTP client must not be constructed"),
+    )
+
+    with pytest.raises(LLMResponseError, match="escalation provider is not configured"):
+        await llm_request([{"role": "user", "content": "escalate"}], provider="escalation")
 
 
 async def test_llm_request_preserves_stream_usage_and_finish_reason(monkeypatch):
@@ -311,6 +342,32 @@ async def test_llm_request_accepts_non_stream_json_completion(monkeypatch):
     result = await llm_request([{"role": "user", "content": "hi"}])
 
     assert result == payload
+
+
+def test_llm_json_error_dict_fallback_redacts_every_secret_form():
+    payload = {
+        "error": {
+            "api_key": "dict-key-sentinel",
+            "Authorization": "Bearer dict-bearer-sentinel",
+            "url": "https://provider.invalid/v1?api_key=dict-query-sentinel",
+            "X-API-Key": "dict-header-sentinel",
+        }
+    }
+
+    with pytest.raises(LLMResponseError) as exc_info:
+        from src.http_client import _parse_chat_completion_json
+
+        _parse_chat_completion_json(payload)
+
+    message = str(exc_info.value)
+    for sentinel in (
+        "dict-key-sentinel",
+        "dict-bearer-sentinel",
+        "dict-query-sentinel",
+        "dict-header-sentinel",
+    ):
+        assert sentinel not in message
+    assert "[REDACTED]" in message
 
 
 @pytest.mark.parametrize(

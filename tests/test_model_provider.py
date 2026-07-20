@@ -71,3 +71,16 @@ def test_sanitize_provider_error_redacts_bearer_query_and_header_values():
     assert "query-sentinel-key" not in message
     assert "header-sentinel-key" not in message
     assert "[REDACTED]" in message
+
+
+def test_sanitize_provider_error_redacts_quoted_secret_fields():
+    message = sanitize_provider_error(
+        RuntimeError(
+            "provider failed: {'api_key': 'single-quoted-sentinel'}; "
+            '{"Authorization": "Bearer double-quoted-sentinel"}'
+        )
+    )
+
+    assert "single-quoted-sentinel" not in message
+    assert "double-quoted-sentinel" not in message
+    assert "[REDACTED]" in message
