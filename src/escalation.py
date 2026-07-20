@@ -44,7 +44,7 @@ _EVALUATOR_FIELD_RE = re.compile(
     r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b"
 )
 _RAW_HTTP_MARKER_RE = re.compile(
-    r"(?i)(?:HTTP/\d(?:\.\d)?\b|"
+    r"(?i)(?:\braw[\s_-]+HTTP\b|HTTP/\d(?:\.\d)?\b|"
     r"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+https?://|"
     r"(?:raw[\s_-]+)?HTTP[\s_-]+(?:request|response|payload|body|headers?)\b|"
     r"(?:request|response)[\s_-]+(?:payload|body|headers?)\s*:)"

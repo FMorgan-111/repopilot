@@ -315,6 +315,54 @@ def test_raw_http_marker_is_a_fail_closed_boundary_in_every_context_field():
         assert forbidden not in combined
 
 
+def test_standalone_raw_http_marker_truncates_evidence_and_test_error():
+    state = _escalated_state()
+    state.evidence = [
+        Evidence(
+            evidence_id="ev_raw_http_boundary",
+            tool="read_symbol",
+            file_path="src/auth.py",
+            symbol="submit",
+            summary="Safe summary inline Raw-HTTP: evidence-http-sentinel",
+            content=(
+                "def submit(user):\n"
+                "    return user\n"
+                "debug prefix RAW_HTTP: evidence-content-sentinel\n"
+                "evidence-continuation-sentinel"
+            ),
+            fingerprint="a" * 64,
+        )
+    ]
+    state.fix_attempts = [
+        FixAttempt(
+            test_result="failed",
+            failure_kind="test_failed",
+            error_log=(
+                "AssertionError: safe failure inline raw HTTP: test-http-sentinel\n"
+                "test-continuation-sentinel"
+            ),
+        )
+    ]
+
+    packet = build_escalation_packet(state)
+    rendered = render_escalation_packet(packet)
+    combined = packet.model_dump_json() + rendered
+
+    assert packet.evidence[0].summary == "Safe summary inline"
+    assert packet.evidence[0].content.endswith("debug prefix")
+    assert packet.test_error_summaries == (
+        "AssertionError: safe failure inline",
+    )
+    for forbidden in (
+        "evidence-http-sentinel",
+        "evidence-content-sentinel",
+        "evidence-continuation-sentinel",
+        "test-http-sentinel",
+        "test-continuation-sentinel",
+    ):
+        assert forbidden not in combined
+
+
 def test_direct_packet_construction_bounds_fields_and_is_deeply_immutable():
     packet = EscalationPacket(
         issue_title="t" * 5_000,
