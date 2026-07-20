@@ -11,6 +11,12 @@ def test_legacy_harness_default_model_is_gemini_flash():
     assert harness.DEFAULT_MODEL == "gemini-3.5-flash:stable"
 
 
+def test_legacy_harness_default_base_url_is_linoapi():
+    from eval import harness
+
+    assert harness.DEFAULT_BASE_URL == "https://linoapi.com.cn/v1"
+
+
 def sample_record():
     return {
         "id": "acme/widget#7:8",

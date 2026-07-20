@@ -37,7 +37,8 @@ if str(REPO_ROOT) not in sys.path:
 
 load_dotenv(REPO_ROOT / ".env", override=True)
 
-_LLM_BASE = os.getenv("OPENAI_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
+DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
+_LLM_BASE = os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
 _LLM_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
 _LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
