@@ -5,6 +5,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.worktrees/
 
 # Regenerable eval outputs (run `python eval/harness.py` to recreate)
 eval/eval_results.json
