@@ -9,7 +9,14 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from ..escalation import (
+    build_escalation_packet,
+    immediate_model_policy_reason,
+    record_model_invocation,
+    render_escalation_packet,
+)
 from ..llm import llm_call
+from ..model_policy import apply_escalation, should_escalate
 from ..patch_match import closest_region, locate_search_block
 from ..schemas import PlanDecision
 from ..state import (
@@ -37,6 +44,19 @@ PLAN_ISSUE_BODY_LIMIT = 2500
 PLAN_FILE_CONTENT_LIMIT = 6000
 PLAN_MAX_FILES = 3
 PLAN_FAILURE_LOG_LIMIT = 1000
+
+ESCALATED_PLAN_SYSTEM = (
+    "You are RepoPilot's escalated planning node. The user message is the complete "
+    "allowlisted EscalationPacket; do not request hidden conversation or evaluator "
+    "data. Return ONLY JSON with keys: plan, patch_edits, patch, files, "
+    "test_command, and decision_frame. Each patch_edits item uses file, exact "
+    "search, replace, and optional replace_all or node_target. Leave patch empty "
+    "when patch_edits can express the edit. decision_frame must use stage='plan' "
+    "and include summary, hypotheses, selected_hypothesis_id, evidence, next_checks, "
+    "recommended_action, risk, and confidence. If one approved local evidence call "
+    "is essential, include optional tool_intent with action, args, reason, and "
+    "expected_evidence; deterministic policy decides whether it runs."
+)
 
 # Hard cap on consecutive collect_more_context rounds before we give up.
 # Default 1: eval showed the planner spiralling on collect_more_context instead
@@ -656,6 +676,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM for a concrete patch-oriented plan."""
     import sys
     state = _as_state(state)
+    apply_escalation(state, should_escalate(state))
     if _is_budget_exceeded(state):
         state.failure_reason = "Token budget exceeded before planning."
         state.current_phase = Phase.FAILURE
@@ -686,9 +707,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if prior_failed_edits:
         diversity_context = f"\n\n{prior_failed_edits}"
     recall_context = ""
-    recall = await _semantic_recall_context(state)
-    if recall:
-        recall_context = f"\n\n{recall}"
+    if state.active_provider == "primary":
+        recall = await _semantic_recall_context(state)
+        if recall:
+            recall_context = f"\n\n{recall}"
 
     files_terms = _issue_search_terms(state.issue_title, state.issue_body)
     file_limit, max_files = _budget_scaled_file_limits(state)
@@ -746,6 +768,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         f"{correction_context}"
         f"{human_context}"
     )
+    if state.active_provider == "escalation":
+        system = ESCALATED_PLAN_SYSTEM
+        user = render_escalation_packet(build_escalation_packet(state))
     prompt_tokens_estimate = _estimate_tokens(system, user)
     _record_node_diagnostic(
         state,
@@ -765,36 +790,94 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         has_context_pressure=bool(context_pressure_context),
     )
 
-    t0 = time.monotonic()
-    try:
-        print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
-        response = _extract_json_object(await llm_call(system, user))
-    except Exception as exc:
+    while True:
+        invoked_provider = state.active_provider
+        invoked_model = state.active_model
+        response_text = ""
+        t0 = time.monotonic()
+        try:
+            print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
+            if invoked_provider == "primary":
+                raw_response = await llm_call(system, user)
+            else:
+                raw_response = await llm_call(
+                    system,
+                    user,
+                    model=invoked_model,
+                    provider="escalation",
+                )
+            response = _extract_json_object(raw_response)
+            response_text = json.dumps(response)
+            if not response:
+                raise ValueError("Model returned an empty structured response")
+            has_explicit_frame = "decision_frame" in response
+            decision = _normalize_plan_decision(response)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            immediate_reason = immediate_model_policy_reason(exc)
+            response_tokens_estimate = _estimate_tokens(response_text)
+            status = "invalid_response" if immediate_reason else "error"
+            record_model_invocation(
+                state,
+                model=invoked_model,
+                provider=invoked_provider,
+                node="plan_fix",
+                elapsed_seconds=elapsed,
+                input_tokens=prompt_tokens_estimate,
+                output_tokens=response_tokens_estimate,
+                status=status,
+                error=exc,
+            )
+            state.token_usage += prompt_tokens_estimate + response_tokens_estimate
+            _record_node_diagnostic(
+                state,
+                node="plan_fix",
+                event="llm_call",
+                status="error",
+                elapsed_seconds=elapsed,
+                error=exc,
+                prompt_tokens_estimate=prompt_tokens_estimate,
+                response_tokens_estimate=response_tokens_estimate,
+            )
+            if immediate_reason and invoked_provider == "primary":
+                apply_escalation(
+                    state,
+                    should_escalate(state, immediate_reason=immediate_reason),
+                )
+                if state.active_provider == "escalation":
+                    system = ESCALATED_PLAN_SYSTEM
+                    user = render_escalation_packet(build_escalation_packet(state))
+                    prompt_tokens_estimate = _estimate_tokens(system, user)
+                    continue
+            state.failure_reason = (
+                f"Failed to generate fix plan: {_describe_exception(exc)}"
+            )
+            state.current_phase = Phase.FAILURE
+            return state
+
+        elapsed = time.monotonic() - t0
+        response_tokens_estimate = _estimate_tokens(response_text)
+        record_model_invocation(
+            state,
+            model=invoked_model,
+            provider=invoked_provider,
+            node="plan_fix",
+            elapsed_seconds=elapsed,
+            input_tokens=prompt_tokens_estimate,
+            output_tokens=response_tokens_estimate,
+            status="ok",
+        )
         _record_node_diagnostic(
             state,
             node="plan_fix",
             event="llm_call",
-            status="error",
-            elapsed_seconds=time.monotonic() - t0,
-            error=exc,
+            status="success",
+            elapsed_seconds=elapsed,
             prompt_tokens_estimate=prompt_tokens_estimate,
+            response_tokens_estimate=response_tokens_estimate,
         )
-        state.failure_reason = f"Failed to generate fix plan: {_describe_exception(exc)}"
-        state.current_phase = Phase.FAILURE
-        return state
+        break
 
-    response_text = json.dumps(response)
-    _record_node_diagnostic(
-        state,
-        node="plan_fix",
-        event="llm_call",
-        status="success",
-        elapsed_seconds=time.monotonic() - t0,
-        prompt_tokens_estimate=prompt_tokens_estimate,
-        response_tokens_estimate=_estimate_tokens(response_text),
-    )
-    has_explicit_frame = "decision_frame" in response
-    decision = _normalize_plan_decision(response)
     state.fix_plan = decision.plan
     state.patch_content = decision.patch
     state.patch_edits = decision.patch_edits

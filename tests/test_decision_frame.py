@@ -170,6 +170,82 @@ async def test_plan_fix_records_successful_llm_diagnostic(monkeypatch):
     assert next_state.node_diagnostics[-1]["response_tokens_estimate"] > 0
 
 
+async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
+    monkeypatch,
+):
+    calls = []
+
+    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-test-sentinel")
+    monkeypatch.setenv("LLM_ESCALATION_MODEL", "claude-opus-4-8:stable")
+
+    async def fake_llm_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
+        calls.append((system, user, model, provider))
+        if len(calls) == 1:
+            return {
+                "plan": "invalid frame stage",
+                "decision_frame": {
+                    "stage": "reflect",
+                    "summary": "This cannot validate as a plan.",
+                },
+            }
+        return {
+            "plan": "Guard the missing user.",
+            "patch": "",
+            "patch_edits": [
+                {
+                    "file": "src/auth.py",
+                    "search": "if user is None:\n    submit(user)\n",
+                    "replace": "if user is None:\n    return\n",
+                }
+            ],
+            "files": ["src/auth.py"],
+            "test_command": "pytest tests/test_auth.py -q",
+            "decision_frame": {
+                "stage": "plan",
+                "summary": "Guard missing users.",
+                "recommended_action": "execute",
+                "risk": "low",
+                "confidence": 0.9,
+            },
+        }
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        owner="acme",
+        repo="widget",
+        repo_ref="a" * 40,
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    next_state = await plan_node.plan_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.EXECUTE
+    assert [call[3] for call in calls] == ["primary", "escalation"]
+    assert calls[1][2] == "claude-opus-4-8:stable"
+    assert next_state.escalated is True
+    assert next_state.escalation_reason == (
+        "invalid_structured_response_after_retries"
+    )
+    assert [item.status for item in next_state.model_history[-2:]] == [
+        "invalid_response",
+        "ok",
+    ]
+    assert [item.provider for item in next_state.model_history[-2:]] == [
+        "primary",
+        "escalation",
+    ]
+    assert any(
+        item.get("event") == "model_escalated"
+        for item in next_state.node_diagnostics
+    )
+
+
 async def test_plan_fix_records_prompt_built_diagnostic(monkeypatch):
     async def fake_llm_call(system, user):
         return json.dumps(

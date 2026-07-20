@@ -7,7 +7,14 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from ..escalation import (
+    build_escalation_packet,
+    immediate_model_policy_reason,
+    record_model_invocation,
+    render_escalation_packet,
+)
 from ..llm import llm_call
+from ..model_policy import apply_escalation, should_escalate
 from ..schemas import ReflectDecision
 from ..state import (
     AgentState,
@@ -24,6 +31,18 @@ from ..state import (
     _remember,
 )
 from .plan import _prior_failed_edits_context
+
+ESCALATED_REFLECT_SYSTEM = (
+    "You are RepoPilot's escalated reflection node. The user message is the "
+    "complete allowlisted EscalationPacket; do not request hidden conversation or "
+    "evaluator data. Return ONLY JSON with root_cause, what_went_wrong, "
+    "suggested_fix_approach, files_that_also_need_changes, and decision_frame. "
+    "decision_frame must use stage='reflect' and include summary, hypotheses, "
+    "selected_hypothesis_id, evidence, next_checks, recommended_action='plan', "
+    "risk, and confidence. If one approved local evidence call is essential, "
+    "include optional tool_intent with action, args, reason, and expected_evidence; "
+    "deterministic policy decides whether it runs."
+)
 
 
 def _normalize_string_list(value: Any) -> list[str]:
@@ -187,6 +206,7 @@ def _patch_edit_snippet(attempt: Any, limit: int = 2000) -> str:
 async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM to analyze WHY the previous fix attempt failed."""
     state = _as_state(state)
+    apply_escalation(state, should_escalate(state))
     if _is_budget_exceeded(state):
         state.failure_reason = "Token budget exceeded before reflection."
         state.current_phase = Phase.FAILURE
@@ -259,23 +279,98 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
         )
     if patch_apply_failure:
         user = f"{user}\n\n{_patch_apply_failure_prompt(state, test_output)}"
+    if state.active_provider == "escalation":
+        system = ESCALATED_REFLECT_SYSTEM
+        user = render_escalation_packet(build_escalation_packet(state))
     prompt_tokens_estimate = _estimate_tokens(system, user)
 
-    t0 = time.monotonic()
-    try:
-        response = _extract_json_object(await llm_call(system, user))
-        response_text = json.dumps(response)
+    while True:
+        invoked_provider = state.active_provider
+        invoked_model = state.active_model
+        response_text = ""
+        t0 = time.monotonic()
+        try:
+            if invoked_provider == "primary":
+                raw_response = await llm_call(system, user)
+            else:
+                raw_response = await llm_call(
+                    system,
+                    user,
+                    model=invoked_model,
+                    provider="escalation",
+                )
+            response = _extract_json_object(raw_response)
+            response_text = json.dumps(response)
+            if not response:
+                raise ValueError("Model returned an empty structured response")
+            has_explicit_frame = "decision_frame" in response
+            decision = _normalize_reflect_decision(response)
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            immediate_reason = immediate_model_policy_reason(exc)
+            response_tokens_estimate = _estimate_tokens(response_text)
+            status = "invalid_response" if immediate_reason else "error"
+            record_model_invocation(
+                state,
+                model=invoked_model,
+                provider=invoked_provider,
+                node="reflect_on_failure",
+                elapsed_seconds=elapsed,
+                input_tokens=prompt_tokens_estimate,
+                output_tokens=response_tokens_estimate,
+                status=status,
+                error=exc,
+            )
+            state.token_usage += prompt_tokens_estimate + response_tokens_estimate
+            _record_node_diagnostic(
+                state,
+                node="reflect_on_failure",
+                event="llm_call",
+                status="error",
+                elapsed_seconds=elapsed,
+                error=exc,
+                prompt_tokens_estimate=prompt_tokens_estimate,
+                response_tokens_estimate=response_tokens_estimate,
+            )
+            if immediate_reason and invoked_provider == "primary":
+                apply_escalation(
+                    state,
+                    should_escalate(state, immediate_reason=immediate_reason),
+                )
+                if state.active_provider == "escalation":
+                    system = ESCALATED_REFLECT_SYSTEM
+                    user = render_escalation_packet(build_escalation_packet(state))
+                    prompt_tokens_estimate = _estimate_tokens(system, user)
+                    continue
+            state.reflection_notes = f"Reflection failed: {_describe_exception(exc)}"
+            _remember(
+                state,
+                "assistant",
+                f"Reflection error: {_describe_exception(exc)}",
+            )
+            break
+
+        elapsed = time.monotonic() - t0
+        response_tokens_estimate = _estimate_tokens(response_text)
+        record_model_invocation(
+            state,
+            model=invoked_model,
+            provider=invoked_provider,
+            node="reflect_on_failure",
+            elapsed_seconds=elapsed,
+            input_tokens=prompt_tokens_estimate,
+            output_tokens=response_tokens_estimate,
+            status="ok",
+        )
         _record_node_diagnostic(
             state,
             node="reflect_on_failure",
             event="llm_call",
             status="success",
-            elapsed_seconds=time.monotonic() - t0,
+            elapsed_seconds=elapsed,
             prompt_tokens_estimate=prompt_tokens_estimate,
-            response_tokens_estimate=_estimate_tokens(response_text),
+            response_tokens_estimate=response_tokens_estimate,
         )
-        has_explicit_frame = "decision_frame" in response
-        decision = _normalize_reflect_decision(response)
         state.reflection_notes = response_text
         state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
         _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")
@@ -298,19 +393,7 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 frame=frame,
                 reason="missing_explicit_decision_frame",
             )
-    except Exception as exc:
-        _record_node_diagnostic(
-            state,
-            node="reflect_on_failure",
-            event="llm_call",
-            status="error",
-            elapsed_seconds=time.monotonic() - t0,
-            error=exc,
-            prompt_tokens_estimate=prompt_tokens_estimate,
-        )
-        state.reflection_notes = f"Reflection failed: {_describe_exception(exc)}"
-        state.token_usage += _estimate_tokens(system, user)
-        _remember(state, "assistant", f"Reflection error: {_describe_exception(exc)}")
+        break
 
     state.current_phase = Phase.PLAN
     return state
