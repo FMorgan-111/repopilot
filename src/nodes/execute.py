@@ -628,7 +628,9 @@ def _apply_patch_edits(
                 # drift (indent / trailing space). Retry with a normalized, unique
                 # line match before giving up, reindenting the replacement to match.
                 span = (
-                    None if edit.replace_all else find_normalized_span(content, edit.search)
+                    None
+                    if edit.replace_all or edit.exact_only
+                    else find_normalized_span(content, edit.search)
                 )
                 if span is None:
                     # Last resort: if this is really a whole-function rewrite whose
@@ -637,7 +639,9 @@ def _apply_patch_edits(
                     # truncate a partial edit. Python files only.
                     qualname = (
                         None
-                        if edit.replace_all or not edit.file_path.endswith(".py")
+                        if edit.replace_all
+                        or edit.exact_only
+                        or not edit.file_path.endswith(".py")
                         else try_upgrade_to_node_target(content, edit.search, edit.replace)
                     )
                     node_span = (

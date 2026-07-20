@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
+import os
 import re
+import stat
 import subprocess
 import textwrap
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypeVar
+from typing import Callable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
@@ -76,7 +80,10 @@ _TEXT_SOURCE_SUFFIXES = frozenset(
 _EVALUATOR_FIELD_RE = re.compile(
     r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b"
 )
-_UNIFIED_DIFF_RE = re.compile(r"(?m)^(?:diff --git |@@ |--- a/|\+\+\+ b/)")
+_UNIFIED_DIFF_RE = re.compile(
+    r"(?im)^\s*(?:diff --git\b|@@\s|---\s+(?:a/|/dev/null)|"
+    r"\+\+\+\s+(?:b/|/dev/null)|\*\*\*\s+(?:begin|end)\s+patch\b)"
+)
 
 REPAIR_PLAN_SYSTEM = (
     "Return ONLY one JSON object containing exactly these keys: root_cause, "
@@ -97,6 +104,14 @@ VERIFIED_EDIT_SYSTEM = (
 
 class RepairContextError(ValueError):
     """The requested context or model-authored anchor failed closed."""
+
+
+@dataclass(frozen=True)
+class _TargetSnapshot:
+    file_path: str
+    content: str | None
+    content_sha256: str
+    is_new: bool
 
 
 def _git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -121,33 +136,115 @@ def _validate_checkout(state: AgentState) -> Path:
     return root
 
 
-def _safe_target(root: Path, relative: str) -> tuple[Path, bool]:
+def _decode_utf8(data: bytes) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RepairContextError("target file must be readable UTF-8 text") from exc
+
+
+def _read_regular_no_follow(root: Path, relative: str) -> bytes:
+    """Read a regular file without following any checkout-relative symlink."""
+    parts = relative.split("/")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    descriptors: list[int] = []
+    try:
+        current = os.open(root, directory_flags)
+        descriptors.append(current)
+        for component in parts[:-1]:
+            current = os.open(
+                component,
+                directory_flags | no_follow,
+                dir_fd=current,
+            )
+            descriptors.append(current)
+        file_descriptor = os.open(
+            parts[-1],
+            os.O_RDONLY | no_follow,
+            dir_fd=current,
+        )
+        descriptors.append(file_descriptor)
+        before = os.fstat(file_descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise RepairContextError("target file is not a regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_descriptor, 64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(file_descriptor)
+        identity_before = (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        )
+        identity_after = (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        )
+        if identity_before != identity_after:
+            raise RepairContextError("target file changed while reading its preimage")
+        return b"".join(chunks)
+    except RepairContextError:
+        raise
+    except OSError as exc:
+        raise RepairContextError(
+            "target file is missing, symlinked, or not a regular checkout file"
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+def _assert_intentional_new_target(root: Path, relative: str) -> None:
+    """Prove every existing parent is a real directory and the leaf is absent."""
+    current = root
+    parts = relative.split("/")
+    for index, component in enumerate(parts):
+        current = current / component
+        try:
+            status = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(status.st_mode):
+            raise RepairContextError("target file symlink escapes the exact checkout")
+        if index < len(parts) - 1:
+            if not stat.S_ISDIR(status.st_mode):
+                raise RepairContextError("target file parent is not a directory")
+        else:
+            raise RepairContextError("target file is not tracked at the exact checkout")
+
+
+def _target_snapshot(root: Path, relative: str) -> _TargetSnapshot:
     path = canonical_repo_path(relative)
     if is_sensitive_repo_path(path):
         raise RepairContextError("target file is a sensitive repository path")
-    candidate = root / path
-    if candidate.is_symlink():
-        raise RepairContextError("target file escapes the exact checkout")
-    resolved = candidate.resolve()
-    if not resolved.is_relative_to(root):
-        raise RepairContextError("target file escapes the exact checkout")
-    if resolved.exists():
-        if not resolved.is_file():
-            raise RepairContextError("target file is not a regular file")
-        tracked = _git(root, "ls-files", "--error-unmatch", "--", path)
-        if tracked.returncode != 0:
-            raise RepairContextError("target file is not tracked at the exact checkout")
-        return resolved, False
-    if resolved.suffix.lower() not in _TEXT_SOURCE_SUFFIXES:
+    tracked = _git(root, "ls-files", "--error-unmatch", "--", path)
+    if tracked.returncode == 0:
+        data = _read_regular_no_follow(root, path)
+        return _TargetSnapshot(
+            file_path=path,
+            content=_decode_utf8(data),
+            content_sha256=hashlib.sha256(data).hexdigest(),
+            is_new=False,
+        )
+    _assert_intentional_new_target(root, path)
+    if Path(path).suffix.lower() not in _TEXT_SOURCE_SUFFIXES:
         raise RepairContextError("target file is missing or not an intentional new text file")
-    return resolved, True
-
-
-def _read_utf8(path: Path) -> str:
-    try:
-        return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise RepairContextError("target file must be readable UTF-8 text") from exc
+    return _TargetSnapshot(
+        file_path=path,
+        content=None,
+        content_sha256=hashlib.sha256(b"").hexdigest(),
+        is_new=True,
+    )
 
 
 def _python_symbol_spans(source: str, requested: str) -> list[tuple[int, int]]:
@@ -222,26 +319,29 @@ def _fallback_window(source: str, symbol: str | None = None) -> str:
     return source[:TARGET_CONTEXT_CONTENT_LIMIT]
 
 
-def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
-    """Resolve every plan target to bounded exact text in the prepared checkout."""
+def _build_target_context_with_snapshots(
+    state: AgentState,
+    plan: RepairPlan,
+) -> tuple[list[Evidence], dict[str, _TargetSnapshot]]:
+    """Resolve targets from fresh no-follow reads and return exact preimages."""
     if len(plan.target_files) > TARGET_CONTEXT_FILE_LIMIT:
         raise RepairContextError("too many target files for context budget")
     if len(plan.target_symbols) > TARGET_CONTEXT_SYMBOL_LIMIT:
         raise RepairContextError("too many target symbols for context budget")
     root = _validate_checkout(state)
-    targets: dict[str, tuple[Path, str | None]] = {}
+    targets: dict[str, _TargetSnapshot] = {}
     for relative in plan.target_files:
-        path, is_new = _safe_target(root, relative)
-        targets[relative] = (path, None if is_new else _read_utf8(path))
+        targets[relative] = _target_snapshot(root, relative)
 
     pending: list[dict[str, str | None]] = []
     represented_files: set[str] = set()
     for symbol in plan.target_symbols:
         matches: list[tuple[str, str, tuple[int, int] | None]] = []
-        for relative, (path, source) in targets.items():
+        for relative, snapshot in targets.items():
+            source = snapshot.content
             if source is None:
                 continue
-            if path.suffix.lower() == ".py":
+            if Path(relative).suffix.lower() == ".py":
                 matches.extend(
                     (relative, source, span)
                     for span in _python_symbol_spans(source, symbol)
@@ -265,7 +365,8 @@ def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
         )
         represented_files.add(relative)
 
-    for relative, (_path, source) in targets.items():
+    for relative, snapshot in targets.items():
+        source = snapshot.content
         if relative in represented_files:
             continue
         pending.append(
@@ -288,7 +389,11 @@ def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
     ):
         raise RepairContextError("target context contains an evaluator-only field")
 
+    # Persisted Evidence is untrusted input. Building the target prompt from an
+    # empty isolated store prevents a forged ID/fingerprint collision from
+    # substituting attacker-controlled content for the fresh checkout read.
     temporary = state.model_copy(deep=True)
+    temporary.evidence = []
     store = EvidenceStore(
         temporary,
         max_items=30,
@@ -306,8 +411,23 @@ def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
     )
     if [item.evidence_id for item in selected] != [item.evidence_id for item in result]:
         raise RepairContextError("target evidence exceeds total context budget")
-    state.evidence = temporary.evidence
-    return result
+    collision_ids = {item.evidence_id for item in result}
+    collision_fingerprints = {item.fingerprint for item in result}
+    preserved = [
+        item
+        for item in state.evidence
+        if item.evidence_id not in collision_ids
+        and item.fingerprint not in collision_fingerprints
+    ]
+    available = max(0, 30 - len(result))
+    state.evidence = [*preserved[:available], *result]
+    return result, targets
+
+
+def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
+    """Resolve every plan target to bounded exact text in the prepared checkout."""
+    evidence, _snapshots = _build_target_context_with_snapshots(state, plan)
+    return evidence
 
 
 def _safe_generated_text(value: str) -> str:
@@ -338,6 +458,7 @@ def _safe_plan(plan: RepairPlan) -> RepairPlan:
 
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+ResultT = TypeVar("ResultT")
 
 
 async def _call_schema(
@@ -346,7 +467,8 @@ async def _call_schema(
     system: str,
     user: str,
     schema: type[SchemaT],
-) -> SchemaT:
+    semantic_validate: Callable[[SchemaT], ResultT],
+) -> ResultT:
     model = state.active_model
     provider = state.active_provider
     started = time.monotonic()
@@ -354,7 +476,8 @@ async def _call_schema(
     try:
         raw = await llm_call(system, user, model=model, provider=provider)
         response_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
-        result = schema.model_validate(raw)
+        parsed = schema.model_validate(raw)
+        result = semantic_validate(parsed)
     except Exception as exc:
         elapsed = time.monotonic() - started
         record_model_invocation(
@@ -365,7 +488,11 @@ async def _call_schema(
             elapsed_seconds=elapsed,
             input_tokens=_estimate_tokens(system, user),
             output_tokens=_estimate_tokens(response_text) if response_text else 0,
-            status=("invalid_response" if isinstance(exc, (ValidationError, ValueError)) else "error"),
+            status=(
+                "invalid_response"
+                if isinstance(exc, (ValidationError, RepairContextError, ValueError))
+                else "error"
+            ),
             error=exc,
         )
         state.token_usage += _estimate_tokens(system, user, response_text)
@@ -390,6 +517,7 @@ def _validate_batch(
     plan: RepairPlan,
     batch: VerifiedEditBatch,
     evidence: list[Evidence],
+    snapshots: dict[str, _TargetSnapshot],
 ) -> None:
     root = _validate_checkout(state)
     plan_files = set(plan.target_files)
@@ -401,20 +529,32 @@ def _validate_batch(
     for edit in batch.edits:
         if edit.file_path not in plan_files:
             raise RepairContextError("verified edit file is outside the RepairPlan")
-        path, is_new = _safe_target(root, edit.file_path)
+        expected = snapshots.get(edit.file_path)
+        if expected is None:
+            raise RepairContextError("verified edit lacks an exact target preimage")
+        current = _target_snapshot(root, edit.file_path)
+        if (
+            current.is_new != expected.is_new
+            or current.content_sha256 != expected.content_sha256
+        ):
+            raise RepairContextError("target file changed from its exact preimage")
         if _UNIFIED_DIFF_RE.search(edit.search) or _UNIFIED_DIFF_RE.search(edit.replace):
             raise RepairContextError("unified diff content is not a verified edit anchor")
         if redact_secrets(edit.search) != edit.search or redact_secrets(edit.replace) != edit.replace:
             raise RepairContextError("verified edit contains credential-shaped text")
-        if is_new:
-            if edit.node_target or edit.search:
-                raise RepairContextError("intentional new text file cannot use an existing anchor")
-            continue
         anchor = (edit.file_path, edit.node_target or "", edit.search)
         if anchor in anchors:
             raise RepairContextError("verified edit anchors must be unique")
         anchors.add(anchor)
-        source = _read_utf8(path)
+        edit._expected_content_sha256 = expected.content_sha256
+        edit._exact_only = True
+        if current.is_new:
+            if edit.node_target or edit.search:
+                raise RepairContextError("intentional new text file cannot use an existing anchor")
+            continue
+        source = current.content
+        if source is None:  # defensive narrowing; existing targets always have content
+            raise RepairContextError("existing target file lacks an exact preimage")
         file_evidence = evidence_by_file.get(edit.file_path, [])
         if edit.node_target:
             if edit.node_target not in plan.target_symbols:
@@ -444,10 +584,20 @@ def _validate_batch(
                 raise RepairContextError("verified edit search anchor was not in target evidence")
 
 
-def verified_edits_to_patch_edits(batch: VerifiedEditBatch) -> list[PatchEdit]:
+def verified_edits_to_patch_edits(
+    batch: VerifiedEditBatch,
+    *,
+    state: AgentState,
+) -> list[PatchEdit]:
     """Convert already-validated existing-file edits to the legacy executor type."""
+    root = _validate_checkout(state)
     edits: list[PatchEdit] = []
     for edit in batch.edits:
+        if not edit._exact_only or not edit._expected_content_sha256:
+            raise RepairContextError("verified edit is missing its exact preimage binding")
+        current = _target_snapshot(root, edit.file_path)
+        if current.content_sha256 != edit._expected_content_sha256:
+            raise RepairContextError("target file changed from its exact preimage")
         if not edit.search and not edit.node_target:
             raise RepairContextError(
                 "intentional new text file edits require PatchGate before conversion"
@@ -458,6 +608,8 @@ def verified_edits_to_patch_edits(batch: VerifiedEditBatch) -> list[PatchEdit]:
                 node_target=edit.node_target or "",
                 search=edit.search,
                 replace=edit.replace,
+                expected_content_sha256=edit._expected_content_sha256,
+                exact_only=True,
             )
         )
     return edits
@@ -473,14 +625,23 @@ async def generate_opus_repair(
     if packet.base_commit != state.repo_ref:
         raise RepairContextError("EscalationPacket base commit does not match checkout")
     rendered_packet = render_escalation_packet(packet)
-    plan = await _call_schema(
+
+    def validate_plan(candidate: RepairPlan) -> tuple[
+        RepairPlan,
+        list[Evidence],
+        dict[str, _TargetSnapshot],
+    ]:
+        safe_plan = _safe_plan(candidate)
+        evidence, snapshots = _build_target_context_with_snapshots(state, safe_plan)
+        return safe_plan, evidence, snapshots
+
+    plan, evidence, snapshots = await _call_schema(
         state,
         system=REPAIR_PLAN_SYSTEM,
         user=rendered_packet,
         schema=RepairPlan,
+        semantic_validate=validate_plan,
     )
-    plan = _safe_plan(plan)
-    evidence = build_target_context(state, plan)
     payload = {
         "escalation_packet": json.loads(rendered_packet),
         "repair_plan": plan.model_dump(mode="json"),
@@ -497,11 +658,15 @@ async def generate_opus_repair(
     user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     if len(user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("verified edit prompt exceeds strict context budget")
+    def validate_edits(candidate: VerifiedEditBatch) -> VerifiedEditBatch:
+        _validate_batch(state, plan, candidate, evidence, snapshots)
+        return candidate
+
     batch = await _call_schema(
         state,
         system=VERIFIED_EDIT_SYSTEM,
         user=user,
         schema=VerifiedEditBatch,
+        semantic_validate=validate_edits,
     )
-    _validate_batch(state, plan, batch, evidence)
     return plan, batch

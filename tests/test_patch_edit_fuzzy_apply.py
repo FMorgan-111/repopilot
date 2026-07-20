@@ -89,3 +89,22 @@ def test_replace_all_does_not_use_fuzzy_fallback(tmp_path):
     )
     assert not result.applied
     assert "was not found" in result.output
+
+
+def test_verified_exact_only_edit_does_not_use_whitespace_fallback(tmp_path):
+    path = _write(tmp_path, "a.py", "def f():\n\treturn 1\n")
+
+    result = _apply_patch_edits(
+        str(tmp_path),
+        [
+            PatchEdit(
+                file_path="a.py",
+                search="def f():\n    return 1",
+                replace="def f():\n    return 2",
+                exact_only=True,
+            )
+        ],
+    )
+
+    assert not result.applied
+    assert path.read_text(encoding="utf-8") == "def f():\n\treturn 1\n"

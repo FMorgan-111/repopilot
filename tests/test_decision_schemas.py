@@ -96,6 +96,73 @@ def test_repair_plan_and_verified_edit_schemas_are_strict():
         VerifiedEditBatch(edits=[])
 
 
+@pytest.mark.parametrize("field", ["target_files", "target_symbols", "rejected_approaches"])
+@pytest.mark.parametrize("value", ["src/widget.py", None, 7, {"path": "src/widget.py"}])
+def test_repair_plan_requires_real_arrays(field, value):
+    payload = {
+        "root_cause": "The calculation omits the offset.",
+        "target_files": ["src/widget.py"],
+        "target_symbols": ["Widget.compute"],
+        "required_behavior": "Apply the offset.",
+        "regression_test_strategy": "Run the focused regression test.",
+        "rejected_approaches": ["Do not special-case the sample."],
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        RepairPlan.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("root_cause", "   "),
+        ("required_behavior", "\n\t"),
+        ("regression_test_strategy", ""),
+        ("target_symbols", ["Widget.compute", " Widget.compute "]),
+        ("rejected_approaches", ["valid", "  "]),
+    ],
+)
+def test_repair_plan_rejects_blank_or_duplicate_trimmed_text(field, value):
+    payload = {
+        "root_cause": "The calculation omits the offset.",
+        "target_files": ["src/widget.py"],
+        "target_symbols": ["Widget.compute"],
+        "required_behavior": "Apply the offset.",
+        "regression_test_strategy": "Run the focused regression test.",
+        "rejected_approaches": ["Do not special-case the sample."],
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        RepairPlan.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("root_cause", "diff --git a/src/widget.py b/src/widget.py"),
+        ("required_behavior", "  @@ -1 +1 @@"),
+        ("regression_test_strategy", 'Return {"patch": "..."}'),
+        ("target_symbols", ['{"edits": []}']),
+        ("rejected_approaches", ["*** Begin Patch"]),
+    ],
+)
+def test_repair_plan_rejects_patch_or_edit_shaped_smuggling(field, value):
+    payload = {
+        "root_cause": "The calculation omits the offset.",
+        "target_files": ["src/widget.py"],
+        "target_symbols": ["Widget.compute"],
+        "required_behavior": "Apply the offset.",
+        "regression_test_strategy": "Run the focused regression test.",
+        "rejected_approaches": ["Do not special-case the sample."],
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError):
+        RepairPlan.model_validate(payload)
+
+
 def test_plan_decision_accepts_search_replace_patch_edits():
     decision = PlanDecision.model_validate(
         {

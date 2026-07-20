@@ -10,11 +10,24 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 
 from .repo_paths import canonical_repo_path
 
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
+
+_REPAIR_SMUGGLING_RE = re.compile(
+    r"(?im)(?:^\s*(?:diff --git\b|@@\s|---\s+(?:a/|/dev/null)|"
+    r"\+\+\+\s+(?:b/|/dev/null)|\*\*\*\s+(?:begin|end)\s+patch\b)|"
+    r"[\"']?(?:patch|patch_edits|edits|file_path|search|replace)[\"']?\s*[:=])"
+)
 
 APPROVED_NO_PROGRESS_KINDS = frozenset(
     {
@@ -145,6 +158,18 @@ class PatchEdit(BaseModel):
     # The executor locates the node via AST — no verbatim text anchoring, no
     # line drift. When set, `search` must be empty.
     node_target: str = ""
+    # Verified escalation edits are bound to this exact whole-file preimage.
+    # Task 8's PatchGate consumes the digest; `exact_only` already disables all
+    # normalized/fuzzy fallbacks in the legacy executor.
+    expected_content_sha256: str = Field(default="", max_length=64)
+    exact_only: bool = False
+
+    @field_validator("expected_content_sha256")
+    @classmethod
+    def _validate_expected_digest(cls, value: str) -> str:
+        if value and not re.fullmatch(r"[0-9a-f]{64}", value):
+            raise ValueError("expected_content_sha256 must be lowercase SHA-256")
+        return value
 
     @model_validator(mode="before")
     @classmethod
@@ -349,11 +374,38 @@ class RepairPlan(BaseModel):
     regression_test_strategy: str = Field(min_length=1, max_length=4_000)
     rejected_approaches: list[str] = Field(default_factory=list, max_length=16)
 
+    @staticmethod
+    def _reject_smuggling(value: str) -> str:
+        if _REPAIR_SMUGGLING_RE.search(value):
+            raise ValueError("RepairPlan fields cannot contain patch or edit payloads")
+        return value
+
+    @field_validator(
+        "root_cause",
+        "required_behavior",
+        "regression_test_strategy",
+        mode="before",
+    )
+    @classmethod
+    def _validate_narrative(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("RepairPlan narrative fields must be strings")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("RepairPlan narrative fields cannot be blank")
+        return cls._reject_smuggling(normalized)
+
     @field_validator("target_files", mode="before")
     @classmethod
     def _validate_target_files(cls, value: Any) -> list[str]:
-        files = _normalize_string_list(value)
-        canonical = [canonical_repo_path(path) for path in files]
+        if not isinstance(value, list):
+            raise ValueError("RepairPlan target_files must be an array")
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError("RepairPlan target_files must contain strings")
+        files = [item.strip() for item in value]
+        if any(not item for item in files):
+            raise ValueError("RepairPlan target_files cannot contain blank paths")
+        canonical = [canonical_repo_path(cls._reject_smuggling(path)) for path in files]
         if any(len(path) > 500 for path in canonical):
             raise ValueError("RepairPlan target file is too long")
         if len(canonical) != len(set(canonical)):
@@ -363,7 +415,11 @@ class RepairPlan(BaseModel):
     @field_validator("target_symbols", "rejected_approaches", mode="before")
     @classmethod
     def _validate_unique_strings(cls, value: Any, info: Any) -> list[str]:
-        items = [item.strip() for item in _normalize_string_list(value)]
+        if not isinstance(value, list):
+            raise ValueError(f"RepairPlan {info.field_name} must be an array")
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError(f"RepairPlan {info.field_name} must contain strings")
+        items = [cls._reject_smuggling(item.strip()) for item in value]
         if any(not item for item in items):
             raise ValueError("RepairPlan string lists cannot contain empty values")
         maximum = 300 if info.field_name == "target_symbols" else 1_000
@@ -384,6 +440,8 @@ class VerifiedEdit(BaseModel):
     search: str = Field(max_length=8_000)
     replace: str = Field(max_length=100_000)
     intent: str = Field(min_length=1, max_length=2_000)
+    _expected_content_sha256: str = PrivateAttr(default="")
+    _exact_only: bool = PrivateAttr(default=False)
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -395,8 +453,20 @@ class VerifiedEdit(BaseModel):
     def _normalize_node_target(cls, value: Any) -> str | None:
         if value is None:
             return None
-        target = str(value).strip()
+        if not isinstance(value, str):
+            raise ValueError("VerifiedEdit node_target must be a string or null")
+        target = value.strip()
         return target or None
+
+    @field_validator("intent", mode="before")
+    @classmethod
+    def _validate_intent(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("VerifiedEdit intent must be a string")
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("VerifiedEdit intent cannot be blank")
+        return normalized
 
     @model_validator(mode="after")
     def _use_one_anchor(self) -> "VerifiedEdit":

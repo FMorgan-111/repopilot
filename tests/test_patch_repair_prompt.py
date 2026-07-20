@@ -424,13 +424,14 @@ async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkey
     assert result.current_phase == new_agent.Phase.EXECUTE
     assert len(calls) == 2
     assert result.patch_content == ""
-    assert result.patch_edits == [
-        new_agent.PatchEdit(
-            file_path="widget.py",
-            node_target="compute",
-            replace="def compute(value):\n    return value + 1\n",
-        )
-    ]
+    assert len(result.patch_edits) == 1
+    assert result.patch_edits[0].file_path == "widget.py"
+    assert result.patch_edits[0].node_target == "compute"
+    assert result.patch_edits[0].replace == (
+        "def compute(value):\n    return value + 1\n"
+    )
+    assert result.patch_edits[0].exact_only is True
+    assert len(result.patch_edits[0].expected_content_sha256) == 64
     assert [entry.provider for entry in result.model_history[-2:]] == [
         "escalation",
         "escalation",

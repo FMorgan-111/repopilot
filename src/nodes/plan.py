@@ -803,7 +803,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state,
                     build_escalation_packet(state),
                 )
-                patch_edits = verified_edits_to_patch_edits(verified_batch)
+                patch_edits = verified_edits_to_patch_edits(
+                    verified_batch,
+                    state=state,
+                )
                 response_text = json.dumps(
                     {
                         "repair_plan": repair_plan.model_dump(mode="json"),
