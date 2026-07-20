@@ -335,6 +335,42 @@ class Evidence(BaseModel):
     fingerprint: str
 
 
+ToolAction = Literal[
+    "search_symbol",
+    "search_text",
+    "read_symbol",
+    "read_range",
+    "find_references",
+    "list_related_tests",
+    "run_targeted_test",
+    "inspect_git_diff",
+    "validate_patch",
+    "request_repair",
+    "finish_investigation",
+]
+
+
+class ToolInvocation(BaseModel):
+    action: ToolAction
+    args_fingerprint: str
+    status: Literal["approved", "rejected", "ok", "error", "duplicate"]
+    evidence_id: str | None = None
+    error_class: str = ""
+
+    @field_validator("error_class", mode="before")
+    @classmethod
+    def _keep_exception_class_only(cls, value: Any) -> str:
+        if isinstance(value, BaseException):
+            return type(value).__name__
+        candidate = str(value or "").strip().partition(":")[0].strip()
+        if re.fullmatch(
+            r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)",
+            candidate,
+        ):
+            return candidate
+        return ""
+
+
 class AgentState(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
@@ -391,6 +427,7 @@ class AgentState(BaseModel):
     model_history: list[ModelInvocation] = Field(default_factory=list)
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
+    tool_history: list[ToolInvocation] = Field(default_factory=list)
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False
