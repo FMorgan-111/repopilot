@@ -20,7 +20,7 @@ from .graph import (
     run_graph,
 )
 from .nodes.commit import commit_fix, create_pr, push_files
-from .nodes.execute import apply_patch, execute_fix, git_clone, run_pytest
+from .nodes.execute import apply_patch, execute_fix, git_clone, git_diff, run_pytest
 from .nodes.failure import handle_failure
 from .nodes.locate import locate_code
 from .nodes.plan import plan_fix
@@ -91,6 +91,7 @@ __all__ = [
     "execute_fix",
     "final_report_from_state",
     "git_clone",
+    "git_diff",
     "handle_failure",
     "intelligent_analyze_issue",
     "locate_code",
@@ -287,6 +288,7 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
             "route_decisions": state.route_decisions,
             "node_diagnostics": state.node_diagnostics,
             "human_input_request": state.human_input_request,
+            "model_patch": git_diff(state.repo_path),
             "error": state.failure_reason or None,
         }
     )

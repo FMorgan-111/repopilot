@@ -460,6 +460,37 @@ def _git_apply(repo_path: str, patch_content: str) -> subprocess.CompletedProces
     )
 
 
+def git_diff(repo_path: str) -> str:
+    """Return the applied work-tree patch in SWE-bench prediction form."""
+    if not repo_path:
+        return ""
+    try:
+        intent = subprocess.run(
+            ["git", "-C", repo_path, "add", "-N", "--", "."],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        if intent.returncode != 0:
+            return ""
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_path,
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 def _combined_process_output(result: subprocess.CompletedProcess) -> str:
     return "\n".join(part for part in [result.stdout, result.stderr] if part)
 

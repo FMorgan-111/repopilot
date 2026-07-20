@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from eval import agent_v2_harness
+from eval import agent_v2_harness, swe_bench
 
 
 def test_legacy_harness_default_model_is_gemini_flash():
@@ -110,6 +110,65 @@ def sample_record():
         },
         "signals": {"has_tests_changed": True},
     }
+
+
+def swe_bench_sample():
+    return swe_bench.normalize_verified_row(
+        {
+            "instance_id": "acme__widget-8",
+            "repo": "acme/widget",
+            "issue_id": "7",
+            "issue_url": "https://github.com/acme/widget/issues/7",
+            "problem_statement": "Login crash\n\nThe endpoint crashes.",
+            "base_commit": "a" * 40,
+            "patch": "gold patch must remain hidden",
+            "test_patch": "test patch must remain hidden",
+            "FAIL_TO_PASS": "[]",
+            "PASS_TO_PASS": "[]",
+            "version": "1.0",
+            "created_at": "2026-01-01",
+            "difficulty": "medium",
+        }
+    )
+
+
+async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_clone(state):
+        captured["ref"] = state.repo_ref
+        return "/tmp/exact-work"
+
+    async def fake_agent(issue_url, **kwargs):
+        captured["seed"] = kwargs["seed"]
+        return {
+            "success": False,
+            "final_phase": "FAILED",
+            "trace_id": "trace",
+            "run_id": "trace",
+            "model_patch": "diff --git",
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "git_clone", fake_clone, raising=False)
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda run_id: {})
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+        seed_gold_files=True,
+    )
+
+    assert captured["ref"] == "a" * 40
+    assert captured["seed"]["repo_path"] == "/tmp/exact-work"
+    assert "evaluation" not in captured["seed"]
+    assert "gold patch must remain hidden" not in json.dumps(captured["seed"])
+    assert result["instance_id"] == "acme__widget-8"
+    assert result["base_commit"] == "a" * 40
+    assert result["model_patch"] == "diff --git"
+    assert result["evaluation_mode"] == "end_to_end"
 
 
 async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatch):
@@ -298,6 +357,73 @@ async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):
         }
     ]
     assert json.loads(results_path.read_text(encoding="utf-8")) == results
+
+
+async def test_run_swe_bench_eval_selects_dataset_and_writes_predictions(
+    monkeypatch, tmp_path
+):
+    sample = swe_bench_sample()
+    calls = []
+
+    def fake_load(count, seed):
+        calls.append((count, seed))
+        return [sample]
+
+    async def fake_evaluate(
+        selected,
+        idx,
+        max_retries=3,
+        token_budget=50000,
+        seed_gold_files=False,
+    ):
+        return {
+            "id": selected["id"],
+            "instance_id": selected["instance_id"],
+            "model": "gemini-3.5-flash:stable",
+            "model_patch": "diff --git",
+            "success": False,
+        }
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_samples",
+        fake_load,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "evaluate_agent_v2_sample",
+        fake_evaluate,
+    )
+    predictions_path = tmp_path / "predictions.jsonl"
+
+    results = await agent_v2_harness.run_agent_v2_eval(
+        n_samples=1,
+        dataset="swe-bench-verified",
+        dataset_seed=23,
+        predictions_path=predictions_path,
+        results_path=tmp_path / "results.json",
+    )
+
+    assert calls == [(1, 23)]
+    assert results[0]["instance_id"] == "acme__widget-8"
+    assert json.loads(predictions_path.read_text().strip()) == {
+        "instance_id": "acme__widget-8",
+        "model_name_or_path": "gemini-3.5-flash:stable",
+        "model_patch": "diff --git",
+    }
+
+
+async def test_predictions_file_requires_swe_bench_dataset(tmp_path):
+    with pytest.raises(
+        ValueError,
+        match="predictions_path requires dataset='swe-bench-verified'",
+    ):
+        await agent_v2_harness.run_agent_v2_eval(
+            dataset="custom",
+            predictions_path=tmp_path / "predictions.jsonl",
+            results_path=tmp_path / "results.json",
+        )
 
 
 async def test_run_agent_v2_eval_closes_memory_store_after_success(

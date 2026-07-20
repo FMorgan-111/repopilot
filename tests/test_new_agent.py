@@ -67,6 +67,72 @@ async def test_oracle_seed_with_files_starts_agent_at_plan(monkeypatch):
     assert captured["state"].current_phase == new_agent.Phase.PLAN
 
 
+def test_agent_payload_exports_binary_git_diff(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    source = tmp_path / "value.txt"
+    source.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "value.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    source.write_text("after\n", encoding="utf-8")
+    expected = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--binary", "--no-ext-diff"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert payload["model_patch"] == expected
+
+
+def test_agent_payload_exports_untracked_files(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "new_file.py").write_text("enabled = True\n", encoding="utf-8")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert "new file mode" in payload["model_patch"]
+    assert "new_file.py" in payload["model_patch"]
+    assert "+enabled = True" in payload["model_patch"]
+
+
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
     visited = []
 

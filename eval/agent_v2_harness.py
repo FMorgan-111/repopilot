@@ -21,6 +21,13 @@ replay_run = importlib.import_module("src.run_store").replay_run
 close_llm_client = importlib.import_module("src.http_client").close_llm_client
 get_llm_model = importlib.import_module("src.http_client")._get_llm_model
 close_store = importlib.import_module("src.memory").close_store
+AgentState = importlib.import_module("src.state").AgentState
+git_clone = importlib.import_module("src.nodes.execute").git_clone
+classify_sample = importlib.import_module("eval.failure_taxonomy").classify_sample
+_swe_bench = importlib.import_module("eval.swe_bench")
+build_agent_seed = _swe_bench.build_agent_seed
+load_verified_samples = _swe_bench.load_verified_samples
+write_predictions = _swe_bench.write_predictions
 
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
@@ -177,6 +184,26 @@ def _build_gold_seed(sample: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
+async def _build_eval_seed(
+    sample: dict[str, Any], seed_gold_files: bool
+) -> dict[str, Any] | None:
+    """Build an oracle seed or prepare an exact SWE-bench issue seed."""
+    if sample.get("source") != "swe-bench-verified":
+        return _build_gold_seed(sample) if seed_gold_files else None
+    issue = sample["issue"]
+    repo = sample["repo"]
+    prep = AgentState(
+        issue_url=issue["url"],
+        owner=repo["owner"],
+        repo=repo["name"],
+        issue_number=issue["number"],
+        repo_ref=sample["base_commit"],
+        skip_commit=True,
+    )
+    repo_path = await git_clone(prep)
+    return build_agent_seed(sample, repo_path)
+
+
 async def evaluate_agent_v2_sample(
     sample: dict[str, Any],
     idx: int,
@@ -189,8 +216,9 @@ async def evaluate_agent_v2_sample(
     patch = sample.get("patch", {})
     signals = sample.get("signals", {})
     issue_url = issue["url"]
+    is_swe_bench = sample.get("source") == "swe-bench-verified"
 
-    seed = _build_gold_seed(sample) if seed_gold_files else None
+    seed = await _build_eval_seed(sample, seed_gold_files)
 
     payload = await agent_v2(
         issue_url,
@@ -210,10 +238,12 @@ async def evaluate_agent_v2_sample(
         except Exception as exc:  # replay should not hide the eval result
             replay_error = f"{type(exc).__name__}: {exc}"
 
-    return {
+    result = {
         "id": sample["id"],
         "mode": "agent_v2",
-        "evaluation_mode": "oracle_files" if seed_gold_files else "end_to_end",
+        "evaluation_mode": (
+            "oracle_files" if seed_gold_files and not is_swe_bench else "end_to_end"
+        ),
         "model": _configured_model(),
         "commit_sha": _current_commit_sha(),
         "repo": f"{repo['owner']}/{repo['name']}",
@@ -233,6 +263,16 @@ async def evaluate_agent_v2_sample(
         "replay": replay,
         "replay_error": replay_error,
     }
+    if is_swe_bench:
+        result.update(
+            {
+                "instance_id": sample["instance_id"],
+                "base_commit": sample["base_commit"],
+                "model_patch": payload.get("model_patch", ""),
+            }
+        )
+        result["failure_class"] = classify_sample(result)["decisive"]
+    return result
 
 
 async def run_agent_v2_eval(
@@ -243,9 +283,25 @@ async def run_agent_v2_eval(
     sample_id: str | None = None,
     seed_gold_files: bool = False,
     samples_path: Path | None = None,
+    dataset: str = "custom",
+    dataset_seed: int = 17,
+    predictions_path: Path | str | None = None,
 ) -> list[dict[str, Any]]:
     try:
-        samples = load_samples(n_samples, sample_id=sample_id, samples_path=samples_path)
+        if predictions_path is not None and dataset != "swe-bench-verified":
+            raise ValueError(
+                "predictions_path requires dataset='swe-bench-verified'"
+            )
+        if dataset == "swe-bench-verified":
+            samples = load_verified_samples(n_samples, dataset_seed)
+        elif dataset == "custom":
+            samples = load_samples(
+                n_samples,
+                sample_id=sample_id,
+                samples_path=samples_path,
+            )
+        else:
+            raise ValueError(f"Unsupported dataset: {dataset}")
         results: list[dict[str, Any]] = []
 
         for i, sample in enumerate(samples):
@@ -264,6 +320,12 @@ async def run_agent_v2_eval(
 
         path = _write_results_with_fallback(results, results_path)
         print(f"\nAgent v2 eval results saved to {path}", flush=True)
+        if predictions_path is not None:
+            prediction_file = write_predictions(results, Path(predictions_path))
+            print(
+                f"SWE-bench predictions saved to {prediction_file}",
+                flush=True,
+            )
         return results
     finally:
         await _close_shared_resources()
@@ -281,6 +343,13 @@ def main(argv: list[str] | None = None) -> None:
                         help="Seed relevant_files from dataset gold changed files")
     parser.add_argument("--samples-file", type=str, default=None,
                         help="Path to custom samples JSONL file")
+    parser.add_argument(
+        "--dataset",
+        choices=("custom", "swe-bench-verified"),
+        default="custom",
+    )
+    parser.add_argument("--dataset-seed", type=int, default=17)
+    parser.add_argument("--predictions-file", type=str, default=None)
     args = parser.parse_args(argv)
 
     samples_path = Path(args.samples_file) if args.samples_file else SAMPLES_PATH
@@ -291,6 +360,9 @@ def main(argv: list[str] | None = None) -> None:
             token_budget=args.token_budget,
             seed_gold_files=args.seed_gold_files,
             samples_path=samples_path,
+            dataset=args.dataset,
+            dataset_seed=args.dataset_seed,
+            predictions_path=args.predictions_file,
         )
     )
 
