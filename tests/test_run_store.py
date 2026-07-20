@@ -246,6 +246,59 @@ def test_save_load_and_replay_preserve_outcome_summary_state(tmp_path):
     assert replay["summary_token_usage"] == 47
 
 
+def test_run_store_sanitizes_hostile_summary_even_when_state_validation_is_bypassed(
+    tmp_path,
+):
+    root_dir = tmp_path / ".repopilot"
+    state = paused_state("hostile-outcome-summary")
+    hostile = (
+        "safe persisted prefix Authorization: Bearer sk-run-store-sentinel "
+        "FAIL_TO_PASS HTTP/1.1 tests/generated_run_store.py"
+    )
+    object.__setattr__(state, "attempt_outcome_summary", hostile)
+
+    saved_path = run_store.save_run(state, root_dir=root_dir)
+    saved_text = saved_path.read_text(encoding="utf-8")
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+    replay = run_store.replay_run(state.trace_id, root_dir=root_dir)
+
+    for rendered in (
+        saved_text,
+        loaded.attempt_outcome_summary,
+        replay["attempt_outcome_summary"],
+    ):
+        assert "sk-run-store-sentinel" not in rendered
+        assert "FAIL_TO_PASS" not in rendered
+        assert "HTTP/1.1" not in rendered
+        assert "tests/generated_run_store.py" not in rendered
+
+
+def test_run_store_load_and_replay_sanitize_hostile_file(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    path = run_store.run_path("hostile-summary-file", root_dir=root_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "issue_url": "https://github.com/acme/widget/issues/7",
+                "trace_id": "hostile-summary-file",
+                "current_phase": "PLAN",
+                "attempt_outcome_summary": (
+                    "safe loaded prefix raw HTTP response body: "
+                    "raw-load-sentinel"
+                ),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = run_store.load_run("hostile-summary-file", root_dir=root_dir)
+    replay = run_store.replay_run("hostile-summary-file", root_dir=root_dir)
+
+    assert loaded.attempt_outcome_summary == "safe loaded prefix"
+    assert replay["attempt_outcome_summary"] == "safe loaded prefix"
+
+
 def test_legacy_saved_state_loads_outcome_summary_defaults(tmp_path):
     root_dir = tmp_path / ".repopilot"
     path = run_store.run_path("legacy-summary", root_dir=root_dir)

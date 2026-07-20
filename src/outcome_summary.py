@@ -10,9 +10,10 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from .escalation import _safe_text, record_model_invocation
+from .escalation import record_model_invocation
 from .llm import llm_call
 from .state import AgentState, DecisionFrame, FixAttempt, _estimate_tokens
+from .summary_safety import sanitize_summary_text
 
 MAX_OUTCOME_SUMMARY_CHARS = 200
 PRIMARY_SUMMARY_MODEL = "gemini-3.5-flash:stable"
@@ -55,7 +56,7 @@ def _safe_summary_component(
     *,
     denied_literals: Iterable[str] = (),
 ) -> str:
-    safe = _safe_text(value, limit, denied_literals=denied_literals)
+    safe = sanitize_summary_text(value, limit, denied_literals=denied_literals)
     return safe.replace(OUTCOME_SUMMARY_SECTION, "").strip()
 
 
@@ -85,28 +86,46 @@ def _latest_frame(state: AgentState, stage: str) -> DecisionFrame | None:
 
 
 def _plan_signature(frame: DecisionFrame | None, attempt: FixAttempt) -> str:
-    if frame is not None:
-        material: dict[str, Any] = {
-            "frame_id": frame.frame_id,
-            "summary": frame.summary,
-            "selected_hypothesis_id": frame.selected_hypothesis_id,
-            "recommended_action": frame.recommended_action,
-        }
-    else:
-        material = {
-            "patch_present": bool(attempt.patch_content),
-            "edit_targets": [
-                {"file": edit.file_path, "node": edit.node_target}
-                for edit in attempt.patch_edits
+    def digest(value: str) -> str:
+        return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+    def canonical_digest(value: object) -> str:
+        encoded_value = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        return digest(encoded_value)
+
+    material: dict[str, Any] = {
+        "frame": frame.model_dump(mode="json") if frame is not None else None,
+        "transaction": {
+            "patch_sha256": digest(attempt.patch_content),
+            "legacy_file_path_sha256": digest(attempt.file_path),
+            "edits": [
+                {
+                    "order": index,
+                    "edit_sha256": canonical_digest(edit.model_dump(mode="json")),
+                    "file_path_sha256": digest(edit.file_path),
+                    "search_sha256": digest(edit.search),
+                    "replace_sha256": digest(edit.replace),
+                    "node_target_sha256": digest(edit.node_target),
+                    "replace_all": edit.replace_all,
+                    "expected_content_sha256": edit.expected_content_sha256,
+                    "exact_only": edit.exact_only,
+                }
+                for index, edit in enumerate(attempt.patch_edits)
             ],
-        }
+        },
+    }
     encoded = json.dumps(
         material,
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def build_outcome_summary_input(state: AgentState) -> OutcomeSummaryInput:
@@ -154,9 +173,7 @@ def deterministic_outcome_summary(item: OutcomeSummaryInput) -> str:
         f"plan={item.plan_signature}; patch={item.patch_outcome}; "
         f"test={item.test_failure_class}; next={item.reflection_action}"
     )
-    return _safe_text(text, MAX_OUTCOME_SUMMARY_CHARS)[
-        :MAX_OUTCOME_SUMMARY_CHARS
-    ]
+    return sanitize_summary_text(text, MAX_OUTCOME_SUMMARY_CHARS)
 
 
 async def summarize_attempt_outcome(

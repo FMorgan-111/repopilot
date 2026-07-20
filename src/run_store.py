@@ -9,6 +9,7 @@ from typing import Any
 
 from .home import repopilot_home
 from .state import AgentState
+from .summary_safety import sanitize_summary_text
 
 
 def default_runs_dir() -> Path:
@@ -30,7 +31,9 @@ def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
 
     path = run_path(state.trace_id, root_dir=root_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state.model_dump(mode="json"), indent=2), encoding="utf-8")
+    payload = state.model_dump(mode="json")
+    payload["attempt_outcome_summary"] = _safe_outcome_summary(state)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
 
 
@@ -129,7 +132,7 @@ def summarize_replay(state: AgentState) -> dict[str, Any]:
         "run_id": state.trace_id,
         "issue_url": state.issue_url,
         "current_phase": state.current_phase.value,
-        "attempt_outcome_summary": state.attempt_outcome_summary,
+        "attempt_outcome_summary": _safe_outcome_summary(state),
         "summary_token_usage": state.summary_token_usage,
         "pause": {
             "pending_human_input": state.pending_human_input,
@@ -138,6 +141,13 @@ def summarize_replay(state: AgentState) -> dict[str, Any]:
         },
         "timeline": timeline,
     }
+
+
+def _safe_outcome_summary(state: AgentState) -> str:
+    return sanitize_summary_text(
+        state.attempt_outcome_summary,
+        denied_literals=(item.path for item in state.generated_test_approvals),
+    )
 
 
 def format_replay_markdown(replay: dict[str, Any]) -> str:

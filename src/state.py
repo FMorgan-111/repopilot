@@ -15,11 +15,13 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
 from .repo_paths import canonical_repo_path
+from .summary_safety import sanitize_summary_text
 
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
 
@@ -730,6 +732,28 @@ class AgentState(BaseModel):
     @classmethod
     def _keep_approved_escalation_reason(cls, value: Any) -> str:
         return sanitize_escalation_reason(value)
+
+    @field_validator("attempt_outcome_summary", mode="before")
+    @classmethod
+    def _bound_outcome_summary(cls, value: Any) -> str:
+        return sanitize_summary_text(value)
+
+    @model_validator(mode="after")
+    def _remove_generated_paths_from_outcome_summary(self) -> "AgentState":
+        safe = sanitize_summary_text(
+            self.attempt_outcome_summary,
+            denied_literals=(item.path for item in self.generated_test_approvals),
+        )
+        if safe != self.attempt_outcome_summary:
+            object.__setattr__(self, "attempt_outcome_summary", safe)
+        return self
+
+    @field_serializer("attempt_outcome_summary")
+    def _serialize_safe_outcome_summary(self, value: str) -> str:
+        return sanitize_summary_text(
+            value,
+            denied_literals=(item.path for item in self.generated_test_approvals),
+        )
 
     @field_validator("node_diagnostics", mode="before")
     @classmethod

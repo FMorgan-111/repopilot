@@ -15,6 +15,8 @@ from src.state import (
     DecisionFrame,
     FixAttempt,
     GeneratedTestApproval,
+    Hypothesis,
+    PatchEdit,
     Phase,
 )
 
@@ -197,6 +199,146 @@ def test_plan_prompt_has_no_summary_section_when_summary_is_empty():
     prompt = build_plan_user_prompt(make_reflect_state(attempt_outcome_summary=""))
 
     assert "Completed attempts (rolling summary):" not in prompt
+
+
+def test_nonempty_summary_is_the_only_completed_attempt_context_in_plan():
+    sentinels = {
+        "attempt-result-sentinel",
+        "attempt-error-sentinel",
+        "failed-search-sentinel",
+        "failed-replace-sentinel",
+        "reflection-notes-sentinel",
+        "plan-frame-summary-sentinel",
+        "plan-hypothesis-sentinel",
+        "reflect-frame-summary-sentinel",
+        "search-correction-sentinel",
+        "semantic-recall-sentinel",
+    }
+    plan_frame = DecisionFrame(
+        frame_id="df_plan",
+        stage="plan",
+        summary="plan-frame-summary-sentinel",
+        hypotheses=[
+            Hypothesis(
+                id="H1",
+                claim="plan-hypothesis-sentinel",
+                evidence=["plan-hypothesis-evidence-sentinel"],
+            )
+        ],
+        selected_hypothesis_id="H1",
+        recommended_action="execute",
+    )
+    reflect_frame = DecisionFrame(
+        frame_id="df_reflect",
+        parent_frame_id="df_plan",
+        stage="reflect",
+        summary="reflect-frame-summary-sentinel",
+        recommended_action="plan",
+    )
+    state = make_reflect_state(
+        attempt_outcome_summary="one safe completed-attempt summary",
+        reflection_notes="reflection-notes-sentinel",
+        search_correction_context="search-correction-sentinel",
+        fix_attempts=[
+            FixAttempt(
+                test_result="attempt-result-sentinel",
+                failure_kind="patch_apply_failed",
+                error_log="attempt-error-sentinel",
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/widget.py",
+                        search="failed-search-sentinel",
+                        replace="failed-replace-sentinel",
+                    )
+                ],
+            )
+        ],
+        decision_frame=reflect_frame,
+        frame_history=[plan_frame, reflect_frame],
+    )
+
+    prompt = build_plan_user_prompt(
+        state,
+        recall_context="\n\nsemantic-recall-sentinel",
+    )
+
+    assert prompt.count("Completed attempts (rolling summary):") == 1
+    assert prompt.count("one safe completed-attempt summary") == 1
+    assert all(sentinel not in prompt for sentinel in sentinels)
+    assert "plan-hypothesis-evidence-sentinel" not in prompt
+
+
+def test_agent_state_sanitizes_summary_on_construction_assignment_and_dump():
+    generated_path = "tests/regression_issue_123.py"
+    state = make_reflect_state(
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path=generated_path,
+                content_sha256="a" * 64,
+                patch_gate_fingerprint="b" * 64,
+            )
+        ],
+        attempt_outcome_summary="x" * 500,
+    )
+    assert len(state.attempt_outcome_summary) == MAX_OUTCOME_SUMMARY_CHARS
+
+    state.attempt_outcome_summary = (
+        "safe assigned prefix Authorization: Bearer sk-assignment-sentinel "
+        "FAIL_TO_PASS HTTP/1.1 " + generated_path
+    )
+    assert "sk-assignment-sentinel" not in state.attempt_outcome_summary
+    assert "FAIL_TO_PASS" not in state.attempt_outcome_summary
+    assert "HTTP/1.1" not in state.attempt_outcome_summary
+    assert generated_path not in state.attempt_outcome_summary
+
+    state.attempt_outcome_summary = f"safe dynamic path prefix {generated_path} tail"
+    assert state.attempt_outcome_summary == "safe dynamic path prefix"
+
+    object.__setattr__(
+        state,
+        "attempt_outcome_summary",
+        "safe dumped prefix HTTP response payload: dump-http-sentinel",
+    )
+    dumped = state.model_dump(mode="json")["attempt_outcome_summary"]
+    assert dumped == "safe dumped prefix"
+    assert "dump-http-sentinel" not in dumped
+
+
+def test_plan_signature_binds_full_frame_and_ordered_edit_transaction():
+    first = make_reflect_state()
+    first.frame_history[0].risk = "low"
+    first.fix_attempts[-1].patch_content = "raw-patch-sentinel"
+    first.fix_attempts[-1].patch_edits = [
+        PatchEdit(
+            file_path="src/a.py",
+            search="old-a",
+            replace="new-a",
+            exact_only=True,
+            expected_content_sha256="a" * 64,
+        ),
+        PatchEdit(file_path="src/b.py", search="old-b", replace="new-b"),
+    ]
+    same = first.model_copy(deep=True)
+    changed_frame = first.model_copy(deep=True)
+    changed_frame.frame_history[0].risk = "high"
+    changed_edit = first.model_copy(deep=True)
+    changed_edit.fix_attempts[-1].patch_edits[0].replace = "different-new-a"
+    changed_order = first.model_copy(deep=True)
+    changed_order.fix_attempts[-1].patch_edits.reverse()
+    changed_preimage = first.model_copy(deep=True)
+    changed_preimage.fix_attempts[-1].patch_edits[0].expected_content_sha256 = "b" * 64
+
+    first_input = build_outcome_summary_input(first)
+    encoded = first_input.model_dump_json()
+
+    assert first_input.plan_signature == build_outcome_summary_input(same).plan_signature
+    assert first_input.plan_signature != build_outcome_summary_input(changed_frame).plan_signature
+    assert first_input.plan_signature != build_outcome_summary_input(changed_edit).plan_signature
+    assert first_input.plan_signature != build_outcome_summary_input(changed_order).plan_signature
+    assert first_input.plan_signature != build_outcome_summary_input(changed_preimage).plan_signature
+    assert "raw-patch-sentinel" not in encoded
+    assert "old-a" not in encoded
+    assert "new-a" not in encoded
 
 
 def test_build_input_uses_only_latest_attempt_and_current_history_frames():

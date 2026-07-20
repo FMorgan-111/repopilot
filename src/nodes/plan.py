@@ -712,16 +712,26 @@ def build_plan_user_prompt(
     recall_context: str = "",
 ) -> str:
     """Build the primary planner prompt with one bounded outcome-summary section."""
-    previous_failures = "\n\n".join(
-        f"Attempt {idx + 1}: {attempt.test_result}\n"
-        f"{_truncate_prompt_text(attempt.error_log, PLAN_FAILURE_LOG_LIMIT)}"
-        for idx, attempt in enumerate(state.fix_attempts)
+    summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
+    include_legacy_attempt_context = not summary
+    previous_failures = (
+        "\n\n".join(
+            f"Attempt {idx + 1}: {attempt.test_result}\n"
+            f"{_truncate_prompt_text(attempt.error_log, PLAN_FAILURE_LOG_LIMIT)}"
+            for idx, attempt in enumerate(state.fix_attempts)
+        )
+        if include_legacy_attempt_context
+        else ""
     )
     reflection_context = ""
-    if state.reflection_notes:
+    if include_legacy_attempt_context and state.reflection_notes:
         reflection_context = f"\n\nREFLECTION ANALYSIS:\n{state.reflection_notes}"
     hypothesis_continuity_context = ""
-    continuity_context = _hypothesis_continuity_context(state)
+    continuity_context = (
+        _hypothesis_continuity_context(state)
+        if include_legacy_attempt_context
+        else ""
+    )
     if continuity_context:
         hypothesis_continuity_context = f"\n\n{continuity_context}"
     human_context = ""
@@ -733,11 +743,15 @@ def build_plan_user_prompt(
     if pressure:
         context_pressure_context = f"\n\n{pressure}"
     diversity_context = ""
-    prior_failed_edits = _prior_failed_edits_context(state)
+    prior_failed_edits = (
+        _prior_failed_edits_context(state)
+        if include_legacy_attempt_context
+        else ""
+    )
     if prior_failed_edits:
         diversity_context = f"\n\n{prior_failed_edits}"
     correction_context = ""
-    if state.search_correction_context:
+    if include_legacy_attempt_context and state.search_correction_context:
         correction_context = f"\n\n{state.search_correction_context}"
     files_terms = _issue_search_terms(state.issue_title, state.issue_body)
     file_limit, max_files = _budget_scaled_file_limits(state)
@@ -746,17 +760,23 @@ def build_plan_user_prompt(
         f"CONTENT:\n{_relevance_window(file.content, files_terms, file_limit)}"
         for file in state.relevant_files[:max_files]
     )
-    summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
     completed_attempts_context = ""
     if summary:
         completed_attempts_context = (
             f"\n\n{OUTCOME_SUMMARY_SECTION}\n{summary}"
         )
+    legacy_attempt_context = (
+        f"\n\nPrevious failures:\n{previous_failures}"
+        if include_legacy_attempt_context
+        else ""
+    )
     user = (
         f"Issue URL: {state.issue_url}\n"
         f"Title: {state.issue_title}\n\nBody:\n"
         f"{_truncate_prompt_text(state.issue_body, PLAN_ISSUE_BODY_LIMIT)}\n\n"
-        f"Relevant files:\n{files_context}{recall_context}\n\nPrevious failures:\n{previous_failures}"
+        f"Relevant files:\n{files_context}"
+        f"{recall_context if include_legacy_attempt_context else ''}"
+        f"{legacy_attempt_context}"
         f"{reflection_context}"
         f"{hypothesis_continuity_context}"
         f"{context_pressure_context}"
