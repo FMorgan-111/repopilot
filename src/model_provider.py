@@ -66,10 +66,15 @@ _QUOTED_FIELD_SECRET = re.compile(
 )
 
 
-def sanitize_provider_error(exc: BaseException) -> str:
-    """Return an exception message with common credentials replaced safely."""
-    message = str(exc)
+def redact_secrets(text: str) -> str:
+    """Replace credential-shaped values before text leaves a local boundary."""
+    message = str(text)
     message = _BEARER_SECRET.sub(r"\1[REDACTED]", message)
     message = _QUERY_SECRET.sub(r"\1[REDACTED]", message)
     message = _QUOTED_FIELD_SECRET.sub(r"\1[REDACTED]", message)
     return _HEADER_SECRET.sub(r"\1[REDACTED]", message)
+
+
+def sanitize_provider_error(exc: BaseException) -> str:
+    """Return an exception message with common credentials replaced safely."""
+    return redact_secrets(str(exc))

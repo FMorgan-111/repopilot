@@ -325,6 +325,16 @@ class NoProgressEvent(BaseModel):
         return sanitize_routing_node(value)
 
 
+class Evidence(BaseModel):
+    evidence_id: str
+    tool: str
+    file_path: str | None = None
+    symbol: str | None = None
+    summary: str
+    content: str
+    fingerprint: str
+
+
 class AgentState(BaseModel):
     model_config = ConfigDict(validate_assignment=True)
 
@@ -380,6 +390,7 @@ class AgentState(BaseModel):
     last_test_failure_signature: str = ""
     model_history: list[ModelInvocation] = Field(default_factory=list)
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
+    evidence: list[Evidence] = Field(default_factory=list)
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False

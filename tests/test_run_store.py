@@ -1,7 +1,7 @@
 import json
 
 from src import new_agent, run_store
-from src.state import ModelInvocation, NoProgressEvent
+from src.state import Evidence, ModelInvocation, NoProgressEvent
 
 
 def paused_state(trace_id: str = "abc123def456"):
@@ -228,6 +228,41 @@ def test_legacy_saved_state_loads_model_routing_defaults(tmp_path):
     assert loaded.no_progress_rounds == 0
     assert loaded.model_history == []
     assert loaded.no_progress_history == []
+
+
+def test_save_and_load_preserves_evidence_and_legacy_state_defaults_to_empty(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    state = paused_state("evidence-state")
+    state.evidence = [
+        Evidence(
+            evidence_id="ev_abc123",
+            tool="read_file",
+            file_path="src/widget.py",
+            symbol="Widget.render",
+            summary="Rendered widget source.",
+            content="def render(): pass",
+            fingerprint="abc123",
+        )
+    ]
+
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+
+    assert loaded.evidence == state.evidence
+
+    legacy_path = run_store.run_path("legacy-evidence", root_dir=root_dir)
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "issue_url": "https://github.com/acme/widget/issues/7",
+                "trace_id": "legacy-evidence",
+                "current_phase": "PLAN",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert run_store.load_run("legacy-evidence", root_dir=root_dir).evidence == []
 
 
 def test_save_run_uses_repopilot_home_by_default(tmp_path, monkeypatch):
