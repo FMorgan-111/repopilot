@@ -6,6 +6,7 @@ import sys
 
 from .new_agent import agent_v2, resume_agent_v2
 from .run_store import format_replay_markdown, inspect_run, list_runs, replay_run
+from .state import DEFAULT_AGENT_V2_TOKEN_BUDGET
 
 
 def main(argv: list[str] | None = None):
@@ -46,8 +47,8 @@ def _run_issue(argv: list[str]) -> dict:
     parser.add_argument(
         "--token-budget",
         type=int,
-        default=50000,
-        help="Token budget (default: 50000)",
+        default=DEFAULT_AGENT_V2_TOKEN_BUDGET,
+        help=f"Token budget (default: {DEFAULT_AGENT_V2_TOKEN_BUDGET})",
     )
     parser.add_argument(
         "--json",

@@ -40,6 +40,9 @@ load_dotenv(REPO_ROOT / ".env", override=True)
 DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
 _LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
+DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
+    "src.state"
+).DEFAULT_AGENT_V2_TOKEN_BUDGET
 
 _llm_client: httpx.AsyncClient | None = None
 
@@ -1076,7 +1079,7 @@ async def run_eval(
 async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
     max_retries: int = 3,
-    token_budget: int = 50000,
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     sample_id: str | None = None,
     seed_gold_files: bool = False,
 ) -> list[dict[str, Any]]:
@@ -1103,7 +1106,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--token-budget", type=int, default=50000)
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=DEFAULT_AGENT_V2_TOKEN_BUDGET,
+    )
     parser.add_argument(
         "--sample-id",
         default=None,

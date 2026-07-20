@@ -1,8 +1,66 @@
+import inspect
 import json
 
 import pytest
 
 from eval import agent_v2_harness, swe_bench
+
+
+def test_agent_v2_eval_public_defaults_are_100000():
+    from eval import harness
+
+    assert (
+        inspect.signature(agent_v2_harness.evaluate_agent_v2_sample)
+        .parameters["token_budget"]
+        .default
+        == 100_000
+    )
+    assert (
+        inspect.signature(agent_v2_harness.run_agent_v2_eval)
+        .parameters["token_budget"]
+        .default
+        == 100_000
+    )
+    assert (
+        inspect.signature(harness.run_agent_v2_eval)
+        .parameters["token_budget"]
+        .default
+        == 100_000
+    )
+
+
+def test_agent_v2_eval_cli_uses_100000_default_budget(monkeypatch):
+    calls = []
+
+    async def fake_run_agent_v2_eval(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "run_agent_v2_eval",
+        fake_run_agent_v2_eval,
+    )
+
+    agent_v2_harness.main([])
+
+    assert calls[0]["token_budget"] == 100_000
+
+
+def test_legacy_eval_cli_uses_100000_agent_v2_default_budget(monkeypatch):
+    from eval import harness
+
+    calls = []
+
+    async def fake_run_agent_v2_eval(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(harness, "run_agent_v2_eval", fake_run_agent_v2_eval)
+
+    harness.main(["--agent-v2"])
+
+    assert calls[0]["token_budget"] == 100_000
 
 
 def test_legacy_harness_default_model_is_gemini_flash():
@@ -328,7 +386,7 @@ async def test_seeded_eval_is_labeled_oracle_even_when_gold_seed_is_unavailable(
 async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):
     samples = [sample_record()]
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         return {
             "id": sample["id"],
@@ -431,7 +489,7 @@ async def test_run_agent_v2_eval_closes_memory_store_after_success(
 ):
     calls = []
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         return {
             "id": sample["id"],
@@ -472,7 +530,7 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
 ):
     samples = [sample_record()]
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         return {
             "id": sample["id"],
@@ -523,7 +581,7 @@ async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
 ):
     calls = []
 
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         raise RuntimeError("sample failed after partial work")
 
@@ -550,7 +608,7 @@ async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
 async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
     monkeypatch, tmp_path
 ):
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         return {
             "id": sample["id"],
@@ -586,7 +644,7 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
 async def test_run_agent_v2_eval_does_not_mask_results_when_memory_cleanup_raises(
     monkeypatch, tmp_path, capsys
 ):
-    async def fake_evaluate(sample, idx, max_retries=3, token_budget=50000,
+    async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
         return {
             "id": sample["id"],
@@ -633,7 +691,7 @@ def test_harness_main_dispatches_agent_v2_mode(monkeypatch):
     async def fake_run_agent_v2_eval(
         n_samples=5,
         max_retries=3,
-        token_budget=50000,
+        token_budget=100000,
         sample_id=None,
         seed_gold_files=False,
     ):
@@ -681,7 +739,7 @@ async def test_harness_run_agent_v2_eval_forwards_sample_id(monkeypatch):
             self,
             n_samples=5,
             max_retries=3,
-            token_budget=50000,
+            token_budget=100000,
             sample_id=None,
             seed_gold_files=False,
         ):

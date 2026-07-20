@@ -102,7 +102,16 @@ async def test_post_agent_invalid_url_returns_error(monkeypatch, api_client):
 
 
 async def test_post_agent_v2_routes_to_new_agent(monkeypatch, api_client):
-    async def fake_agent_v2(issue_url, max_retries=3, token_budget=50000):
+    captured = {}
+
+    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
+        captured.update(
+            {
+                "issue_url": issue_url,
+                "max_retries": max_retries,
+                "token_budget": token_budget,
+            }
+        )
         return {
             "done": True,
             "success": True,
@@ -130,6 +139,29 @@ async def test_post_agent_v2_routes_to_new_agent(monkeypatch, api_client):
     assert data["success"] is True
     assert data["final_phase"] == "DONE"
     assert data["pr_url"] == "https://github.com/acme/widget/pull/42"
+    assert captured == {
+        "issue_url": "https://github.com/acme/widget/issues/42",
+        "max_retries": 2,
+        "token_budget": 5_000,
+    }
+
+
+async def test_post_agent_v2_uses_100000_default_budget(monkeypatch, api_client):
+    captured = {}
+
+    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
+        captured["token_budget"] = token_budget
+        return {"success": True, "error": None}
+
+    monkeypatch.setattr(main, "agent_v2", fake_agent_v2)
+
+    response = await api_client.post(
+        "/agent/v2",
+        json={"issue_url": "https://github.com/acme/widget/issues/42"},
+    )
+
+    assert response.status_code == 200
+    assert captured["token_budget"] == 100_000
 
 
 async def test_post_agent_v2_resume_routes_to_resume_agent(monkeypatch, api_client):

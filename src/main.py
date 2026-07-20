@@ -12,6 +12,7 @@ from src.agent import analyze_issue
 from src.agent_loop import agent_analyze
 from src.new_agent import agent_v2, intelligent_analyze_issue, resume_agent_v2
 from src.run_store import format_replay_markdown, replay_run
+from src.state import DEFAULT_AGENT_V2_TOKEN_BUDGET
 
 app = FastAPI(title="RepoPilot")
 
@@ -28,13 +29,13 @@ class AgentRequest(BaseModel):
 class IntelligentAgentRequest(BaseModel):
     issue_url: str
     max_turns: int = 10
-    token_budget: int = 100000
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET
 
 
 class AgentV2Request(BaseModel):
     issue_url: str
     max_retries: int = 3
-    token_budget: int = 50000
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET
 
 
 class AgentV2ResumeRequest(BaseModel):

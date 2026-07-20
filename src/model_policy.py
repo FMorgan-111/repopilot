@@ -6,10 +6,17 @@ import hashlib
 import json
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from .model_provider import escalation_is_configured, get_model_config
-from .state import AgentState, NoProgressEvent
+from .state import (
+    APPROVED_ESCALATION_REASONS,
+    APPROVED_NO_PROGRESS_KINDS,
+    APPROVED_ROUTING_NODES,
+    AgentState,
+    NoProgressEvent,
+    sanitize_escalation_reason,
+)
 
 _IMMEDIATE_REASONS = frozenset(
     {
@@ -20,25 +27,6 @@ _IMMEDIATE_REASONS = frozenset(
 
 # These names cover the six policy signals in the design while retaining short
 # names for callers that already classified a plan, context, edit, or test event.
-_APPROVED_NO_PROGRESS_KINDS = frozenset(
-    {
-        "nonexistent_search_block",
-        "nonexistent_search_blocks",
-        "repeated_patch_signature",
-        "repeated_edit",
-        "repeated_unlocatable_edit",
-        "unchanged_context",
-        "unchanged_hypothesis",
-        "unchanged_plan",
-        "unchanged_test_failure",
-        "no_evidence_or_applicable_patch",
-        "plan",
-        "context",
-        "edit",
-        "test_failure",
-    }
-)
-
 _PLAN_SIGNATURE_KINDS = frozenset(
     {
         "nonexistent_search_block",
@@ -51,15 +39,32 @@ _PLAN_SIGNATURE_KINDS = frozenset(
         "no_evidence_or_applicable_patch",
         "plan",
         "edit",
+        "repeated_plan",
     }
 )
-_CONTEXT_SIGNATURE_KINDS = frozenset({"unchanged_context", "context"})
-_TEST_SIGNATURE_KINDS = frozenset({"unchanged_test_failure", "test_failure"})
+_CONTEXT_SIGNATURE_KINDS = frozenset(
+    {"unchanged_context", "context", "repeated_context"}
+)
+_TEST_SIGNATURE_KINDS = frozenset(
+    {
+        "unchanged_test_failure",
+        "test_failure",
+        "repeated_test",
+        "repeated_test_failure",
+    }
+)
 
 
 class EscalationDecision(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     escalate: bool
     reason: str = ""
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def _keep_approved_reason(cls, value: Any) -> str:
+        return sanitize_escalation_reason(value)
 
 
 def _canonical_fingerprint(value: Any) -> str:
@@ -75,6 +80,19 @@ def _canonical_fingerprint(value: Any) -> str:
 def record_progress(state: AgentState) -> None:
     """Reset the consecutive no-progress counter after material progress."""
     state.no_progress_rounds = 0
+    state.last_plan_signature = ""
+    state.last_context_fingerprint = ""
+    state.last_test_failure_signature = ""
+
+
+def _signature_field(kind: str) -> str:
+    if kind in _PLAN_SIGNATURE_KINDS:
+        return "last_plan_signature"
+    if kind in _CONTEXT_SIGNATURE_KINDS:
+        return "last_context_fingerprint"
+    if kind in _TEST_SIGNATURE_KINDS:
+        return "last_test_failure_signature"
+    return ""
 
 
 def record_no_progress(
@@ -85,7 +103,29 @@ def record_no_progress(
     node: str,
 ) -> None:
     """Record a safe, canonical no-progress event and update its signature."""
+    if kind not in APPROVED_NO_PROGRESS_KINDS or node not in APPROVED_ROUTING_NODES:
+        record_progress(state)
+        return
+
+    signature_field = _signature_field(kind)
+    if not signature_field:
+        record_progress(state)
+        return
+
     canonical_fingerprint = _canonical_fingerprint(fingerprint)
+    previous_signature = getattr(state, signature_field)
+    previous_event = state.no_progress_history[-1] if state.no_progress_history else None
+    is_consecutive_match = (
+        bool(previous_signature)
+        and previous_signature == canonical_fingerprint
+        and previous_event is not None
+        and previous_event.fingerprint == canonical_fingerprint
+        and _signature_field(previous_event.kind) == signature_field
+    )
+    state.no_progress_rounds = (
+        state.no_progress_rounds + 1 if is_consecutive_match else 1
+    )
+    setattr(state, signature_field, canonical_fingerprint)
     state.no_progress_history.append(
         NoProgressEvent(
             kind=kind,
@@ -94,17 +134,6 @@ def record_no_progress(
         )
     )
 
-    if kind not in _APPROVED_NO_PROGRESS_KINDS:
-        state.no_progress_rounds = 0
-        return
-
-    state.no_progress_rounds += 1
-    if kind in _PLAN_SIGNATURE_KINDS:
-        state.last_plan_signature = canonical_fingerprint
-    elif kind in _CONTEXT_SIGNATURE_KINDS:
-        state.last_context_fingerprint = canonical_fingerprint
-    elif kind in _TEST_SIGNATURE_KINDS:
-        state.last_test_failure_signature = canonical_fingerprint
 
 
 def should_escalate(
@@ -127,7 +156,7 @@ def should_escalate(
         reason = "repeated_no_progress"
         if state.no_progress_history:
             latest_kind = state.no_progress_history[-1].kind
-            if latest_kind in _APPROVED_NO_PROGRESS_KINDS:
+            if latest_kind in APPROVED_NO_PROGRESS_KINDS:
                 reason = latest_kind
         return EscalationDecision(escalate=True, reason=reason)
     return EscalationDecision(escalate=False)
@@ -138,7 +167,12 @@ def apply_escalation(
     decision: EscalationDecision,
 ) -> None:
     """Apply an escalation once without ever switching back to primary."""
-    if not decision.escalate or state.escalated:
+    if (
+        not decision.escalate
+        or not decision.reason
+        or decision.reason not in APPROVED_ESCALATION_REASONS
+        or state.escalated
+    ):
         return
     if state.active_provider == "escalation" or not escalation_is_configured():
         return

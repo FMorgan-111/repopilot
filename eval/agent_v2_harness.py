@@ -22,6 +22,9 @@ get_llm_model = importlib.import_module("src.http_client")._get_llm_model
 repopilot_home = importlib.import_module("src.home").repopilot_home
 close_store = importlib.import_module("src.memory").close_store
 AgentState = importlib.import_module("src.state").AgentState
+DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
+    "src.state"
+).DEFAULT_AGENT_V2_TOKEN_BUDGET
 git_clone = importlib.import_module("src.nodes.execute").git_clone
 classify_sample = importlib.import_module("eval.failure_taxonomy").classify_sample
 _swe_bench = importlib.import_module("eval.swe_bench")
@@ -205,7 +208,7 @@ async def evaluate_agent_v2_sample(
     sample: dict[str, Any],
     idx: int,
     max_retries: int = 3,
-    token_budget: int = 50000,
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     seed_gold_files: bool = False,
 ) -> dict[str, Any]:
     issue = sample["issue"]
@@ -275,7 +278,7 @@ async def evaluate_agent_v2_sample(
 async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
     max_retries: int = 3,
-    token_budget: int = 50000,
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     results_path: Path | str = RESULTS_PATH,
     sample_id: str | None = None,
     seed_gold_files: bool = False,
@@ -335,7 +338,11 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--token-budget", type=int, default=50000)
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=DEFAULT_AGENT_V2_TOKEN_BUDGET,
+    )
     parser.add_argument("--seed-gold-files", action="store_true",
                         help="Seed relevant_files from dataset gold changed files")
     parser.add_argument("--samples-file", type=str, default=None,

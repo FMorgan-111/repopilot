@@ -9,7 +9,101 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
+
+APPROVED_NO_PROGRESS_KINDS = frozenset(
+    {
+        "nonexistent_search_block",
+        "nonexistent_search_blocks",
+        "repeated_patch_signature",
+        "repeated_edit",
+        "repeated_unlocatable_edit",
+        "unchanged_context",
+        "unchanged_hypothesis",
+        "unchanged_plan",
+        "unchanged_test_failure",
+        "no_evidence_or_applicable_patch",
+        "plan",
+        "context",
+        "edit",
+        "test_failure",
+        "repeated_plan",
+        "repeated_context",
+        "repeated_test",
+        "repeated_test_failure",
+    }
+)
+
+APPROVED_ESCALATION_REASONS = frozenset(
+    {
+        "empty_completion_after_retries",
+        "invalid_structured_response_after_retries",
+        "primary_budget_reserve",
+        "repeated_no_progress",
+        "test_generation_retry",
+        *APPROVED_NO_PROGRESS_KINDS,
+    }
+)
+
+APPROVED_ROUTING_NODES = frozenset(
+    {
+        "understand",
+        "locate",
+        "plan",
+        "reflect",
+        "execute",
+        "verify",
+        "commit",
+        "failure",
+        "coverage",
+        "test_generation",
+        "outcome_summary",
+        "understand_issue",
+        "locate_code",
+        "plan_fix",
+        "reflect_on_failure",
+        "execute_fix",
+        "verify_fix",
+        "commit_fix",
+        "handle_failure",
+        "coverage_gate",
+        "test_generator",
+    }
+)
+
+
+def sanitize_escalation_reason(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in APPROVED_ESCALATION_REASONS else ""
+
+
+def sanitize_no_progress_kind(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in APPROVED_NO_PROGRESS_KINDS else ""
+
+
+def sanitize_routing_node(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if candidate in APPROVED_ROUTING_NODES else ""
+
+
+def sanitize_node_diagnostics(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    sanitized: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        diagnostic = dict(item)
+        if diagnostic.get("event") == "model_escalated":
+            diagnostic["reason"] = sanitize_escalation_reason(
+                diagnostic.get("reason")
+            )
+        sanitized.append(diagnostic)
+    return sanitized
 
 
 class Phase(str, Enum):
@@ -183,6 +277,8 @@ class FinalReport(BaseModel):
 
 
 class ModelInvocation(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     model: str
     provider: Literal["primary", "escalation"]
     node: str
@@ -197,20 +293,41 @@ class ModelInvocation(BaseModel):
     def _keep_exception_class_only(cls, value: Any) -> str:
         if isinstance(value, BaseException):
             return type(value).__name__
-        match = re.match(
-            r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*",
-            str(value or "").strip(),
-        )
-        return match.group(0) if match else ""
+        candidate = str(value or "").strip().partition(":")[0].strip()
+        if re.fullmatch(
+            r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)",
+            candidate,
+        ):
+            return candidate
+        return ""
+
+    @field_validator("node", mode="before")
+    @classmethod
+    def _keep_approved_node(cls, value: Any) -> str:
+        return sanitize_routing_node(value)
 
 
 class NoProgressEvent(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     kind: str
     fingerprint: str
     node: str
 
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _keep_approved_kind(cls, value: Any) -> str:
+        return sanitize_no_progress_kind(value)
+
+    @field_validator("node", mode="before")
+    @classmethod
+    def _keep_approved_node(cls, value: Any) -> str:
+        return sanitize_routing_node(value)
+
 
 class AgentState(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     issue_url: str
     issue_title: str = ""
     issue_body: str = ""
@@ -220,7 +337,7 @@ class AgentState(BaseModel):
     conversation_history: list[ConversationTurn] = Field(default_factory=list)
     token_usage: int = 0
     max_retries: int = 3
-    token_budget: int = 50000
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET
     retry_count: int = 0
     tool_calls: list[ToolCall] = Field(default_factory=list)
     owner: str = ""
@@ -266,6 +383,16 @@ class AgentState(BaseModel):
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False
+
+    @field_validator("escalation_reason", mode="before")
+    @classmethod
+    def _keep_approved_escalation_reason(cls, value: Any) -> str:
+        return sanitize_escalation_reason(value)
+
+    @field_validator("node_diagnostics", mode="before")
+    @classmethod
+    def _sanitize_routing_diagnostics(cls, value: Any) -> list[dict[str, Any]]:
+        return sanitize_node_diagnostics(value)
 
 
 NodeFn = Callable[[AgentState], Awaitable[AgentState]]

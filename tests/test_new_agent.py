@@ -3,6 +3,8 @@ import functools
 import json
 import subprocess
 
+import pytest
+
 import src.nodes.execute as execute_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
@@ -11,6 +13,14 @@ from src.state import ModelInvocation, NoProgressEvent
 
 def test_agent_v2_default_budget_is_100000():
     assert new_agent.agent_v2.__defaults__[1] == 100_000
+
+
+def test_agent_state_default_budget_is_100000():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7"
+    )
+
+    assert state.token_budget == 100_000
 
 
 async def test_agent_v2_initializes_primary_model_from_provider(monkeypatch):
@@ -33,6 +43,31 @@ async def test_agent_v2_initializes_primary_model_from_provider(monkeypatch):
 
     assert captured["state"].active_provider == "primary"
     assert captured["state"].active_model == "configured-gemini"
+    assert captured["state"].token_budget == 100_000
+
+
+async def test_agent_v2_preserves_explicit_budget(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    class PrimaryConfig:
+        model = "configured-gemini"
+
+    monkeypatch.setattr(new_agent, "get_model_config", lambda provider: PrimaryConfig())
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        token_budget=12_345,
+    )
+
+    assert captured["state"].token_budget == 12_345
 
 
 def test_agent_payload_includes_only_safe_model_routing_history(monkeypatch):
@@ -77,6 +112,78 @@ def test_agent_payload_includes_only_safe_model_routing_history(monkeypatch):
     serialized = json.dumps(payload)
     assert "never-export-this-key" not in serialized
     assert "api_key" not in serialized
+
+
+def test_agent_payload_rejects_hostile_routing_strings():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        escalation_reason="FAIL_TO_PASS",
+        model_history=[
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node='"quoted-sentinel"',
+                elapsed_seconds=1.0,
+                input_tokens=1,
+                output_tokens=1,
+                status="error",
+                error_class="CredentialSentinel",
+            )
+        ],
+        no_progress_history=[
+            NoProgressEvent(
+                kind="unknown_value",
+                fingerprint="safe-sha",
+                node="FAIL_TO_PASS",
+            )
+        ],
+        node_diagnostics=[
+            {
+                "event": "model_escalated",
+                "from": "gemini-3.5-flash:stable",
+                "to": "claude-opus-4-8:stable",
+                "reason": "FAIL_TO_PASS",
+                "round": 2,
+            }
+        ],
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+    serialized = json.dumps(payload)
+
+    assert payload["escalation_reason"] == ""
+    assert payload["model_history"][0]["error_class"] == ""
+    assert payload["model_history"][0]["node"] == ""
+    assert payload["no_progress_history"][0]["kind"] == ""
+    assert payload["no_progress_history"][0]["node"] == ""
+    assert payload["node_diagnostics"][0]["reason"] == ""
+    for hostile_value in (
+        "CredentialSentinel",
+        '"quoted-sentinel"',
+        "FAIL_TO_PASS",
+        "unknown_value",
+    ):
+        assert hostile_value not in serialized
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    ["CredentialSentinel", '"quoted-sentinel"', "FAIL_TO_PASS", "unknown_value"],
+)
+def test_model_invocation_rejects_non_exception_error_class(hostile_value):
+    invocation = ModelInvocation(
+        model="gemini-3.5-flash:stable",
+        provider="primary",
+        node="plan",
+        elapsed_seconds=1.0,
+        input_tokens=1,
+        output_tokens=1,
+        status="error",
+        error_class=hostile_value,
+    )
+
+    assert invocation.error_class == ""
+    assert hostile_value not in invocation.model_dump_json()
 
 
 async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):

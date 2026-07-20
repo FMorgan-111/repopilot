@@ -30,6 +30,7 @@ from .nodes.verify import verify_fix
 from .model_provider import get_model_config
 from .run_store import load_run, save_run
 from .state import (
+    DEFAULT_AGENT_V2_TOKEN_BUDGET,
     AgentState,
     ConversationTurn,
     DecisionFrame,
@@ -54,6 +55,7 @@ from .state import (
     _record_node_diagnostic,
     _record_tool,
     _remember,
+    sanitize_node_diagnostics,
 )
 from .tracer import Tracer
 
@@ -291,7 +293,7 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
             "frame_history": [frame.model_dump() for frame in state.frame_history],
             "decision_warnings": state.decision_warnings,
             "route_decisions": state.route_decisions,
-            "node_diagnostics": state.node_diagnostics,
+            "node_diagnostics": sanitize_node_diagnostics(state.node_diagnostics),
             "active_model": state.active_model,
             "active_provider": state.active_provider,
             "escalated": state.escalated,
@@ -339,7 +341,7 @@ def _best_effort_save_run(state: AgentState) -> None:
 async def agent_v2(
     issue_url: str,
     max_retries: int = 3,
-    token_budget: int = 100000,
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     save_final_run: bool = False,
     skip_commit: bool = False,
     seed: dict | None = None,
@@ -512,7 +514,9 @@ def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> N
 
 
 async def intelligent_analyze_issue(
-    issue_url: str, max_retries: int = 3, token_budget: int = 100000
+    issue_url: str,
+    max_retries: int = 3,
+    token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
 ) -> dict:
     """Backward-compatible alias for the previous experimental endpoint."""
     return await agent_v2(issue_url, max_retries=max_retries, token_budget=token_budget)
