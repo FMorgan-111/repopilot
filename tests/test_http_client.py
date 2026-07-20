@@ -119,10 +119,10 @@ def test_llm_timeout_budget_is_explicit():
     assert llm_retry_budget_seconds() == 320.0
 
 
-def test_default_llm_model_is_claude_sonnet_5(monkeypatch):
+def test_default_llm_model_is_gemini_flash(monkeypatch):
     monkeypatch.delenv("LLM_MODEL", raising=False)
 
-    assert _get_llm_model() == "claude-sonnet-5:stable"
+    assert _get_llm_model() == "gemini-3.5-flash:stable"
 
 
 @pytest.fixture(autouse=True)

@@ -163,7 +163,7 @@ def _get_llm_base_url() -> str:
 
 
 def _get_llm_model() -> str:
-    return os.getenv("LLM_MODEL", "claude-sonnet-5:stable")
+    return os.getenv("LLM_MODEL", "gemini-3.5-flash:stable")
 
 
 async def llm_request(
