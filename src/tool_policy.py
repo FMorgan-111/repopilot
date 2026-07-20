@@ -6,14 +6,13 @@ import hashlib
 import json
 import re
 import shlex
-import sys
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from .local_search import is_sensitive_repo_path
-from .safe_subprocess import run_bounded_process
+from .safe_subprocess import run_bounded_process, trusted_executable, trusted_python
 from .state import AgentState, ToolAction
 
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
@@ -129,38 +128,47 @@ def _git_result(root: Path, argv: list[str], *, max_output_bytes: int = 256_000)
     return result.stdout
 
 
-def _is_tracked(root: Path, path: str) -> bool:
-    result = run_bounded_process(
-        ["git", "-C", str(root), "ls-files", "--error-unmatch", "--", path],
-        cwd=root,
-        timeout=10,
-        max_output_bytes=4_096,
-    )
-    return result.returncode == 0
-
-
-def _is_explicit_generated_test(state: AgentState, path: str) -> bool:
+def _is_test_path(path: str) -> bool:
     parts = Path(path).parts
     name = Path(path).name
     is_test_name = name.startswith("test_") and name.endswith(".py")
     is_test_name = is_test_name or name.endswith("_test.py")
-    in_test_root = any(part.lower() in {"test", "tests"} for part in parts[:-1])
-    normalized_patch = state.patch_content.replace("\r\n", "\n")
-    header = f"diff --git a/{path} b/{path}\n"
-    matching_block = next(
-        (
-            block
-            for block in re.split(r"(?=^diff --git )", normalized_patch, flags=re.MULTILINE)
-            if block.startswith(header)
-        ),
-        "",
+    in_test_root = not parts[:-1] or any(
+        part.lower() in {"test", "tests"} for part in parts[:-1]
     )
-    return (
-        is_test_name
-        and in_test_root
-        and bool(re.search(r"(?m)^new file mode [0-7]{6}$", matching_block))
-        and "--- /dev/null\n" in matching_block
-        and f"+++ b/{path}\n" in matching_block
+    return is_test_name and in_test_root
+
+
+def _is_exact_base_member(root: Path, state: AgentState, path: str) -> bool:
+    try:
+        output = _git_result(
+            root,
+            ["git", "-C", str(root), "ls-tree", state.repo_ref, "--", path],
+            max_output_bytes=8_192,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    record = output.rstrip("\n")
+    return bool(re.fullmatch(rf"100(?:644|755) blob [0-9a-f]{{40}}\t{re.escape(path)}", record))
+
+
+def _is_approved_generated_test(root: Path, state: AgentState, path: str) -> bool:
+    patch_approval = state.tool_patch_approval
+    if patch_approval is None or patch_approval.base_ref.lower() != state.repo_ref.lower():
+        return False
+    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+    if patch_sha != patch_approval.patch_sha256:
+        return False
+    try:
+        current = (root / path).read_bytes()
+    except OSError:
+        return False
+    content_sha = hashlib.sha256(current).hexdigest()
+    return any(
+        approval.path == path
+        and approval.content_sha256 == content_sha
+        and approval.patch_gate_fingerprint == patch_approval.patch_gate_fingerprint
+        for approval in state.generated_test_approvals
     )
 
 
@@ -172,8 +180,10 @@ def _target_selector(root: Path, state: AgentState, token: str) -> bool:
         normalized = _relative_path(root, path_part, require_file=True)
     except ValueError:
         return False
-    return _is_tracked(root, normalized) or _is_explicit_generated_test(
-        state, normalized
+    if not _is_test_path(normalized):
+        return False
+    return _is_exact_base_member(root, state, normalized) or _is_approved_generated_test(
+        root, state, normalized
     )
 
 
@@ -219,7 +229,7 @@ def _committed_package_scripts(root: Path, state: AgentState) -> dict[str, objec
 
 def _project_test_prefix(
     root: Path, state: AgentState, tokens: list[str]
-) -> list[str]:
+) -> str:
     if not tokens or tokens[0].lower() not in _PACKAGE_EXECUTABLES:
         raise ValueError("unsupported_project_runner")
     executable = tokens[0].lower()
@@ -234,7 +244,10 @@ def _project_test_prefix(
     scripts = _committed_package_scripts(root, state)
     if not isinstance(scripts.get(script), str) or not str(scripts[script]).strip():
         raise ValueError("missing_test_script")
-    return [executable, *tokens[1:]]
+    launcher = trusted_executable(executable, required=False)
+    if launcher is None:
+        raise ValueError("untrusted_project_runner")
+    return launcher
 
 
 def _checkout_head(root: Path) -> str:
@@ -249,20 +262,20 @@ def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str
     tokens = _safe_tokens(command)
     if tokens[0] == "pytest":
         suffix = tokens[1:]
-        argv = [sys.executable, "-m", "pytest", *suffix]
+        argv = [trusted_python(), "-m", "pytest", *suffix]
     elif tokens[:3] == ["python", "-m", "pytest"]:
         suffix = tokens[3:]
-        argv = [sys.executable, "-m", "pytest", *suffix]
+        argv = [trusted_python(), "-m", "pytest", *suffix]
     else:
         configured = _safe_tokens(state.test_command) if state.test_command else []
-        prefix = _project_test_prefix(root, state, configured) if configured else []
-        if not prefix or tokens[: len(prefix)] != prefix:
+        launcher = _project_test_prefix(root, state, configured) if configured else ""
+        if not launcher or tokens[: len(configured)] != configured:
             raise ValueError("test_command_not_allowlisted")
-        suffix = tokens[len(prefix) :]
+        suffix = tokens[len(configured) :]
         if not suffix or suffix[0] != "--":
             raise ValueError("target_separator_required")
         suffix = suffix[1:]
-        argv = tokens
+        argv = [launcher, *tokens[1:]]
     selectors = [token for token in suffix if _target_selector(root, state, token)]
     if not selectors:
         raise ValueError("target_selector_required")

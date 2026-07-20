@@ -38,6 +38,9 @@ def is_sensitive_repo_path(path: str) -> bool:
         name in _SECRET_NAMES
         or name == ".env"
         or name.startswith(".env.")
+        or name.startswith("credentials.")
+        or name in {".git-credentials", ".gitconfig", "secret", "secrets"}
+        or name.startswith("secrets.")
         or name.endswith((".key", ".kdbx", ".pem", ".p12", ".pfx"))
     )
 

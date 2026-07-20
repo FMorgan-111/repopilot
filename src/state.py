@@ -335,6 +335,22 @@ class Evidence(BaseModel):
     fingerprint: str
 
 
+class ToolPatchApproval(BaseModel):
+    """PatchGate authorization for the exact patch exposed to a tool sandbox."""
+
+    base_ref: str = Field(pattern=r"^[0-9a-fA-F]{40}$")
+    patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class GeneratedTestApproval(BaseModel):
+    """Persisted authorization for one exact generated test payload."""
+
+    path: str
+    content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 ToolAction = Literal[
     "search_symbol",
     "search_text",
@@ -428,6 +444,8 @@ class AgentState(BaseModel):
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     tool_history: list[ToolInvocation] = Field(default_factory=list)
+    tool_patch_approval: ToolPatchApproval | None = None
+    generated_test_approvals: list[GeneratedTestApproval] = Field(default_factory=list)
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False

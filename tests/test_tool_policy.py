@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
 from pathlib import Path
 
 import pytest
 
-from src.state import AgentState, ToolInvocation
+from src.state import (
+    AgentState,
+    GeneratedTestApproval,
+    ToolInvocation,
+    ToolPatchApproval,
+)
 from src.tool_policy import ToolIntent, ToolPolicy
 
 
@@ -195,7 +201,7 @@ def test_rejects_missing_or_mismatched_exact_checkout(tmp_path, updates):
     assert decision.approved is False
 
 
-def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
+def test_accepts_python_module_pytest_and_existing_project_command(tmp_path, monkeypatch):
     root, commit = _repo(tmp_path)
     (root / "package.json").write_text('{"scripts":{"test":"pytest"}}', encoding="utf-8")
     subprocess.run(["git", "-C", str(root), "add", "package.json"], check=True)
@@ -208,6 +214,10 @@ def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
     ).stdout.strip()
     state = _state(root, commit, test_command="npm test")
     policy = ToolPolicy()
+    monkeypatch.setattr(
+        "src.tool_policy.trusted_executable",
+        lambda name, required=False: "/usr/bin/npm" if name == "npm" else None,
+    )
 
     python = policy.authorize(
         state,
@@ -292,7 +302,7 @@ def test_rejects_inexact_or_preconfigured_project_commands(
     assert decision.approved is False
 
 
-def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path):
+def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path, monkeypatch):
     root, commit = _repo(tmp_path)
     (root / "package.json").write_text(
         '{"scripts":{"test:unit":"pytest"}}', encoding="utf-8"
@@ -305,6 +315,10 @@ def test_accepts_exact_colon_scoped_test_script_from_committed_manifest(tmp_path
         capture_output=True,
         text=True,
     ).stdout.strip()
+    monkeypatch.setattr(
+        "src.tool_policy.trusted_executable",
+        lambda name, required=False: "/usr/bin/npm" if name == "npm" else None,
+    )
 
     decision = ToolPolicy().authorize(
         _state(root, commit, test_command="npm run test:unit"),
@@ -360,12 +374,14 @@ def test_rejects_modified_or_symlinked_project_manifest(tmp_path):
         ("search_text", {"text": "token", "path": ".git"}),
         ("search_text", {"text": "token", "path": ".env"}),
         ("read_range", {"path": "private.pem", "start_line": 1, "end_line": 1}),
+        ("read_range", {"path": "credentials.yaml", "start_line": 1, "end_line": 1}),
     ],
 )
 def test_rejects_vcs_metadata_and_common_secret_paths(tmp_path, action, args):
     root, commit = _repo(tmp_path)
     (root / ".env").write_text("TOKEN=sentinel\n", encoding="utf-8")
     (root / "private.pem").write_text("sentinel\n", encoding="utf-8")
+    (root / "credentials.yaml").write_text("sentinel\n", encoding="utf-8")
 
     decision = ToolPolicy().authorize(
         _state(root, commit), _intent(action, args), calls_this_round=0
@@ -374,7 +390,7 @@ def test_rejects_vcs_metadata_and_common_secret_paths(tmp_path, action, args):
     assert decision.approved is False
 
 
-def test_untracked_test_selector_requires_explicit_generated_patch_marker(tmp_path):
+def test_untracked_test_selector_requires_persisted_patchgate_approval(tmp_path):
     root, commit = _repo(tmp_path)
     generated = root / "tests" / "test_generated_regression.py"
     generated.write_text("def test_generated():\n    assert True\n", encoding="utf-8")
@@ -385,7 +401,7 @@ def test_untracked_test_selector_requires_explicit_generated_patch_marker(tmp_pa
         _intent("run_targeted_test", {"command": command}),
         calls_this_round=0,
     )
-    marked = ToolPolicy().authorize(
+    merely_marked = ToolPolicy().authorize(
         _state(
             root,
             commit,
@@ -402,7 +418,108 @@ def test_untracked_test_selector_requires_explicit_generated_patch_marker(tmp_pa
     )
 
     assert unmarked.approved is False
-    assert marked.approved is True
+    assert merely_marked.approved is False
+
+
+def test_approved_generated_test_requires_exact_current_content(tmp_path):
+    root, commit = _repo(tmp_path)
+    path = "tests/test_generated_regression.py"
+    generated = root / path
+    content = "def test_generated():\n    assert True\n"
+    generated.write_text(content, encoding="utf-8")
+    patch = (
+        f"diff --git a/{path} b/{path}\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        f"+++ b/{path}\n"
+        "@@ -0,0 +1,2 @@\n"
+        "+def test_generated():\n"
+        "+    assert True\n"
+    )
+    gate_fingerprint = "a" * 64
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=ToolPatchApproval(
+            base_ref=commit,
+            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch_gate_fingerprint=gate_fingerprint,
+        ),
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path=path,
+                content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+                patch_gate_fingerprint=gate_fingerprint,
+            )
+        ],
+    )
+    command = f"pytest {path}"
+
+    approved = ToolPolicy().authorize(
+        state,
+        _intent("run_targeted_test", {"command": command}),
+        calls_this_round=0,
+    )
+    generated.write_text(content + "# tampered\n", encoding="utf-8")
+    tampered = ToolPolicy().authorize(
+        state,
+        _intent("run_targeted_test", {"command": command}),
+        calls_this_round=0,
+    )
+
+    assert approved.approved is True
+    assert tampered.approved is False
+
+
+def test_generated_test_approval_round_trips_and_legacy_defaults_empty(tmp_path):
+    root, commit = _repo(tmp_path)
+    state = _state(
+        root,
+        commit,
+        tool_patch_approval=ToolPatchApproval(
+            base_ref=commit,
+            patch_sha256="b" * 64,
+            patch_gate_fingerprint="c" * 64,
+        ),
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path="tests/test_generated.py",
+                content_sha256="d" * 64,
+                patch_gate_fingerprint="c" * 64,
+            )
+        ],
+    )
+
+    loaded = AgentState.model_validate_json(state.model_dump_json())
+    legacy = AgentState(issue_url="https://github.com/acme/widget/issues/1")
+
+    assert loaded.tool_patch_approval == state.tool_patch_approval
+    assert loaded.generated_test_approvals == state.generated_test_approvals
+    assert legacy.tool_patch_approval is None
+    assert legacy.generated_test_approvals == []
+
+
+def test_rejects_source_and_index_only_test_selectors(tmp_path):
+    root, commit = _repo(tmp_path)
+    staged = root / "tests" / "test_staged.py"
+    staged.write_text("def test_staged():\n    assert True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", str(staged)], check=True)
+    policy = ToolPolicy()
+
+    source = policy.authorize(
+        _state(root, commit),
+        _intent("run_targeted_test", {"command": "pytest src/widget.py"}),
+        calls_this_round=0,
+    )
+    staged_only = policy.authorize(
+        _state(root, commit),
+        _intent("run_targeted_test", {"command": "pytest tests/test_staged.py"}),
+        calls_this_round=0,
+    )
+
+    assert source.approved is False
+    assert staged_only.approved is False
 
 
 def test_generated_test_marker_must_belong_to_the_same_new_file_diff(tmp_path):

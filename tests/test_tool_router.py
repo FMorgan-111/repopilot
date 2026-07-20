@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
 from pathlib import Path
 
 import pytest
 
 from src.evidence import EvidenceStore
 from src.safe_subprocess import BoundedProcessResult
-from src.state import AgentState
+from src.state import AgentState, ToolPatchApproval
 from src.tool_policy import ToolIntent
 from src.tool_router import route_tool_intent
 
@@ -81,9 +82,13 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
         captured["argv"] = argv
         captured["root"] = root
         captured.update(kwargs)
+        assert root != root_repo
+        assert not (root / ".git").exists()
+        assert (root / "tests" / "test_widget.py").is_file()
         return BoundedProcessResult(argv=argv, returncode=0, stdout="one passed", stderr="")
 
     monkeypatch.setattr("src.tool_router._run", fake_run)
+    root_repo = root
     state = _state(root, commit)
 
     result = await route_tool_intent(
@@ -95,9 +100,55 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     assert result.status == "ok"
     assert isinstance(captured["argv"], list)
     assert captured["argv"][1:3] == ["-m", "pytest"]
-    assert captured["root"] == root
-    assert captured["isolate_network"] is True
+    assert captured["root"] != root_repo
+    assert captured["sandbox"].workspace == captured["root"]
     assert "one passed" in state.evidence[-1].content
+
+
+async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
+    tmp_path, monkeypatch
+):
+    root, commit = _repo(tmp_path)
+    source = root / "src" / "widget.py"
+    source.write_text(
+        source.read_text(encoding="utf-8").replace("'old'", "'approved'"),
+        encoding="utf-8",
+    )
+    (root / "host-only-sentinel").write_text("must-not-copy", encoding="utf-8")
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", commit, "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=ToolPatchApproval(
+            base_ref=commit,
+            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch_gate_fingerprint="e" * 64,
+        ),
+    )
+
+    def fake_run(argv, snapshot, **kwargs):
+        assert "'approved'" in (snapshot / "src" / "widget.py").read_text()
+        assert not (snapshot / "host-only-sentinel").exists()
+        assert not (snapshot / ".git").exists()
+        assert kwargs["sandbox"].home != Path.home()
+        assert kwargs["sandbox"].temp != Path("/tmp")
+        return BoundedProcessResult(argv=argv, returncode=0, stdout="passed", stderr="")
+
+    monkeypatch.setattr("src.tool_router._run", fake_run)
+
+    result = await route_tool_intent(
+        state,
+        _intent("run_targeted_test", command="pytest tests/test_widget.py::test_render"),
+        calls_this_round=0,
+    )
+
+    assert result.status == "ok"
 
 
 async def test_diff_and_patch_validation_use_state_baseline(tmp_path):
@@ -220,6 +271,38 @@ async def test_git_diff_excludes_tracked_dotenv_content(tmp_path):
     assert result.status == "ok"
     assert "old-sentinel" not in state.evidence[-1].content
     assert "new-sentinel" not in state.evidence[-1].content
+
+
+async def test_git_diff_filters_case_insensitive_secret_and_sensitive_rename(tmp_path):
+    root, commit = _repo(tmp_path)
+    upper = root / ".ENV"
+    renamed = root / ".env.production"
+    upper.write_text("TOKEN=upper-old\n", encoding="utf-8")
+    renamed.write_text("TOKEN=rename-old\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", ".ENV", ".env.production"], check=True)
+    subprocess.run(["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True)
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    upper.write_text("TOKEN=upper-new\n", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(root), "mv", ".env.production", "public.py"], check=True
+    )
+    state = _state(root, commit)
+
+    result = await route_tool_intent(
+        state, _intent("inspect_git_diff"), calls_this_round=0
+    )
+
+    assert result.status == "ok"
+    content = state.evidence[-1].content
+    assert "upper-old" not in content
+    assert "upper-new" not in content
+    assert "rename-old" not in content
+    assert "public.py" not in content
 
 
 async def test_policy_rejection_is_persisted_without_execution(tmp_path):
