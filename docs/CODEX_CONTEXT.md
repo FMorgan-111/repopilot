@@ -1724,3 +1724,35 @@ Next recommended step:
   or (b) widening the eval batch to get a larger resolved% distribution
   first. Network-flaky samples (celery) should be retried or skipped, not
   counted as agent failures.
+
+## 2026-07-20 SWE-bench Verified + Resilient API Cache
+
+Added an official SWE-bench Verified evaluation path before changing the live
+GitHub API cache:
+
+- `eval/swe_bench.py` normalizes and deterministically selects official rows,
+  persists raw JSONL plus revision metadata, builds an allowlisted agent seed,
+  and writes official prediction JSONL.
+- Benchmark repositories are cached by the full 40-character `base_commit`.
+  LOCATE searches that exact local checkout, so issue reading, search,
+  patching, and tests all use one historical tree without GitHub code search.
+- Agent results export binary Git diffs, including newly created files, as
+  `model_patch`. Gold and test patches never enter prompts.
+- The eval harness accepts `--dataset swe-bench-verified`, `--dataset-seed`,
+  and `--predictions-file`. SWE-bench runs remain `end_to_end` even if the
+  oracle-file flag is accidentally supplied.
+- GitHub API reads use a 600-second fresh TTL and a bounded stale fallback,
+  defaulting to 86,400 seconds total age. Only network/timeouts and
+  429/502/503/504 errors may use stale data; 404 and schema errors propagate.
+  `REPOPILOT_CACHE_STALE_TTL` controls the bound.
+- Cache and repository diagnostics contain event metadata and shortened cache
+  keys but no response bodies, tokens, or tokenized remote URLs.
+
+Operator flow:
+
+1. `pip install -e '.[eval]'`
+2. Run `eval/agent_v2_harness.py` with the SWE-bench dataset and predictions
+   arguments documented in the README.
+3. Score the resulting JSONL with `swebench.harness.run_evaluation`. Docker or
+   image failures are infrastructure failures and must not be reported as
+   model failures.

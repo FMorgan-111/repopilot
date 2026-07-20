@@ -292,6 +292,47 @@ the relevant files and produce a fix. `--seed-gold-files` is labeled
 and patching in isolation. Oracle-file results must not be reported as
 end-to-end success rates.
 
+### SWE-bench Verified
+
+Install the optional evaluation dependencies and run a reproducible ten-sample
+inference batch:
+
+```bash
+pip install -e '.[eval]'
+python -u eval/agent_v2_harness.py \
+  --dataset swe-bench-verified \
+  --dataset-seed 17 \
+  --samples 10 \
+  --max-retries 3 \
+  --token-budget 50000 \
+  --predictions-file eval/swe_bench_predictions.jsonl
+```
+
+Each instance is cloned and checked out at its exact 40-character
+`base_commit` before local code search, patching, and testing. The issue seed
+contains no gold patch, test patch, or evaluator-only fields. A RepoPilot
+`success` value describes the agent run; the benchmark's final resolved rate
+comes only from the official SWE-bench harness:
+
+```bash
+python -m swebench.harness.run_evaluation \
+  --dataset_name SWE-bench/SWE-bench_Verified \
+  --predictions_path eval/swe_bench_predictions.jsonl \
+  --max_workers 1 \
+  --run_id repopilot-gemini-10
+```
+
+Official scoring requires Docker and may download large repository images.
+If Docker or an image build is unavailable, keep the prediction JSONL and
+report scoring as infrastructure-blocked instead of counting it as a model
+failure.
+
+GitHub API responses remain fresh for 600 seconds by default. On retryable
+network, timeout, 429, 502, 503, or 504 errors, RepoPilot may serve an older
+cached response for up to 86,400 seconds total. Configure these bounds with
+`REPOPILOT_CACHE_TTL` and `REPOPILOT_CACHE_STALE_TTL`; 404 and other
+non-retryable errors never use stale data.
+
 ### Running the FastAPI server
 
 ```bash

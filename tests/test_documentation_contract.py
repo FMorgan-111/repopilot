@@ -62,3 +62,13 @@ def test_trace_utility_uses_the_shared_model_default():
 
     assert "deepseek-v4-flash" not in trace_source
     assert "setdefault('LLM_MODEL'" not in trace_source
+
+
+def test_readme_documents_reproducible_swe_bench_evaluation():
+    readme = _read("README.md")
+
+    assert "pip install -e '.[eval]'" in readme
+    assert "--dataset swe-bench-verified" in readme
+    assert "--predictions-file" in readme
+    assert "REPOPILOT_CACHE_STALE_TTL" in readme
+    assert "base_commit" in readme
