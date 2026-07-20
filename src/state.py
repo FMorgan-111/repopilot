@@ -195,7 +195,12 @@ class PatchEdit(BaseModel):
 
     @model_validator(mode="after")
     def _require_anchor(self) -> "PatchEdit":
-        if not self.search and not self.node_target:
+        intentional_new = (
+            self.exact_only
+            and self.expected_content_sha256 == hashlib.sha256(b"").hexdigest()
+            and bool(self.replace)
+        )
+        if not self.search and not self.node_target and not intentional_new:
             raise ValueError(
                 "PatchEdit requires either `search` or `node_target`."
             )
@@ -705,6 +710,8 @@ class AgentState(BaseModel):
     evidence: list[Evidence] = Field(default_factory=list)
     tool_history: list[ToolInvocation] = Field(default_factory=list)
     tool_patch_approval: ToolPatchApproval | None = None
+    active_repair_plan: RepairPlan | None = None
+    patch_correction_count: int = Field(default=0, ge=0, le=2)
     generated_test_approvals: list[GeneratedTestApproval] = Field(
         default_factory=list, max_length=20_000
     )

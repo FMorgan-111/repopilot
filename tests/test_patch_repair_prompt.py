@@ -423,7 +423,9 @@ async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkey
 
     assert result.current_phase == new_agent.Phase.EXECUTE
     assert len(calls) == 2
-    assert result.patch_content == ""
+    assert result.patch_content.startswith("diff --git a/widget.py b/widget.py")
+    assert result.tool_patch_approval is not None
+    assert result.tool_patch_approval.base_ref == ref
     assert len(result.patch_edits) == 1
     assert result.patch_edits[0].file_path == "widget.py"
     assert result.patch_edits[0].node_target == "compute"

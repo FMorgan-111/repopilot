@@ -17,8 +17,12 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
+from ..patch_gate import validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
-from ..repair_flow import generate_opus_repair, verified_edits_to_patch_edits
+from ..repair_flow import (
+    generate_opus_repair,
+    request_verified_edit_correction,
+)
 from ..schemas import PlanDecision
 from ..state import (
     AgentState,
@@ -802,11 +806,43 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 repair_plan, verified_batch = await generate_opus_repair(
                     state,
                     build_escalation_packet(state),
+                    validate_edits=False,
                 )
-                patch_edits = verified_edits_to_patch_edits(
-                    verified_batch,
-                    state=state,
-                )
+                state.active_repair_plan = repair_plan
+                while True:
+                    gate_result = validate_patch_batch(
+                        state,
+                        repair_plan,
+                        verified_batch,
+                    )
+                    if gate_result.accepted:
+                        patch_edits = gate_result.edits
+                        break
+                    if state.patch_correction_count >= 2:
+                        state.patch_edits = []
+                        state.patch_content = ""
+                        state.tool_patch_approval = None
+                        state.failure_reason = (
+                            "PatchGate rejected the initial batch and two local corrections."
+                        )
+                        state.current_phase = Phase.REFLECT
+                        _record_node_diagnostic(
+                            state,
+                            node="plan_fix",
+                            event="patch_gate",
+                            status="error",
+                            elapsed_seconds=0.0,
+                            correction_count=state.patch_correction_count,
+                            issue_codes=[issue.code for issue in gate_result.issues],
+                        )
+                        return state
+                    state.patch_correction_count += 1
+                    verified_batch = await request_verified_edit_correction(
+                        state,
+                        repair_plan,
+                        verified_batch,
+                        gate_result.issues,
+                    )
                 response_text = json.dumps(
                     {
                         "repair_plan": repair_plan.model_dump(mode="json"),
@@ -822,7 +858,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                         f"Regression test strategy: "
                         f"{repair_plan.regression_test_strategy}"
                     ),
-                    patch="",
+                    patch=state.patch_content,
                     patch_edits=patch_edits,
                     files=repair_plan.target_files,
                     test_command=state.test_command,

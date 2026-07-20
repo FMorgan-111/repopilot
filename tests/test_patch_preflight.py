@@ -1,8 +1,11 @@
 import subprocess
+import hashlib
 
 import src.nodes.execute as execute_node
 from src import new_agent
 from src.patch_repair import repair_unified_diff
+from src.patch_gate import validate_patch_batch
+from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
 async def test_execute_fix_prepares_environment_for_precloned_benchmark_repo(
@@ -412,3 +415,60 @@ index 1234567..abcdefg 100644
         "recounted_hunk_lengths",
     ]
     assert any(call.tool_name == "patch_repair" for call in next_state.tool_calls)
+
+
+def test_apply_patch_edits_creates_gate_bound_new_text_file(tmp_path):
+    digest = hashlib.sha256(b"").hexdigest()
+    edit = new_agent.PatchEdit(
+        file_path="tests/test_new.py",
+        replace="def test_new():\n    assert True\n",
+        expected_content_sha256=digest,
+        exact_only=True,
+    )
+
+    result = execute_node._apply_patch_edits(str(tmp_path), [edit])
+
+    assert result.applied
+    assert (tmp_path / "tests/test_new.py").read_text(encoding="utf-8") == edit.replace
+
+
+async def test_execute_revalidates_gate_preimage_immediately_before_apply(monkeypatch, tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    source = "value = 1\n"
+    (repo / "a.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    ref = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    plan = RepairPlan(
+        root_cause="wrong value",
+        target_files=["a.py"],
+        required_behavior="use two",
+        regression_test_strategy="focused test",
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/a/b/issues/1",
+        repo_path=str(repo),
+        repo_ref=ref,
+        active_repair_plan=plan,
+    )
+    batch = VerifiedEditBatch(
+        edits=[VerifiedEdit(file_path="a.py", search="value = 1", replace="value = 2", intent="fix")]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+    (repo / "a.py").write_text("value = 9\n", encoding="utf-8")
+    monkeypatch.setattr(execute_node, "_create_venv", lambda path: {"python": "python3", "reason": "exists"})
+
+    async def should_not_test(*args, **kwargs):
+        raise AssertionError("tests must not run after a preimage mismatch")
+
+    monkeypatch.setattr(execute_node, "run_pytest", should_not_test)
+
+    result = await execute_node.execute_fix(state)
+
+    assert result.fix_attempts[-1].failure_kind == "execution_error"
+    assert "preimage" in result.fix_attempts[-1].error_log.lower()
+    assert (repo / "a.py").read_text(encoding="utf-8") == "value = 9\n"

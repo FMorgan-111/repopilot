@@ -1,4 +1,100 @@
 import src.new_agent as new_agent
+import subprocess
+
+from src.nodes import plan as plan_node
+from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
+
+
+def _patch_gate_state(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    source = "def value():\n    return 1\n"
+    (repo / "a.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    ref = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    state = new_agent.AgentState(
+        issue_url="https://github.com/a/b/issues/1",
+        issue_title="value is wrong",
+        issue_body="value should return two",
+        repo_path=str(repo),
+        repo_ref=ref,
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_no_progress",
+        retry_count=1,
+    )
+    plan = RepairPlan(
+        root_cause="value returns one",
+        target_files=["a.py"],
+        target_symbols=[],
+        required_behavior="return two",
+        regression_test_strategy="run focused test",
+    )
+    return state, plan, source
+
+
+def _verified(search, replace="return 2"):
+    return VerifiedEditBatch(
+        edits=[VerifiedEdit(file_path="a.py", search=search, replace=replace, intent="fix value")]
+    )
+
+
+async def test_patch_gate_uses_two_local_corrections_without_consuming_retry(tmp_path, monkeypatch):
+    state, repair_plan, source = _patch_gate_state(tmp_path)
+    seen = []
+
+    async def generate(*args, **kwargs):
+        assert kwargs["validate_edits"] is False
+        return repair_plan, _verified("not in file")
+
+    responses = [_verified("still absent"), _verified("return 1")]
+
+    async def correct(current_state, plan, batch, issues):
+        seen.append((current_state.active_model, issues[0].code, issues[0].correction_context))
+        return responses.pop(0)
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", generate)
+    monkeypatch.setattr(plan_node, "request_verified_edit_correction", correct)
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.retry_count == 1
+    assert result.patch_correction_count == 0
+    assert len(seen) == 2
+    assert all(item[0] == "claude-opus-4-8:stable" for item in seen)
+    assert seen[0][1] == "search_missing"
+    assert source[:100] in seen[0][2]
+    assert result.tool_patch_approval is not None
+
+
+async def test_third_invalid_patch_routes_to_reflect_without_third_correction(tmp_path, monkeypatch):
+    state, repair_plan, _source = _patch_gate_state(tmp_path)
+    calls = 0
+
+    async def generate(*args, **kwargs):
+        return repair_plan, _verified("missing zero")
+
+    async def correct(*args):
+        nonlocal calls
+        calls += 1
+        return _verified(f"missing {calls}")
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", generate)
+    monkeypatch.setattr(plan_node, "request_verified_edit_correction", correct)
+
+    result = await plan_node.plan_fix(state)
+
+    assert calls == 2
+    assert result.current_phase == new_agent.Phase.REFLECT
+    assert result.patch_correction_count == 2
+    assert result.retry_count == 1
+    assert not result.patch_edits
 
 
 async def test_patch_apply_failure_routes_to_failure_when_budget_exhausted():

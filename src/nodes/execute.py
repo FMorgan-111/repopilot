@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -576,7 +577,13 @@ def _apply_patch_edits(
                 ),
             )
 
-        if not file_path.exists():
+        is_new_file = (
+            edit.exact_only
+            and not edit.search
+            and not edit.node_target
+            and edit.expected_content_sha256 == hashlib.sha256(b"").hexdigest()
+        )
+        if not file_path.exists() and not is_new_file:
             return PatchEditApplyResult(
                 applied=False,
                 output=(
@@ -587,9 +594,32 @@ def _apply_patch_edits(
 
         content = pending_writes.get(file_path)
         if content is None:
-            content = file_path.read_text(encoding="utf-8")
+            if is_new_file:
+                content = ""
+            else:
+                if file_path.is_symlink():
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=f"Exact edit failed: edit {index} target is a symlink.",
+                    )
+                raw_content = file_path.read_bytes()
+                if (
+                    edit.exact_only
+                    and hashlib.sha256(raw_content).hexdigest()
+                    != edit.expected_content_sha256
+                ):
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=(
+                            f"Exact edit failed: edit {index} target preimage changed "
+                            f"for {edit.file_path}."
+                        ),
+                    )
+                content = raw_content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
 
-        if edit.node_target:
+        if is_new_file:
+            updated = edit.replace
+        elif edit.node_target:
             # AST-anchored replacement: locate the named def/class and replace
             # its whole span. No verbatim text anchoring, no line drift.
             span = locate_node_span(content, edit.node_target)
@@ -688,6 +718,7 @@ def _apply_patch_edits(
             changed_files.append(edit.file_path)
 
     for file_path, content in pending_writes.items():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content, encoding="utf-8")
 
     return PatchEditApplyResult(
@@ -1050,6 +1081,12 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     pytest_record,
                 )
         if state.patch_edits:
+            if state.tool_patch_approval is not None or any(
+                edit.exact_only for edit in state.patch_edits
+            ):
+                from ..patch_gate import revalidate_approved_patch
+
+                revalidate_approved_patch(state)
             edit_result = _apply_patch_edits(state.repo_path, state.patch_edits)
             _record_tool(
                 state,

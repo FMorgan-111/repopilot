@@ -101,6 +101,13 @@ VERIFIED_EDIT_SYSTEM = (
     "Do not return a unified diff or infer unseen file content."
 )
 
+VERIFIED_EDIT_CORRECTION_SYSTEM = (
+    "Return ONLY one JSON object with key edits. Correct the previous verified "
+    "edit batch using the exact PatchGate issue code and real bounded code window. "
+    "Use only RepairPlan target files. Use one unique node_target or copy a search "
+    "block verbatim. Never use fuzzy matching or a unified diff."
+)
+
 
 class RepairContextError(ValueError):
     """The requested context or model-authored anchor failed closed."""
@@ -621,6 +628,8 @@ def verified_edits_to_patch_edits(
 async def generate_opus_repair(
     state: AgentState,
     packet: EscalationPacket,
+    *,
+    validate_edits: bool = True,
 ) -> tuple[RepairPlan, VerifiedEditBatch]:
     """Generate patch-free intent, resolve exact context, then request edits."""
     if state.active_provider != "escalation" or not state.escalated:
@@ -662,7 +671,8 @@ async def generate_opus_repair(
     if len(user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("verified edit prompt exceeds strict context budget")
     def validate_edits(candidate: VerifiedEditBatch) -> VerifiedEditBatch:
-        _validate_batch(state, plan, candidate, evidence, snapshots)
+        if validate_edits:
+            _validate_batch(state, plan, candidate, evidence, snapshots)
         return candidate
 
     batch = await _call_schema(
@@ -673,3 +683,50 @@ async def generate_opus_repair(
         semantic_validate=validate_edits,
     )
     return plan, batch
+
+
+async def request_verified_edit_correction(
+    state: AgentState,
+    plan: RepairPlan,
+    previous_batch: VerifiedEditBatch,
+    issues: list[object],
+) -> VerifiedEditBatch:
+    """Ask the same active model for one bounded, local PatchGate correction."""
+    if state.active_provider != "escalation" or not state.escalated:
+        raise RepairContextError("verified edit correction requires active escalation")
+    safe_issues: list[dict[str, str]] = []
+    for issue in issues[:16]:
+        safe_issues.append(
+            {
+                "code": str(getattr(issue, "code", "apply_failed"))[:64],
+                "file_path": canonical_repo_path(str(getattr(issue, "file_path", ""))),
+                "message": _safe_generated_text(str(getattr(issue, "message", "")))[:500],
+                "real_code_window": _safe_generated_text(
+                    str(getattr(issue, "correction_context", ""))
+                )[:1_200],
+            }
+        )
+    payload = {
+        "repair_plan": plan.model_dump(mode="json"),
+        "patch_gate_issues": safe_issues,
+        "previous_edits": [
+            {
+                "file_path": edit.file_path,
+                "node_target": edit.node_target,
+                "search": edit.search[:8_000],
+                "replace": edit.replace[:8_000],
+                "intent": edit.intent,
+            }
+            for edit in previous_batch.edits
+        ],
+    }
+    user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    if len(user) > 40_000:
+        raise RepairContextError("verified edit correction exceeds strict context budget")
+    return await _call_schema(
+        state,
+        system=VERIFIED_EDIT_CORRECTION_SYSTEM,
+        user=user,
+        schema=VerifiedEditBatch,
+        semantic_validate=lambda candidate: candidate,
+    )
