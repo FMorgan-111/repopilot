@@ -27,6 +27,75 @@ def test_legacy_harness_base_url_honors_normalized_override(monkeypatch):
     assert harness._get_llm_base_url() == "https://example.test/v1"
 
 
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("LINOAPI_API_KEY", "lino-key"),
+        ("LLM_API_KEY", "llm-key"),
+        ("DEEPSEEK_API_KEY", "deepseek-key"),
+    ],
+)
+def test_legacy_harness_resolves_each_supported_api_key(
+    monkeypatch, variable, value
+):
+    from eval import harness
+
+    for name in ("LINOAPI_API_KEY", "LLM_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv(variable, value)
+
+    assert harness._get_llm_api_key() == value
+
+
+def test_legacy_harness_api_key_precedence_matches_production(monkeypatch):
+    from eval import harness
+
+    monkeypatch.setenv("LINOAPI_API_KEY", "lino-key")
+    monkeypatch.setenv("LLM_API_KEY", "llm-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+
+    assert harness._get_llm_api_key() == "lino-key"
+
+    monkeypatch.delenv("LINOAPI_API_KEY")
+    assert harness._get_llm_api_key() == "llm-key"
+
+
+def test_legacy_harness_api_key_falls_back_to_empty(monkeypatch):
+    from eval import harness
+
+    for name in ("LINOAPI_API_KEY", "LLM_API_KEY", "DEEPSEEK_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    assert harness._get_llm_api_key() == ""
+
+
+async def test_legacy_harness_llm_request_resolves_api_key_at_request_time(
+    monkeypatch,
+):
+    from eval import harness
+
+    captured = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": []}
+
+    class FakeClient:
+        async def post(self, url, *, json, headers):
+            captured.update(headers)
+            return FakeResponse()
+
+    monkeypatch.setattr(harness, "_get_client", lambda: FakeClient())
+    monkeypatch.setenv("LINOAPI_API_KEY", "request-time-key")
+
+    await harness.llm_request([{"role": "user", "content": "hi"}])
+
+    assert captured["Authorization"] == "Bearer request-time-key"
+
+
 def sample_record():
     return {
         "id": "acme/widget#7:8",

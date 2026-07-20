@@ -38,7 +38,6 @@ if str(REPO_ROOT) not in sys.path:
 load_dotenv(REPO_ROOT / ".env", override=True)
 
 DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
-_LLM_KEY = os.getenv("DEEPSEEK_API_KEY") or os.getenv("LLM_API_KEY", "")
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
 _LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
 
@@ -47,6 +46,14 @@ _llm_client: httpx.AsyncClient | None = None
 
 def _get_llm_base_url() -> str:
     return os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+
+
+def _get_llm_api_key() -> str:
+    return (
+        os.getenv("LINOAPI_API_KEY")
+        or os.getenv("LLM_API_KEY")
+        or os.getenv("DEEPSEEK_API_KEY", "")
+    )
 
 
 def _get_client() -> httpx.AsyncClient:
@@ -72,7 +79,7 @@ async def llm_request(
         "temperature": temperature,
     }
     headers = {
-        "Authorization": f"Bearer {_LLM_KEY}",
+        "Authorization": f"Bearer {_get_llm_api_key()}",
         "Content-Type": "application/json",
     }
     client = _get_client()

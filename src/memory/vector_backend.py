@@ -5,13 +5,21 @@ from __future__ import annotations
 import sqlite3
 import warnings
 
-from .numpy_vector_index import NumpyVectorIndex
 from .vector_index import VectorIndex
 
-try:
+
+def _create_sqlite_vec_index(conn: sqlite3.Connection, dim: int) -> VectorIndex:
+    """Import the optional sqlite-vec backend only when memory is enabled."""
     from .sqlite_vec_index import SqliteVecIndex
-except ImportError:  # sqlite-vec is optional
-    SqliteVecIndex = None  # type: ignore[assignment,misc]
+
+    return SqliteVecIndex(conn, dim)
+
+
+def _create_numpy_vector_index(conn: sqlite3.Connection, dim: int) -> VectorIndex:
+    """Import the optional NumPy fallback only after sqlite-vec is unavailable."""
+    from .numpy_vector_index import NumpyVectorIndex
+
+    return NumpyVectorIndex(conn, dim)
 
 _fallback_warning_emitted = False
 
@@ -21,9 +29,7 @@ def create_vector_index(
 ) -> tuple[VectorIndex, str]:
     """Prefer sqlite-vec and visibly fall back on unsupported Python builds."""
     try:
-        if SqliteVecIndex is None:
-            raise ImportError("sqlite-vec is not installed")
-        return SqliteVecIndex(conn, dim), "sqlite_vec"
+        return _create_sqlite_vec_index(conn, dim), "sqlite_vec"
     except (ImportError, AttributeError, sqlite3.Error, RuntimeError) as exc:
         global _fallback_warning_emitted
         if not _fallback_warning_emitted:
@@ -34,4 +40,4 @@ def create_vector_index(
                 stacklevel=2,
             )
             _fallback_warning_emitted = True
-        return NumpyVectorIndex(conn, dim), "numpy"
+        return _create_numpy_vector_index(conn, dim), "numpy"

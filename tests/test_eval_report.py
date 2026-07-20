@@ -1,4 +1,11 @@
+import subprocess
+import sys
+from pathlib import Path
+
 from eval import report
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def agent_v2_result():
@@ -74,6 +81,16 @@ def agent_v2_result():
     }
 
 
+def test_report_imports_when_run_from_eval_directory():
+    subprocess.run(
+        [sys.executable, "-c", "import report"],
+        cwd=ROOT / "eval",
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     results = [agent_v2_result()]
 
@@ -81,7 +98,7 @@ def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     markdown = report.generate_markdown(results, metrics)
 
     assert "| agent_v2_samples | 1 |" in markdown
-    assert "| agent_v2_success_rate | 0.000 |" in markdown
+    assert "| agent_v2_combined_all_modes_resolved_rate | 0.000 |" in markdown
     assert "| agent_v2_waiting_for_user | 0 |" in markdown
     assert "**Models**: claude-sonnet-5:stable" in markdown
     assert "**Commits**: deadbeef" in markdown
@@ -184,15 +201,58 @@ def test_generate_markdown_surfaces_plan_fix_phase_timeout():
 
 def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
     legacy = agent_v2_result()
+    legacy.update(
+        {
+            "model": "z-model",
+            "commit_sha": "commit-2",
+            "agent_payload": {
+                "fix_attempts": [
+                    {
+                        "failure_kind": "test_failed",
+                        "error_log": "assertion failed",
+                    }
+                ]
+            },
+        }
+    )
     explicit_end_to_end = agent_v2_result()
     explicit_end_to_end.update(
-        {"id": "acme/widget#8:9", "evaluation_mode": "end_to_end", "success": True}
+        {
+            "id": "acme/widget#8:9",
+            "evaluation_mode": "end_to_end",
+            "success": True,
+            "model": "a-model",
+            "commit_sha": "commit-1",
+        }
     )
     oracle = agent_v2_result()
     oracle.update(
-        {"id": "acme/widget#10:11", "evaluation_mode": "oracle_files", "success": True}
+        {
+            "id": "acme/widget#10:11",
+            "evaluation_mode": "oracle_files",
+            "model": "oracle-b",
+            "commit_sha": "oracle-2",
+            "agent_payload": {
+                "fix_attempts": [
+                    {
+                        "failure_kind": "patch_apply_failed",
+                        "error_log": "target file was not found",
+                    }
+                ]
+            },
+        }
     )
-    results = [legacy, explicit_end_to_end, oracle]
+    oracle_success = agent_v2_result()
+    oracle_success.update(
+        {
+            "id": "acme/widget#12:13",
+            "evaluation_mode": "oracle_files",
+            "success": True,
+            "model": "oracle-a",
+            "commit_sha": "oracle-1",
+        }
+    )
+    results = [legacy, explicit_end_to_end, oracle, oracle_success]
 
     metrics = report.compute_metrics(results)
     markdown = report.generate_markdown(results, metrics)
@@ -202,12 +262,23 @@ def test_agent_v2_metrics_and_markdown_separate_evaluation_modes():
         "samples": 2,
         "successes": 1,
         "success_rate": 0.5,
+        "resolved_rate": 0.5,
+        "failure_taxonomy": {"resolved": 1, "test_failed": 1},
+        "models": ["a-model", "z-model"],
+        "commits": ["commit-1", "commit-2"],
     }
     assert by_mode["oracle_files"] == {
-        "samples": 1,
+        "samples": 2,
         "successes": 1,
-        "success_rate": 1.0,
+        "success_rate": 0.5,
+        "resolved_rate": 0.5,
+        "failure_taxonomy": {"resolved": 1, "wrong_file_path": 1},
+        "models": ["oracle-a", "oracle-b"],
+        "commits": ["oracle-1", "oracle-2"],
     }
-    assert "| agent_v2_end_to_end_success_rate | 0.500 |" in markdown
-    assert "| agent_v2_oracle_files_success_rate | 1.000 |" in markdown
+    assert "## Agent V2 Evaluation Modes" in markdown
+    assert "| end_to_end | 2 | a-model, z-model | commit-1, commit-2 | 1/2 (50.0%) | resolved: 1; test_failed: 1 |" in markdown
+    assert "| oracle_files | 2 | oracle-a, oracle-b | oracle-1, oracle-2 | 1/2 (50.0%) | resolved: 1; wrong_file_path: 1 |" in markdown
+    assert "agent_v2_success_rate" not in markdown
+    assert "agent_v2_combined_all_modes_resolved_rate" in markdown
     assert "| Sample ID | Evaluation Mode | Run ID |" in markdown

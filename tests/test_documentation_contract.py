@@ -30,6 +30,8 @@ def test_contributor_guide_uses_package_metadata_instead_of_manual_dependency_fi
 
     assert 'pip install -e ".[memory,dev]"' in guide
     assert "requirements.txt 未列全" not in guide
+    assert "gemini-3.5-flash:stable" in guide
+    assert "claude-sonnet-5:stable" not in guide
     assert "end_to_end" in guide
     assert "oracle_files" in guide
 
@@ -53,3 +55,10 @@ def test_eval_report_does_not_claim_an_obsolete_hard_coded_model():
     report_source = _read("eval/report.py")
 
     assert "deepseek-v4-flash" not in report_source
+
+
+def test_trace_utility_uses_the_shared_model_default():
+    trace_source = _read("run_trace.py")
+
+    assert "deepseek-v4-flash" not in trace_source
+    assert "setdefault('LLM_MODEL'" not in trace_source

@@ -13,6 +13,11 @@ import statistics
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .failure_taxonomy import summarize as summarize_failures
+else:  # Support `python eval/report.py` and imports from the eval directory.
+    from failure_taxonomy import summarize as summarize_failures
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 SUMMARY_PATH = REPO_ROOT / "eval" / "eval_summary.md"
@@ -64,10 +69,23 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
             if _evaluation_mode(result) == evaluation_mode
         ]
         mode_successes = len([result for result in mode_results if result.get("success")])
+        taxonomy = summarize_failures(mode_results)
         by_evaluation_mode[evaluation_mode] = {
             "samples": len(mode_results),
             "successes": mode_successes,
             "success_rate": mode_successes / len(mode_results) if mode_results else 0.0,
+            "resolved_rate": taxonomy["resolve_rate"],
+            "failure_taxonomy": taxonomy["decisive"],
+            "models": sorted(
+                {result["model"] for result in mode_results if result.get("model")}
+            ),
+            "commits": sorted(
+                {
+                    result["commit_sha"]
+                    for result in mode_results
+                    if result.get("commit_sha")
+                }
+            ),
         }
 
     return {
@@ -152,20 +170,13 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
     agent_v2 = metrics.get("agent_v2", {})
     if agent_v2.get("samples"):
         lines.append(f"| agent_v2_samples | {agent_v2['samples']} |\n")
-        lines.append(f"| agent_v2_success_rate | {agent_v2['success_rate']:.3f} |\n")
+        lines.append(
+            "| agent_v2_combined_all_modes_resolved_rate "
+            f"| {agent_v2['success_rate']:.3f} |\n"
+        )
         lines.append(f"| agent_v2_waiting_for_user | {agent_v2['waiting_for_user']} |\n")
-        for evaluation_mode, mode_metrics in agent_v2.get(
-            "by_evaluation_mode", {}
-        ).items():
-            if not mode_metrics["samples"]:
-                continue
-            lines.append(
-                f"| agent_v2_{evaluation_mode}_samples | {mode_metrics['samples']} |\n"
-            )
-            lines.append(
-                f"| agent_v2_{evaluation_mode}_success_rate "
-                f"| {mode_metrics['success_rate']:.3f} |\n"
-            )
+
+        _append_evaluation_mode_summary(lines, agent_v2["by_evaluation_mode"])
 
     lines.append("\n## Per-Sample Results\n\n")
     lines.append("| # | Sample ID | file_recall@1 | file_recall@3 | file_recall@5 | patch_apply | test_pass | cost |\n")
@@ -211,6 +222,36 @@ def _is_agent_v2_result(result: dict[str, Any]) -> bool:
 def _evaluation_mode(result: dict[str, Any]) -> str:
     mode = result.get("evaluation_mode", "end_to_end")
     return mode if mode in {"end_to_end", "oracle_files"} else "end_to_end"
+
+
+def _append_evaluation_mode_summary(
+    lines: list[str], by_evaluation_mode: dict[str, dict[str, Any]]
+) -> None:
+    lines.append("\n## Agent V2 Evaluation Modes\n\n")
+    lines.append(
+        "| Mode | Samples | Models | Commits | Resolved Rate | "
+        "Decisive Failure Taxonomy |\n"
+    )
+    lines.append(
+        "|------|---------|--------|---------|---------------|"
+        "---------------------------|\n"
+    )
+    for mode, mode_metrics in by_evaluation_mode.items():
+        samples = mode_metrics["samples"]
+        if not samples:
+            continue
+        models = _markdown_table_cell(", ".join(mode_metrics["models"]) or "none")
+        commits = _markdown_table_cell(", ".join(mode_metrics["commits"]) or "none")
+        taxonomy = "; ".join(
+            f"{category}: {count}"
+            for category, count in mode_metrics["failure_taxonomy"].items()
+        )
+        taxonomy = _markdown_table_cell(taxonomy or "none")
+        lines.append(
+            f"| {mode} | {samples} | {models} | {commits} "
+            f"| {mode_metrics['successes']}/{samples} "
+            f"({mode_metrics['resolved_rate']:.1%}) | {taxonomy} |\n"
+        )
 
 
 def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) -> None:

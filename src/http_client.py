@@ -247,9 +247,39 @@ def _parse_chat_completion_json(payload: object) -> dict:
             continue
         content = message.get("content")
         tool_calls = message.get("tool_calls")
-        if (isinstance(content, str) and content) or tool_calls:
+        validated_tool_calls = (
+            _validate_tool_calls(tool_calls) if tool_calls is not None else []
+        )
+        if (isinstance(content, str) and content) or validated_tool_calls:
             return payload
     raise LLMResponseError("empty chat completion response")
+
+
+def _provider_index(value: object, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise LLMResponseError(f"invalid {label} index") from exc
+
+
+def _validate_tool_calls(tool_calls: object) -> list[dict]:
+    if not isinstance(tool_calls, list):
+        raise LLMResponseError("incomplete tool call structure")
+    for call in tool_calls:
+        if not isinstance(call, dict):
+            raise LLMResponseError("incomplete tool call structure")
+        function = call.get("function")
+        if (
+            not isinstance(call.get("id"), str)
+            or not call["id"]
+            or call.get("type") != "function"
+            or not isinstance(function, dict)
+            or not isinstance(function.get("name"), str)
+            or not function["name"]
+            or not isinstance(function.get("arguments"), str)
+        ):
+            raise LLMResponseError("incomplete tool call structure")
+    return tool_calls
 
 
 async def _consume_sse_chat_completion(resp: object) -> dict:
@@ -280,7 +310,7 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
         for position, choice in enumerate(event_choices):
             if not isinstance(choice, dict):
                 continue
-            index = int(choice.get("index", position))
+            index = _provider_index(choice.get("index", position), "choice")
             state = choice_states.setdefault(
                 index,
                 {
@@ -336,10 +366,10 @@ def _accumulate_tool_call_deltas(states: dict[int, dict], deltas: object) -> Non
     for position, delta in enumerate(deltas):
         if not isinstance(delta, dict):
             continue
-        index = int(delta.get("index", position))
+        index = _provider_index(delta.get("index", position), "tool call")
         state = states.setdefault(
             index,
-            {"id": "", "type": "function", "name": "", "arguments": ""},
+            {"id": "", "type": "", "name": "", "arguments": ""},
         )
         if isinstance(delta.get("id"), str):
             state["id"] += delta["id"]
@@ -366,4 +396,4 @@ def _finalize_tool_calls(states: dict[int, dict]) -> list[dict]:
                 },
             }
         )
-    return calls
+    return _validate_tool_calls(calls)

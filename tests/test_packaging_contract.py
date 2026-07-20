@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 try:
@@ -48,3 +51,33 @@ def test_generated_editable_install_metadata_is_ignored():
     assert "*.egg-info/" in gitignore
     assert "build/" in gitignore
     assert "dist/" in gitignore
+
+
+def test_base_install_can_use_disabled_episode_memory_without_numpy():
+    code = """
+import builtins
+import sys
+
+real_import = builtins.__import__
+
+def reject_optional_memory_dependencies(name, *args, **kwargs):
+    if name.split('.', 1)[0] in {'numpy', 'sqlite_vec'}:
+        raise ImportError(f'blocked optional dependency: {name}')
+    return real_import(name, *args, **kwargs)
+
+builtins.__import__ = reject_optional_memory_dependencies
+from src.memory.error_episode_store import get_episode_store
+assert get_episode_store() is None
+assert 'numpy' not in sys.modules
+"""
+    env = os.environ.copy()
+    env.pop("REPOPILOT_ENABLE_EPISODES", None)
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )

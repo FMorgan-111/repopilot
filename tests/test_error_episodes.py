@@ -115,15 +115,20 @@ def test_sqlite_vec_index_cosine_knn():
     assert hits[1].rowid == 3
 
 
-def test_numpy_vector_index_cosine_knn_and_persistence():
-    conn = sqlite3.connect(":memory:")
-    idx = NumpyVectorIndex(conn, dim=3)
-    idx.add(1, [1, 0, 0])
-    idx.add(2, [0, 1, 0])
-    idx.add(3, [0.9, 0.1, 0])
+def test_numpy_vector_index_cosine_knn_and_persistence(tmp_path):
+    db_path = tmp_path / "numpy-vectors.db"
+    first_conn = sqlite3.connect(db_path)
+    first_index = NumpyVectorIndex(first_conn, dim=3)
+    first_index.add(1, [1, 0, 0])
+    first_index.add(2, [0, 1, 0])
+    first_index.add(3, [0.9, 0.1, 0])
+    first_conn.commit()
+    first_conn.close()
 
-    reopened = NumpyVectorIndex(conn, dim=3)
-    hits = reopened.search([1, 0, 0], k=2)
+    second_conn = sqlite3.connect(db_path)
+    second_index = NumpyVectorIndex(second_conn, dim=3)
+    hits = second_index.search([1, 0, 0], k=2)
+    second_conn.close()
 
     assert [hit.rowid for hit in hits] == [1, 3]
     assert hits[0].distance == pytest.approx(0.0)
@@ -139,11 +144,12 @@ def test_numpy_vector_index_validates_dimensions():
 
 
 def test_backend_factory_falls_back_when_sqlite_vec_is_unavailable(monkeypatch):
-    class BrokenSqliteVecIndex:
-        def __init__(self, conn, dim):
-            raise AttributeError("extension loading disabled")
+    def broken_sqlite_vec_index(conn, dim):
+        raise AttributeError("extension loading disabled")
 
-    monkeypatch.setattr(vector_backend, "SqliteVecIndex", BrokenSqliteVecIndex)
+    monkeypatch.setattr(
+        vector_backend, "_create_sqlite_vec_index", broken_sqlite_vec_index
+    )
     monkeypatch.setattr(vector_backend, "_fallback_warning_emitted", False)
 
     with pytest.warns(RuntimeWarning, match="falling back to NumPy"):

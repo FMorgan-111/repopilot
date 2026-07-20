@@ -301,6 +301,85 @@ async def test_llm_request_accepts_tool_call_only_stream(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            'data: {"choices":[{"index":"bad","delta":{"content":"hi"}}]}\n\n',
+            "invalid choice index",
+        ),
+        (
+            'data: {"choices":[{"delta":{"tool_calls":['
+            '{"index":null,"id":"call_1","type":"function","function":'
+            '{"name":"lookup","arguments":"{}"}}]}}]}\n\n',
+            "invalid tool call index",
+        ),
+    ],
+)
+async def test_llm_request_wraps_malformed_provider_indexes(
+    monkeypatch, body, message
+):
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(sse=body),
+    )
+
+    with pytest.raises(LLMResponseError, match=message):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+async def test_llm_request_rejects_incomplete_streamed_tool_call(monkeypatch):
+    body = (
+        'data: {"choices":[{"delta":{"tool_calls":['
+        '{"index":0,"type":"function","function":'
+        '{"name":"lookup","arguments":"{}"}}]},'
+        '"finish_reason":"tool_calls"}]}\n\n'
+        "data: [DONE]\n"
+    )
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(sse=body),
+    )
+
+    with pytest.raises(LLMResponseError, match="incomplete tool call structure"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+async def test_llm_request_rejects_incomplete_json_tool_call(monkeypatch):
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"arguments": "{}"},
+                        }
+                    ],
+                }
+            }
+        ]
+    }
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        real_client,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(
+            json_body=payload, content_type="application/json"
+        ),
+    )
+
+    with pytest.raises(LLMResponseError, match="incomplete tool call structure"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
 async def test_github_request_retries_on_429(httpx_mock, monkeypatch):
     """Mock returns 429 twice, then 200 — should retry and eventually succeed."""
     monkeypatch.setattr(asyncio, "sleep", _noop_sleep)
