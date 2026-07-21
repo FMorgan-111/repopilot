@@ -429,6 +429,27 @@ def test_report_redacts_plain_secrets_from_terminal_fields(field, secret_text):
     assert "[REDACTED]" in markdown
 
 
+@pytest.mark.parametrize(
+    "secret_text",
+    [
+        "LLM_API_KEY=plain-secret-987654321",
+        'LLM_ESCALATION_API_KEY = "plain-secret-987654321" # escalation',
+        "GITHUB_TOKEN='plain-secret-987654321' # release",
+        "x_api_key = plain-secret-987654321 # lower-case",
+    ],
+)
+def test_report_redacts_prefixed_secret_env_vars(secret_text):
+    result = agent_v2_result()
+    result["final_phase"] = secret_text
+    result["replay"] = None
+    result["replay_error"] = secret_text
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "plain-secret-987654321" not in markdown
+    assert "[REDACTED]" in markdown
+
+
 def test_report_sanitizes_clean_legacy_sample_id():
     sentinel = (
         "sk-legacy-secret-123456789 FAIL_TO_PASS "

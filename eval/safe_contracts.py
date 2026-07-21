@@ -51,6 +51,19 @@ _ASSIGNED_SECRET_RE = re.compile(
     r"access[-_]?token|token)\b\s*[:=]\s*)"
     r"(?:Bearer\s+)?(?![\"'])[^\s,;]+"
 )
+_ENV_ASSIGNMENT_RE = re.compile(
+    r"(?i)(?<![?&A-Za-z0-9_])"
+    r"(?P<prefix>(?P<name>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*)"
+    r"(?P<value>\"(?:\\.|[^\"\\\r\n])*\"|"
+    r"'(?:\\.|[^'\\\r\n])*'|[^\s,;#]+)"
+)
+_SENSITIVE_ENV_SUFFIXES = (
+    "ACCESS_TOKEN",
+    "AUTHORIZATION",
+    "API_KEY",
+    "APIKEY",
+    "TOKEN",
+)
 _SK_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
 _ARCHIVE_PAYLOAD_RE = re.compile(r"(?:PK\\x03\\x04|PK\x03\x04)")
 _FORBIDDEN_TEST_TREE_PARTS = frozenset(
@@ -144,6 +157,7 @@ def sanitize_output_text(value: Any, limit: int = 2_000) -> str:
     if not isinstance(value, (str, int, float, bool)):
         return ""
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = _ENV_ASSIGNMENT_RE.sub(_redact_env_assignment, text)
     text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _QUOTED_FIELD_SECRET_RE.sub(
         lambda match: (
@@ -162,6 +176,15 @@ def sanitize_output_text(value: Any, limit: int = 2_000) -> str:
     if boundaries:
         text = text[: min(boundaries)]
     return text.strip()[: max(0, limit)]
+
+
+def _redact_env_assignment(match: re.Match[str]) -> str:
+    name = match.group("name")
+    if not name.upper().endswith(_SENSITIVE_ENV_SUFFIXES):
+        return match.group(0)
+    value = match.group("value")
+    quote = value[0] if value[:1] in {"'", '"'} else ""
+    return f"{match.group('prefix')}{quote}[REDACTED]{quote}"
 
 
 def safe_int(value: Any, default: int = 0) -> int:

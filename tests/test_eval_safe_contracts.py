@@ -169,3 +169,56 @@ def test_output_sanitizer_redacts_plain_secret_forms_without_breaking_structure(
     value, expected
 ):
     assert sanitize_output_text(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            "LLM_API_KEY=plain-secret-987654321",
+            "LLM_API_KEY=[REDACTED]",
+        ),
+        (
+            'LLM_ESCALATION_API_KEY = "plain-secret-987654321" # primary',
+            'LLM_ESCALATION_API_KEY = "[REDACTED]" # primary',
+        ),
+        (
+            "GITHUB_TOKEN='plain-secret-987654321' # release",
+            "GITHUB_TOKEN='[REDACTED]' # release",
+        ),
+        (
+            "x_api_key = plain-secret-987654321 # lower-case",
+            "x_api_key = [REDACTED] # lower-case",
+        ),
+        (
+            "repo_AUTHORIZATION = 'plain-secret-987654321'",
+            "repo_AUTHORIZATION = '[REDACTED]'",
+        ),
+        (
+            'SERVICE_ACCESS_TOKEN="plain-secret-987654321"',
+            'SERVICE_ACCESS_TOKEN="[REDACTED]"',
+        ),
+        (
+            "export Mixed_Case_Api_Key = 'plain-secret-987654321' # keep",
+            "export Mixed_Case_Api_Key = '[REDACTED]' # keep",
+        ),
+    ],
+)
+def test_output_sanitizer_redacts_prefixed_secret_env_assignments(
+    value, expected
+):
+    assert sanitize_output_text(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "LLM_MODEL=plain-secret-987654321",
+        "TOKENIZER_MODEL=plain-secret-987654321",
+        "ACCESS_TOKEN_TTL=plain-secret-987654321",
+        "AUTHORIZATION_MODE=plain-secret-987654321",
+        "API_KEY_HINT=plain-secret-987654321",
+    ],
+)
+def test_output_sanitizer_does_not_redact_non_sensitive_env_names(value):
+    assert sanitize_output_text(value) == value
