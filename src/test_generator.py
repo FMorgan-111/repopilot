@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -346,14 +347,35 @@ async def run_test_generation_attempts(
                 _refresh_diff(state)
                 combined = _combined_approval(state, production, generated_approval)
                 state.tool_patch_approval = combined
-                state.generated_test_approvals = [
-                    GeneratedTestApproval(
-                        path=path,
-                        content_sha256=hashlib.sha256((root / path).read_bytes()).hexdigest(),
-                        patch_gate_fingerprint=combined.patch_gate_fingerprint,
+                generated_entries = {
+                    entry.path: entry for entry in generated_approval.changed_manifest
+                }
+                markers: list[GeneratedTestApproval] = []
+                for path in changed:
+                    entry = generated_entries[path]
+                    base = subprocess.run(
+                        ["git", "show", f"{state.repo_ref}:{path}"],
+                        cwd=root,
+                        check=False,
+                        capture_output=True,
+                        timeout=30,
                     )
-                    for path in changed
-                ]
+                    markers.append(
+                        GeneratedTestApproval(
+                            path=path,
+                            change=entry.change,
+                            base_content_sha256=(
+                                hashlib.sha256(base.stdout).hexdigest()
+                                if entry.change == "modified" and base.returncode == 0
+                                else None
+                            ),
+                            content_sha256=hashlib.sha256(
+                                (root / path).read_bytes()
+                            ).hexdigest(),
+                            patch_gate_fingerprint=combined.patch_gate_fingerprint,
+                        )
+                    )
+                state.generated_test_approvals = markers
                 state.active_repair_plan = production.active_repair_plan
                 state.patch_edits = [
                     edit.model_copy(deep=True) for edit in production.patch_edits

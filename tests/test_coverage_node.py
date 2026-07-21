@@ -277,6 +277,39 @@ async def test_existing_candidate_only_succeeds_after_validator(
 
 
 @pytest.mark.asyncio
+async def test_live_drift_before_proof_persistence_is_coverage_infra(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state = _state(tmp_path)
+    candidate = CoverageCandidate(
+        test_files=["tests/test_a.py"],
+        argv=["python", "-m", "pytest", "tests/test_a.py", "-q"],
+        source="existing",
+    )
+    monkeypatch.setattr("src.nodes.coverage.collect_changed_targets", lambda *_: [])
+    monkeypatch.setattr(
+        "src.nodes.coverage.discover_coverage_candidates", lambda *_: [candidate]
+    )
+
+    async def validate(*_):
+        return _verified(candidate)
+
+    def drifted(_state):
+        raise ValueError("live binding drifted")
+
+    monkeypatch.setattr("src.nodes.coverage.validate_differential_coverage", validate)
+    monkeypatch.setattr("src.nodes.coverage.validate_live_coverage_binding", drifted)
+    result = await ensure_coverage(state)
+
+    assert result.current_phase == Phase.FAILURE
+    assert result.coverage_status == "failed"
+    assert result.coverage_failure_reason == "coverage_infra"
+    assert result.coverage_proof is None
+    assert result.pr_url is None
+
+
+@pytest.mark.asyncio
 async def test_two_invalid_generated_tests_fail_without_pr(
     tmp_path: Path,
     monkeypatch,

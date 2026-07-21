@@ -10,12 +10,15 @@ import ast
 import asyncio
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Literal
 
@@ -28,6 +31,7 @@ from .state import (
     AgentState,
     CoverageProof,
     CoverageStatus,
+    SnapshotManifestEntry,
     TestRunFingerprint,
     tool_manifest_fingerprint,
 )
@@ -131,6 +135,30 @@ class CoverageDecision(BaseModel):
     base_runs: list[TestRunFingerprint] = Field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ApprovedLiveTarget:
+    """One exact UTF-8 file authorized by the current live PatchGate output."""
+
+    path: str
+    change: Literal["added", "modified", "deleted"]
+    mode: Literal["100644", "100755"]
+    content: str | None
+    content_sha256: str | None
+    size: int
+    base_blob_sha: str | None
+
+
+@dataclass(frozen=True)
+class LiveCoverageBinding:
+    """Immutable authorization shared by coverage, prediction, and commit."""
+
+    patch_content: str
+    patch_sha256: str
+    patch_gate_fingerprint: str
+    manifest_fingerprint: str
+    approved_targets: tuple[ApprovedLiveTarget, ...]
+
+
 def _git(root: Path, argv: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         argv,
@@ -167,6 +195,230 @@ def _exact_ref(root: Path, base_ref: str) -> str:
     if resolved.returncode or resolved.stdout.strip() != base_ref:
         raise ValueError("base ref does not resolve to the exact commit")
     return base_ref
+
+
+def _clear_live_proof(state: AgentState) -> None:
+    state.coverage_proof = None
+    if state.coverage_status in {"existing_verified", "generated_verified"}:
+        state.coverage_status = "pending"
+    state.pr_url = None
+
+
+def _git_bytes(
+    root: Path,
+    argv: list[str],
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        argv,
+        cwd=root,
+        check=False,
+        capture_output=True,
+        timeout=60,
+    )
+
+
+def _base_blob(
+    root: Path,
+    ref: str,
+    path: str,
+) -> tuple[str, str, bytes] | None:
+    listed = _git_bytes(
+        root,
+        ["git", "ls-tree", "-z", ref, "--", f":(literal){path}"],
+    )
+    if listed.returncode or not listed.stdout:
+        return None
+    records = [record for record in listed.stdout.split(b"\0") if record]
+    if len(records) != 1:
+        raise ValueError("base manifest path is ambiguous")
+    metadata, separator, raw_path = records[0].partition(b"\t")
+    fields = metadata.split()
+    if (
+        not separator
+        or raw_path.decode("utf-8", "strict") != path
+        or len(fields) != 3
+        or fields[0] not in {b"100644", b"100755"}
+        or fields[1] != b"blob"
+    ):
+        raise ValueError("base manifest entry is not a regular file")
+    blob = _git_bytes(root, ["git", "show", f"{ref}:{path}"])
+    if blob.returncode:
+        raise ValueError("base manifest blob is unavailable")
+    return fields[0].decode("ascii"), fields[2].decode("ascii"), blob.stdout
+
+
+def _changed_live_paths(root: Path, ref: str) -> list[str]:
+    tracked = _git_bytes(
+        root,
+        [
+            "git",
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            "--no-textconv",
+            ref,
+            "--",
+        ],
+    )
+    untracked = _git_bytes(
+        root,
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    if tracked.returncode or untracked.returncode:
+        raise RuntimeError("live changed-path enumeration failed")
+    paths: set[str] = set()
+    folded: set[str] = set()
+    for raw in [*tracked.stdout.split(b"\0"), *untracked.stdout.split(b"\0")]:
+        if not raw:
+            continue
+        path = canonical_repo_path(raw.decode("utf-8", "strict"))
+        key = path.casefold()
+        if key in folded and path not in paths:
+            raise ValueError("live changed paths contain a canonical collision")
+        folded.add(key)
+        paths.add(path)
+    return sorted(paths)
+
+
+def _read_live_regular(root: Path, path: str) -> tuple[str, bytes]:
+    current = root
+    for component in Path(path).parts:
+        current = current / component
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("live changed path contains a symlink")
+    info = current.lstat()
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("live changed path is not a regular file")
+    if info.st_size > 512_000_000:
+        raise ValueError("live changed file exceeds size limit")
+    descriptor = os.open(
+        current,
+        os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (info.st_dev, info.st_ino):
+            raise ValueError("live changed file identity drifted")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 65_536):
+            total += len(chunk)
+            if total > 512_000_000:
+                raise ValueError("live changed file exceeds size limit")
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    text = content.decode("utf-8")
+    if "\0" in text:
+        raise ValueError("live changed file contains NUL")
+    mode: Literal["100644", "100755"] = (
+        "100755" if opened.st_mode & 0o111 else "100644"
+    )
+    return mode, content
+
+
+def validate_live_coverage_binding(state: AgentState) -> LiveCoverageBinding:
+    """Bind the exact live diff and manifest to the persisted PatchGate approval."""
+    try:
+        root = _exact_repo_root(Path(state.repo_path))
+        ref = _exact_ref(root, state.repo_ref)
+        head = _git(root, ["git", "rev-parse", "HEAD"]).stdout.strip()
+        approval = state.tool_patch_approval
+        if head != ref or approval is None or approval.base_ref != ref:
+            raise ValueError("live approval base mismatch")
+        patch_sha256 = hashlib.sha256(
+            state.patch_content.encode("utf-8")
+        ).hexdigest()
+        if patch_sha256 != approval.patch_sha256:
+            raise ValueError("live approval patch fingerprint mismatch")
+        manifest_fingerprint = tool_manifest_fingerprint(approval.changed_manifest)
+        if manifest_fingerprint != approval.manifest_fingerprint:
+            raise ValueError("live approval manifest fingerprint mismatch")
+        proof = state.coverage_proof
+        if proof is not None and (
+            proof.base_ref != ref
+            or proof.patch_sha256 != approval.patch_sha256
+            or proof.patch_gate_fingerprint != approval.patch_gate_fingerprint
+            or proof.manifest_fingerprint != approval.manifest_fingerprint
+        ):
+            raise ValueError("persisted coverage proof binding mismatch")
+
+        # Import lazily to avoid importing the nodes package while it imports
+        # this coverage module during graph construction.
+        from .nodes.execute import git_diff
+
+        live_patch = git_diff(str(root))
+        if live_patch != state.patch_content:
+            raise ValueError("live worktree diff does not match approved patch")
+
+        manifest: list[SnapshotManifestEntry] = []
+        targets: list[ApprovedLiveTarget] = []
+        for path in _changed_live_paths(root, ref):
+            base = _base_blob(root, ref, path)
+            live = root / path
+            try:
+                live.lstat()
+            except FileNotFoundError:
+                if base is None:
+                    raise ValueError("live changed path is missing from base and worktree")
+                base_mode, base_sha, base_content = base
+                entry = SnapshotManifestEntry(
+                    path=path,
+                    change="deleted",
+                    mode=base_mode,
+                    size=len(base_content),
+                )
+                target = ApprovedLiveTarget(
+                    path=path,
+                    change="deleted",
+                    mode=base_mode,  # type: ignore[arg-type]
+                    content=None,
+                    content_sha256=None,
+                    size=len(base_content),
+                    base_blob_sha=base_sha,
+                )
+            else:
+                mode, content = _read_live_regular(root, path)
+                digest = hashlib.sha256(content).hexdigest()
+                change: Literal["added", "modified"] = (
+                    "added" if base is None else "modified"
+                )
+                entry = SnapshotManifestEntry(
+                    path=path,
+                    change=change,
+                    mode=mode,
+                    content_sha256=digest,
+                    size=len(content),
+                )
+                target = ApprovedLiveTarget(
+                    path=path,
+                    change=change,
+                    mode=mode,
+                    content=content.decode("utf-8"),
+                    content_sha256=digest,
+                    size=len(content),
+                    base_blob_sha=None if base is None else base[1],
+                )
+            manifest.append(entry)
+            targets.append(target)
+        if tuple(manifest) != tuple(approval.changed_manifest):
+            raise ValueError("live changed manifest does not match approval")
+        return LiveCoverageBinding(
+            patch_content=state.patch_content,
+            patch_sha256=patch_sha256,
+            patch_gate_fingerprint=approval.patch_gate_fingerprint,
+            manifest_fingerprint=manifest_fingerprint,
+            approved_targets=tuple(targets),
+        )
+    except (OSError, RuntimeError, subprocess.SubprocessError, UnicodeDecodeError, ValueError):
+        _clear_live_proof(state)
+        raise ValueError("coverage live binding mismatch") from None
 
 
 def _symbol_spans(source: str) -> list[tuple[int, int, str]]:
@@ -350,16 +602,42 @@ def _authorize_candidate_files(
         for file_path in candidate.test_files:
             item = approved.get(file_path)
             path = root / file_path
+            manifest_entry = next(
+                (
+                    entry
+                    for entry in approval.changed_manifest
+                    if entry.path == file_path
+                ),
+                None,
+            )
+            base = subprocess.run(
+                ["git", "show", f"{ref}:{file_path}"],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                timeout=30,
+            )
             if (
                 file_path not in state.coverage_test_files
                 or item is None
                 or item.patch_gate_fingerprint != approval.patch_gate_fingerprint
+                or manifest_entry is None
+                or manifest_entry.change != item.change
+                or manifest_entry.content_sha256 != item.content_sha256
                 or not path.is_file()
                 or path.is_symlink()
                 or hashlib.sha256(path.read_bytes()).hexdigest()
                 != item.content_sha256
             ):
                 raise ValueError("generated candidate approval does not match its file")
+            if item.change == "added" and base.returncode == 0:
+                raise ValueError("added generated candidate exists in exact base")
+            if item.change == "modified" and (
+                base.returncode != 0
+                or hashlib.sha256(base.stdout).hexdigest()
+                != item.base_content_sha256
+            ):
+                raise ValueError("modified generated candidate base preimage mismatch")
         return
 
     for file_path in candidate.test_files:
@@ -618,23 +896,20 @@ async def _run_isolated_candidate(
     *,
     apply_approved_changes: bool,
 ) -> TestRunFingerprint:
+    validate_live_coverage_binding(state)
     root = Path(state.repo_path).resolve(strict=True)
     config = state.tool_sandbox_config
     if config is None:
         raise ValueError("coverage requires a configured OCI sandbox")
     argv, _normalized = fixed_test_argv(root, state, candidate.argv)
-    overlays = (
-        {
-            path: (root / path).read_bytes()
-            for path in candidate.test_files
-        }
-        if candidate.source == "generated" and not apply_approved_changes
-        else None
-    )
     with disposable_test_snapshot(
         state,
         apply_approved_changes=apply_approved_changes,
-        test_overlays=overlays,
+        test_overlay_paths=(
+            candidate.test_files
+            if candidate.source == "generated" and not apply_approved_changes
+            else None
+        ),
     ) as sandbox:
         result = await asyncio.to_thread(
             run_oci_process,
@@ -649,6 +924,7 @@ async def _run_isolated_candidate(
             f"{result.stdout}\n{result.stderr}",
             sandbox.workspace,
         )
+    validate_live_coverage_binding(state)
     return fingerprint
 
 
@@ -695,6 +971,7 @@ async def validate_differential_coverage(
 ) -> CoverageDecision:
     """Require fixed pass twice and the exact same base assertion twice."""
     try:
+        validate_live_coverage_binding(state)
         root = _exact_repo_root(Path(state.repo_path))
         ref = _exact_ref(root, state.repo_ref)
         head = _git(root, ["git", "rev-parse", "HEAD"]).stdout.strip()
@@ -767,6 +1044,15 @@ async def validate_differential_coverage(
             fixed_runs=fixed_runs,
             base_runs=base_runs,
         )
+    try:
+        validate_live_coverage_binding(state)
+    except ValueError:
+        return _decision(
+            candidate,
+            "coverage_infra",
+            fixed_runs=fixed_runs,
+            base_runs=base_runs,
+        )
     return CoverageDecision(
         verified=True,
         status=(
@@ -783,11 +1069,14 @@ __all__ = [
     "ChangedTarget",
     "CoverageCandidate",
     "CoverageDecision",
+    "ApprovedLiveTarget",
+    "LiveCoverageBinding",
     "collect_changed_targets",
     "coverage_proof_matches_state",
     "discover_coverage_candidates",
     "is_allowed_test_path",
     "normalize_test_result",
     "temporary_base_checkout",
+    "validate_live_coverage_binding",
     "validate_differential_coverage",
 ]

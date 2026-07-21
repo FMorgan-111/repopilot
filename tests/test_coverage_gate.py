@@ -264,6 +264,78 @@ async def test_generated_candidate_is_overlaid_on_base_snapshot_only(
 
 
 @pytest.mark.asyncio
+async def test_modified_generated_test_is_bound_and_overlaid_on_exact_base(
+    differential_repo,
+    monkeypatch,
+):
+    root, base_ref, state, _existing = differential_repo
+    generated = root / "tests" / "test_maths.py"
+    base_test = generated.read_bytes()
+    generated.write_text(
+        "from src.maths import answer\n\n"
+        "def test_answer():\n    assert answer() == 2, 'generated regression'\n",
+        encoding="utf-8",
+    )
+    from src.nodes.execute import git_diff
+
+    full_patch = git_diff(str(root))
+    approval = state.tool_patch_approval
+    assert approval is not None
+    generated_bytes = generated.read_bytes()
+    generated_entry = SnapshotManifestEntry(
+        path="tests/test_maths.py",
+        change="modified",
+        mode="100644",
+        content_sha256=hashlib.sha256(generated_bytes).hexdigest(),
+        size=len(generated_bytes),
+    )
+    manifest = [*approval.changed_manifest, generated_entry]
+    combined_fingerprint = "6" * 64
+    state.patch_content = full_patch
+    state.tool_patch_approval = ToolPatchApproval(
+        base_ref=base_ref,
+        patch_sha256=hashlib.sha256(full_patch.encode()).hexdigest(),
+        patch_gate_fingerprint=combined_fingerprint,
+        changed_manifest=manifest,
+        manifest_fingerprint=tool_manifest_fingerprint(manifest),
+    )
+    state.coverage_test_files = ["tests/test_maths.py"]
+    state.generated_test_approvals = [
+        GeneratedTestApproval(
+            path="tests/test_maths.py",
+            change="modified",
+            base_content_sha256=hashlib.sha256(base_test).hexdigest(),
+            content_sha256=generated_entry.content_sha256,
+            patch_gate_fingerprint=combined_fingerprint,
+        )
+    ]
+    candidate = CoverageCandidate(
+        test_files=["tests/test_maths.py"],
+        argv=["python", "-m", "pytest", "tests/test_maths.py", "-q"],
+        source="generated",
+    )
+
+    def generated_oci(argv, *, sandbox, **_kwargs):
+        assert "generated regression" in (
+            sandbox.workspace / "tests" / "test_maths.py"
+        ).read_text()
+        fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
+        if fixed:
+            return BoundedProcessResult(list(argv), 0, "1 passed", "")
+        return BoundedProcessResult(
+            list(argv),
+            1,
+            "FAILED tests/test_maths.py::test_answer - AssertionError: expected 2 got 1",
+            "",
+        )
+
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", generated_oci)
+    decision = await validate_differential_coverage(state, candidate)
+    assert decision.verified is True
+    assert decision.status == "generated_verified"
+
+
+@pytest.mark.asyncio
 async def test_differential_coverage_requires_stable_fixed_pass_base_failure(
     differential_repo,
 ):

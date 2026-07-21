@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import base64
-import subprocess
-from pathlib import Path
 from typing import Any
 
 import httpx
 
 from ..memory import _fire_and_forget, get_store
+from ..coverage_gate import LiveCoverageBinding, validate_live_coverage_binding
 from ..state import AgentState, Phase, _as_state, _record_tool
 from ..tools import GITHUB_API, _headers
 
@@ -91,10 +90,18 @@ async def _github_add_issue_comment(state: AgentState, body: str) -> dict[str, A
     return resp.json()
 
 
-async def push_files(state: AgentState) -> dict[str, Any]:
+async def push_files(
+    state: AgentState,
+    binding: LiveCoverageBinding | None = None,
+) -> dict[str, Any]:
     """Push changed files through GitHub Contents API."""
     if not state.repo_path:
         raise RuntimeError("Cannot push files without a local repository path.")
+    binding = binding or validate_live_coverage_binding(state)
+    if not binding.approved_targets:
+        raise RuntimeError("Patch applied but produced no approved changed files.")
+    if any(target.change == "deleted" for target in binding.approved_targets):
+        raise RuntimeError("Approved deletions are unsupported by the commit boundary.")
 
     branch = state.branch_name or f"repopilot-fix-{state.issue_number}"
     state.branch_name = branch
@@ -104,40 +111,26 @@ async def push_files(state: AgentState) -> dict[str, Any]:
     state.base_branch = base_branch
     base_ref = await _github_get_ref(state, base_branch)
     base_sha = base_ref.get("object", {}).get("sha", "")
-    if not base_sha:
-        raise RuntimeError(f"Could not resolve base branch {base_branch}.")
+    if base_sha != state.repo_ref:
+        raise RuntimeError(f"Base branch {base_branch} drifted from the approved commit.")
     await _github_create_ref(state, branch, base_sha)
 
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD"],
-        cwd=state.repo_path,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if changed.returncode != 0:
-        raise RuntimeError(changed.stderr or changed.stdout)
-
-    changed_paths = [line.strip() for line in changed.stdout.splitlines() if line.strip()]
-    if not changed_paths:
-        raise RuntimeError("Patch applied but produced no changed files.")
-
     results = []
-    for path in changed_paths:
-        full_path = Path(state.repo_path) / path
-        if not full_path.exists():
-            continue
-        content = full_path.read_text(encoding="utf-8")
-        sha = await _github_get_file_sha(state, path, base_branch)
+    for target in binding.approved_targets:
+        if target.content is None or target.content_sha256 is None:
+            raise RuntimeError("Approved commit target has no exact content.")
+        sha = target.base_blob_sha if target.change == "modified" else ""
+        if target.change == "modified" and not sha:
+            raise RuntimeError("Approved modified target lacks its base blob SHA.")
         result = await _github_create_or_update_file(
             state,
-            path=path,
-            content=content,
+            path=target.path,
+            content=target.content,
             branch=branch,
-            message=f"Fix #{state.issue_number}: update {path}",
-            sha=sha,
+            message=f"Fix #{state.issue_number}: update {target.path}",
+            sha=sha or "",
         )
-        results.append({"path": path, "result": result})
+        results.append({"path": target.path, "result": result})
 
     return {"branch": branch, "base": base_branch, "files": results}
 
@@ -166,7 +159,8 @@ async def commit_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     try:
-        pushed = await push_files(state)
+        binding = validate_live_coverage_binding(state)
+        pushed = await push_files(state, binding)
         _record_tool(state, "push_files", {"branch": state.branch_name}, pushed)
         pr = await create_pr(state)
         _record_tool(

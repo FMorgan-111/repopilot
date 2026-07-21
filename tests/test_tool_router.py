@@ -12,6 +12,7 @@ from src.evidence import EvidenceStore
 from src.safe_subprocess import BoundedProcessResult
 from src.state import (
     AgentState,
+    GeneratedTestApproval,
     SnapshotManifestEntry,
     ToolPatchApproval,
     ToolSandboxConfig,
@@ -21,6 +22,7 @@ from src.tool_router import (
     _disposable_test_snapshot,
     _preflight_exact_tree,
     _scan_snapshot,
+    disposable_test_snapshot,
     route_tool_intent,
 )
 
@@ -631,6 +633,54 @@ def test_public_disposable_snapshot_can_select_exact_base_or_approved_fixed(
         state, apply_approved_changes=True
     ) as fixed:
         assert "'fixed'" in (fixed.workspace / "src" / "widget.py").read_text()
+
+
+def test_public_disposable_snapshot_rejects_caller_supplied_overlay_bytes(tmp_path):
+    root, commit = _repo(tmp_path)
+    state = _state(root, commit)
+
+    with pytest.raises(TypeError):
+        with disposable_test_snapshot(
+            state,
+            apply_approved_changes=False,
+            test_overlays={"tests/test_widget.py": b"caller-controlled"},
+        ):
+            pytest.fail("caller-supplied overlay bytes were accepted")
+
+
+def test_public_disposable_snapshot_derives_only_fully_approved_test_overlays(
+    tmp_path,
+):
+    root, commit = _repo(tmp_path)
+    state = _state(
+        root,
+        commit,
+        coverage_test_files=["tests/test_widget.py"],
+    )
+
+    with pytest.raises(ValueError, match="generated test approval"):
+        with disposable_test_snapshot(
+            state,
+            apply_approved_changes=False,
+            test_overlay_paths=["tests/test_widget.py"],
+        ):
+            pytest.fail("unapproved existing test was overlaid")
+
+
+def test_generated_test_approval_persists_modified_base_preimage_binding(tmp_path):
+    root, commit = _repo(tmp_path)
+    base = (root / "tests" / "test_widget.py").read_bytes()
+    approval = GeneratedTestApproval(
+        path="tests/test_widget.py",
+        change="modified",
+        base_content_sha256=hashlib.sha256(base).hexdigest(),
+        content_sha256="d" * 64,
+        patch_gate_fingerprint="e" * 64,
+    )
+
+    loaded = GeneratedTestApproval.model_validate_json(approval.model_dump_json())
+    assert loaded.change == "modified"
+    assert loaded.base_content_sha256 == hashlib.sha256(base).hexdigest()
 
 
 async def test_sensitive_delete_and_public_add_suppresses_all_diff_evidence(tmp_path):

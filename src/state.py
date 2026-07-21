@@ -20,7 +20,7 @@ from pydantic import (
     model_validator,
 )
 
-from .evaluator_safety import sanitize_evaluator_text
+from .evaluator_safety import contains_evaluator_only, sanitize_evaluator_text
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
 
@@ -403,6 +403,8 @@ class RepairPlan(BaseModel):
 
     @staticmethod
     def _reject_smuggling(value: str) -> str:
+        if contains_evaluator_only(value):
+            raise ValueError("RepairPlan fields cannot contain evaluator metadata")
         if _REPAIR_SMUGGLING_RE.search(value):
             raise ValueError("RepairPlan fields cannot contain patch or edit payloads")
         return value
@@ -469,6 +471,17 @@ class VerifiedEdit(BaseModel):
     intent: str = Field(min_length=1, max_length=2_000)
     _expected_content_sha256: str = PrivateAttr(default="")
     _exact_only: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_evaluator_metadata(cls, value: Any) -> Any:
+        if isinstance(value, dict) and any(
+            contains_evaluator_only(item)
+            for item in value.values()
+            if item is not None
+        ):
+            raise ValueError("VerifiedEdit cannot contain evaluator metadata")
+        return value
 
     @field_validator("file_path", mode="before")
     @classmethod
@@ -742,9 +755,28 @@ class ToolPatchApproval(BaseModel):
 class GeneratedTestApproval(BaseModel):
     """Persisted authorization for one exact generated test payload."""
 
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
     path: str
+    change: Literal["added", "modified"] = "added"
+    base_content_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def _validate_path(cls, value: Any) -> str:
+        return canonical_repo_path(value)
+
+    @model_validator(mode="after")
+    def _validate_base_binding(self) -> "GeneratedTestApproval":
+        if self.change == "added" and self.base_content_sha256 is not None:
+            raise ValueError("added generated test cannot have a base preimage")
+        if self.change == "modified" and self.base_content_sha256 is None:
+            raise ValueError("modified generated test requires a base preimage")
+        return self
 
 
 ToolAction = Literal[
@@ -864,6 +896,27 @@ class AgentState(BaseModel):
     # Benchmark/eval mode skips COMMIT only after differential coverage proof.
     skip_commit: bool = False
     _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_evaluator_patch_state(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        patch_values = [
+            value.get("patch_content"),
+            value.get("patch_edits"),
+            value.get("active_repair_plan"),
+        ]
+        for attempt in value.get("fix_attempts") or []:
+            if isinstance(attempt, dict):
+                patch_values.extend(
+                    [attempt.get("patch_content"), attempt.get("patch_edits")]
+                )
+            elif isinstance(attempt, FixAttempt):
+                patch_values.extend([attempt.patch_content, attempt.patch_edits])
+        if any(contains_evaluator_only(item) for item in patch_values if item):
+            raise ValueError("AgentState cannot contain evaluator patch metadata")
+        return value
 
     @field_validator("coverage_proof", mode="before")
     @classmethod

@@ -246,7 +246,7 @@ async def test_oracle_seed_with_files_starts_agent_at_plan(monkeypatch):
     assert captured["state"].current_phase == new_agent.Phase.PLAN
 
 
-def test_agent_payload_exports_binary_git_diff(tmp_path):
+def test_agent_payload_rejects_unapproved_binary_git_diff(tmp_path):
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
@@ -278,10 +278,12 @@ def test_agent_payload_exports_binary_git_diff(tmp_path):
 
     payload = new_agent.agent_payload_from_state(state, turns_taken=0)
 
-    assert payload["model_patch"] == expected
+    assert expected
+    assert payload["model_patch"] == ""
+    assert payload["success"] is False
 
 
-def test_agent_payload_exports_untracked_files(tmp_path):
+def test_agent_payload_rejects_unapproved_untracked_files(tmp_path):
     subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
     subprocess.run(
         ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
@@ -307,9 +309,8 @@ def test_agent_payload_exports_untracked_files(tmp_path):
 
     payload = new_agent.agent_payload_from_state(state, turns_taken=0)
 
-    assert "new file mode" in payload["model_patch"]
-    assert "new_file.py" in payload["model_patch"]
-    assert "+enabled = True" in payload["model_patch"]
+    assert payload["model_patch"] == ""
+    assert payload["success"] is False
 
 
 def test_agent_payload_excludes_untracked_generated_archives(tmp_path):
@@ -339,7 +340,7 @@ def test_agent_payload_excludes_untracked_generated_archives(tmp_path):
 
     payload = new_agent.agent_payload_from_state(state, turns_taken=0)
 
-    assert "new_file.py" in payload["model_patch"]
+    assert payload["model_patch"] == ""
     assert "setuptools-33.1.1.zip" not in payload["model_patch"]
 
 
@@ -653,7 +654,7 @@ async def test_agent_v2_ignores_final_run_persistence_errors(monkeypatch):
         save_final_run=True,
     )
 
-    assert payload["success"] is True
+    assert payload["success"] is False
     assert payload["final_phase"] == "DONE"
     assert payload["run_id"] == payload["trace_id"]
 
@@ -677,7 +678,7 @@ async def test_agent_v2_saves_final_run_when_requested(monkeypatch, tmp_path):
         save_final_run=True,
     )
 
-    assert payload["success"] is True
+    assert payload["success"] is False
     assert payload["run_id"] == payload["trace_id"]
     assert (tmp_path / ".repopilot" / "runs" / f"{payload['trace_id']}.json").exists()
 
@@ -780,7 +781,7 @@ async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch)
             "Breaking changes are not allowed."
         ),
     )
-    assert payload["success"] is True
+    assert payload["success"] is False
     assert payload["run_id"] == "abc123def456"
     assert payload["final_phase"] == "DONE"
 

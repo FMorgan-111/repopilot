@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .local_search import is_sensitive_repo_path
+from .evaluator_safety import contains_evaluator_only
 from .model_provider import redact_secrets
 from .patch_match import closest_region, leading_spaces, locate_node_span, reindent
 from .repo_paths import canonical_repo_path
@@ -341,6 +342,20 @@ def validate_patch_batch(
 ) -> PatchGateResult:
     """Simulate a complete edit batch and authorize its exact resulting diff."""
     issues: list[PatchGateIssue] = []
+    if contains_evaluator_only(plan.model_dump(mode="json")) or contains_evaluator_only(
+        batch.model_dump(mode="json")
+    ):
+        _clear_gate_output(state)
+        return PatchGateResult(
+            accepted=False,
+            issues=[
+                _issue(
+                    "scope_violation",
+                    "",
+                    "Evaluator metadata is forbidden at the PatchGate boundary.",
+                )
+            ],
+        )
     try:
         root = _exact_root(state)
     except ValueError as exc:

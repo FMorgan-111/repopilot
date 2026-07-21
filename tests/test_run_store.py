@@ -299,6 +299,49 @@ def test_run_store_load_and_replay_sanitize_hostile_file(tmp_path):
     assert replay["attempt_outcome_summary"] == "safe loaded prefix"
 
 
+def test_run_store_clears_legacy_evaluator_contaminated_patch_state(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    sentinel = "legacy-evaluator-patch-sentinel-8139"
+    path = run_store.run_path("hostile-legacy-patch", root_dir=root_dir)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "issue_url": "https://github.com/acme/widget/issues/7",
+                "trace_id": "hostile-legacy-patch",
+                "current_phase": "PLAN",
+                "patch_content": f"gold_patch={sentinel}",
+                "patch_edits": [
+                    {
+                        "file_path": "tests/test_safe.py",
+                        "search": "value = 1",
+                        "replace": f"FAIL_TO_PASS: {sentinel}",
+                    }
+                ],
+                "fix_attempts": [
+                    {
+                        "patch_content": f"test_patch={sentinel}",
+                        "test_result": "passed",
+                        "success": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = run_store.load_run("hostile-legacy-patch", root_dir=root_dir)
+    saved = run_store.save_run(loaded, root_dir=root_dir).read_text(encoding="utf-8")
+
+    assert loaded.patch_content == ""
+    assert loaded.patch_edits == []
+    assert loaded.fix_attempts[0].patch_content == ""
+    assert loaded.fix_attempts[0].success is False
+    assert sentinel not in saved
+    assert "gold_patch" not in saved.casefold()
+    assert "fail_to_pass" not in saved.casefold()
+
+
 def test_legacy_saved_state_loads_outcome_summary_defaults(tmp_path):
     root_dir = tmp_path / ".repopilot"
     path = run_store.run_path("legacy-summary", root_dir=root_dir)

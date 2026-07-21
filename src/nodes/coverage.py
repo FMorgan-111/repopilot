@@ -12,6 +12,7 @@ from ..coverage_gate import (
     collect_changed_targets,
     coverage_proof_matches_state,
     discover_coverage_candidates,
+    validate_live_coverage_binding,
     validate_differential_coverage,
 )
 from ..state import AgentState, CoverageProof, Phase, _as_state
@@ -22,6 +23,7 @@ def _persist_verified(state: AgentState, decision: CoverageDecision) -> None:
     candidate = decision.candidate
     if not decision.verified or candidate is None:
         raise ValueError("coverage proof persistence requires a verified candidate")
+    validate_live_coverage_binding(state)
     state.coverage_status = decision.status
     state.coverage_test_files = list(candidate.test_files)
     state.coverage_test_command = " ".join(candidate.argv)
@@ -46,7 +48,22 @@ def _persist_verified(state: AgentState, decision: CoverageDecision) -> None:
             for path in candidate.test_files
         },
     )
+    validate_live_coverage_binding(state)
     state.current_phase = Phase.DONE if state.skip_commit else Phase.COMMIT
+
+
+def _try_persist_verified(state: AgentState, decision: CoverageDecision) -> bool:
+    try:
+        _persist_verified(state, decision)
+    except (OSError, RuntimeError, ValueError):
+        state.coverage_status = "failed"
+        state.coverage_failure_reason = "coverage_infra"
+        state.coverage_proof = None
+        state.failure_reason = "coverage_infra:live_binding_mismatch"
+        state.pr_url = None
+        state.current_phase = Phase.FAILURE
+        return False
+    return True
 
 
 async def ensure_coverage(state: AgentState | dict[str, Any]) -> AgentState:
@@ -63,7 +80,7 @@ async def ensure_coverage(state: AgentState | dict[str, Any]) -> AgentState:
             )
             replay = await validate_differential_coverage(state, replay_candidate)
             if replay.verified:
-                _persist_verified(state, replay)
+                _try_persist_verified(state, replay)
                 return state
             replay_reason = replay.reason
         else:
@@ -84,13 +101,13 @@ async def ensure_coverage(state: AgentState | dict[str, Any]) -> AgentState:
     for candidate in candidates:
         decision = await validate_differential_coverage(state, candidate)
         if decision.verified:
-            _persist_verified(state, decision)
+            _try_persist_verified(state, decision)
             return state
         rejection_reason = decision.reason
 
     generated = await run_test_generation_attempts(state, rejection_reason)
     if generated.verified:
-        _persist_verified(state, generated)
+        _try_persist_verified(state, generated)
         return state
 
     reason = generated.reason or "invalid_generated_test"

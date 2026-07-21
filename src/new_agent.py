@@ -20,6 +20,7 @@ from .graph import (
     run_graph,
 )
 from .evaluator_safety import safe_prediction_patch
+from .coverage_gate import validate_live_coverage_binding
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.coverage import ensure_coverage
@@ -290,11 +291,17 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
 
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
     report = final_report_from_state(state, turns_taken)
+    try:
+        live_binding = validate_live_coverage_binding(state)
+    except ValueError:
+        live_binding = None
+    terminal_success = state.current_phase == Phase.DONE and live_binding is not None
     payload = report.model_dump()
+    payload["fix_applied"] = terminal_success
     payload.update(
         {
             "done": state.current_phase in {Phase.DONE, Phase.FAILED},
-            "success": state.current_phase == Phase.DONE,
+            "success": terminal_success,
             "waiting_for_user": state.current_phase == Phase.WAITING_FOR_USER,
             "final_phase": state.current_phase.value,
             "trace_id": state.trace_id,
@@ -334,9 +341,7 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 else None
             ),
             "model_patch": safe_prediction_patch(
-                ""
-                if state.coverage_failure_reason == "generated_test_rollback_failed"
-                else git_diff(state.repo_path)
+                live_binding.patch_content if live_binding is not None else ""
             ),
             "error": state.failure_reason or None,
         }

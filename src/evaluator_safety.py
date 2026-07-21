@@ -17,30 +17,13 @@ def contains_evaluator_only(value: object) -> bool:
 
 
 def sanitize_evaluator_text(value: object) -> str:
-    """Remove complete lines and indented blocks containing evaluator metadata.
-
-    Substituting just a field name is unsafe because its value would remain.  A
-    marker therefore removes its whole line; a marker used as a block header
-    also removes following lines until the next blank line.
-    """
+    """Truncate at the first line bearing evaluator-only metadata."""
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     safe_lines: list[str] = []
-    skipping_block = False
     for line in text.split("\n"):
-        if skipping_block:
-            if line.strip():
-                continue
-            skipping_block = False
-            if safe_lines and safe_lines[-1] != "":
-                safe_lines.append("")
-            continue
-        marker = _EVALUATOR_ONLY_RE.search(line)
-        if marker is None:
-            safe_lines.append(line)
-            continue
-        suffix = line[marker.end() :].strip()
-        if not suffix or suffix in {":", "=", "-"}:
-            skipping_block = True
+        if _EVALUATOR_ONLY_RE.search(line) is not None:
+            break
+        safe_lines.append(line)
     return "\n".join(safe_lines).strip()
 
 

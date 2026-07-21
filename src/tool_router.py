@@ -9,7 +9,7 @@ import tarfile
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Literal, Mapping
+from typing import Iterator, Literal, Sequence
 
 from pydantic import BaseModel
 
@@ -56,6 +56,9 @@ _MAX_PATCH_BYTES = 2_000_000
 _MAX_SNAPSHOT_FILES = 20_000
 _MAX_SNAPSHOT_BYTES = 512_000_000
 _MAX_ARCHIVE_BYTES = 768_000_000
+_MAX_TEST_OVERLAY_FILES = 16
+_MAX_TEST_OVERLAY_FILE_BYTES = 512_000
+_MAX_TEST_OVERLAY_TOTAL_BYTES = 2_000_000
 _PROTECTED_RUNTIME_MANIFESTS = frozenset(
     {
         "package.json",
@@ -374,10 +377,112 @@ def _validate_generated_snapshot(state: AgentState, workspace: Path) -> None:
             digest != generated.content_sha256
             or source_digest != generated.content_sha256
             or manifest_entry is None
-            or manifest_entry.change != "added"
+            or manifest_entry.change != generated.change
             or manifest_entry.content_sha256 != generated.content_sha256
         ):
             raise ValueError("approved generated test content mismatch")
+
+
+def _read_overlay_source(root: Path, relative: str) -> bytes:
+    current = root
+    for component in Path(relative).parts:
+        current = current / component
+        info = current.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise ValueError("generated test overlay crosses a symlink")
+    info = current.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_size > _MAX_TEST_OVERLAY_FILE_BYTES:
+        raise ValueError("generated test overlay is not a bounded regular file")
+    descriptor = os.open(current, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or (
+            opened.st_dev,
+            opened.st_ino,
+        ) != (info.st_dev, info.st_ino):
+            raise ValueError("generated test overlay identity drifted")
+        chunks: list[bytes] = []
+        total = 0
+        while chunk := os.read(descriptor, 65_536):
+            total += len(chunk)
+            if total > _MAX_TEST_OVERLAY_FILE_BYTES:
+                raise ValueError("generated test overlay exceeds its byte cap")
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    content = b"".join(chunks)
+    text = content.decode("utf-8")
+    if "\0" in text:
+        raise ValueError("generated test overlay contains NUL")
+    return content
+
+
+def _approved_test_overlays(
+    state: AgentState,
+    paths: Sequence[str] | None,
+) -> tuple[tuple[str, bytes], ...]:
+    if paths is None:
+        return ()
+    if len(paths) > _MAX_TEST_OVERLAY_FILES:
+        raise ValueError("too many generated test overlays")
+    approval = state.tool_patch_approval
+    if approval is None:
+        raise ValueError("generated test approval requires a combined patch approval")
+    root = Path(state.repo_path).resolve(strict=True)
+    normalized = [canonical_repo_path(path) for path in paths]
+    if len(normalized) != len(set(normalized)):
+        raise ValueError("generated test overlay paths must be unique")
+    generated = {item.path: item for item in state.generated_test_approvals}
+    entries = {item.path: item for item in approval.changed_manifest}
+    overlays: list[tuple[str, bytes]] = []
+    total = 0
+    for path in normalized:
+        name = Path(path).name.casefold()
+        is_test_name = (name.startswith("test_") or name.endswith("_test.py")) and name.endswith(".py")
+        if (
+            path not in state.coverage_test_files
+            or is_sensitive_repo_path(path)
+            or not is_test_name
+            or not any(part.casefold() in {"test", "tests"} for part in Path(path).parts[:-1])
+        ):
+            raise ValueError("generated test overlay is not an approved test path")
+        marker = generated.get(path)
+        entry = entries.get(path)
+        if marker is None:
+            raise ValueError("generated test approval is missing")
+        if (
+            marker.patch_gate_fingerprint != approval.patch_gate_fingerprint
+            or entry is None
+            or entry.change not in {"added", "modified"}
+            or marker.change != entry.change
+            or marker.content_sha256 != entry.content_sha256
+        ):
+            raise ValueError("generated test approval does not match the combined manifest")
+        content = _read_overlay_source(root, path)
+        digest = hashlib.sha256(content).hexdigest()
+        if digest != marker.content_sha256 or len(content) != entry.size:
+            raise ValueError("generated test overlay digest does not match approval")
+        base = run_bounded_process(
+            [trusted_executable("git"), "-C", str(root), "show", f"{state.repo_ref}:{path}"],
+            cwd=root,
+            timeout=30,
+            max_output_bytes=_MAX_TEST_OVERLAY_FILE_BYTES + 1,
+            decode_errors="strict",
+        )
+        if marker.change == "added":
+            if base.returncode == 0:
+                raise ValueError("added generated test unexpectedly exists in base")
+        elif (
+            base.returncode != 0
+            or marker.base_content_sha256
+            != hashlib.sha256(base.stdout.encode("utf-8")).hexdigest()
+        ):
+            raise ValueError("modified generated test base preimage mismatch")
+        total += len(content)
+        if total > _MAX_TEST_OVERLAY_TOTAL_BYTES:
+            raise ValueError("generated test overlays exceed total byte cap")
+        overlays.append((path, content))
+    return tuple(overlays)
 
 
 @contextmanager
@@ -385,7 +490,7 @@ def disposable_test_snapshot(
     state: AgentState,
     *,
     apply_approved_changes: bool = True,
-    test_overlays: Mapping[str, bytes] | None = None,
+    test_overlay_paths: Sequence[str] | None = None,
 ) -> Iterator[SandboxPaths]:
     """Yield a fresh exact-base archive snapshot, optionally with its approved diff."""
     with tempfile.TemporaryDirectory(prefix="repopilot-tool-sandbox-") as directory:
@@ -445,11 +550,10 @@ def disposable_test_snapshot(
             raise ValueError("snapshot changes do not match approved manifest")
         if apply_approved_changes:
             _validate_generated_snapshot(state, sandbox.workspace)
-        for raw_path, content in (test_overlays or {}).items():
+        for raw_path, content in _approved_test_overlays(state, test_overlay_paths):
             path = canonical_repo_path(raw_path)
             if (
                 is_sensitive_repo_path(path)
-                or not isinstance(content, bytes)
                 or len(content) > 512_000
             ):
                 raise ValueError("unsafe disposable test overlay")

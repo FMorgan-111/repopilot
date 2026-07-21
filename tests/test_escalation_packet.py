@@ -129,7 +129,7 @@ def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
             patch_gate_fingerprint="d" * 64,
         )
     ]
-    state.fix_attempts = [
+    hostile_legacy_attempts = [
         FixAttempt(
             patch_content="gold-patch-payload-sentinel",
             test_result="failed",
@@ -184,6 +184,9 @@ def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
             status="ok",
         )
     ]
+    # Simulate a legacy/validation-bypassed object only after ordinary state
+    # assignments; current AgentState rejects these attempts on every assignment.
+    object.__setattr__(state, "fix_attempts", hostile_legacy_attempts)
 
     packet = build_escalation_packet(state)
     dumped = packet.model_dump_json()

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .home import repopilot_home
+from .evaluator_safety import contains_evaluator_only
 from .state import AgentState
 from .summary_safety import sanitize_summary_text
 
@@ -32,6 +33,7 @@ def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
     path = run_path(state.trace_id, root_dir=root_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = state.model_dump(mode="json")
+    payload = _clear_legacy_evaluator_patch_state(payload)
     payload["attempt_outcome_summary"] = _safe_outcome_summary(state)
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return path
@@ -40,7 +42,47 @@ def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
 def load_run(run_id: str, root_dir: Path | str | None = None) -> AgentState:
     path = run_path(run_id, root_dir=root_dir)
     data = json.loads(path.read_text(encoding="utf-8"))
-    return AgentState.model_validate(data)
+    return AgentState.model_validate(_clear_legacy_evaluator_patch_state(data))
+
+
+def _clear_legacy_evaluator_patch_state(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove legacy patch-bearing fields before they cross the state boundary."""
+    cleaned = dict(data)
+    patch_fields = (
+        cleaned.get("patch_content"),
+        cleaned.get("patch_edits"),
+        cleaned.get("active_repair_plan"),
+    )
+    if any(contains_evaluator_only(item) for item in patch_fields if item):
+        cleaned["patch_content"] = ""
+        cleaned["patch_edits"] = []
+        cleaned["active_repair_plan"] = None
+        cleaned["tool_patch_approval"] = None
+        cleaned["generated_test_approvals"] = []
+        cleaned["coverage_proof"] = None
+        cleaned["coverage_status"] = "pending"
+    attempts: list[Any] = []
+    for raw in cleaned.get("fix_attempts") or []:
+        if not isinstance(raw, dict):
+            attempts.append(raw)
+            continue
+        attempt = dict(raw)
+        patch_values = (attempt.get("patch_content"), attempt.get("patch_edits"))
+        if any(contains_evaluator_only(item) for item in patch_values if item):
+            attempt.update(
+                {
+                    "patch_content": "",
+                    "patch_edits": [],
+                    "file_path": "",
+                    "test_result": "",
+                    "failure_kind": "evaluator_contaminated",
+                    "error_log": "",
+                    "success": False,
+                }
+            )
+        attempts.append(attempt)
+    cleaned["fix_attempts"] = attempts
+    return cleaned
 
 
 def inspect_run(run_id: str, root_dir: Path | str | None = None) -> dict[str, Any]:
