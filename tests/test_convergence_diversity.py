@@ -12,6 +12,7 @@ from src import model_policy
 from src.evidence import EvidenceStore
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
+from src.nodes import execute as execute_node
 from src.state import PatchEdit
 
 
@@ -384,6 +385,178 @@ async def test_assertion_diversity_resolves_prior_search_to_exact_ast_symbol(
     assert result.assertion_diversity_required is (
         expected_phase == new_agent.Phase.PLAN
     )
+
+
+@pytest.mark.parametrize(
+    ("candidate_symbol", "expected_phase"),
+    [("f", new_agent.Phase.PLAN), ("g", new_agent.Phase.EXECUTE)],
+)
+async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
+    tmp_path,
+    monkeypatch,
+    candidate_symbol,
+    expected_phase,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = (
+        "def f():\n"
+        "    old_value = 1\n"
+        "    return old_value\n\n"
+        "def g():\n"
+        "    return 2\n"
+    )
+    (repo / "module.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    async def failed_test(*args, **kwargs):
+        return {
+            "command": "pytest",
+            "returncode": 1,
+            "stdout": "AssertionError: expected new value",
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "run_pytest", failed_test)
+    monkeypatch.setattr(
+        execute_node,
+        "_create_venv",
+        lambda _repo: {"python": "python3", "reason": "exists", "success": True},
+    )
+    state = _base_state(
+        current_phase=new_agent.Phase.EXECUTE,
+        repo_path=str(repo),
+        repo_ref=ref,
+        patch_edits=[
+            PatchEdit(
+                file_path="module.py",
+                search="    old_value = 1\n",
+                replace="    new_value = 3\n",
+            )
+        ],
+        test_command="pytest",
+    )
+
+    state = await execute_node.execute_fix(state)
+
+    assert "old_value = 1" not in (repo / "module.py").read_text(encoding="utf-8")
+    assert state.fix_attempts[-1].patch_edits[0].resolved_target_symbol == "f"
+    state.assertion_diversity_required = True
+    state.current_phase = new_agent.Phase.PLAN
+
+    async def fake_llm_call(system, user):
+        return json.dumps(
+            {
+                "kind": "plan",
+                "plan": f"Target {candidate_symbol}.",
+                "patch": "",
+                "patch_edits": [
+                    {
+                        "file": "module.py",
+                        "node_target": candidate_symbol,
+                        "replace": f"def {candidate_symbol}():\n    return 9\n",
+                    }
+                ],
+                "files": ["module.py"],
+                "test_command": "pytest",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": f"Target {candidate_symbol}.",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == expected_phase
+
+
+async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = (
+        "class Widget:\n"
+        "    def f(self):\n"
+        "        old_value = 1\n"
+        "        return old_value\n"
+    )
+    (repo / "module.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    async def failed_test(*args, **kwargs):
+        return {
+            "command": "pytest", "returncode": 1,
+            "stdout": "AssertionError: expected new", "stderr": "", "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "run_pytest", failed_test)
+    monkeypatch.setattr(
+        execute_node,
+        "_create_venv",
+        lambda _repo: {"python": "python3", "reason": "exists", "success": True},
+    )
+    state = _base_state(
+        current_phase=new_agent.Phase.EXECUTE,
+        repo_path=str(repo),
+        repo_ref=ref,
+        patch_edits=[
+            PatchEdit(
+                file_path="module.py",
+                search="        old_value = 1\n",
+                replace="        new_value = 3\n",
+            )
+        ],
+        test_command="pytest",
+    )
+
+    result = await execute_node.execute_fix(state)
+
+    assert result.fix_attempts[-1].patch_edits[0].resolved_target_symbol == "Widget.f"
+
+
+def test_legacy_patch_edit_defaults_resolved_symbol_for_saved_state_compatibility():
+    edit = PatchEdit.model_validate(
+        {
+            "file_path": "module.py",
+            "search": "old",
+            "replace": "new",
+        }
+    )
+
+    assert edit.resolved_target_symbol == ""
 
 
 async def test_plan_prompt_includes_failed_edits(monkeypatch):
@@ -944,7 +1117,7 @@ async def test_escalated_reflect_tool_reprompt_contains_only_delta_evidence(
     ]
 
     async def fake_llm_call(system, user, **kwargs):
-        calls.append(user)
+        calls.append((system, user))
         return responses.pop(0)
 
     async def delta_router(state, intent, *, calls_this_round):
@@ -989,6 +1162,11 @@ async def test_escalated_reflect_tool_reprompt_contains_only_delta_evidence(
     result = await reflect_node.reflect_on_failure(state)
 
     assert result.current_phase == new_agent.Phase.PLAN
-    assert "old-reflect-evidence-sentinel" in calls[0]
-    assert "new-reflect-evidence-sentinel" in calls[1]
-    assert "old-reflect-evidence-sentinel" not in calls[1]
+    assert all(system == reflect_node.ESCALATED_REFLECT_SYSTEM for system, _ in calls)
+    assert "old-reflect-evidence-sentinel" in calls[0][1]
+    assert "new-reflect-evidence-sentinel" in calls[1][1]
+    assert "old-reflect-evidence-sentinel" not in calls[1][1]
+    assert not any(
+        item.get("event") == "opus_no_progress"
+        for item in result.node_diagnostics
+    )

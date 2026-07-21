@@ -30,7 +30,7 @@ from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
     generate_opus_repair,
-    read_exact_checkout_text,
+    resolve_search_target_symbol,
     request_verified_edit_correction,
 )
 from ..reasoning_loop import (
@@ -258,36 +258,6 @@ def _planned_edits_repeat_failure(state: AgentState) -> bool:
     )
 
 
-def _enclosing_symbol_for_search(state: AgentState, edit: Any) -> str | None:
-    if not edit.search or not edit.file_path.endswith(".py"):
-        return None
-    try:
-        source = read_exact_checkout_text(state, edit.file_path)
-        if source.count(edit.search) != 1:
-            return None
-        line = source.count("\n", 0, source.index(edit.search)) + 1
-        tree = ast.parse(source)
-    except (OSError, SyntaxError, ValueError):
-        return None
-
-    candidates: list[tuple[int, str]] = []
-
-    def visit(node: ast.AST, prefix: tuple[str, ...] = ()) -> None:
-        for child in ast.iter_child_nodes(node):
-            child_prefix = prefix
-            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                end_line = getattr(child, "end_lineno", child.lineno)
-                child_prefix = (*prefix, child.name)
-                if child.lineno <= line <= end_line:
-                    candidates.append((len(child_prefix), ".".join(child_prefix)))
-            visit(child, child_prefix)
-
-    visit(tree)
-    if not candidates:
-        return None
-    return max(candidates)[1]
-
-
 def _prior_assertion_symbols(state: AgentState) -> tuple[set[str], bool]:
     symbols: set[str] = set()
     unresolved = False
@@ -295,10 +265,17 @@ def _prior_assertion_symbols(state: AgentState) -> tuple[set[str], bool]:
         if attempt.success or _test_failure_class(attempt) != "assertion_failure":
             continue
         for edit in attempt.patch_edits:
+            if edit.resolved_target_symbol:
+                symbols.add(edit.resolved_target_symbol)
+                continue
             if edit.node_target:
                 symbols.add(edit.node_target)
                 continue
-            symbol = _enclosing_symbol_for_search(state, edit)
+            symbol = resolve_search_target_symbol(
+                state,
+                edit.file_path,
+                edit.search,
+            )
             if symbol is None:
                 unresolved = True
             else:
@@ -1361,6 +1338,20 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     frame.recommended_action = "plan"
                     state.current_phase = Phase.PLAN
                 else:
+                    for edit in state.patch_edits:
+                        if (
+                            edit.search
+                            and not edit.node_target
+                            and not edit.resolved_target_symbol
+                        ):
+                            edit.resolved_target_symbol = (
+                                resolve_search_target_symbol(
+                                    state,
+                                    edit.file_path,
+                                    edit.search,
+                                )
+                                or ""
+                            )
                     record_progress(state)
                     state.assertion_diversity_required = False
                     if _planned_edits_repeat_failure(state):

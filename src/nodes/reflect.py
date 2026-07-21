@@ -47,13 +47,14 @@ from .plan import _prior_failed_edits_context
 ESCALATED_REFLECT_SYSTEM = (
     "You are RepoPilot's escalated reflection node. The user message is the "
     "complete allowlisted EscalationPacket; do not request hidden conversation or "
-    "evaluator data. Return ONLY JSON with root_cause, what_went_wrong, "
-    "suggested_fix_approach, files_that_also_need_changes, and decision_frame. "
+    "evaluator data. Return exactly one exclusive JSON variant and must not mix "
+    "fields: kind='tool' with only tool_intent; kind='reflect' with root_cause, "
+    "what_went_wrong, suggested_fix_approach, files_that_also_need_changes, and "
+    "decision_frame; or kind='stop' with only stop_reason. "
     "decision_frame must use stage='reflect' and include summary, hypotheses, "
     "selected_hypothesis_id, evidence, next_checks, recommended_action='plan', "
-    "risk, and confidence. If one approved local evidence call is essential, "
-    "include optional tool_intent with action, args, reason, and expected_evidence; "
-    "deterministic policy decides whether it runs."
+    "risk, and confidence. A tool_intent contains action, args, reason, and "
+    "expected_evidence; deterministic policy decides whether it runs."
 )
 
 
@@ -297,7 +298,8 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     system = (
         "You are RepoPilot's reflection node. Return exactly one JSON response "
         "variant: kind='tool' with one tool_intent, kind='reflect' with the "
-        "reflection fields below, or kind='stop'. The deterministic runtime alone "
+        "reflection fields below, or kind='stop' with stop_reason. Never mix fields "
+        "from different variants. The deterministic runtime alone "
         "chooses model escalation. Analyze WHY the fix failed. "
         "Be specific. Return JSON with keys: root_cause (string), "
         "what_went_wrong (string), suggested_fix_approach (string), "

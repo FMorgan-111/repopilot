@@ -164,6 +164,9 @@ class PatchEdit(BaseModel):
     # The executor locates the node via AST — no verbatim text anchoring, no
     # line drift. When set, `search` must be empty.
     node_target: str = ""
+    # Safe identity resolved from the exact pre-apply source for search-only edits.
+    # This is metadata only; the executor continues to apply `search` verbatim.
+    resolved_target_symbol: str = Field(default="", max_length=300)
     # Verified escalation edits are bound to this exact whole-file preimage.
     # Task 8's PatchGate consumes the digest; `exact_only` already disables all
     # normalized/fuzzy fallbacks in the legacy executor.
@@ -176,6 +179,17 @@ class PatchEdit(BaseModel):
         if value and not re.fullmatch(r"[0-9a-f]{64}", value):
             raise ValueError("expected_content_sha256 must be lowercase SHA-256")
         return value
+
+    @field_validator("resolved_target_symbol")
+    @classmethod
+    def _validate_resolved_target_symbol(cls, value: str) -> str:
+        symbol = str(value or "").strip()
+        if symbol and not re.fullmatch(
+            r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*",
+            symbol,
+        ):
+            raise ValueError("resolved_target_symbol must be a dotted code symbol")
+        return symbol
 
     @model_validator(mode="before")
     @classmethod

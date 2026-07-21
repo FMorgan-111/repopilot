@@ -8,6 +8,7 @@ from src import graph, model_policy, new_agent, run_store
 from src.evidence import EvidenceStore
 from src.http_client import LLMResponseError
 from src.nodes import plan as plan_node
+from src.nodes import reflect as reflect_node
 from src.reasoning_loop import (
     ReasoningStop,
     response_tool_intent,
@@ -33,6 +34,16 @@ def _state(**updates):
     }
     values.update(updates)
     return new_agent.AgentState(**values)
+
+
+def test_escalated_reflect_prompt_declares_three_exclusive_variants():
+    prompt = reflect_node.ESCALATED_REFLECT_SYSTEM
+
+    assert "kind='tool'" in prompt
+    assert "kind='reflect'" in prompt
+    assert "kind='stop'" in prompt
+    assert "optional tool_intent" not in prompt
+    assert "must not mix" in prompt.lower()
 
 
 def _enable_escalation(monkeypatch):

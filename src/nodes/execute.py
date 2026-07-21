@@ -23,6 +23,7 @@ from ..patch_match import (
     try_upgrade_to_node_target,
 )
 from ..patch_repair import repair_unified_diff
+from ..repair_flow import resolve_search_target_symbol
 from ..state import (
     AgentState,
     FixAttempt,
@@ -1023,6 +1024,16 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     patch = state.patch_content
+    for edit in state.patch_edits:
+        if edit.search and not edit.node_target and not edit.resolved_target_symbol:
+            edit.resolved_target_symbol = (
+                resolve_search_target_symbol(
+                    state,
+                    edit.file_path,
+                    edit.search,
+                )
+                or ""
+            )
     attempt = FixAttempt(
         patch_content=patch,
         patch_edits=state.patch_edits,

@@ -460,6 +460,39 @@ def read_exact_checkout_text(state: AgentState, file_path: str) -> str:
     return _decode_utf8(_read_regular_no_follow(root, path))
 
 
+def resolve_search_target_symbol(
+    state: AgentState,
+    file_path: str,
+    search: str,
+) -> str | None:
+    """Resolve one unique Python search anchor to its exact enclosing symbol."""
+    if not search or not file_path.endswith(".py"):
+        return None
+    try:
+        source = read_exact_checkout_text(state, file_path)
+        if source.count(search) != 1:
+            return None
+        line = source.count("\n", 0, source.index(search)) + 1
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+    candidates: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST, prefix: tuple[str, ...] = ()) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_prefix = prefix
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                end_line = getattr(child, "end_lineno", child.lineno)
+                child_prefix = (*prefix, child.name)
+                if child.lineno <= line <= end_line:
+                    candidates.append((len(child_prefix), ".".join(child_prefix)))
+            visit(child, child_prefix)
+
+    visit(tree)
+    return max(candidates)[1] if candidates else None
+
+
 def _safe_generated_text(value: str) -> str:
     redacted = redact_secrets(value)
     return _EVALUATOR_FIELD_RE.sub("[REDACTED_EVALUATOR_FIELD]", redacted)

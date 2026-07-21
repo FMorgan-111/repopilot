@@ -155,3 +155,28 @@ Final evidence:
 - full suite: `815 passed, 2 skipped, 1 warning in 22.96s`;
 - required and additional Ruff checks: `All checks passed!`;
 - `git diff --check`: passed.
+
+## Third formal re-review follow-up
+
+The third review isolated two remaining contract/identity gaps. Regression tests
+were written first and produced behavioral RED: `5 failed, 1 passed`. The existing
+strict escalated tool-to-reflect production path remained green while the prompt
+contract and pre-apply resolved-symbol metadata were absent.
+
+The final fixes:
+
+- align primary and escalated REFLECT prompts with the validator's three exclusive variants: tagged tool, tagged reflect outcome, or tagged stop, with no mixed fields; and
+- add backward-compatible `PatchEdit.resolved_target_symbol` metadata, resolve it from the confined exact Python preimage in PLAN/EXECUTE before mutation, persist it through `FixAttempt`, and prefer it during assertion diversity checks while retaining a fail-closed legacy fallback.
+
+The real-repository regressions apply a search-only edit so its old anchor disappears,
+then prove the same function is rejected, a different function is accepted, and a
+method persists its dotted `Class.method` identity. Legacy serialized edits default
+the new field to an empty string.
+
+Final evidence:
+
+- focused third-review set: `6 passed`;
+- expanded decision/patch/execute/run-store suite: `303 passed`;
+- full suite: `820 passed, 2 skipped, 1 warning in 21.68s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.
