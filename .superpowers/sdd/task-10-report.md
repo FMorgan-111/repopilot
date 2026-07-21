@@ -180,3 +180,26 @@ Final evidence:
 - full suite: `820 passed, 2 skipped, 1 warning in 21.68s`;
 - required and additional Ruff checks: `All checks passed!`;
 - `git diff --check`: passed.
+
+## Closing trust-boundary review
+
+The closing review found one remaining trust boundary: model-authored
+`resolved_target_symbol` could be mistaken for runtime-derived identity. Tests were
+added first. After correcting an initial test selector typo, the behavioral RED was
+`4 failed, 1 passed`: valid forged symbols survived PLAN/EXECUTE, and an invalid
+path-shaped value failed the whole plan instead of being discarded. The Opus
+VerifiedEdit conversion boundary already remained green.
+
+The fix removes `resolved_target_symbol` from every model-authored PLAN edit before
+schema validation. PLAN and EXECUTE then unconditionally overwrite search-edit
+metadata from the confined exact preimage, derive node-edit identity from the
+validated `node_target`, or clear metadata on failure. Persisted FixAttempt/run
+metadata remains loadable and legacy edits retain the empty default.
+
+Final evidence:
+
+- focused closing-review set: `5 passed`;
+- expanded convergence/model/execute/repair/run-store suite: `305 passed`;
+- full suite: `822 passed, 2 skipped, 1 warning in 21.54s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.

@@ -741,6 +741,7 @@ async def test_crlf_target_uses_lf_semantics_but_keeps_raw_preimage_digest(
     patch_edit = verified_edits_to_patch_edits(batch, state=state)[0]
 
     assert patch_edit.expected_content_sha256 == hashlib.sha256(raw_source).hexdigest()
+    assert patch_edit.resolved_target_symbol == ""
     result = _apply_patch_edits(str(repo), [patch_edit])
     assert result.applied, result.output
     assert target.read_text(encoding="utf-8") == (

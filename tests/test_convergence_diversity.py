@@ -447,6 +447,7 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
                 file_path="module.py",
                 search="    old_value = 1\n",
                 replace="    new_value = 3\n",
+                resolved_target_symbol="g",
             )
         ],
         test_command="pytest",
@@ -488,6 +489,71 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == expected_phase
+
+
+@pytest.mark.parametrize(
+    "forged_symbol",
+    ["g", "../../forged-identity-trace-sentinel"],
+)
+async def test_plan_discards_model_authored_resolved_symbol_and_recomputes_exactly(
+    tmp_path,
+    monkeypatch,
+    forged_symbol,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = "def f():\n    old_value = 1\n    return old_value\n"
+    (repo / "module.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    async def fake_llm_call(system, user):
+        return json.dumps(
+            {
+                "kind": "plan",
+                "plan": "Change f.",
+                "patch": "",
+                "patch_edits": [
+                    {
+                        "file": "module.py",
+                        "search": "    old_value = 1\n",
+                        "replace": "    new_value = 3\n",
+                        "resolved_target_symbol": forged_symbol,
+                    }
+                ],
+                "files": ["module.py"],
+                "test_command": "pytest",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": "Change f.",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(repo_path=str(repo), repo_ref=ref)
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.patch_edits[0].resolved_target_symbol == "f"
+    assert "forged-identity-trace-sentinel" not in result.model_dump_json()
 
 
 async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monkeypatch):

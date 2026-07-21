@@ -707,10 +707,13 @@ def _drop_invalid_edits(patch_edits: Any) -> list[Any]:
         if not isinstance(e, dict):
             kept.append(e)
             continue
-        has_file = any(e.get(k) for k in ("file_path", "file", "path"))
-        has_anchor = bool(e.get("search") or e.get("node_target"))
+        clean_edit = dict(e)
+        # Model output can never author trusted pre-apply identity metadata.
+        clean_edit.pop("resolved_target_symbol", None)
+        has_file = any(clean_edit.get(k) for k in ("file_path", "file", "path"))
+        has_anchor = bool(clean_edit.get("search") or clean_edit.get("node_target"))
         if has_file and has_anchor:
-            kept.append(e)
+            kept.append(clean_edit)
     return kept
 
 
@@ -1339,11 +1342,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state.current_phase = Phase.PLAN
                 else:
                     for edit in state.patch_edits:
-                        if (
-                            edit.search
-                            and not edit.node_target
-                            and not edit.resolved_target_symbol
-                        ):
+                        if edit.node_target:
+                            edit.resolved_target_symbol = edit.node_target
+                        elif edit.search:
                             edit.resolved_target_symbol = (
                                 resolve_search_target_symbol(
                                     state,
@@ -1352,6 +1353,8 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                                 )
                                 or ""
                             )
+                        else:
+                            edit.resolved_target_symbol = ""
                     record_progress(state)
                     state.assertion_diversity_required = False
                     if _planned_edits_repeat_failure(state):

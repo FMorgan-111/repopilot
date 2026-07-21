@@ -1025,7 +1025,9 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
 
     patch = state.patch_content
     for edit in state.patch_edits:
-        if edit.search and not edit.node_target and not edit.resolved_target_symbol:
+        if edit.node_target:
+            edit.resolved_target_symbol = edit.node_target
+        elif edit.search:
             edit.resolved_target_symbol = (
                 resolve_search_target_symbol(
                     state,
@@ -1034,6 +1036,8 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 )
                 or ""
             )
+        else:
+            edit.resolved_target_symbol = ""
     attempt = FixAttempt(
         patch_content=patch,
         patch_edits=state.patch_edits,
