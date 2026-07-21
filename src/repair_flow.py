@@ -13,12 +13,13 @@ import textwrap
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Awaitable, Callable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from .escalation import (
     EscalationPacket,
+    build_escalation_packet,
     record_model_invocation,
     render_escalation_packet,
 )
@@ -26,8 +27,14 @@ from .evidence import EvidenceStore
 from .llm import llm_call
 from .local_search import is_sensitive_repo_path
 from .model_provider import redact_secrets
+from .model_policy import apply_escalation, should_escalate
 from .patch_match import locate_node_span
 from .repo_paths import canonical_repo_path
+from .reasoning_loop import (
+    ReasoningStop,
+    route_reasoning_tool,
+    validate_reasoning_response,
+)
 from .state import (
     AgentState,
     Evidence,
@@ -36,6 +43,7 @@ from .state import (
     VerifiedEditBatch,
     _estimate_tokens,
 )
+from .tool_router import ToolRouteResult, route_tool_intent
 
 TARGET_CONTEXT_CONTENT_LIMIT = 8_000
 TARGET_CONTEXT_TOTAL_LIMIT = 24_000
@@ -86,15 +94,17 @@ _UNIFIED_DIFF_RE = re.compile(
 )
 
 REPAIR_PLAN_SYSTEM = (
-    "Return ONLY one JSON object containing exactly these keys: root_cause, "
+    "Return ONLY one discriminated JSON variant: kind='tool' with one tool_intent, "
+    "kind='repair_plan' containing exactly these keys: root_cause, "
     "target_files, target_symbols, required_behavior, regression_test_strategy, "
-    "rejected_approaches. Identify a bounded implementation plan from the supplied "
+    "rejected_approaches, or kind='stop'. Identify a bounded implementation plan from the supplied "
     "EscalationPacket. target_files must be repository-relative paths and "
     "target_symbols must use exact dotted names when applicable."
 )
 
 VERIFIED_EDIT_SYSTEM = (
-    "Return ONLY one JSON object with key edits. Each item must contain file_path, "
+    "Return ONLY one discriminated JSON variant: kind='tool' with one tool_intent, "
+    "kind='verified_edits' with key edits, or kind='stop'. Each edit must contain file_path, "
     "node_target (string or null), search, replace, and intent. Use only a target "
     "file and evidence shown in the user payload. Prefer one unique node_target; "
     "otherwise copy a search string verbatim from that file's target evidence. "
@@ -102,7 +112,8 @@ VERIFIED_EDIT_SYSTEM = (
 )
 
 VERIFIED_EDIT_CORRECTION_SYSTEM = (
-    "Return ONLY one JSON object with key edits. Correct the previous verified "
+    "Return ONLY one discriminated JSON variant: kind='tool' with one tool_intent, "
+    "kind='verified_edits' with key edits, or kind='stop'. Correct the previous verified "
     "edit batch using the exact PatchGate issue code and real bounded code window. "
     "Use only RepairPlan target files. Use one unique node_target or copy a search "
     "block verbatim. Never use fuzzy matching or a unified diff."
@@ -478,17 +489,76 @@ async def _call_schema(
     user: str,
     schema: type[SchemaT],
     semantic_validate: Callable[[SchemaT], ResultT],
+    outcome_kind: str,
+    router: Callable[..., Awaitable[ToolRouteResult]],
+    policy_hook: Callable[[AgentState], None] | None = None,
+    reprompt: Callable[[tuple[str, ...]], str] | None = None,
+    tool_counter: list[int] | None = None,
 ) -> ResultT:
-    model = state.active_model
-    provider = state.active_provider
-    started = time.monotonic()
-    response_text = ""
-    try:
-        raw = await llm_call(system, user, model=model, provider=provider)
-        response_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
-        parsed = schema.model_validate(raw)
-        result = semantic_validate(parsed)
-    except Exception as exc:
+    counter = tool_counter if tool_counter is not None else [0]
+    current_user = user
+    outcome_fields = set(schema.model_fields)
+    while True:
+        apply_escalation(state, should_escalate(state))
+        if policy_hook is not None:
+            policy_hook(state)
+        model = state.active_model
+        provider = state.active_provider
+        started = time.monotonic()
+        response_text = ""
+        tool_step = None
+        try:
+            raw = await llm_call(
+                system,
+                current_user,
+                model=model,
+                provider=provider,
+            )
+            if not isinstance(raw, dict):
+                raise ValueError("structured response must be a JSON object")
+            response_text = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+            response_kind = validate_reasoning_response(
+                raw,
+                outcome_kind=outcome_kind,
+                outcome_fields=outcome_fields,
+            )
+            if response_kind == "stop":
+                raise ReasoningStop(str(raw.get("stop_reason") or "model_stop"))
+            tool_step = await route_reasoning_tool(
+                state,
+                raw,
+                node="plan_fix",
+                calls_this_round=counter[0],
+                router=router,
+            )
+            if tool_step.handled:
+                result = None
+            else:
+                payload = {key: value for key, value in raw.items() if key != "kind"}
+                parsed = schema.model_validate(payload)
+                result = semantic_validate(parsed)
+        except Exception as exc:
+            elapsed = time.monotonic() - started
+            record_model_invocation(
+                state,
+                model=model,
+                provider=provider,
+                node="plan_fix",
+                elapsed_seconds=elapsed,
+                input_tokens=_estimate_tokens(system, current_user),
+                output_tokens=_estimate_tokens(response_text) if response_text else 0,
+                status=(
+                    "invalid_response"
+                    if isinstance(
+                        exc,
+                        (ValidationError, RepairContextError, ReasoningStop, ValueError),
+                    )
+                    else "error"
+                ),
+                error=exc,
+            )
+            state.token_usage += _estimate_tokens(system, current_user, response_text)
+            raise
         elapsed = time.monotonic() - started
         record_model_invocation(
             state,
@@ -496,30 +566,22 @@ async def _call_schema(
             provider=provider,
             node="plan_fix",
             elapsed_seconds=elapsed,
-            input_tokens=_estimate_tokens(system, user),
-            output_tokens=_estimate_tokens(response_text) if response_text else 0,
-            status=(
-                "invalid_response"
-                if isinstance(exc, (ValidationError, RepairContextError, ValueError))
-                else "error"
-            ),
-            error=exc,
+            input_tokens=_estimate_tokens(system, current_user),
+            output_tokens=_estimate_tokens(response_text),
+            status="ok",
         )
-        state.token_usage += _estimate_tokens(system, user, response_text)
-        raise
-    elapsed = time.monotonic() - started
-    record_model_invocation(
-        state,
-        model=model,
-        provider=provider,
-        node="plan_fix",
-        elapsed_seconds=elapsed,
-        input_tokens=_estimate_tokens(system, user),
-        output_tokens=_estimate_tokens(response_text),
-        status="ok",
-    )
-    state.token_usage += _estimate_tokens(system, user, response_text)
-    return result
+        state.token_usage += _estimate_tokens(system, current_user, response_text)
+        if tool_step is not None and tool_step.handled:
+            if tool_step.stop_reason:
+                raise ReasoningStop(tool_step.stop_reason)
+            counter[0] += 1
+            current_user = (
+                reprompt(tool_step.evidence_ids)
+                if reprompt is not None
+                else current_user
+            )
+            continue
+        return result  # type: ignore[return-value]
 
 
 def _validate_batch(
@@ -631,6 +693,9 @@ async def generate_opus_repair(
     *,
     first_stage_prompt: str | None = None,
     validate_edits: bool = True,
+    router: Callable[..., Awaitable[ToolRouteResult]] = route_tool_intent,
+    policy_hook: Callable[[AgentState], None] | None = None,
+    tool_counter: list[int] | None = None,
 ) -> tuple[RepairPlan, VerifiedEditBatch]:
     """Generate patch-free intent, resolve exact context, then request edits."""
     if state.active_provider != "escalation" or not state.escalated:
@@ -641,6 +706,8 @@ async def generate_opus_repair(
     plan_user = rendered_packet if first_stage_prompt is None else first_stage_prompt
     if len(plan_user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("repair plan prompt exceeds strict context budget")
+    reasoning_tool_counter = tool_counter if tool_counter is not None else [0]
+    state._reasoning_tool_counter = reasoning_tool_counter
 
     def validate_plan(candidate: RepairPlan) -> tuple[
         RepairPlan,
@@ -657,6 +724,13 @@ async def generate_opus_repair(
         user=plan_user,
         schema=RepairPlan,
         semantic_validate=validate_plan,
+        outcome_kind="repair_plan",
+        router=router,
+        policy_hook=policy_hook,
+        reprompt=lambda evidence_ids: render_escalation_packet(
+            build_escalation_packet(state, evidence_ids=evidence_ids)
+        ),
+        tool_counter=reasoning_tool_counter,
     )
     payload = {
         "escalation_packet": json.loads(rendered_packet),
@@ -685,6 +759,27 @@ async def generate_opus_repair(
         user=user,
         schema=VerifiedEditBatch,
         semantic_validate=validate_edits,
+        outcome_kind="verified_edits",
+        router=router,
+        policy_hook=policy_hook,
+        reprompt=lambda evidence_ids: json.dumps(
+            {
+                **payload,
+                "escalation_packet": json.loads(
+                    render_escalation_packet(
+                        build_escalation_packet(state, evidence_ids=evidence_ids)
+                    )
+                ),
+                "new_evidence": [
+                    item.model_dump(mode="json")
+                    for item in EvidenceStore(state).select(list(evidence_ids))
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        tool_counter=reasoning_tool_counter,
     )
     return plan, batch
 
@@ -694,6 +789,10 @@ async def request_verified_edit_correction(
     plan: RepairPlan,
     previous_batch: VerifiedEditBatch,
     issues: list[object],
+    *,
+    router: Callable[..., Awaitable[ToolRouteResult]] = route_tool_intent,
+    policy_hook: Callable[[AgentState], None] | None = None,
+    tool_counter: list[int] | None = None,
 ) -> VerifiedEditBatch:
     """Ask the same active model for one bounded, local PatchGate correction."""
     if state.active_provider != "escalation" or not state.escalated:
@@ -737,4 +836,24 @@ async def request_verified_edit_correction(
         user=user,
         schema=VerifiedEditBatch,
         semantic_validate=lambda candidate: candidate,
+        outcome_kind="verified_edits",
+        router=router,
+        policy_hook=policy_hook,
+        reprompt=lambda evidence_ids: json.dumps(
+            {
+                **payload,
+                "new_evidence": [
+                    item.model_dump(mode="json")
+                    for item in EvidenceStore(state).select(list(evidence_ids))
+                ],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        tool_counter=(
+            tool_counter
+            if tool_counter is not None
+            else state._reasoning_tool_counter
+        ),
     )

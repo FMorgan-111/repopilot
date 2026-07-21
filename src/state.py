@@ -731,6 +731,7 @@ class AgentState(BaseModel):
     # Benchmark/eval mode: a verified test pass routes straight to DONE instead
     # of opening a PR (we have no write access to upstream repos under eval).
     skip_commit: bool = False
+    _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
 
     @field_validator("escalation_reason", mode="before")
     @classmethod

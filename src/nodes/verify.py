@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Any
 
 from ..model_policy import record_no_progress, record_progress
@@ -82,8 +83,44 @@ def _test_failure_class(attempt: FixAttempt) -> str:
 
 
 def _failure_signature_payload(attempt: FixAttempt, failure_class: str) -> dict[str, str]:
-    normalized_error = " ".join(attempt.error_log.split())
-    return {"class": failure_class, "error": normalized_error}
+    error_log = attempt.error_log.replace("\\", "/")
+    test_ids = sorted(
+        set(
+            re.findall(
+                r"(?m)^(?:FAILED|ERROR)\s+([\w./-]+(?:::[\w.\[\]-]+)+)",
+                error_log,
+            )
+        )
+    )
+    assertion_lines: list[str] = []
+    for line in error_log.splitlines():
+        lowered = line.lower()
+        if not any(
+            marker in lowered
+            for marker in ("assertionerror", "assert ", "expected", "actual")
+        ):
+            continue
+        normalized = re.sub(r"(?:[A-Za-z]:)?/(?:[^\s:]+/)+", "<path>/", line)
+        normalized = re.sub(r":\d+(?=[:\s])", ":<line>", normalized)
+        normalized = re.sub(
+            r"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+Z?\b",
+            "<timestamp>",
+            normalized,
+        )
+        normalized = re.sub(r"\b\d+(?:\.\d+)?s\b", "<duration>", normalized)
+        normalized = " ".join(normalized.split())
+        if normalized and normalized not in assertion_lines:
+            assertion_lines.append(normalized)
+    return {
+        "class": failure_class,
+        "test_ids": "|".join(test_ids),
+        "assertion": "|".join(assertion_lines[:8]),
+        "detail": (
+            ""
+            if failure_class == "assertion_failure"
+            else " ".join(error_log.split())[:2_000]
+        ),
+    }
 
 
 def _canonical_signature(payload: dict[str, str]) -> str:

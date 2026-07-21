@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -43,6 +44,44 @@ _OUTCOME_FIELDS = {
         }
     ),
 }
+_LEGACY_OUTCOME_FIELDS = {
+    "plan": _OUTCOME_FIELDS["plan"]
+    | {
+        "edits",
+        "hypotheses",
+        "selected_hypothesis_id",
+        "evidence",
+        "next_checks",
+        "confidence",
+        "risk",
+    },
+    "reflect": _OUTCOME_FIELDS["reflect"]
+    | {
+        "hypotheses",
+        "selected_hypothesis_id",
+        "evidence",
+        "next_checks",
+        "confidence",
+        "risk",
+    },
+}
+_FORBIDDEN_REASONING_RE = re.compile(
+    r"(?i)(?:\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b|"
+    r"\braw[\s_-]+HTTP\b|HTTP/\d(?:\.\d)?\b|"
+    r"(?:request|response)[\s_-]+(?:payload|body|headers?)\s*:)"
+)
+
+
+class ReasoningStop(RuntimeError):
+    """A validated model/tool stop decision from a bounded reasoning call."""
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
+
+
+class ValidationError(ValueError):
+    """A safe structured-response boundary error without raw model payloads."""
 
 
 @dataclass(frozen=True)
@@ -56,38 +95,50 @@ def validate_reasoning_response(
     response: dict[str, Any],
     *,
     outcome_kind: str,
+    outcome_fields: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Validate the explicit union, adapting only untagged legacy outcomes."""
-    if outcome_kind not in {"plan", "reflect"}:
-        raise ValueError("structured response has an unsupported outcome kind")
+    serialized = json.dumps(response, ensure_ascii=False, sort_keys=True)
+    if _FORBIDDEN_REASONING_RE.search(serialized):
+        raise ValidationError("structured response contains a forbidden trace boundary")
+    explicit_fields = frozenset(outcome_fields or _OUTCOME_FIELDS.get(outcome_kind, ()))
+    if not explicit_fields:
+        raise ValidationError("structured response has an unsupported outcome kind")
+    explicit_fields = explicit_fields | {"kind"}
+    legacy_fields = _LEGACY_OUTCOME_FIELDS.get(outcome_kind, explicit_fields - {"kind"})
 
     explicit_kind = str(response.get("kind") or "").strip().lower()
     if not explicit_kind:
         if response.get("tool_intent") is not None:
             response_tool_intent(response)
             return "tool"
-        if response.get("stop_reason") and len(response) == 1:
+        if response.get("stop_reason"):
+            if set(response) != {"stop_reason"}:
+                raise ValidationError("structured response mixed stop and outcome variants")
             return "stop"
+        unexpected = set(response) - set(legacy_fields)
+        if unexpected:
+            raise ValidationError("structured response has non-allowlisted legacy fields")
         return outcome_kind
 
     if explicit_kind not in {"tool", "stop", outcome_kind}:
-        raise ValueError("structured response has an unknown or wrong variant")
+        raise ValidationError("structured response has an unknown or wrong variant")
     if explicit_kind == "tool":
         response_tool_intent(response)
         unexpected = set(response) - {"kind", "tool_intent"}
         if unexpected:
-            raise ValueError("structured response mixed tool and outcome variants")
+            raise ValidationError("structured response mixed tool and outcome variants")
         return explicit_kind
     if explicit_kind == "stop":
         unexpected = set(response) - {"kind", "stop_reason"}
         if unexpected:
-            raise ValueError("structured response mixed stop and outcome variants")
+            raise ValidationError("structured response mixed stop and outcome variants")
         return explicit_kind
     if response.get("tool_intent") is not None or response.get("stop_reason"):
-        raise ValueError("structured response mixed outcome with another variant")
-    unexpected = set(response) - _OUTCOME_FIELDS[outcome_kind]
+        raise ValidationError("structured response mixed outcome with another variant")
+    unexpected = set(response) - set(explicit_fields)
     if unexpected:
-        raise ValueError("structured response mixed or added outcome fields")
+        raise ValidationError("structured response mixed or added outcome fields")
     return explicit_kind
 
 
@@ -95,8 +146,6 @@ def response_tool_intent(response: dict[str, Any]) -> ToolIntent | None:
     """Return one validated tool intent without accepting mixed outcome payloads."""
     kind = str(response.get("kind") or "").strip().lower()
     raw_intent = response.get("tool_intent")
-    if kind and kind not in {"tool", "plan", "reflect", "stop"}:
-        raise ValueError("structured response has an unknown variant")
     if kind != "tool" and raw_intent is None:
         return None
     if kind and kind != "tool" and raw_intent is not None:

@@ -292,3 +292,68 @@ async def test_repeated_infra_failure_keeps_infra_semantics_without_retry():
     assert state.current_phase == new_agent.Phase.FAILURE
     assert state.failure_reason.startswith("Infrastructure error during execution")
     assert state.retry_count == 2
+
+
+async def test_assertion_signature_ignores_volatile_paths_lines_times_and_summary():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+    )
+    logs = [
+        (
+            "/private/tmp/run-a/repo/tests/test_widget.py:41: AssertionError\n"
+            "FAILED tests/test_widget.py::test_value - AssertionError: expected 2 actual 1\n"
+            "1 failed in 0.21s at 2026-07-21T10:11:12Z"
+        ),
+        (
+            "/tmp/run-b/repo/tests/test_widget.py:99: AssertionError\n"
+            "FAILED tests/test_widget.py::test_value - AssertionError: expected 2 actual 1\n"
+            "=== short test summary info ===\n1 failed in 9.87s at 2027-01-02T03:04:05Z"
+        ),
+    ]
+
+    for log in logs:
+        state.current_phase = new_agent.Phase.VERIFY
+        state.fix_attempts.append(
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/widget.py",
+                        node_target="widget",
+                        replace="def widget():\n    return 1\n",
+                    )
+                ],
+                failure_kind="assertion_failure",
+                error_log=log,
+            )
+        )
+        state = await new_agent.verify_fix(state)
+        record_progress(state)
+
+    assert state.assertion_no_progress_rounds == 1
+    assert state.assertion_diversity_required is True
+
+
+async def test_assertion_signature_resets_when_failing_test_identity_changes():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+    )
+    for test_id in ("test_value", "test_other_value"):
+        state.current_phase = new_agent.Phase.VERIFY
+        state.fix_attempts.append(
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log=(
+                    f"FAILED tests/test_widget.py::{test_id} - "
+                    "AssertionError: expected 2 actual 1"
+                ),
+            )
+        )
+        state = await new_agent.verify_fix(state)
+        record_progress(state)
+
+    assert state.assertion_no_progress_rounds == 0
+    assert state.assertion_diversity_required is False

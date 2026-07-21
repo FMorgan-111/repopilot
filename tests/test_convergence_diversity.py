@@ -4,8 +4,11 @@ final-attempt force-execute (solution 2) in plan_fix / reflect_on_failure."""
 import json
 from types import SimpleNamespace
 
+import pytest
+
 from src import new_agent
 from src import model_policy
+from src.evidence import EvidenceStore
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 from src.state import PatchEdit
@@ -198,6 +201,91 @@ async def test_assertion_diversity_rejects_same_target_symbol(monkeypatch):
         warning.get("warning") == "assertion_target_not_diversified"
         for warning in result.decision_warnings
     )
+
+
+async def test_assertion_diversity_rejects_different_search_in_same_unknown_symbol(
+    monkeypatch,
+):
+    async def fake_llm_call(system, user):
+        return _execute_response(
+            "app/router.py",
+            "    second_line()",
+            "    replacement_line()",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        assertion_diversity_required=True,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="app/router.py",
+                        search="    first_line()",
+                        replace="    wrong_line()",
+                    )
+                ],
+                failure_kind="assertion_failure",
+                error_log="AssertionError: expected new",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.PLAN
+    assert not result.patch_edits
+
+
+async def test_assertion_diversity_accepts_distinct_explicit_node_target(monkeypatch):
+    async def fake_llm_call(system, user):
+        return json.dumps(
+            {
+                "kind": "plan",
+                "plan": "Target another symbol.",
+                "patch": "",
+                "patch_edits": [
+                    {
+                        "file": "app/router.py",
+                        "node_target": "other_helper",
+                        "replace": "def other_helper():\n    return 'new'\n",
+                    }
+                ],
+                "files": ["app/router.py"],
+                "test_command": "pytest",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": "Target other_helper.",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        assertion_diversity_required=True,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="app/router.py",
+                        node_target="handle",
+                        replace="def handle():\n    return 'wrong'\n",
+                    )
+                ],
+                failure_kind="assertion_failure",
+                error_log="AssertionError: expected new",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.patch_edits[0].node_target == "other_helper"
+    assert result.assertion_diversity_required is False
 
 
 async def test_plan_prompt_includes_failed_edits(monkeypatch):
@@ -542,6 +630,112 @@ async def test_repeated_assertion_reflection_requires_different_target_symbol(
     assert "different target symbol" in captured["user"].lower()
 
 
+async def test_legacy_reflection_persists_only_normalized_decision_json(monkeypatch):
+    async def fake_llm_call(system, user, **kwargs):
+        return {
+            "root_cause": "The causal branch is elsewhere.",
+            "what_went_wrong": "The prior edit targeted the wrong symbol.",
+            "suggested_fix_approach": "Change helper instead.",
+            "files_that_also_need_changes": [],
+            "hypotheses": [{"id": "H1", "claim": "helper", "score": 0.8}],
+            "confidence": 0.8,
+            "risk": "medium",
+        }
+
+    async def fake_summary(state, **kwargs):
+        return "safe summary"
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summary)
+    state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log="AssertionError: sentinel",
+            )
+        ],
+    )
+
+    result = await reflect_node.reflect_on_failure(state)
+    persisted = json.loads(result.reflection_notes)
+
+    assert set(persisted) == {
+        "root_cause",
+        "what_went_wrong",
+        "suggested_fix_approach",
+        "files_that_also_need_changes",
+        "decision_frame",
+    }
+
+
+@pytest.mark.parametrize("terminal", ["model_stop", "tool_stop", "opus_limit"])
+async def test_reflect_terminal_branches_finalize_summary_exactly_once(
+    monkeypatch,
+    terminal,
+):
+    summary_calls = 0
+
+    async def fake_summary(state, **kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        return f"summary for {terminal}"
+
+    if terminal == "model_stop":
+        async def fake_llm_call(*args, **kwargs):
+            return {"kind": "stop", "stop_reason": "done"}
+    elif terminal == "tool_stop":
+        async def fake_llm_call(*args, **kwargs):
+            return {
+                "kind": "tool",
+                "tool_intent": {
+                    "action": "finish_investigation",
+                    "args": {},
+                    "reason": "no repair",
+                    "expected_evidence": "none",
+                },
+            }
+
+        async def stop_router(state, intent, *, calls_this_round):
+            return SimpleNamespace(
+                status="ok",
+                evidence_id=None,
+                made_progress=False,
+                control_action="finish_investigation",
+            )
+
+        monkeypatch.setattr(reflect_node, "route_tool_intent", stop_router)
+    else:
+        async def fake_llm_call(*args, **kwargs):
+            raise ValueError("invalid escalated reflection")
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summary)
+    state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        active_provider=("escalation" if terminal == "opus_limit" else "primary"),
+        active_model=(
+            "claude-opus-4-8:stable"
+            if terminal == "opus_limit"
+            else "gemini-3.5-flash:stable"
+        ),
+        escalated=terminal == "opus_limit",
+        escalation_reason=("repeated_plan" if terminal == "opus_limit" else ""),
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log="AssertionError: sentinel",
+            )
+        ],
+    )
+
+    result = await reflect_node.reflect_on_failure(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.attempt_outcome_summary == f"summary for {terminal}"
+    assert summary_calls == 1
+
+
 async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
     calls = []
     responses = [
@@ -619,3 +813,84 @@ async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
     assert result.active_provider == "escalation"
     assert calls[2][0] == reflect_node.ESCALATED_REFLECT_SYSTEM
     assert calls[2][2]["provider"] == "escalation"
+
+
+async def test_escalated_reflect_tool_reprompt_contains_only_delta_evidence(
+    monkeypatch,
+):
+    calls = []
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "causal-helper"},
+                "reason": "locate helper",
+                "expected_evidence": "helper source",
+            },
+        },
+        {
+            "kind": "reflect",
+            "root_cause": "The helper is causal.",
+            "what_went_wrong": "The prior target was downstream.",
+            "suggested_fix_approach": "Change causal_helper.",
+            "files_that_also_need_changes": [],
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": "Change causal_helper.",
+                "recommended_action": "plan",
+                "risk": "medium",
+                "confidence": 0.8,
+            },
+        },
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        calls.append(user)
+        return responses.pop(0)
+
+    async def delta_router(state, intent, *, calls_this_round):
+        added = EvidenceStore(state).add(
+            tool="search_text",
+            summary="new helper evidence",
+            content="new-reflect-evidence-sentinel",
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id=added.evidence.evidence_id,
+            made_progress=True,
+            control_action="",
+        )
+
+    async def fake_summary(state, **kwargs):
+        return "safe summary"
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "route_tool_intent", delta_router)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summary)
+    state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+        repo_ref="a" * 40,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log="AssertionError: sentinel",
+            )
+        ],
+    )
+    EvidenceStore(state).add(
+        tool="read_range",
+        summary="old evidence",
+        content="old-reflect-evidence-sentinel",
+    )
+
+    result = await reflect_node.reflect_on_failure(state)
+
+    assert result.current_phase == new_agent.Phase.PLAN
+    assert "old-reflect-evidence-sentinel" in calls[0]
+    assert "new-reflect-evidence-sentinel" in calls[1]
+    assert "old-reflect-evidence-sentinel" not in calls[1]

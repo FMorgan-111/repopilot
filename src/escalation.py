@@ -16,6 +16,7 @@ from pydantic import (
     field_validator,
 )
 
+from .evidence import EvidenceStore
 from .http_client import LLMResponseError
 from .model_provider import redact_secrets
 from .state import AgentState, FixAttempt, ModelInvocation
@@ -324,10 +325,18 @@ def _generated_test_paths(state: AgentState) -> set[str]:
     return {approval.path for approval in state.generated_test_approvals}
 
 
-def _bounded_evidence(state: AgentState) -> tuple[EscalationEvidence, ...]:
+def _bounded_evidence(
+    state: AgentState,
+    evidence_ids: tuple[str, ...] | None = None,
+) -> tuple[EscalationEvidence, ...]:
     generated_paths = _generated_test_paths(state)
+    source = (
+        state.evidence
+        if evidence_ids is None
+        else EvidenceStore(state).select(list(evidence_ids))
+    )
     eligible = (
-        item for item in state.evidence if item.file_path not in generated_paths
+        item for item in source if item.file_path not in generated_paths
     )
     return _bounded_evidence_values(eligible, denied_literals=generated_paths)
 
@@ -371,7 +380,11 @@ def _rejected_approaches(state: AgentState) -> tuple[str, ...]:
     return _bounded_items(values, denied_literals=_generated_test_paths(state))
 
 
-def build_escalation_packet(state: AgentState) -> EscalationPacket:
+def build_escalation_packet(
+    state: AgentState,
+    *,
+    evidence_ids: tuple[str, ...] | None = None,
+) -> EscalationPacket:
     """Copy only approved agent state fields into an independently bounded packet."""
     failed_attempts = [attempt for attempt in state.fix_attempts if not attempt.success]
     patch_failures = [
@@ -406,7 +419,7 @@ def build_escalation_packet(state: AgentState) -> EscalationPacket:
         ),
         # Exact equality is intentional: the packet must identify the prepared base.
         base_commit=state.repo_ref,
-        evidence=_bounded_evidence(state),
+        evidence=_bounded_evidence(state, evidence_ids),
         failed_edit_signatures=[
             _attempt_signature(attempt)
             for attempt in failed_attempts[-HISTORY_LIST_LIMIT:]

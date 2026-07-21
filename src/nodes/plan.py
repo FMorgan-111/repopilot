@@ -33,6 +33,7 @@ from ..repair_flow import (
     request_verified_edit_correction,
 )
 from ..reasoning_loop import (
+    ReasoningStop,
     prompt_with_new_evidence,
     record_opus_no_progress,
     route_reasoning_tool,
@@ -800,9 +801,14 @@ def build_plan_user_prompt(
     return f"{user}{completed_attempts_context}"
 
 
-def _build_escalated_plan_user_prompt(state: AgentState) -> str:
+def _build_escalated_plan_user_prompt(
+    state: AgentState,
+    evidence_ids: tuple[str, ...] | None = None,
+) -> str:
     """Render the Task 6 packet plus one first-stage-only rolling summary."""
-    packet = render_escalation_packet(build_escalation_packet(state))
+    packet = render_escalation_packet(
+        build_escalation_packet(state, evidence_ids=evidence_ids)
+    )
     packet = packet.replace(OUTCOME_SUMMARY_SECTION, "")
     summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
     if not summary:
@@ -890,6 +896,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     )
 
     calls_this_round = 0
+    reasoning_tool_counter = [0]
     while True:
         previous_provider = state.active_provider
         apply_escalation(state, should_escalate(state))
@@ -907,11 +914,13 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         try:
             print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
             if two_stage_repair:
+                reasoning_tool_counter[0] = calls_this_round
                 repair_plan, verified_batch = await generate_opus_repair(
                     state,
                     build_escalation_packet(state),
                     first_stage_prompt=user,
                     validate_edits=False,
+                    tool_counter=reasoning_tool_counter,
                 )
                 _clear_patch_authorization(state)
                 state.active_repair_plan = repair_plan
@@ -1058,6 +1067,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 prompt_tokens_estimate=prompt_tokens_estimate,
                 response_tokens_estimate=response_tokens_estimate,
             )
+            if isinstance(exc, ReasoningStop):
+                state.failure_reason = exc.reason
+                state.current_phase = Phase.FAILURE
+                return state
             if immediate_reason and invoked_provider == "primary":
                 apply_escalation(
                     state,
@@ -1120,7 +1133,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             calls_this_round += 1
             if state.active_provider == "escalation":
                 system = ESCALATED_PLAN_SYSTEM
-                user = _build_escalated_plan_user_prompt(state)
+                user = _build_escalated_plan_user_prompt(
+                    state,
+                    tool_step.evidence_ids,
+                )
             else:
                 system = primary_system
                 user = (
@@ -1256,11 +1272,23 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state.current_phase = Phase.PLAN
             else:
                 state.search_correction_context = ""  # resolved; stop feeding it
-                repeated_failed_target = any(
-                    _edit_key(edit) in _failed_edit_keys(state)
-                    for edit in state.patch_edits
+                prior_assertion_symbols = {
+                    edit.node_target
+                    for attempt in state.fix_attempts
+                    if not attempt.success
+                    and attempt.failure_kind == "assertion_failure"
+                    for edit in attempt.patch_edits
+                    if edit.node_target
+                }
+                assertion_target_not_diversified = (
+                    state.assertion_diversity_required
+                    and any(
+                        not edit.node_target
+                        or edit.node_target in prior_assertion_symbols
+                        for edit in state.patch_edits
+                    )
                 )
-                if state.assertion_diversity_required and repeated_failed_target:
+                if assertion_target_not_diversified:
                     state.decision_warnings.append(
                         {
                             "node": "plan_fix",

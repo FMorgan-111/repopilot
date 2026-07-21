@@ -90,6 +90,33 @@ Result: `785 passed, 2 skipped, 1 warning in 22.61s`. The warning is the existin
 
 `git diff --check`: passed.
 
+## Formal independent review follow-up
+
+The formal review found one Critical and five Important runtime gaps. Regression
+tests were added first and produced behavioral RED with no collection failure:
+`13 failed, 87 passed`. The failures covered legacy REFLECT evaluator/raw payload
+rejection, normalized reflection persistence, Opus inner tool/policy/stop handling,
+delta-only escalation evidence, symbol-level assertion diversity, stable assertion
+signatures, and exactly-once terminal reflection summaries.
+
+The follow-up implementation:
+
+- validates tagged and untagged outcomes against explicit allowlists and rejects evaluator/raw HTTP markers before any REFLECT state or trace persistence;
+- persists canonical `ReflectDecision` JSON rather than the raw model response;
+- runs every RepairPlan, VerifiedEdit, and local correction model call through the deterministic policy gate and shared bounded tool router, with stop propagation and one shared eight-call counter;
+- allows `build_escalation_packet` to select explicit evidence IDs and uses only the immediate tool delta on escalated PLAN/REFLECT and inner repair re-prompts;
+- fails assertion diversity closed for search-only edits and accepts only an explicit `node_target` distinct from prior failed assertion symbols;
+- derives stable assertion signatures from failure class, test IDs, and normalized assertion identity while discarding volatile paths, line numbers, timestamps, durations, and summary noise; and
+- routes every terminal REFLECT loop through one bounded, secret-redacted outcome-summary finalizer exactly once.
+
+Follow-up GREEN evidence:
+
+- formal-review regression set: `101 passed`;
+- expanded focused suite across the brief plus repair, escalation, and outcome-summary coverage: `240 passed`;
+- full suite: `802 passed, 2 skipped, 1 warning in 21.17s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.
+
 ## Safety and compatibility review
 
 - Tool diagnostics persist action, status, bounded counters, and evidence ID only; raw arguments and model rationales are not persisted there.

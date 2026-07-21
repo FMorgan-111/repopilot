@@ -259,6 +259,29 @@ def test_discriminated_reasoning_response_rejects_ambiguous_variants(
         validate_reasoning_response(response, outcome_kind=outcome_kind)
 
 
+@pytest.mark.parametrize(
+    "response",
+    [
+        {"root_cause": "safe", "test_patch": "evaluator-only"},
+        {"root_cause": "FAIL_TO_PASS evaluator marker"},
+        {"root_cause": "raw HTTP response payload: secret"},
+        {
+            "root_cause": "safe",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "sentinel"},
+                "reason": "mixed",
+                "expected_evidence": "source",
+            },
+        },
+        {"root_cause": "safe", "stop_reason": "mixed"},
+    ],
+)
+def test_legacy_reflect_response_rejects_evaluator_raw_or_mixed_payload(response):
+    with pytest.raises(ValueError, match="structured response"):
+        validate_reasoning_response(response, outcome_kind="reflect")
+
+
 def test_evaluator_only_payload_never_enters_safe_evidence_or_prompt():
     state = _state()
     added = EvidenceStore(state).add(

@@ -15,7 +15,7 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
-from ..outcome_summary import summarize_attempt_outcome
+from ..outcome_summary import sanitize_outcome_summary, summarize_attempt_outcome
 from ..reasoning_loop import (
     prompt_with_new_evidence,
     record_opus_no_progress,
@@ -228,6 +228,26 @@ def _assertion_diversity_instructions(state: AgentState, latest: Any) -> str:
     )
 
 
+async def _finalize_reflection(
+    state: AgentState,
+    *,
+    phase: Phase,
+    failure_reason: str = "",
+) -> AgentState:
+    """Summarize one completed reflection loop exactly once before routing."""
+    state.attempt_outcome_summary = sanitize_outcome_summary(
+        state,
+        await summarize_attempt_outcome(
+            state,
+            llm=llm_call,
+        ),
+    )
+    if failure_reason:
+        state.failure_reason = failure_reason
+    state.current_phase = phase
+    return state
+
+
 async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM to analyze WHY the previous fix attempt failed."""
     state = _as_state(state)
@@ -414,9 +434,11 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                     node="reflect_on_failure",
                     fingerprint={"error_class": type(exc).__name__},
                 ):
-                    state.failure_reason = "opus_no_progress_limit"
-                    state.current_phase = Phase.FAILURE
-                    return state
+                    return await _finalize_reflection(
+                        state,
+                        phase=Phase.FAILURE,
+                        failure_reason="opus_no_progress_limit",
+                    )
                 system = ESCALATED_REFLECT_SYSTEM
                 user = render_escalation_packet(build_escalation_packet(state))
                 if assertion_diversity:
@@ -454,19 +476,28 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             response_tokens_estimate=response_tokens_estimate,
         )
         if model_stopped:
-            state.failure_reason = "model_stop"
-            state.current_phase = Phase.FAILURE
-            return state
+            return await _finalize_reflection(
+                state,
+                phase=Phase.FAILURE,
+                failure_reason="model_stop",
+            )
         if tool_step is not None and tool_step.handled:
             state.token_usage += _estimate_tokens(system, user, response_text)
             if tool_step.stop_reason:
-                state.failure_reason = tool_step.stop_reason
-                state.current_phase = Phase.FAILURE
-                return state
+                return await _finalize_reflection(
+                    state,
+                    phase=Phase.FAILURE,
+                    failure_reason=tool_step.stop_reason,
+                )
             calls_this_round += 1
             if state.active_provider == "escalation":
                 system = ESCALATED_REFLECT_SYSTEM
-                user = render_escalation_packet(build_escalation_packet(state))
+                user = render_escalation_packet(
+                    build_escalation_packet(
+                        state,
+                        evidence_ids=tool_step.evidence_ids,
+                    )
+                )
                 if assertion_diversity:
                     user = f"{user}\n\n{assertion_diversity}"
                 primary_system = system
@@ -484,7 +515,12 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 )
             prompt_tokens_estimate = _estimate_tokens(system, user)
             continue
-        state.reflection_notes = response_text
+        state.reflection_notes = json.dumps(
+            decision.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
         state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
         _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")
         frame = decision.decision_frame
@@ -508,9 +544,4 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             )
         break
 
-    state.attempt_outcome_summary = await summarize_attempt_outcome(
-        state,
-        llm=llm_call,
-    )
-    state.current_phase = Phase.PLAN
-    return state
+    return await _finalize_reflection(state, phase=Phase.PLAN)

@@ -2,10 +2,13 @@ import hashlib
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from src.escalation import build_escalation_packet, render_escalation_packet
+from src.evidence import EvidenceStore
+from src.reasoning_loop import ReasoningStop
 from src.repair_flow import (
     TARGET_CONTEXT_CONTENT_LIMIT,
     RepairContextError,
@@ -265,6 +268,120 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
         "plan_fix",
         "plan_fix",
     ]
+
+
+async def test_opus_inner_repair_tool_uses_delta_evidence_and_pre_call_policy(
+    tmp_path,
+    monkeypatch,
+):
+    source = "class Widget:\n    def compute(self, value):\n        return value\n"
+    repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
+    state = _state(repo, ref)
+    EvidenceStore(state).add(
+        tool="read_range",
+        summary="old evidence",
+        content="old-evidence-sentinel",
+    )
+    calls = []
+    policy_calls = []
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "offset"},
+                "reason": "locate cause",
+                "expected_evidence": "offset definition",
+            },
+        },
+        {"kind": "repair_plan", **_plan().model_dump(mode="json")},
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "read_symbol",
+                "args": {"path": "src/widget.py", "symbol": "Widget.compute"},
+                "reason": "confirm exact target",
+                "expected_evidence": "target definition",
+            },
+        },
+        {
+            "kind": "verified_edits",
+            "edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "node_target": "Widget.compute",
+                    "search": "",
+                    "replace": "def compute(self, value):\n    return value + 1\n",
+                    "intent": "Apply offset.",
+                }
+            ],
+        },
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        calls.append(user)
+        return responses.pop(0)
+
+    router_calls = 0
+
+    async def fake_router(current, intent, *, calls_this_round):
+        nonlocal router_calls
+        router_calls += 1
+        added = EvidenceStore(current).add(
+            tool=intent.action,
+            summary=f"new evidence {router_calls}",
+            content=f"new-evidence-sentinel-{router_calls}",
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id=added.evidence.evidence_id,
+            made_progress=True,
+            control_action="",
+        )
+
+    def policy_hook(current):
+        policy_calls.append(current.active_provider)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    plan, batch = await generate_opus_repair(
+        state,
+        build_escalation_packet(state),
+        router=fake_router,
+        policy_hook=policy_hook,
+    )
+
+    assert plan.target_symbols == ["Widget.compute"]
+    assert batch.edits[0].node_target == "Widget.compute"
+    assert len(policy_calls) == 4
+    assert "new-evidence-sentinel-1" in calls[1]
+    assert "old-evidence-sentinel" not in calls[1]
+    assert "new-evidence-sentinel-2" in calls[3]
+    assert "old-evidence-sentinel" not in calls[3]
+
+
+async def test_opus_inner_repair_stop_terminates_without_schema_retry(
+    tmp_path,
+    monkeypatch,
+):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def compute(value):\n    return value\n"},
+    )
+    state = _state(repo, ref)
+    calls = 0
+
+    async def fake_llm_call(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return {"kind": "stop", "stop_reason": "no safe repair"}
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    with pytest.raises(ReasoningStop, match="no safe repair"):
+        await generate_opus_repair(state, build_escalation_packet(state))
+
+    assert calls == 1
 
 
 async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(

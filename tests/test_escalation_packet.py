@@ -641,3 +641,28 @@ async def test_escalated_reflect_uses_packet_and_active_escalation_model(monkeyp
     assert result.model_history[-2].node == "reflect_on_failure"
     assert result.model_history[-1].provider == "primary"
     assert result.model_history[-1].node == "outcome_summary"
+
+
+def test_escalation_packet_can_select_only_explicit_evidence_ids():
+    state = _escalated_state()
+    state.evidence = [
+        Evidence(
+            evidence_id="ev_old",
+            tool="read_range",
+            summary="old evidence",
+            content="old content",
+            fingerprint="a" * 64,
+        ),
+        Evidence(
+            evidence_id="ev_new",
+            tool="read_range",
+            summary="new evidence",
+            content="new content",
+            fingerprint="b" * 64,
+        ),
+    ]
+
+    packet = build_escalation_packet(state, evidence_ids=("ev_new",))
+
+    assert [item.evidence_id for item in packet.evidence] == ["ev_new"]
+    assert "old content" not in render_escalation_packet(packet)
