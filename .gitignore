@@ -13,5 +13,12 @@ eval/eval_results.json
 eval/swe_bench_predictions.jsonl
 eval/eval_summary.md
 eval/baseline_*.json
+eval/baseline_*_ids.txt
+eval/checkpoint_*.txt
+eval/checkpoint_*.json
+eval/checkpoint_*_summary.md
+eval/checkpoint_*_predictions.jsonl
+eval/success_first_*.json
+eval/success_first_*_summary.md
 examples/traces/case_1.json
 examples/traces/trace_*.json
