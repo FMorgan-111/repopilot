@@ -629,6 +629,7 @@ async def generate_opus_repair(
     state: AgentState,
     packet: EscalationPacket,
     *,
+    first_stage_prompt: str | None = None,
     validate_edits: bool = True,
 ) -> tuple[RepairPlan, VerifiedEditBatch]:
     """Generate patch-free intent, resolve exact context, then request edits."""
@@ -637,6 +638,9 @@ async def generate_opus_repair(
     if packet.base_commit != state.repo_ref:
         raise RepairContextError("EscalationPacket base commit does not match checkout")
     rendered_packet = render_escalation_packet(packet)
+    plan_user = rendered_packet if first_stage_prompt is None else first_stage_prompt
+    if len(plan_user) > REPAIR_PROMPT_LIMIT:
+        raise RepairContextError("repair plan prompt exceeds strict context budget")
 
     def validate_plan(candidate: RepairPlan) -> tuple[
         RepairPlan,
@@ -650,7 +654,7 @@ async def generate_opus_repair(
     plan, evidence, snapshots = await _call_schema(
         state,
         system=REPAIR_PLAN_SYSTEM,
-        user=rendered_packet,
+        user=plan_user,
         schema=RepairPlan,
         semantic_validate=validate_plan,
     )

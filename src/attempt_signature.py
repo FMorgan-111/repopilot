@@ -45,7 +45,14 @@ def build_plan_transaction_signature(state: AgentState) -> str:
     frame = _latest_plan_frame(state)
     attempt = state.fix_attempts[-1] if state.fix_attempts else FixAttempt()
     material: dict[str, Any] = {
-        "frame": frame.model_dump(mode="json") if frame is not None else None,
+        "frame": (
+            frame.model_dump(
+                mode="json",
+                exclude={"frame_id", "parent_frame_id"},
+            )
+            if frame is not None
+            else None
+        ),
         "transaction": {
             "patch_sha256": _digest(attempt.patch_content),
             "legacy_file_path_sha256": _digest(attempt.file_path),

@@ -788,6 +788,16 @@ def build_plan_user_prompt(
     return f"{user}{completed_attempts_context}"
 
 
+def _build_escalated_plan_user_prompt(state: AgentState) -> str:
+    """Render the Task 6 packet plus one first-stage-only rolling summary."""
+    packet = render_escalation_packet(build_escalation_packet(state))
+    packet = packet.replace(OUTCOME_SUMMARY_SECTION, "")
+    summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
+    if not summary:
+        return packet
+    return f"{packet}\n\n{OUTCOME_SUMMARY_SECTION}\n{summary}"
+
+
 async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM for a concrete patch-oriented plan."""
     import sys
@@ -840,7 +850,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     user = build_plan_user_prompt(state, recall_context=recall_context)
     if state.active_provider == "escalation":
         system = ESCALATED_PLAN_SYSTEM
-        user = render_escalation_packet(build_escalation_packet(state))
+        user = _build_escalated_plan_user_prompt(state)
     prompt_tokens_estimate = _estimate_tokens(system, user)
     _record_node_diagnostic(
         state,
@@ -874,6 +884,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 repair_plan, verified_batch = await generate_opus_repair(
                     state,
                     build_escalation_packet(state),
+                    first_stage_prompt=user,
                     validate_edits=False,
                 )
                 _clear_patch_authorization(state)
@@ -1002,7 +1013,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 )
                 if state.active_provider == "escalation":
                     system = ESCALATED_PLAN_SYSTEM
-                    user = render_escalation_packet(build_escalation_packet(state))
+                    user = _build_escalated_plan_user_prompt(state)
                     prompt_tokens_estimate = _estimate_tokens(system, user)
                     continue
             state.failure_reason = f"Failed to generate fix plan: {type(exc).__name__}"

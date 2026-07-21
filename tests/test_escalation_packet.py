@@ -13,6 +13,7 @@ from src.escalation import (
 from src.http_client import LLMResponseError
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
+from src.outcome_summary import OUTCOME_SUMMARY_SECTION
 from src.state import (
     AgentState,
     ConversationTurn,
@@ -495,7 +496,7 @@ async def test_primary_plan_keeps_current_bounded_prompt_and_default_call(monkey
     assert result.model_history[-1].status == "ok"
 
 
-async def test_escalated_plan_uses_only_packet_and_active_escalation_model(
+async def test_escalated_plan_uses_packet_plus_summary_for_first_stage_only(
     tmp_path, monkeypatch
 ):
     import subprocess
@@ -540,6 +541,7 @@ async def test_escalated_plan_uses_only_packet_and_active_escalation_model(
 
     monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
     state = _escalated_state()
+    state.attempt_outcome_summary = "safe rolling outcome"
     repo = tmp_path / "repo"
     (repo / "src").mkdir(parents=True)
     (repo / "src" / "auth.py").write_text(
@@ -573,16 +575,23 @@ async def test_escalated_plan_uses_only_packet_and_active_escalation_model(
         ToolCall(tool_name="raw", result="raw-http-payload-sentinel")
     ]
     expected_packet = render_escalation_packet(build_escalation_packet(state))
+    expected_first_prompt = (
+        f"{expected_packet}\n\n{OUTCOME_SUMMARY_SECTION}\n"
+        "safe rolling outcome"
+    )
 
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == Phase.EXECUTE
     assert [call["provider"] for call in calls] == ["escalation", "escalation"]
     assert all(call["model"] == "claude-opus-4-8:stable" for call in calls)
-    assert calls[0]["user"] == expected_packet
+    assert calls[0]["user"] == expected_first_prompt
+    assert calls[0]["user"].count(OUTCOME_SUMMARY_SECTION) == 1
     assert "patch" not in calls[0]["system"].lower()
     assert "edit" not in calls[0]["system"].lower()
     assert "target_evidence" in calls[1]["user"]
+    assert OUTCOME_SUMMARY_SECTION not in calls[1]["user"]
+    assert "safe rolling outcome" not in calls[1]["user"]
     assert "Issue URL:" not in calls[0]["user"]
     assert "Relevant files:" not in calls[0]["user"]
     assert "unrelated-conversation-sentinel" not in calls[0]["user"]

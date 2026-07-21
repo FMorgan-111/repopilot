@@ -411,7 +411,7 @@ def test_build_input_uses_only_latest_attempt_and_current_history_frames():
     assert item.plan_signature
 
 
-def test_escalation_packet_does_not_include_primary_plan_summary_section():
+def test_escalation_packet_contract_remains_summary_free():
     state = make_reflect_state(
         active_model="claude-opus-4-8:stable",
         active_provider="escalation",

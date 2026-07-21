@@ -267,6 +267,57 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
     ]
 
 
+async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(
+    tmp_path, monkeypatch
+):
+    source = (
+        "class Widget:\n"
+        "    def compute(self, value):\n"
+        "        return value\n"
+    )
+    repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
+    state = _state(repo, ref)
+    packet = build_escalation_packet(state)
+    summary_section = "Completed attempts (rolling summary):"
+    first_stage_prompt = (
+        f"{render_escalation_packet(packet)}\n\n{summary_section}\n"
+        "safe rolling outcome"
+    )
+    calls = []
+
+    async def fake_llm_call(*args, **kwargs):
+        calls.append({"system": args[0], "user": args[1]})
+        if len(calls) == 1:
+            return _plan().model_dump()
+        return {
+            "edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "node_target": "Widget.compute",
+                    "search": "",
+                    "replace": (
+                        "def compute(self, value):\n"
+                        "    return value + 1\n"
+                    ),
+                    "intent": "Apply the required offset.",
+                }
+            ]
+        }
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    await generate_opus_repair(
+        state,
+        packet,
+        first_stage_prompt=first_stage_prompt,
+    )
+
+    assert calls[0]["user"] == first_stage_prompt
+    assert calls[0]["user"].count(summary_section) == 1
+    assert summary_section not in calls[1]["user"]
+    assert "safe rolling outcome" not in calls[1]["user"]
+
+
 async def test_generate_opus_repair_fails_before_second_call_for_invalid_target(
     tmp_path, monkeypatch
 ):

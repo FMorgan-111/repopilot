@@ -321,6 +321,56 @@ def test_plan_no_progress_uses_live_transaction_even_with_same_fingerprint(mutat
     assert state.no_progress_rounds == 1
 
 
+def test_plan_no_progress_ignores_frame_bookkeeping_identity():
+    state = make_state(
+        decision_frame=DecisionFrame(
+            frame_id="df_0001",
+            parent_frame_id="df_parent_0001",
+            stage="plan",
+            summary="Guard the missing user.",
+            recommended_action="execute",
+            risk="low",
+        ),
+        fix_attempts=[
+            FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/auth.py",
+                        search="return user",
+                        replace="return checked_user",
+                        expected_content_sha256="a" * 64,
+                        exact_only=True,
+                    )
+                ]
+            )
+        ],
+    )
+
+    model_policy.record_no_progress(
+        state,
+        kind="unchanged_plan",
+        fingerprint="ignored-first",
+        node="plan_fix",
+    )
+    first_signature = state.last_plan_signature
+    state.decision_frame = state.decision_frame.model_copy(
+        update={
+            "frame_id": "df_0002",
+            "parent_frame_id": "df_parent_0002",
+        }
+    )
+    state.frame_history.append(state.decision_frame)
+    model_policy.record_no_progress(
+        state,
+        kind="unchanged_plan",
+        fingerprint="ignored-second",
+        node="plan_fix",
+    )
+
+    assert state.last_plan_signature == first_signature
+    assert state.no_progress_rounds == 2
+
+
 @pytest.mark.parametrize(
     ("budget", "expected"),
     [(100_000, 55_000), (80_000, 40_000), (40_000, 0), (20_000, 0)],
