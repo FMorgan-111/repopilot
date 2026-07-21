@@ -16,6 +16,12 @@ from ..escalation import (
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
 from ..outcome_summary import summarize_attempt_outcome
+from ..reasoning_loop import (
+    prompt_with_new_evidence,
+    record_opus_no_progress,
+    route_reasoning_tool,
+    validate_reasoning_response,
+)
 from ..schemas import ReflectDecision
 from ..state import (
     AgentState,
@@ -30,6 +36,7 @@ from ..state import (
     _record_node_diagnostic,
     _remember,
 )
+from ..tool_router import route_tool_intent
 from .plan import _prior_failed_edits_context
 
 ESCALATED_REFLECT_SYSTEM = (
@@ -203,6 +210,24 @@ def _patch_edit_snippet(attempt: Any, limit: int = 2000) -> str:
     return _truncate_prompt_text("\n".join(blocks), limit)
 
 
+def _assertion_diversity_instructions(state: AgentState, latest: Any) -> str:
+    failure_kind = str(getattr(latest, "failure_kind", "")).lower()
+    error_log = str(getattr(latest, "error_log", "")).lower()
+    if state.no_progress_rounds < 1 or not (
+        failure_kind == "assertion_failure"
+        or "assertionerror" in error_log
+        or "assert " in error_log
+    ):
+        return ""
+    return (
+        "Repeated Assertion Instructions:\n"
+        "- The assertion failure signature is unchanged.\n"
+        "- The next repair MUST choose a different target symbol from every prior "
+        "failed edit; changing replacement text at the same symbol is not progress.\n"
+        "- Name the different target symbol in suggested_fix_approach."
+    )
+
+
 async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     """Ask the LLM to analyze WHY the previous fix attempt failed."""
     state = _as_state(state)
@@ -235,7 +260,10 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
         ) or "(none)"
 
     system = (
-        "You are RepoPilot's reflection node. Analyze WHY the fix failed. "
+        "You are RepoPilot's reflection node. Return exactly one JSON response "
+        "variant: kind='tool' with one tool_intent, kind='reflect' with the "
+        "reflection fields below, or kind='stop'. The deterministic runtime alone "
+        "chooses model escalation. Analyze WHY the fix failed. "
         "Be specific. Return JSON with keys: root_cause (string), "
         "what_went_wrong (string), suggested_fix_approach (string), "
         "files_that_also_need_changes (array of strings), decision_frame (object). "
@@ -279,15 +307,35 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
         )
     if patch_apply_failure:
         user = f"{user}\n\n{_patch_apply_failure_prompt(state, test_output)}"
+    assertion_diversity = _assertion_diversity_instructions(state, latest)
+    if assertion_diversity:
+        user = f"{user}\n\n{assertion_diversity}"
     if state.active_provider == "escalation":
         system = ESCALATED_REFLECT_SYSTEM
         user = render_escalation_packet(build_escalation_packet(state))
+        if assertion_diversity:
+            user = f"{user}\n\n{assertion_diversity}"
+    primary_system = system
+    primary_user = user
     prompt_tokens_estimate = _estimate_tokens(system, user)
 
+    calls_this_round = 0
     while True:
+        previous_provider = state.active_provider
+        apply_escalation(state, should_escalate(state))
+        if previous_provider != state.active_provider:
+            system = ESCALATED_REFLECT_SYSTEM
+            user = render_escalation_packet(build_escalation_packet(state))
+            if assertion_diversity:
+                user = f"{user}\n\n{assertion_diversity}"
+            primary_system = system
+            primary_user = user
+            prompt_tokens_estimate = _estimate_tokens(system, user)
         invoked_provider = state.active_provider
         invoked_model = state.active_model
         response_text = ""
+        tool_step = None
+        model_stopped = False
         t0 = time.monotonic()
         try:
             if invoked_provider == "primary":
@@ -303,8 +351,23 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             response_text = json.dumps(response)
             if not response:
                 raise ValueError("Model returned an empty structured response")
-            has_explicit_frame = "decision_frame" in response
-            decision = _normalize_reflect_decision(response)
+            response_kind = validate_reasoning_response(
+                response,
+                outcome_kind="reflect",
+            )
+            if response_kind == "stop":
+                model_stopped = True
+            else:
+                tool_step = await route_reasoning_tool(
+                    state,
+                    response,
+                    node="reflect_on_failure",
+                    calls_this_round=calls_this_round,
+                    router=route_tool_intent,
+                )
+                if not tool_step.handled:
+                    has_explicit_frame = "decision_frame" in response
+                    decision = _normalize_reflect_decision(response)
         except Exception as exc:
             elapsed = time.monotonic() - t0
             immediate_reason = immediate_model_policy_reason(exc)
@@ -341,8 +404,25 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 if state.active_provider == "escalation":
                     system = ESCALATED_REFLECT_SYSTEM
                     user = render_escalation_packet(build_escalation_packet(state))
+                    if assertion_diversity:
+                        user = f"{user}\n\n{assertion_diversity}"
                     prompt_tokens_estimate = _estimate_tokens(system, user)
                     continue
+            if invoked_provider == "escalation":
+                if record_opus_no_progress(
+                    state,
+                    node="reflect_on_failure",
+                    fingerprint={"error_class": type(exc).__name__},
+                ):
+                    state.failure_reason = "opus_no_progress_limit"
+                    state.current_phase = Phase.FAILURE
+                    return state
+                system = ESCALATED_REFLECT_SYSTEM
+                user = render_escalation_packet(build_escalation_packet(state))
+                if assertion_diversity:
+                    user = f"{user}\n\n{assertion_diversity}"
+                prompt_tokens_estimate = _estimate_tokens(system, user)
+                continue
             error_class = type(exc).__name__
             state.reflection_notes = f"Reflection failed: {error_class}"
             _remember(
@@ -373,6 +453,37 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             prompt_tokens_estimate=prompt_tokens_estimate,
             response_tokens_estimate=response_tokens_estimate,
         )
+        if model_stopped:
+            state.failure_reason = "model_stop"
+            state.current_phase = Phase.FAILURE
+            return state
+        if tool_step is not None and tool_step.handled:
+            state.token_usage += _estimate_tokens(system, user, response_text)
+            if tool_step.stop_reason:
+                state.failure_reason = tool_step.stop_reason
+                state.current_phase = Phase.FAILURE
+                return state
+            calls_this_round += 1
+            if state.active_provider == "escalation":
+                system = ESCALATED_REFLECT_SYSTEM
+                user = render_escalation_packet(build_escalation_packet(state))
+                if assertion_diversity:
+                    user = f"{user}\n\n{assertion_diversity}"
+                primary_system = system
+                primary_user = user
+            else:
+                system = primary_system
+                user = (
+                    prompt_with_new_evidence(
+                        primary_user,
+                        state,
+                        tool_step.evidence_ids,
+                    )
+                    if tool_step.evidence_ids
+                    else primary_user
+                )
+            prompt_tokens_estimate = _estimate_tokens(system, user)
+            continue
         state.reflection_notes = response_text
         state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
         _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")

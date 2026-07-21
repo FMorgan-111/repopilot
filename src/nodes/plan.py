@@ -16,7 +16,12 @@ from ..escalation import (
     render_escalation_packet,
 )
 from ..llm import llm_call
-from ..model_policy import apply_escalation, should_escalate
+from ..model_policy import (
+    apply_escalation,
+    record_no_progress,
+    record_progress,
+    should_escalate,
+)
 from ..outcome_summary import (
     OUTCOME_SUMMARY_SECTION,
     sanitize_outcome_summary,
@@ -26,6 +31,12 @@ from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
     generate_opus_repair,
     request_verified_edit_correction,
+)
+from ..reasoning_loop import (
+    prompt_with_new_evidence,
+    record_opus_no_progress,
+    route_reasoning_tool,
+    validate_reasoning_response,
 )
 from ..schemas import PlanDecision
 from ..state import (
@@ -44,6 +55,7 @@ from ..state import (
     _record_node_diagnostic,
     _remember,
 )
+from ..tool_router import route_tool_intent
 
 PLAN_ISSUE_BODY_LIMIT = 2500
 # The planner needs to see real function bodies, not just import headers. At
@@ -809,7 +821,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     system = (
-        "You are RepoPilot's planning node. Return ONLY JSON with keys: "
+        "You are RepoPilot's planning node. Return exactly one JSON response "
+        "variant: kind='tool' with one tool_intent, kind='plan' with the plan "
+        "fields below, or kind='stop' with no outcome payload. The deterministic "
+        "runtime alone chooses model escalation. Plan fields: "
         "plan (markdown string), patch_edits (array), patch (legacy unified diff string, usually empty), "
         "files (array of paths), test_command (string), decision_frame (object). "
         "Each patch_edits item must include file (path string), search (exact existing text), "
@@ -847,7 +862,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         recall = await _semantic_recall_context(state)
         if recall:
             recall_context = f"\n\n{recall}"
-    user = build_plan_user_prompt(state, recall_context=recall_context)
+    primary_system = system
+    primary_user = build_plan_user_prompt(state, recall_context=recall_context)
+    user = primary_user
     if state.active_provider == "escalation":
         system = ESCALATED_PLAN_SYSTEM
         user = _build_escalated_plan_user_prompt(state)
@@ -872,11 +889,20 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         has_context_pressure=bool(_context_pressure_instructions(state)),
     )
 
+    calls_this_round = 0
     while True:
+        previous_provider = state.active_provider
+        apply_escalation(state, should_escalate(state))
+        if previous_provider != state.active_provider:
+            system = ESCALATED_PLAN_SYSTEM
+            user = _build_escalated_plan_user_prompt(state)
+            prompt_tokens_estimate = _estimate_tokens(system, user)
         invoked_provider = state.active_provider
         invoked_model = state.active_model
         two_stage_repair = invoked_provider == "escalation"
         response_text = ""
+        tool_step = None
+        model_stopped = False
         t0 = time.monotonic()
         try:
             print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
@@ -913,6 +939,17 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                             correction_count=state.patch_correction_count,
                             issue_codes=[issue.code for issue in gate_result.issues],
                         )
+                        if record_opus_no_progress(
+                            state,
+                            node="plan_fix",
+                            fingerprint={
+                                "patch_gate_issues": [
+                                    issue.code for issue in gate_result.issues
+                                ]
+                            },
+                        ):
+                            state.failure_reason = "opus_no_progress_limit"
+                            state.current_phase = Phase.FAILURE
                         return state
                     state.patch_correction_count += 1
                     verified_batch = await request_verified_edit_correction(
@@ -975,8 +1012,23 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 response_text = json.dumps(response)
                 if not response:
                     raise ValueError("Model returned an empty structured response")
-                has_explicit_frame = "decision_frame" in response
-                decision = _normalize_plan_decision(response)
+                response_kind = validate_reasoning_response(
+                    response,
+                    outcome_kind="plan",
+                )
+                if response_kind == "stop":
+                    model_stopped = True
+                else:
+                    tool_step = await route_reasoning_tool(
+                        state,
+                        response,
+                        node="plan_fix",
+                        calls_this_round=calls_this_round,
+                        router=route_tool_intent,
+                    )
+                    if not tool_step.handled:
+                        has_explicit_frame = "decision_frame" in response
+                        decision = _normalize_plan_decision(response)
         except Exception as exc:
             elapsed = time.monotonic() - t0
             immediate_reason = immediate_model_policy_reason(exc)
@@ -1016,6 +1068,19 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     user = _build_escalated_plan_user_prompt(state)
                     prompt_tokens_estimate = _estimate_tokens(system, user)
                     continue
+            if two_stage_repair:
+                if record_opus_no_progress(
+                    state,
+                    node="plan_fix",
+                    fingerprint={"error_class": type(exc).__name__},
+                ):
+                    state.failure_reason = "opus_no_progress_limit"
+                    state.current_phase = Phase.FAILURE
+                    return state
+                system = ESCALATED_PLAN_SYSTEM
+                user = _build_escalated_plan_user_prompt(state)
+                prompt_tokens_estimate = _estimate_tokens(system, user)
+                continue
             state.failure_reason = f"Failed to generate fix plan: {type(exc).__name__}"
             state.current_phase = Phase.FAILURE
             return state
@@ -1042,6 +1107,29 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             prompt_tokens_estimate=prompt_tokens_estimate,
             response_tokens_estimate=response_tokens_estimate,
         )
+        if model_stopped:
+            state.failure_reason = "model_stop"
+            state.current_phase = Phase.FAILURE
+            return state
+        if tool_step is not None and tool_step.handled:
+            state.token_usage += _estimate_tokens(system, user, response_text)
+            if tool_step.stop_reason:
+                state.failure_reason = tool_step.stop_reason
+                state.current_phase = Phase.FAILURE
+                return state
+            calls_this_round += 1
+            if state.active_provider == "escalation":
+                system = ESCALATED_PLAN_SYSTEM
+                user = _build_escalated_plan_user_prompt(state)
+            else:
+                system = primary_system
+                user = (
+                    prompt_with_new_evidence(primary_user, state, tool_step.evidence_ids)
+                    if tool_step.evidence_ids
+                    else primary_user
+                )
+            prompt_tokens_estimate = _estimate_tokens(system, user)
+            continue
         break
 
     state.fix_plan = decision.plan
@@ -1078,6 +1166,13 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if state.patch_content or state.patch_edits:
         dead_reason = _dead_plan_reason(state)
         if dead_reason is not None:
+            record_no_progress(
+                state,
+                kind="repeated_edit",
+                node="plan_fix",
+                fingerprint=dead_reason,
+            )
+            apply_escalation(state, should_escalate(state))
             state.repeated_patch_block_count += 1
             state.decision_warnings.append(
                 {
@@ -1114,6 +1209,20 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 else _unlocatable_edits(state)
             )
             if missing:
+                record_no_progress(
+                    state,
+                    kind="nonexistent_search_block",
+                    node="plan_fix",
+                    fingerprint=[
+                        {
+                            "file": edit.file_path,
+                            "search": edit.search,
+                            "replace": edit.replace,
+                        }
+                        for edit in missing
+                    ],
+                )
+                apply_escalation(state, should_escalate(state))
                 state.hallucinated_search_block_count += 1
                 state.search_correction_context = _build_search_correction(state, missing)
                 state.decision_warnings.append(
@@ -1147,19 +1256,47 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state.current_phase = Phase.PLAN
             else:
                 state.search_correction_context = ""  # resolved; stop feeding it
-                if _planned_edits_repeat_failure(state):
+                repeated_failed_target = any(
+                    _edit_key(edit) in _failed_edit_keys(state)
+                    for edit in state.patch_edits
+                )
+                if state.assertion_diversity_required and repeated_failed_target:
                     state.decision_warnings.append(
                         {
                             "node": "plan_fix",
-                            "warning": "repeated_failed_patch",
+                            "warning": "assertion_target_not_diversified",
                             "detail": (
-                                "Planned patch_edits only repeat edits that already "
-                                "failed; the planner did not diversify."
+                                "Repeated assertion repair reused a prior failed "
+                                "target symbol; a different target is required."
                             ),
                             "frame_id": frame.frame_id,
                         }
                     )
-                state.current_phase = Phase.EXECUTE
+                    record_no_progress(
+                        state,
+                        kind="repeated_edit",
+                        node="plan_fix",
+                    )
+                    apply_escalation(state, should_escalate(state))
+                    _clear_patch_authorization(state)
+                    frame.recommended_action = "plan"
+                    state.current_phase = Phase.PLAN
+                else:
+                    record_progress(state)
+                    state.assertion_diversity_required = False
+                    if _planned_edits_repeat_failure(state):
+                        state.decision_warnings.append(
+                            {
+                                "node": "plan_fix",
+                                "warning": "repeated_failed_patch",
+                                "detail": (
+                                    "Planned patch_edits only repeat edits that already "
+                                    "failed; the planner did not diversify."
+                                ),
+                                "frame_id": frame.frame_id,
+                            }
+                        )
+                    state.current_phase = Phase.EXECUTE
     elif frame.recommended_action == "collect_more_context":
         if _is_final_attempt(state):
             frame.recommended_action = "stop"

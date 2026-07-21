@@ -709,6 +709,10 @@ class AgentState(BaseModel):
     last_plan_signature: str = ""
     last_context_fingerprint: str = ""
     last_test_failure_signature: str = ""
+    last_assertion_failure_signature: str = ""
+    assertion_no_progress_rounds: int = Field(default=0, ge=0)
+    assertion_diversity_required: bool = False
+    opus_no_progress_rounds: dict[str, int] = Field(default_factory=dict)
     model_history: list[ModelInvocation] = Field(default_factory=list)
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
     attempt_outcome_summary: str = Field(

@@ -2,8 +2,10 @@
 final-attempt force-execute (solution 2) in plan_fix / reflect_on_failure."""
 
 import json
+from types import SimpleNamespace
 
 from src import new_agent
+from src import model_policy
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 from src.state import PatchEdit
@@ -19,13 +21,14 @@ def _failed_attempt(file_path="app/router.py", search="def handle():",
 
 
 def _base_state(**kw):
-    return new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-        current_phase=new_agent.Phase.PLAN,
-        **kw,
-    )
+    values = {
+        "issue_url": "https://github.com/acme/widget/issues/7",
+        "issue_title": "Login crash",
+        "issue_body": "Crashes after submit.",
+        "current_phase": new_agent.Phase.PLAN,
+    }
+    values.update(kw)
+    return new_agent.AgentState(**values)
 
 
 def _execute_response(file_path, search, replace, summary="Apply the fix."):
@@ -140,6 +143,60 @@ async def test_plan_fix_no_warning_when_patch_diversified(monkeypatch):
     assert not any(
         w.get("warning") == "repeated_failed_patch"
         for w in next_state.decision_warnings
+    )
+
+
+async def test_assertion_diversity_rejects_same_target_symbol(monkeypatch):
+    async def fake_llm_call(system, user):
+        return json.dumps(
+            {
+                "kind": "plan",
+                "plan": "Change replacement text on the same symbol.",
+                "patch": "",
+                "patch_edits": [
+                    {
+                        "file": "app/router.py",
+                        "node_target": "handle",
+                        "replace": "def handle():\n    return 'new'\n",
+                    }
+                ],
+                "files": ["app/router.py"],
+                "test_command": "pytest",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": "Reuse handle.",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.7,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        assertion_diversity_required=True,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="app/router.py",
+                        node_target="handle",
+                        replace="def handle():\n    return 'wrong'\n",
+                    )
+                ],
+                failure_kind="assertion_failure",
+                error_log="AssertionError: expected new",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.PLAN
+    assert not result.patch_edits
+    assert any(
+        warning.get("warning") == "assertion_target_not_diversified"
+        for warning in result.decision_warnings
     )
 
 
@@ -360,3 +417,205 @@ async def test_plan_fix_fails_fast_on_final_attempt_dead_patch(monkeypatch):
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
+
+
+async def test_two_gemini_invalid_anchors_activate_one_way_escalation(monkeypatch):
+    monkeypatch.setattr(model_policy, "escalation_is_configured", lambda: True)
+    monkeypatch.setattr(
+        model_policy,
+        "get_model_config",
+        lambda provider: SimpleNamespace(model="claude-opus-4-8:stable"),
+    )
+
+    async def fake_llm_call(system, user, **kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'missing-sentinel'",
+            "return 'new-sentinel'",
+            summary="Use the missing anchor.",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        relevant_files=[
+            new_agent.FileInfo(
+                path="src/widget.py",
+                content="def widget():\n    return 'old-sentinel'\n",
+            )
+        ]
+    )
+
+    state = await plan_node.plan_fix(state)
+    assert state.escalated is False
+    assert state.current_phase == new_agent.Phase.PLAN
+
+    state = await plan_node.plan_fix(state)
+
+    assert state.escalated is True
+    assert state.active_provider == "escalation"
+    assert state.escalation_reason == "nonexistent_search_block"
+    assert state.no_progress_rounds == 2
+
+
+async def test_changed_invalid_anchor_is_material_progress(monkeypatch):
+    responses = [
+        _execute_response(
+            "src/widget.py",
+            "return 'missing-one'",
+            "return 'new-sentinel'",
+            summary="First missing anchor.",
+        ),
+        _execute_response(
+            "src/widget.py",
+            "return 'missing-two'",
+            "return 'new-sentinel'",
+            summary="Second missing anchor.",
+        ),
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        relevant_files=[
+            new_agent.FileInfo(
+                path="src/widget.py",
+                content="def widget():\n    return 'old-sentinel'\n",
+            )
+        ]
+    )
+
+    state = await plan_node.plan_fix(state)
+    state = await plan_node.plan_fix(state)
+
+    assert state.no_progress_rounds == 1
+    assert state.escalated is False
+
+
+async def test_repeated_assertion_reflection_requires_different_target_symbol(
+    monkeypatch,
+):
+    captured = {}
+
+    async def fake_llm_call(system, user, **kwargs):
+        captured["user"] = user
+        return {
+            "root_cause": "The same assertion still fails.",
+            "what_went_wrong": "The previous symbol was not causal.",
+            "suggested_fix_approach": "Target another symbol.",
+            "files_that_also_need_changes": [],
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": "Choose another target.",
+                "recommended_action": "plan",
+                "risk": "medium",
+                "confidence": 0.6,
+            },
+        }
+
+    async def fake_summary(state, **kwargs):
+        return "same assertion; choose another symbol"
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summary)
+    state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        no_progress_rounds=1,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/widget.py",
+                        node_target="widget",
+                        replace="def widget():\n    return 'still-wrong'\n",
+                    )
+                ],
+                failure_kind="assertion_failure",
+                error_log="AssertionError: expected new-sentinel",
+            )
+        ],
+    )
+
+    await reflect_node.reflect_on_failure(state)
+
+    assert "different target symbol" in captured["user"].lower()
+
+
+async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
+    calls = []
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "same-sentinel"},
+                "reason": "find source",
+                "expected_evidence": "source location",
+            },
+        },
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "same-sentinel"},
+                "reason": "find source",
+                "expected_evidence": "source location",
+            },
+        },
+        {
+            "kind": "reflect",
+            "root_cause": "The original target was wrong.",
+            "what_went_wrong": "The edit missed the causal symbol.",
+            "suggested_fix_approach": "Choose another symbol.",
+            "files_that_also_need_changes": [],
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": "Choose another symbol.",
+                "recommended_action": "plan",
+                "risk": "medium",
+                "confidence": 0.7,
+            },
+        },
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        calls.append((system, user, kwargs))
+        return responses.pop(0)
+
+    async def duplicate_route(state, intent, *, calls_this_round):
+        return SimpleNamespace(
+            status="duplicate",
+            evidence_id=None,
+            made_progress=False,
+            control_action="",
+        )
+
+    async def fake_summary(state, **kwargs):
+        return "reflection summary"
+
+    monkeypatch.setattr(model_policy, "escalation_is_configured", lambda: True)
+    monkeypatch.setattr(
+        model_policy,
+        "get_model_config",
+        lambda provider: SimpleNamespace(model="claude-opus-4-8:stable"),
+    )
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "route_tool_intent", duplicate_route)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summary)
+    state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        repo_ref="a" * 40,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log="AssertionError: sentinel",
+            )
+        ],
+    )
+
+    result = await reflect_node.reflect_on_failure(state)
+
+    assert result.active_provider == "escalation"
+    assert calls[2][0] == reflect_node.ESCALATED_REFLECT_SYSTEM
+    assert calls[2][2]["provider"] == "escalation"

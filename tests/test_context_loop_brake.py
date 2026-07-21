@@ -8,10 +8,12 @@ the whole token budget:
 """
 
 import json
+from types import SimpleNamespace
 
 from src import new_agent
 from src.nodes import locate as locate_node
 from src.nodes import plan as plan_node
+from src.state import Evidence, ToolInvocation
 
 
 class EmptyMemoryStore:
@@ -33,6 +35,38 @@ def _collect_more_context_response(summary="Need more context before patching.")
                 "next_checks": ["Search for the request router middleware."],
                 "risk": "unknown",
                 "confidence": 0.5,
+            },
+        }
+    )
+
+
+def _base_state(**updates):
+    values = {
+        "issue_url": "https://github.com/acme/widget/issues/7",
+        "issue_title": "sentinel",
+        "issue_body": "update sentinel",
+        "current_phase": new_agent.Phase.PLAN,
+    }
+    values.update(updates)
+    return new_agent.AgentState(**values)
+
+
+def _execute_response(file_path, search, replace):
+    return json.dumps(
+        {
+            "kind": "plan",
+            "plan": "Update the sentinel.",
+            "patch_edits": [
+                {"file": file_path, "search": search, "replace": replace}
+            ],
+            "files": [file_path],
+            "test_command": "pytest tests/test_widget.py -q",
+            "decision_frame": {
+                "stage": "plan",
+                "summary": "Update the sentinel.",
+                "recommended_action": "execute",
+                "risk": "low",
+                "confidence": 0.9,
             },
         }
     )
@@ -337,3 +371,182 @@ async def test_plan_prompt_forces_commit_on_final_round(monkeypatch):
     assert "FINAL context round" in captured["user"]
     assert "MUST" in captured["user"]
     assert "patch_edits now" in captured["user"]
+
+
+async def test_plan_tool_request_reprompts_with_only_new_evidence(monkeypatch):
+    calls = []
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "read_symbol",
+                "args": {"path": "src/widget.py", "symbol": "widget"},
+                "reason": "inspect the sentinel",
+                "expected_evidence": "widget source",
+            },
+        },
+        {
+            "kind": "plan",
+            "plan": "Update the sentinel.",
+            "patch_edits": [
+                {
+                    "file": "src/widget.py",
+                    "search": "return 'old-sentinel'",
+                    "replace": "return 'new-sentinel'",
+                }
+            ],
+            "files": ["src/widget.py"],
+            "test_command": "pytest tests/test_widget.py -q",
+            "decision_frame": {
+                "stage": "plan",
+                "summary": "Update the sentinel.",
+                "recommended_action": "execute",
+                "risk": "low",
+                "confidence": 0.9,
+            },
+        },
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        calls.append(user)
+        return responses.pop(0)
+
+    async def fake_route(state, intent, *, calls_this_round):
+        state.evidence.append(
+            Evidence(
+                evidence_id="ev_new_sentinel",
+                tool="read_symbol",
+                file_path="src/widget.py",
+                symbol="widget",
+                summary="new evidence",
+                content="return 'old-sentinel'",
+                fingerprint="new-fingerprint",
+            )
+        )
+        state.tool_history.append(
+            ToolInvocation(
+                action="read_symbol",
+                args_fingerprint="f" * 64,
+                status="ok",
+                evidence_id="ev_new_sentinel",
+            )
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id="ev_new_sentinel",
+            made_progress=True,
+            control_action="",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(plan_node, "route_tool_intent", fake_route, raising=False)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="sentinel",
+        issue_body="update sentinel",
+        current_phase=new_agent.Phase.PLAN,
+        repo_ref="a" * 40,
+        relevant_files=[
+            new_agent.FileInfo(
+                path="src/widget.py",
+                content="def widget():\n    return 'old-sentinel'\n",
+            )
+        ],
+        evidence=[
+            Evidence(
+                evidence_id="ev_old_sentinel",
+                tool="read_range",
+                summary="old evidence",
+                content="must not be reinjected",
+                fingerprint="old-fingerprint",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert len(calls) == 2
+    assert "ev_new_sentinel" in calls[1]
+    assert "return 'old-sentinel'" in calls[1]
+    assert "ev_old_sentinel" not in calls[1]
+
+
+async def test_duplicate_tool_request_counts_no_progress_before_plan(monkeypatch):
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "sentinel"},
+                "reason": "find sentinel",
+                "expected_evidence": "source location",
+            },
+        },
+        _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        ),
+    ]
+
+    async def fake_llm_call(system, user, **kwargs):
+        return responses.pop(0)
+
+    async def duplicate_route(state, intent, *, calls_this_round):
+        return SimpleNamespace(
+            status="duplicate",
+            evidence_id=None,
+            made_progress=False,
+            control_action="",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(plan_node, "route_tool_intent", duplicate_route, raising=False)
+    state = _base_state(
+        relevant_files=[
+            new_agent.FileInfo(
+                path="src/widget.py",
+                content="def widget():\n    return 'old-sentinel'\n",
+            )
+        ]
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert result.no_progress_rounds == 0
+    assert result.no_progress_history[-1].kind == "unchanged_context"
+
+
+async def test_plan_routes_no_more_than_eight_tool_requests_per_round(monkeypatch):
+    routed = []
+
+    async def fake_llm_call(system, user, **kwargs):
+        return {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": f"sentinel-{len(routed)}"},
+                "reason": "bounded investigation",
+                "expected_evidence": "one result",
+            },
+        }
+
+    async def fake_route(state, intent, *, calls_this_round):
+        routed.append(intent.args["text"])
+        return SimpleNamespace(
+            status="duplicate",
+            evidence_id=None,
+            made_progress=False,
+            control_action="",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(plan_node, "route_tool_intent", fake_route, raising=False)
+
+    result = await plan_node.plan_fix(_base_state())
+
+    assert len(routed) == 8
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.failure_reason == "tool_round_limit"

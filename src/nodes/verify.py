@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any
 
+from ..model_policy import record_no_progress, record_progress
 from ..state import (
     AgentState,
     FixAttempt,
     Phase,
     _as_state,
     _is_budget_exceeded,
+    _record_node_diagnostic,
     _same_failure_seen_twice,
 )
 
@@ -56,6 +60,82 @@ def _failure_kind(attempt: FixAttempt) -> str:
     return ""
 
 
+def _test_failure_class(attempt: FixAttempt) -> str:
+    """Classify only routing-relevant test failures from bounded local output."""
+    failure_kind = _failure_kind(attempt).lower()
+    error_log = attempt.error_log.lower()
+    if "syntaxerror" in error_log or failure_kind == "syntax_error":
+        return "syntax_error"
+    if (
+        "modulenotfounderror" in error_log
+        or "importerror" in error_log
+        or failure_kind == "import_error"
+    ):
+        return "import_error"
+    if (
+        failure_kind == "assertion_failure"
+        or "assertionerror" in error_log
+        or "assert " in error_log
+    ):
+        return "assertion_failure"
+    return failure_kind or "test_failed"
+
+
+def _failure_signature_payload(attempt: FixAttempt, failure_class: str) -> dict[str, str]:
+    normalized_error = " ".join(attempt.error_log.split())
+    return {"class": failure_class, "error": normalized_error}
+
+
+def _canonical_signature(payload: dict[str, str]) -> str:
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _record_test_failure_progress(
+    state: AgentState,
+    latest: FixAttempt,
+    failure_class: str,
+) -> bool:
+    """Return True only when this failure repeats the prior material signature."""
+    payload = _failure_signature_payload(latest, failure_class)
+    signature = _canonical_signature(payload)
+    assertion_failure = failure_class == "assertion_failure"
+    prior_assertion_signature = state.last_assertion_failure_signature
+    if assertion_failure:
+        state.last_assertion_failure_signature = signature
+    else:
+        state.last_assertion_failure_signature = ""
+        state.assertion_no_progress_rounds = 0
+        state.assertion_diversity_required = False
+    repeated_signature = (
+        prior_assertion_signature == signature
+        if assertion_failure
+        else state.last_test_failure_signature == signature
+    )
+    if not repeated_signature:
+        record_progress(state)
+        state.last_test_failure_signature = signature
+        state.assertion_no_progress_rounds = 0
+        state.assertion_diversity_required = False
+        return False
+    state.last_test_failure_signature = signature
+    record_no_progress(
+        state,
+        kind="unchanged_test_failure",
+        node="verify_fix",
+        fingerprint=payload,
+    )
+    if assertion_failure and prior_assertion_signature == signature:
+        state.assertion_no_progress_rounds += 1
+        state.no_progress_rounds = state.assertion_no_progress_rounds
+    return True
+
+
 async def _record_episode_best_effort(state: AgentState, latest: FixAttempt) -> None:
     """Persist this attempt's (issue, outcome, patch) as a cross-repo episode.
     Never raises: if the episode store or embedding model is unavailable, the
@@ -99,17 +179,25 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
     if latest.success:
         # In benchmark/eval mode we have no write access to upstream repos, so a
         # verified test pass is the terminal success — skip the PR step.
+        state.last_assertion_failure_signature = ""
+        state.assertion_no_progress_rounds = 0
+        state.assertion_diversity_required = False
         state.current_phase = Phase.DONE if state.skip_commit else Phase.COMMIT
         return state
 
-    if _same_failure_seen_twice(state):
-        state.failure_reason = "Same patch produced the same failure twice."
-        state.current_phase = Phase.FAILURE
-        return state
-
+    failure_class = _test_failure_class(latest)
     if _failure_kind(latest) == "infra_error":
         message = latest.error_log.strip() or "execution infrastructure failed"
         state.failure_reason = f"Infrastructure error during execution: {message[:500]}"
+        state.current_phase = Phase.FAILURE
+        return state
+
+    if _same_failure_seen_twice(state) and failure_class not in {
+        "syntax_error",
+        "import_error",
+        "assertion_failure",
+    }:
+        state.failure_reason = "Same patch produced the same failure twice."
         state.current_phase = Phase.FAILURE
         return state
 
@@ -151,6 +239,52 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         state.retry_count += 1
         state.current_phase = Phase.REFLECT
         return state
+
+    repeated_failure = _record_test_failure_progress(state, latest, failure_class)
+
+    if failure_class in {"syntax_error", "import_error"}:
+        if state.retry_count >= state.max_retries:
+            state.failure_reason = f"Maximum retries reached: {state.max_retries}."
+            state.current_phase = Phase.FAILURE
+            return state
+        if _is_budget_exceeded(state):
+            state.failure_reason = "Token budget exceeded during verification."
+            state.current_phase = Phase.FAILURE
+            return state
+        state.retry_count += 1
+        state.current_phase = Phase.PLAN
+        _record_node_diagnostic(
+            state,
+            node="verify_fix",
+            event="direct_patch_correction",
+            status="success",
+            elapsed_seconds=0.0,
+            failure_class=failure_class,
+        )
+        return state
+
+    if failure_class == "assertion_failure" and repeated_failure:
+        if state.assertion_no_progress_rounds >= 2:
+            state.failure_reason = "repeated_assertion_no_progress"
+            state.current_phase = Phase.FAILURE
+            _record_node_diagnostic(
+                state,
+                node="verify_fix",
+                event="assertion_no_progress_limit",
+                status="error",
+                elapsed_seconds=0.0,
+                round=state.no_progress_rounds,
+            )
+            return state
+        state.assertion_diversity_required = True
+        _record_node_diagnostic(
+            state,
+            node="verify_fix",
+            event="assertion_diversity_required",
+            status="success",
+            elapsed_seconds=0.0,
+            round=state.no_progress_rounds,
+        )
 
     if state.retry_count >= state.max_retries:
         state.failure_reason = f"Maximum retries reached: {state.max_retries}."

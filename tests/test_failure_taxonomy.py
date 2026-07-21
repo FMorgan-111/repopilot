@@ -6,6 +6,9 @@ from eval.failure_taxonomy import (
     classify_sample,
     summarize,
 )
+from src import new_agent
+from src.model_policy import record_progress
+from src.state import PatchEdit
 
 
 def test_wrong_file_path():
@@ -111,3 +114,181 @@ def test_summarize_distribution():
     assert s["decisive"]["test_failed"] == 1
     assert s["decisive"]["wrong_file_path"] == 1
     assert s["decisive"]["resolved"] == 1
+
+
+async def test_verify_infrastructure_error_does_not_consume_retry_budget():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        retry_count=2,
+        max_retries=3,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="infra_error",
+                error_log="sentinel runner unavailable",
+            )
+        ],
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.retry_count == 2
+    assert result.current_phase == new_agent.Phase.FAILURE
+
+
+async def test_verify_syntax_and_import_failures_route_directly_to_plan():
+    for error_log in (
+        "SyntaxError: invalid syntax at src/widget.py:4",
+        "ImportError: cannot import name Widget",
+        "ModuleNotFoundError: No module named widget",
+    ):
+        state = new_agent.AgentState(
+            issue_url="https://github.com/acme/widget/issues/7",
+            retry_count=0,
+            max_retries=3,
+            current_phase=new_agent.Phase.VERIFY,
+            fix_attempts=[
+                new_agent.FixAttempt(
+                    patch_edits=[
+                        PatchEdit(
+                            file_path="src/widget.py",
+                            search="old-sentinel",
+                            replace="new-sentinel",
+                        )
+                    ],
+                    failure_kind="test_failed",
+                    error_log=error_log,
+                )
+            ],
+        )
+
+        result = await new_agent.verify_fix(state)
+
+        assert result.current_phase == new_agent.Phase.PLAN
+        assert result.retry_count == 1
+        assert result.node_diagnostics[-1]["event"] == "direct_patch_correction"
+
+
+async def test_repeated_unchanged_assertion_diversifies_once_then_terminates():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        retry_count=0,
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+    )
+
+    def assertion_attempt(symbol: str):
+        return new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    node_target=symbol,
+                    replace=f"def {symbol}():\n    return 'wrong'\n",
+                )
+            ],
+            failure_kind="assertion_failure",
+            error_log="AssertionError: expected new-sentinel",
+        )
+
+    state.fix_attempts.append(assertion_attempt("first_target"))
+    state = await new_agent.verify_fix(state)
+    assert state.current_phase == new_agent.Phase.REFLECT
+    assert state.no_progress_rounds == 0
+
+    state.current_phase = new_agent.Phase.VERIFY
+    state.fix_attempts.append(assertion_attempt("second_target"))
+    state = await new_agent.verify_fix(state)
+    assert state.current_phase == new_agent.Phase.REFLECT
+    assert state.no_progress_rounds == 1
+    assert state.node_diagnostics[-1]["event"] == "assertion_diversity_required"
+
+    state.current_phase = new_agent.Phase.VERIFY
+    state.fix_attempts.append(assertion_attempt("third_target"))
+    state = await new_agent.verify_fix(state)
+    assert state.current_phase == new_agent.Phase.FAILURE
+    assert state.failure_reason == "repeated_assertion_no_progress"
+
+
+async def test_assertion_streak_survives_intervening_plan_progress():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+    )
+
+    def attempt(symbol: str):
+        return new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    node_target=symbol,
+                    replace=f"def {symbol}():\n    return 'wrong'\n",
+                )
+            ],
+            failure_kind="assertion_failure",
+            error_log="AssertionError: expected new-sentinel",
+        )
+
+    for symbol in ("first_target", "second_target", "third_target"):
+        state.current_phase = new_agent.Phase.VERIFY
+        state.fix_attempts.append(attempt(symbol))
+        state = await new_agent.verify_fix(state)
+        if symbol != "third_target":
+            record_progress(state)  # successful PLAN result before EXECUTE/VERIFY
+
+    assert state.current_phase == new_agent.Phase.FAILURE
+    assert state.failure_reason == "repeated_assertion_no_progress"
+
+
+async def test_repeated_syntax_failure_routes_to_plan_before_generic_replay_brake():
+    edit = PatchEdit(
+        file_path="src/widget.py",
+        search="return old",
+        replace="return new",
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[edit],
+                failure_kind="syntax_error",
+                error_log="SyntaxError: invalid syntax",
+            ),
+            new_agent.FixAttempt(
+                patch_edits=[edit],
+                failure_kind="syntax_error",
+                error_log="SyntaxError: invalid syntax",
+            ),
+        ],
+    )
+
+    state = await new_agent.verify_fix(state)
+
+    assert state.current_phase == new_agent.Phase.PLAN
+    assert state.failure_reason != "Same patch produced the same failure twice."
+
+
+async def test_repeated_infra_failure_keeps_infra_semantics_without_retry():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        retry_count=2,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="infra_error",
+                error_log="worker unavailable",
+            ),
+            new_agent.FixAttempt(
+                failure_kind="infra_error",
+                error_log="worker unavailable",
+            ),
+        ],
+    )
+
+    state = await new_agent.verify_fix(state)
+
+    assert state.current_phase == new_agent.Phase.FAILURE
+    assert state.failure_reason.startswith("Infrastructure error during execution")
+    assert state.retry_count == 2

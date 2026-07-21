@@ -4,12 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Literal
 
 from pydantic import BaseModel
 
 from .model_provider import redact_secrets
 from .state import AgentState, Evidence
+
+_EVALUATOR_PAYLOAD_RE = re.compile(
+    r"(?im)(?:\b(?:FAIL_TO_PASS|PASS_TO_PASS)\b|"
+    r"[\"'](?:patch|test_patch|gold_patch)[\"']\s*:|"
+    r"^\s*(?:patch|test_patch|gold_patch)\s*:)"
+)
 
 
 class EvidenceAddResult(BaseModel):
@@ -126,7 +133,11 @@ class EvidenceStore:
 
 
 def _normalize_text(value: object) -> str:
-    return redact_secrets(str(value)).replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = redact_secrets(str(value))
+    marker = _EVALUATOR_PAYLOAD_RE.search(text)
+    if marker is not None:
+        text = text[: marker.start()]
+    return text.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def _normalize_path(value: str | None) -> str | None:

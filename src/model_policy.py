@@ -84,6 +84,7 @@ def record_progress(state: AgentState) -> None:
     state.last_plan_signature = ""
     state.last_context_fingerprint = ""
     state.last_test_failure_signature = ""
+    state.opus_no_progress_rounds = {}
 
 
 def _signature_field(kind: str) -> str:

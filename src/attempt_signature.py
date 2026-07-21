@@ -71,5 +71,15 @@ def build_plan_transaction_signature(state: AgentState) -> str:
                 for index, edit in enumerate(attempt.patch_edits)
             ],
         },
+        "pending_transaction": {
+            "patch_sha256": _digest(state.patch_content),
+            "edits": [
+                {
+                    "order": index,
+                    "edit_sha256": _canonical_digest(edit.model_dump(mode="json")),
+                }
+                for index, edit in enumerate(state.patch_edits)
+            ],
+        },
     }
     return _canonical_digest(material)
