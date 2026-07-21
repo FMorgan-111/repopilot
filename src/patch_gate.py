@@ -31,6 +31,7 @@ from .state import (
     VerifiedEditBatch,
     tool_manifest_fingerprint,
 )
+from .test_path_policy import is_allowed_test_path
 
 MAX_PATCH_FILE_BYTES = 512_000
 MAX_CORRECTION_CONTEXT_CHARS = 1_200
@@ -381,8 +382,6 @@ def validate_patch_batch(
             issues.append(_issue("scope_violation", str(raw_path), "Target path is not canonical and repository-relative."))
             continue
         if test_only:
-            from .coverage_gate import is_allowed_test_path
-
             if not is_allowed_test_path(root, path):
                 issues.append(
                     _issue(

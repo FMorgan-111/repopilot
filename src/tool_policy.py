@@ -16,6 +16,7 @@ from .local_search import is_sensitive_repo_path
 from .repo_paths import canonical_repo_path
 from .safe_subprocess import run_bounded_process
 from .state import AgentState, ToolAction, tool_manifest_fingerprint
+from .test_path_policy import is_allowed_test_path
 
 _COMMIT_RE = re.compile(r"[0-9a-fA-F]{40}")
 _ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
@@ -131,17 +132,6 @@ def _git_result(root: Path, argv: list[str], *, max_output_bytes: int = 256_000)
     return result.stdout
 
 
-def _is_test_path(path: str) -> bool:
-    parts = Path(path).parts
-    name = Path(path).name
-    is_test_name = name.startswith("test_") and name.endswith(".py")
-    is_test_name = is_test_name or name.endswith("_test.py")
-    in_test_root = not parts[:-1] or any(
-        part.lower() in {"test", "tests"} for part in parts[:-1]
-    )
-    return is_test_name and in_test_root
-
-
 def _is_exact_base_member(root: Path, state: AgentState, path: str) -> bool:
     try:
         output = _git_result(
@@ -195,7 +185,7 @@ def _target_selector(root: Path, state: AgentState, token: str) -> bool:
         normalized = _relative_path(root, path_part, require_file=True)
     except ValueError:
         return False
-    if not _is_test_path(normalized):
+    if not is_allowed_test_path(root, normalized):
         return False
     return _is_exact_base_member(root, state, normalized) or _is_approved_generated_test(
         root, state, normalized

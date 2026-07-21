@@ -40,6 +40,7 @@ from .state import (
     tool_manifest_fingerprint,
 )
 from .tool_policy import ToolIntent, ToolPolicy
+from .test_path_policy import is_allowed_test_path
 
 
 class ToolRouteResult(BaseModel):
@@ -437,13 +438,10 @@ def _approved_test_overlays(
     overlays: list[tuple[str, bytes]] = []
     total = 0
     for path in normalized:
-        name = Path(path).name.casefold()
-        is_test_name = (name.startswith("test_") or name.endswith("_test.py")) and name.endswith(".py")
         if (
             path not in state.coverage_test_files
             or is_sensitive_repo_path(path)
-            or not is_test_name
-            or not any(part.casefold() in {"test", "tests"} for part in Path(path).parts[:-1])
+            or not is_allowed_test_path(root, path)
         ):
             raise ValueError("generated test overlay is not an approved test path")
         marker = generated.get(path)

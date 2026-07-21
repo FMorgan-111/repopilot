@@ -20,7 +20,7 @@ from .graph import (
     run_graph,
 )
 from .evaluator_safety import safe_prediction_patch
-from .coverage_gate import validate_live_coverage_binding
+from .coverage_gate import validate_terminal_coverage_binding
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.coverage import ensure_coverage
@@ -292,7 +292,7 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
     report = final_report_from_state(state, turns_taken)
     try:
-        live_binding = validate_live_coverage_binding(state)
+        live_binding = validate_terminal_coverage_binding(state)
     except ValueError:
         live_binding = None
     terminal_success = state.current_phase == Phase.DONE and live_binding is not None

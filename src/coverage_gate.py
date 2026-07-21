@@ -24,7 +24,7 @@ from typing import Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .evaluator_safety import contains_evaluator_only, sanitize_evaluator_text
+from .evaluator_safety import sanitize_evaluator_text
 from .model_provider import redact_secrets
 from .repo_paths import canonical_repo_path
 from .state import (
@@ -38,50 +38,19 @@ from .state import (
 from .safe_subprocess import run_oci_process
 from .tool_policy import fixed_test_argv
 from .tool_router import disposable_test_snapshot
+from .test_path_policy import is_allowed_test_path, path_has_symlink
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _SAFE_OPTION_RE = re.compile(
     r"(?:-[qvxs]+|--disable-warnings|--tb=(?:auto|long|short|line|native|no)|"
     r"--maxfail=[0-9]+)"
 )
-_TEST_NAME_RE = re.compile(r"(?:test_.+|.+_test)\.py\Z", re.IGNORECASE)
 _FAILED_PYTEST_RE = re.compile(
     r"(?m)^FAILED\s+(.+?(?:::[^\s]+)+)(?:\s+-|\s*$)"
 )
 _FAILED_UNITTEST_RE = re.compile(r"(?m)^FAIL:\s+([^\s(]+)(?:\s+\(([^)]+)\))?")
 _ERROR_REPORT_RE = re.compile(
     r"(?im)^(?:ERROR(?:\s|:)|.*\berror at (?:setup|teardown)\b)"
-)
-_FORBIDDEN_TEST_TREE_PARTS = frozenset(
-    {
-        ".cache",
-        ".circleci",
-        ".github",
-        ".gitlab",
-        ".mypy_cache",
-        ".nox",
-        ".pytest_cache",
-        ".ruff_cache",
-        ".tox",
-        ".venv",
-        "__pycache__",
-        "build",
-        "ci",
-        "config",
-        "configs",
-        "dependencies",
-        "dependency",
-        "dist",
-        "generated",
-        "htmlcov",
-        "node_modules",
-        "site-packages",
-        "third_party",
-        "vendor",
-        "venv",
-        "workflow",
-        "workflows",
-    }
 )
 _INFRA_MARKERS = (
     "error collecting",
@@ -502,63 +471,6 @@ def collect_changed_targets(repo_path: Path, base_ref: str) -> list[ChangedTarge
     return targets
 
 
-def _path_has_symlink(root: Path, relative: str) -> bool:
-    current = root
-    for part in Path(relative).parts:
-        current = current / part
-        if current.is_symlink():
-            return True
-        if not current.exists():
-            break
-    return False
-
-
-def is_allowed_test_path(repo_root: Path, file_path: str) -> bool:
-    """Return whether a canonical path fits an established Python test layout."""
-    try:
-        root = repo_root.resolve(strict=True)
-        relative = canonical_repo_path(file_path)
-    except (OSError, ValueError):
-        return False
-    if (
-        not root.is_dir()
-        or contains_evaluator_only(relative)
-        or not _TEST_NAME_RE.fullmatch(Path(relative).name)
-    ):
-        return False
-    if _path_has_symlink(root, relative):
-        return False
-    destination = (root / relative).resolve(strict=False)
-    if not destination.is_relative_to(root):
-        return False
-    if destination.exists() and not destination.is_file():
-        return False
-
-    parts = Path(relative).parts
-    if any(part.casefold() in _FORBIDDEN_TEST_TREE_PARTS for part in parts[:-1]):
-        return False
-    test_root_index = next(
-        (index for index, part in enumerate(parts[:-1]) if part.casefold() in {"test", "tests"}),
-        None,
-    )
-    if test_root_index is not None:
-        established = root.joinpath(*parts[: test_root_index + 1])
-        return established.is_dir() and not established.is_symlink()
-
-    # Root-level or colocated tests are accepted only when that convention is
-    # already present in the same directory.
-    parent = destination.parent
-    if not parent.is_dir() or parent.is_symlink():
-        return False
-    return any(
-        item != destination
-        and item.is_file()
-        and not item.is_symlink()
-        and _TEST_NAME_RE.fullmatch(item.name)
-        for item in parent.iterdir()
-    ) or destination.is_file()
-
-
 def _candidate_test_files(argv: list[str]) -> list[str]:
     prefix = 1 if argv[:1] == ["pytest"] else 3 if argv[:3] == ["python", "-m", "pytest"] else 0
     if not prefix or len(argv) <= prefix:
@@ -697,6 +609,31 @@ def coverage_proof_matches_state(state: AgentState, proof: CoverageProof) -> boo
     except (OSError, RuntimeError, ValueError):
         return False
     return True
+
+
+def validate_terminal_coverage_binding(state: AgentState) -> LiveCoverageBinding:
+    """Require a semantically valid proof bound to the exact live approval."""
+    proof = state.coverage_proof
+    if (
+        proof is None
+        or state.coverage_status
+        not in {"existing_verified", "generated_verified"}
+        or state.coverage_status != proof.status
+    ):
+        _clear_live_proof(state)
+        raise ValueError("terminal coverage proof is missing or mismatched")
+    try:
+        semantic_proof = CoverageProof.model_validate(
+            proof.model_dump(mode="python")
+        )
+    except (TypeError, ValueError):
+        _clear_live_proof(state)
+        raise ValueError("terminal coverage proof semantics are invalid") from None
+    binding = validate_live_coverage_binding(state)
+    if not coverage_proof_matches_state(state, semantic_proof):
+        _clear_live_proof(state)
+        raise ValueError("terminal coverage proof binding is invalid")
+    return binding
 
 
 def _candidate_from_command(
@@ -950,13 +887,13 @@ def _copy_test_to_base(fixed_root: Path, base_root: Path, file_path: str) -> Non
     source = fixed_root / relative
     destination = base_root / relative
     if (
-        _path_has_symlink(fixed_root, relative)
+        path_has_symlink(fixed_root, relative)
         or not source.is_file()
         or source.is_symlink()
         or source.stat().st_size > _MAX_TEST_BYTES
     ):
         raise ValueError("candidate test source is not an authorized regular file")
-    if _path_has_symlink(base_root, relative):
+    if path_has_symlink(base_root, relative):
         raise ValueError("candidate test destination crosses a symlink")
     resolved = destination.resolve(strict=False)
     if not resolved.is_relative_to(base_root.resolve()):
@@ -1078,5 +1015,6 @@ __all__ = [
     "normalize_test_result",
     "temporary_base_checkout",
     "validate_live_coverage_binding",
+    "validate_terminal_coverage_binding",
     "validate_differential_coverage",
 ]

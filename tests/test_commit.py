@@ -10,9 +10,11 @@ from src.nodes.commit import push_files
 from src.nodes.execute import git_diff
 from src.state import (
     AgentState,
+    CoverageProof,
     GeneratedTestApproval,
     SnapshotManifestEntry,
     ToolPatchApproval,
+    TestRunFingerprint as RunFingerprint,
     tool_manifest_fingerprint,
 )
 
@@ -137,12 +139,50 @@ def _mock_branch(monkeypatch: pytest.MonkeyPatch, state: AgentState) -> None:
     monkeypatch.setattr("src.nodes.commit._github_create_ref", create_ref)
 
 
+def _attach_proof(state: AgentState) -> None:
+    approval = state.tool_patch_approval
+    assert approval is not None
+    generated = bool(state.generated_test_approvals)
+    test_path = "tests/test_generated.py" if generated else "tests/test_smoke.py"
+    status = "generated_verified" if generated else "existing_verified"
+    source = "generated" if generated else "existing"
+    state.coverage_status = status
+    state.coverage_test_files = [test_path]
+    state.coverage_proof = CoverageProof(
+        source=source,
+        status=status,
+        test_files=[test_path],
+        argv=["python", "-m", "pytest", test_path, "-q"],
+        fixed_runs=[RunFingerprint(exit_code=0, outcome="pass", summary="pass")] * 2,
+        base_runs=[
+            RunFingerprint(
+                exit_code=1,
+                outcome="assertion_failure",
+                failing_test_ids=[f"{test_path}::test_regression"],
+                assertion_fingerprint="c" * 64,
+                summary="assertion_failure",
+            )
+        ]
+        * 2,
+        base_ref=state.repo_ref,
+        patch_sha256=approval.patch_sha256,
+        patch_gate_fingerprint=approval.patch_gate_fingerprint,
+        manifest_fingerprint=approval.manifest_fingerprint,
+        test_content_digests={
+            test_path: hashlib.sha256(
+                (Path(state.repo_path) / test_path).read_bytes()
+            ).hexdigest()
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_push_files_uses_manifest_targets_and_base_blob_sha(
     tmp_path,
     monkeypatch,
 ):
     state = _state(tmp_path)
+    _attach_proof(state)
     _mock_branch(monkeypatch, state)
     writes: list[dict[str, str]] = []
 
@@ -168,6 +208,7 @@ async def test_push_files_includes_approved_untracked_generated_test_without_sha
     monkeypatch,
 ):
     state = _state(tmp_path, add_test=True)
+    _attach_proof(state)
     _mock_branch(monkeypatch, state)
     writes: list[tuple[str, str]] = []
 
@@ -187,6 +228,7 @@ async def test_push_files_includes_approved_untracked_generated_test_without_sha
 @pytest.mark.asyncio
 async def test_push_files_rejects_deletion_before_any_github_api(tmp_path, monkeypatch):
     state = _state(tmp_path, delete_source=True)
+    _attach_proof(state)
     calls: list[str] = []
 
     async def forbidden(*_args, **_kwargs):

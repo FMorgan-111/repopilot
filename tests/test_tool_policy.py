@@ -490,6 +490,39 @@ def test_untracked_test_selector_requires_persisted_patchgate_approval(tmp_path)
     assert merely_marked.approved is False
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/tests/test_ci.py",
+        "vendor/tests/test_vendor.py",
+        "config/tests/test_config.py",
+    ],
+)
+def test_tracked_test_selector_rejects_forbidden_tree(tmp_path, path):
+    root, _commit = _repo(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def test_hidden(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", path], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    decision = ToolPolicy().authorize(
+        _state(root, commit),
+        _intent("run_targeted_test", {"command": f"pytest {path}"}),
+        calls_this_round=0,
+    )
+
+    assert decision.approved is False
+
+
 def test_approved_generated_test_requires_exact_current_content(tmp_path):
     root, commit = _repo(tmp_path)
     path = "tests/test_generated_regression.py"

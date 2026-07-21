@@ -92,6 +92,92 @@ def _approval(
     )
 
 
+def _approved_generated_overlay_state(
+    root: Path,
+    commit: str,
+    path: str,
+) -> AgentState:
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def test_generated(): assert True\n", encoding="utf-8")
+    from src.nodes.execute import git_diff
+
+    patch = git_diff(str(root))
+    content = target.read_bytes()
+    fingerprint = "9" * 64
+    entry = SnapshotManifestEntry(
+        path=path,
+        change="added",
+        mode="100644",
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        size=len(content),
+    )
+    return _state(
+        root,
+        commit,
+        patch_content=patch,
+        coverage_test_files=[path],
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path=path,
+                content_sha256=entry.content_sha256,
+                patch_gate_fingerprint=fingerprint,
+            )
+        ],
+        tool_patch_approval=ToolPatchApproval(
+            base_ref=commit,
+            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch_gate_fingerprint=fingerprint,
+            changed_manifest=[entry],
+            manifest_fingerprint=_manifest_fingerprint([entry]),
+        ),
+    )
+
+
+def _approved_modified_overlay_state(
+    root: Path,
+    commit: str,
+    path: str,
+) -> AgentState:
+    target = root / path
+    base = target.read_bytes()
+    target.write_text("def test_modified(): assert True\n", encoding="utf-8")
+    from src.nodes.execute import git_diff
+
+    patch = git_diff(str(root))
+    content = target.read_bytes()
+    fingerprint = "8" * 64
+    entry = SnapshotManifestEntry(
+        path=path,
+        change="modified",
+        mode="100644",
+        content_sha256=hashlib.sha256(content).hexdigest(),
+        size=len(content),
+    )
+    return _state(
+        root,
+        commit,
+        patch_content=patch,
+        coverage_test_files=[path],
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path=path,
+                change="modified",
+                base_content_sha256=hashlib.sha256(base).hexdigest(),
+                content_sha256=entry.content_sha256,
+                patch_gate_fingerprint=fingerprint,
+            )
+        ],
+        tool_patch_approval=ToolPatchApproval(
+            base_ref=commit,
+            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+            patch_gate_fingerprint=fingerprint,
+            changed_manifest=[entry],
+            manifest_fingerprint=_manifest_fingerprint([entry]),
+        ),
+    )
+
+
 def _intent(action: str, **args: object) -> ToolIntent:
     return ToolIntent(action=action, args=args, reason="diagnose", expected_evidence="result")
 
@@ -681,6 +767,108 @@ def test_generated_test_approval_persists_modified_base_preimage_binding(tmp_pat
     loaded = GeneratedTestApproval.model_validate_json(approval.model_dump_json())
     assert loaded.change == "modified"
     assert loaded.base_content_sha256 == hashlib.sha256(base).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ".github/tests/test_ci.py",
+        "vendor/tests/test_vendor.py",
+        "config/tests/test_config.py",
+    ],
+)
+def test_overlay_rejects_forbidden_test_trees_even_with_forged_approval(
+    tmp_path,
+    path,
+):
+    root, commit = _repo(tmp_path)
+    state = _approved_generated_overlay_state(root, commit, path)
+
+    with pytest.raises(ValueError, match="approved test path"):
+        with disposable_test_snapshot(
+            state,
+            apply_approved_changes=False,
+            test_overlay_paths=[path],
+        ):
+            pytest.fail("forbidden-tree overlay was accepted")
+
+
+@pytest.mark.parametrize(
+    ("existing", "generated"),
+    [
+        ("test_existing.py", "test_generated.py"),
+        ("src/existing_test.py", "src/generated_test.py"),
+    ],
+)
+def test_overlay_accepts_approved_established_root_or_colocated_test_convention(
+    tmp_path,
+    existing,
+    generated,
+):
+    root, _commit = _repo(tmp_path)
+    existing_path = root / existing
+    existing_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_path.write_text("def test_existing(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", existing], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _approved_generated_overlay_state(root, commit, generated)
+
+    with disposable_test_snapshot(
+        state,
+        apply_approved_changes=False,
+        test_overlay_paths=[generated],
+    ) as sandbox:
+        assert (sandbox.workspace / generated).is_file()
+
+
+@pytest.mark.parametrize(
+    ("path", "accepted"),
+    [
+        (".github/tests/test_ci.py", False),
+        ("src/existing_test.py", True),
+    ],
+)
+def test_modified_overlay_uses_the_same_shared_test_path_policy(
+    tmp_path,
+    path,
+    accepted,
+):
+    root, _commit = _repo(tmp_path)
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("def test_base(): assert True\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(root), "add", path], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--amend", "--no-edit"], check=True
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _approved_modified_overlay_state(root, commit, path)
+
+    context = disposable_test_snapshot(
+        state,
+        apply_approved_changes=False,
+        test_overlay_paths=[path],
+    )
+    if not accepted:
+        with pytest.raises(ValueError, match="approved test path"):
+            with context:
+                pytest.fail("forbidden modified overlay was accepted")
+        return
+    with context as sandbox:
+        assert "test_modified" in (sandbox.workspace / path).read_text()
 
 
 async def test_sensitive_delete_and_public_add_suppresses_all_diff_evidence(tmp_path):

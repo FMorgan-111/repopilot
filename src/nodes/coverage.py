@@ -13,6 +13,7 @@ from ..coverage_gate import (
     coverage_proof_matches_state,
     discover_coverage_candidates,
     validate_live_coverage_binding,
+    validate_terminal_coverage_binding,
     validate_differential_coverage,
 )
 from ..state import AgentState, CoverageProof, Phase, _as_state
@@ -48,7 +49,7 @@ def _persist_verified(state: AgentState, decision: CoverageDecision) -> None:
             for path in candidate.test_files
         },
     )
-    validate_live_coverage_binding(state)
+    validate_terminal_coverage_binding(state)
     state.current_phase = Phase.DONE if state.skip_commit else Phase.COMMIT
 
 

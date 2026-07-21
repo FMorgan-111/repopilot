@@ -8,7 +8,7 @@ from typing import Any
 import httpx
 
 from ..memory import _fire_and_forget, get_store
-from ..coverage_gate import LiveCoverageBinding, validate_live_coverage_binding
+from ..coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
 from ..state import AgentState, Phase, _as_state, _record_tool
 from ..tools import GITHUB_API, _headers
 
@@ -97,7 +97,10 @@ async def push_files(
     """Push changed files through GitHub Contents API."""
     if not state.repo_path:
         raise RuntimeError("Cannot push files without a local repository path.")
-    binding = binding or validate_live_coverage_binding(state)
+    terminal_binding = validate_terminal_coverage_binding(state)
+    if binding is not None and binding != terminal_binding:
+        raise RuntimeError("Commit binding changed after terminal validation.")
+    binding = terminal_binding
     if not binding.approved_targets:
         raise RuntimeError("Patch applied but produced no approved changed files.")
     if any(target.change == "deleted" for target in binding.approved_targets):
@@ -159,7 +162,7 @@ async def commit_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     try:
-        binding = validate_live_coverage_binding(state)
+        binding = validate_terminal_coverage_binding(state)
         pushed = await push_files(state, binding)
         _record_tool(state, "push_files", {"branch": state.branch_name}, pushed)
         pr = await create_pr(state)

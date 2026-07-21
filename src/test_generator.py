@@ -16,7 +16,6 @@ from .coverage_gate import (
     CoverageCandidate,
     CoverageDecision,
     collect_changed_targets,
-    is_allowed_test_path,
     validate_differential_coverage,
 )
 from .llm import llm_call
@@ -24,6 +23,7 @@ from .model_policy import EscalationDecision, apply_escalation
 from .model_provider import escalation_is_configured, redact_secrets
 from .patch_gate import apply_approved_patch, validate_patch_batch
 from .repo_paths import canonical_repo_path
+from .test_path_policy import is_allowed_test_path
 from .state import (
     AgentState,
     CoverageProof,

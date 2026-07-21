@@ -13,9 +13,11 @@ from src.patch_gate import apply_approved_patch, validate_patch_batch
 from src.safe_subprocess import BoundedProcessResult
 from src.state import (
     AgentState,
+    CoverageProof,
     Phase,
     RepairPlan,
     ToolSandboxConfig,
+    TestRunFingerprint as RunFingerprint,
     VerifiedEdit,
     VerifiedEditBatch,
 )
@@ -85,6 +87,41 @@ def _approved_state(tmp_path: Path) -> AgentState:
     return state
 
 
+def _attach_proof(state: AgentState) -> None:
+    approval = state.tool_patch_approval
+    assert approval is not None
+    test_path = "tests/test_maths.py"
+    fixed = [RunFingerprint(exit_code=0, outcome="pass", summary="pass")] * 2
+    base = [
+        RunFingerprint(
+            exit_code=1,
+            outcome="assertion_failure",
+            failing_test_ids=[f"{test_path}::test_answer"],
+            assertion_fingerprint="b" * 64,
+            summary="assertion_failure",
+        )
+    ] * 2
+    state.coverage_status = "existing_verified"
+    state.coverage_test_files = [test_path]
+    state.coverage_proof = CoverageProof(
+        source="existing",
+        status="existing_verified",
+        test_files=[test_path],
+        argv=["python", "-m", "pytest", test_path, "-q"],
+        fixed_runs=fixed,
+        base_runs=base,
+        base_ref=state.repo_ref,
+        patch_sha256=approval.patch_sha256,
+        patch_gate_fingerprint=approval.patch_gate_fingerprint,
+        manifest_fingerprint=approval.manifest_fingerprint,
+        test_content_digests={
+            test_path: hashlib.sha256(
+                (Path(state.repo_path) / test_path).read_bytes()
+            ).hexdigest()
+        },
+    )
+
+
 @pytest.mark.asyncio
 async def test_coverage_fails_closed_when_live_patch_drifts_between_runs(
     tmp_path: Path,
@@ -128,6 +165,7 @@ async def test_coverage_fails_closed_when_live_patch_drifts_between_runs(
 
 def test_terminal_prediction_uses_only_the_approved_live_patch(tmp_path: Path):
     state = _approved_state(tmp_path)
+    _attach_proof(state)
     state.current_phase = Phase.DONE
     approved_patch = state.patch_content
 
@@ -142,12 +180,58 @@ def test_terminal_prediction_uses_only_the_approved_live_patch(tmp_path: Path):
     assert drifted_payload["model_patch"] == ""
 
 
+@pytest.mark.parametrize("terminal_phase", [Phase.DONE, Phase.COMMIT])
+def test_terminal_prediction_rejects_valid_live_approval_without_proof(
+    tmp_path: Path,
+    terminal_phase: Phase,
+):
+    state = _approved_state(tmp_path)
+    state.current_phase = terminal_phase
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["success"] is False
+    assert payload["model_patch"] == ""
+
+
+@pytest.mark.parametrize("tamper", ["status", "fingerprint", "semantic"])
+def test_terminal_prediction_rejects_mismatched_or_tampered_proof(
+    tmp_path: Path,
+    tamper: str,
+):
+    state = _approved_state(tmp_path)
+    _attach_proof(state)
+    state.current_phase = Phase.DONE
+    if tamper == "status":
+        state.coverage_status = "generated_verified"
+    elif tamper == "fingerprint":
+        proof = state.coverage_proof
+        assert proof is not None
+        state.coverage_proof = proof.model_copy(
+            update={"patch_gate_fingerprint": "f" * 64}
+        )
+    else:
+        proof = state.coverage_proof
+        assert proof is not None
+        object.__setattr__(
+            state,
+            "coverage_proof",
+            proof.model_copy(update={"fixed_runs": proof.base_runs}),
+        )
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["success"] is False
+    assert payload["model_patch"] == ""
+
+
 @pytest.mark.asyncio
 async def test_commit_rejects_live_drift_before_any_github_api(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     state = _approved_state(tmp_path)
+    _attach_proof(state)
     state.current_phase = Phase.COMMIT
     (Path(state.repo_path) / "unknown.py").write_text("UNAPPROVED = True\n")
     calls: list[str] = []
@@ -163,3 +247,24 @@ async def test_commit_rejects_live_drift_before_any_github_api(
     assert result.current_phase == Phase.FAILURE
     assert result.pr_url is None
     assert result.coverage_proof is None
+
+
+@pytest.mark.asyncio
+async def test_commit_rejects_missing_terminal_proof_before_any_github_api(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    state = _approved_state(tmp_path)
+    state.current_phase = Phase.COMMIT
+    calls: list[str] = []
+
+    async def forbidden_repo_call(_state):
+        calls.append("github")
+        pytest.fail("GitHub API was reached without a terminal coverage proof")
+
+    monkeypatch.setattr("src.nodes.commit._github_get_repo", forbidden_repo_call)
+    result = await commit_fix(state)
+
+    assert calls == []
+    assert result.current_phase == Phase.FAILURE
+    assert result.pr_url is None
