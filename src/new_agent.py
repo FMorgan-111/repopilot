@@ -20,7 +20,7 @@ from .graph import (
     run_graph,
 )
 from .evaluator_safety import safe_prediction_patch
-from .coverage_gate import validate_terminal_coverage_binding
+from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.coverage import ensure_coverage
@@ -278,26 +278,42 @@ def _entry_point_for_phase(phase: Phase) -> str:
     return route
 
 
-def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
-    return FinalReport(
+def _terminal_binding_for_report(
+    state: AgentState,
+) -> LiveCoverageBinding | None:
+    if state.current_phase != Phase.DONE:
+        return None
+    validation_state = state.model_copy(deep=True)
+    try:
+        return validate_terminal_coverage_binding(validation_state)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _final_report_and_binding(
+    state: AgentState, turns_taken: int
+) -> tuple[FinalReport, LiveCoverageBinding | None]:
+    live_binding = _terminal_binding_for_report(state)
+    report = FinalReport(
         issue_url=state.issue_url,
-        fix_applied=state.current_phase == Phase.DONE,
+        fix_applied=live_binding is not None,
         pr_url=state.pr_url,
         test_results=state.fix_attempts[-1].test_result if state.fix_attempts else "",
         turns_taken=turns_taken,
         token_used=state.token_usage,
     )
+    return report, live_binding
+
+
+def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
+    report, _ = _final_report_and_binding(state, turns_taken)
+    return report
 
 
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
-    report = final_report_from_state(state, turns_taken)
-    try:
-        live_binding = validate_terminal_coverage_binding(state)
-    except ValueError:
-        live_binding = None
-    terminal_success = state.current_phase == Phase.DONE and live_binding is not None
+    report, live_binding = _final_report_and_binding(state, turns_taken)
+    terminal_success = report.fix_applied
     payload = report.model_dump()
-    payload["fix_applied"] = terminal_success
     payload.update(
         {
             "done": state.current_phase in {Phase.DONE, Phase.FAILED},

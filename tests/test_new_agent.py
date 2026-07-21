@@ -2,6 +2,7 @@ import asyncio
 import functools
 import json
 import subprocess
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,46 @@ from src.state import ModelInvocation, NoProgressEvent
 
 def test_agent_v2_default_budget_is_100000():
     assert new_agent.agent_v2.__defaults__[1] == 100_000
+
+
+def test_final_report_done_without_terminal_coverage_binding_is_not_applied():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.DONE,
+        pr_url="https://github.com/acme/widget/pull/42",
+    )
+    before = state.model_dump(mode="json")
+
+    report = new_agent.final_report_from_state(state, turns_taken=3)
+
+    assert report.fix_applied is False
+    assert state.model_dump(mode="json") == before
+
+
+def test_agent_payload_reuses_side_effect_free_terminal_validation(monkeypatch):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.DONE,
+    )
+    before = state.model_dump(mode="json")
+    validated_states = []
+
+    def fake_validate(candidate):
+        validated_states.append(candidate)
+        candidate.failure_reason = "validation mutated its input"
+        return SimpleNamespace(patch_content="")
+
+    monkeypatch.setattr(
+        new_agent, "validate_terminal_coverage_binding", fake_validate
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=3)
+
+    assert payload["fix_applied"] is True
+    assert payload["success"] is True
+    assert len(validated_states) == 1
+    assert validated_states[0] is not state
+    assert state.model_dump(mode="json") == before
 
 
 def test_agent_state_default_budget_is_100000():
