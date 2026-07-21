@@ -5,7 +5,13 @@ import pytest
 
 from src import model_policy
 from src.model_provider import ModelConfig
-from src.state import AgentState, NoProgressEvent
+from src.state import (
+    AgentState,
+    DecisionFrame,
+    FixAttempt,
+    NoProgressEvent,
+    PatchEdit,
+)
 
 
 def make_state(**updates):
@@ -113,15 +119,15 @@ def test_two_consecutive_same_signatures_escalate(monkeypatch):
     assert state.no_progress_rounds == 2
 
 
-def test_changed_signature_resets_streak_without_escalating(monkeypatch):
+def test_changed_context_signature_resets_streak_without_escalating(monkeypatch):
     enable_escalation(monkeypatch)
     state = make_state()
 
     model_policy.record_no_progress(
-        state, kind="unchanged_plan", fingerprint="plan-a", node="plan_fix"
+        state, kind="unchanged_context", fingerprint="context-a", node="locate_code"
     )
     model_policy.record_no_progress(
-        state, kind="unchanged_plan", fingerprint="plan-b", node="plan_fix"
+        state, kind="unchanged_context", fingerprint="context-b", node="locate_code"
     )
 
     assert state.no_progress_rounds == 1
@@ -241,9 +247,78 @@ def test_signatures_are_stable_sha256_over_canonical_json():
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
-    assert plan_state.last_plan_signature == digest(plan)
+    assert plan_state.last_plan_signature != digest(plan)
+    assert len(plan_state.last_plan_signature) == 64
     assert context_state.last_context_fingerprint == digest(context)
     assert failure_state.last_test_failure_signature == digest(failure)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda state: setattr(state.decision_frame, "risk", "high"),
+        lambda state: setattr(
+            state.fix_attempts[-1].patch_edits[0],
+            "replace",
+            "return different_user",
+        ),
+        lambda state: setattr(
+            state.fix_attempts[-1].patch_edits[0],
+            "expected_content_sha256",
+            "b" * 64,
+        ),
+    ],
+    ids=["frame", "edit", "preimage"],
+)
+def test_plan_no_progress_uses_live_transaction_even_with_same_fingerprint(mutation):
+    state = make_state(
+        decision_frame=DecisionFrame(
+            stage="plan",
+            summary="Guard the missing user.",
+            recommended_action="execute",
+            risk="low",
+        ),
+        fix_attempts=[
+            FixAttempt(
+                patch_content="diff --git a/src/auth.py b/src/auth.py",
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/auth.py",
+                        search="return user",
+                        replace="return checked_user",
+                        exact_only=True,
+                        expected_content_sha256="a" * 64,
+                    )
+                ],
+            )
+        ],
+    )
+
+    model_policy.record_no_progress(
+        state,
+        kind="unchanged_plan",
+        fingerprint="caller-controlled-same-value",
+        node="plan_fix",
+    )
+    first_signature = state.last_plan_signature
+    model_policy.record_no_progress(
+        state,
+        kind="unchanged_plan",
+        fingerprint="caller-controlled-same-value",
+        node="plan_fix",
+    )
+    assert state.no_progress_rounds == 2
+
+    mutation(state)
+    model_policy.record_no_progress(
+        state,
+        kind="unchanged_plan",
+        fingerprint="caller-controlled-same-value",
+        node="plan_fix",
+    )
+
+    assert state.last_plan_signature != first_signature
+    assert state.no_progress_rounds == 1
 
 
 @pytest.mark.parametrize(

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import time
 from collections.abc import Iterable
@@ -10,6 +9,7 @@ from typing import Any, Awaitable, Callable
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from .attempt_signature import build_plan_transaction_signature
 from .escalation import record_model_invocation
 from .llm import llm_call
 from .state import AgentState, DecisionFrame, FixAttempt, _estimate_tokens
@@ -85,54 +85,10 @@ def _latest_frame(state: AgentState, stage: str) -> DecisionFrame | None:
     return None
 
 
-def _plan_signature(frame: DecisionFrame | None, attempt: FixAttempt) -> str:
-    def digest(value: str) -> str:
-        return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-    def canonical_digest(value: object) -> str:
-        encoded_value = json.dumps(
-            value,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        return digest(encoded_value)
-
-    material: dict[str, Any] = {
-        "frame": frame.model_dump(mode="json") if frame is not None else None,
-        "transaction": {
-            "patch_sha256": digest(attempt.patch_content),
-            "legacy_file_path_sha256": digest(attempt.file_path),
-            "edits": [
-                {
-                    "order": index,
-                    "edit_sha256": canonical_digest(edit.model_dump(mode="json")),
-                    "file_path_sha256": digest(edit.file_path),
-                    "search_sha256": digest(edit.search),
-                    "replace_sha256": digest(edit.replace),
-                    "node_target_sha256": digest(edit.node_target),
-                    "replace_all": edit.replace_all,
-                    "expected_content_sha256": edit.expected_content_sha256,
-                    "exact_only": edit.exact_only,
-                }
-                for index, edit in enumerate(attempt.patch_edits)
-            ],
-        },
-    }
-    encoded = json.dumps(
-        material,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    )
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
 def build_outcome_summary_input(state: AgentState) -> OutcomeSummaryInput:
     """Copy only the latest attempt, current/history frames, and prior summary."""
     latest = state.fix_attempts[-1] if state.fix_attempts else FixAttempt()
     generated_paths = _generated_test_paths(state)
-    plan_frame = _latest_frame(state, "plan")
     reflect_frame = _latest_frame(state, "reflect")
 
     patch_result = latest.test_result or ("passed" if latest.success else "failed")
@@ -160,7 +116,7 @@ def build_outcome_summary_input(state: AgentState) -> OutcomeSummaryInput:
             state,
             state.attempt_outcome_summary,
         ),
-        plan_signature=_plan_signature(plan_frame, latest),
+        plan_signature=build_plan_transaction_signature(state),
         patch_outcome=patch_outcome,
         test_failure_class=failure_class,
         reflection_action=reflection_action,
@@ -170,7 +126,7 @@ def build_outcome_summary_input(state: AgentState) -> OutcomeSummaryInput:
 def deterministic_outcome_summary(item: OutcomeSummaryInput) -> str:
     """Build the non-LLM fallback required at the auxiliary boundary."""
     text = (
-        f"plan={item.plan_signature}; patch={item.patch_outcome}; "
+        f"plan={item.plan_signature}; edit_result={item.patch_outcome}; "
         f"test={item.test_failure_class}; next={item.reflection_action}"
     )
     return sanitize_summary_text(text, MAX_OUTCOME_SUMMARY_CHARS)

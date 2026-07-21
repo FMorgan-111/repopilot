@@ -10,6 +10,9 @@ from .model_provider import redact_secrets
 _EVALUATOR_FIELD_RE = re.compile(
     r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b"
 )
+_PATCH_FIELD_RE = re.compile(
+    r'''(?ix)(?:\{\s*)?(?<![\w])(?:"patch"|'patch'|patch)\s*[:=]'''
+)
 _RAW_HTTP_MARKER_RE = re.compile(
     r"(?i)(?:\braw[\s_-]+HTTP\b|HTTP/\d(?:\.\d)?\b|"
     r"(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+https?://|"
@@ -33,6 +36,7 @@ def sanitize_summary_text(
         marker.start()
         for marker in (
             _EVALUATOR_FIELD_RE.search(text),
+            _PATCH_FIELD_RE.search(text),
             _RAW_HTTP_MARKER_RE.search(text),
             _GENERATED_TEST_PATH_RE.search(text),
         )

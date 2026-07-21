@@ -114,6 +114,45 @@ async def test_reflect_summarizes_only_after_recording_valid_frame(monkeypatch):
     assert next_state.current_phase == new_agent.Phase.PLAN
 
 
+async def test_reflect_error_replaces_outcome_summary_exactly_once(monkeypatch):
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+
+    async def fake_llm_call(system, user):
+        raise RuntimeError("reflection provider unavailable")
+
+    calls = []
+
+    async def fake_summarize(state, **kwargs):
+        assert state.current_phase == new_agent.Phase.REFLECT
+        assert state.reflection_notes == "Reflection failed: RuntimeError"
+        calls.append(state.attempt_outcome_summary)
+        return "replacement outcome after reflection error"
+
+    monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
+    monkeypatch.setattr(reflect_node, "summarize_attempt_outcome", fake_summarize)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.REFLECT,
+        attempt_outcome_summary="stale outcome",
+        fix_attempts=[
+            new_agent.FixAttempt(
+                test_result="failed",
+                failure_kind="assertion_failure",
+                error_log="assert submit was not called",
+            )
+        ],
+    )
+
+    next_state = await reflect_node.reflect_on_failure(state)
+
+    assert calls == ["stale outcome"]
+    assert next_state.attempt_outcome_summary == (
+        "replacement outcome after reflection error"
+    )
+    assert next_state.current_phase == new_agent.Phase.PLAN
+
+
 async def test_plan_fix_records_search_replace_patch_edits(monkeypatch):
     calls = []
 
@@ -388,7 +427,7 @@ async def test_provider_error_in_reflect_never_persists_provider_message(monkeyp
     monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
     monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, **kwargs):
         raise LLMResponseError(" | ".join(hostile_values))
 
     monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
@@ -410,6 +449,9 @@ async def test_provider_error_in_reflect_never_persists_provider_message(monkeyp
 
     assert next_state.current_phase == new_agent.Phase.PLAN
     assert next_state.reflection_notes == "Reflection failed: LLMResponseError"
+    assert next_state.model_history[-2].node == "reflect_on_failure"
+    assert next_state.model_history[-2].error_class == "LLMResponseError"
+    assert next_state.model_history[-1].node == "outcome_summary"
     assert next_state.model_history[-1].error_class == "LLMResponseError"
     assert next_state.node_diagnostics[-1]["error_type"] == "LLMResponseError"
     assert "policy_reason" not in next_state.node_diagnostics[-1]

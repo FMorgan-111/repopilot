@@ -8,6 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from .attempt_signature import build_plan_transaction_signature
 from .model_provider import escalation_is_configured, get_model_config
 from .state import (
     APPROVED_ESCALATION_REASONS,
@@ -99,8 +100,8 @@ def record_no_progress(
     state: AgentState,
     *,
     kind: str,
-    fingerprint: str,
     node: str,
+    fingerprint: Any = "",
 ) -> None:
     """Record a safe, canonical no-progress event and update its signature."""
     if kind not in APPROVED_NO_PROGRESS_KINDS or node not in APPROVED_ROUTING_NODES:
@@ -112,7 +113,11 @@ def record_no_progress(
         record_progress(state)
         return
 
-    canonical_fingerprint = _canonical_fingerprint(fingerprint)
+    canonical_fingerprint = (
+        build_plan_transaction_signature(state)
+        if signature_field == "last_plan_signature"
+        else _canonical_fingerprint(fingerprint)
+    )
     previous_signature = getattr(state, signature_field)
     previous_event = state.no_progress_history[-1] if state.no_progress_history else None
     is_consecutive_match = (

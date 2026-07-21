@@ -6,6 +6,7 @@ from src.nodes.plan import build_plan_user_prompt
 from src.escalation import build_escalation_packet, render_escalation_packet
 from src.outcome_summary import (
     MAX_OUTCOME_SUMMARY_CHARS,
+    OutcomeSummaryInput,
     build_outcome_summary_input,
     deterministic_outcome_summary,
     summarize_attempt_outcome,
@@ -19,6 +20,7 @@ from src.state import (
     PatchEdit,
     Phase,
 )
+from src.summary_safety import sanitize_summary_text
 
 
 def make_reflect_state(**updates):
@@ -302,6 +304,50 @@ def test_agent_state_sanitizes_summary_on_construction_assignment_and_dump():
     dumped = state.model_dump(mode="json")["attempt_outcome_summary"]
     assert dumped == "safe dumped prefix"
     assert "dump-http-sentinel" not in dumped
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "safe prefix patch=private evaluator edit",
+        "safe prefix patch: private evaluator edit",
+        'safe prefix {"patch": "private evaluator edit"}',
+    ],
+)
+def test_summary_sanitizer_stops_at_patch_field_boundaries(value):
+    assert sanitize_summary_text(value) == "safe prefix"
+
+    state = make_reflect_state(attempt_outcome_summary=value)
+    prompt = build_plan_user_prompt(state)
+
+    assert state.attempt_outcome_summary == "safe prefix"
+    assert "private evaluator edit" not in prompt
+
+
+def test_summary_sanitizer_preserves_patch_language_but_stops_at_raw_http():
+    natural_language = "patch applied cleanly; tests still fail"
+
+    assert sanitize_summary_text(natural_language) == natural_language
+    assert (
+        sanitize_summary_text(
+            "safe prefix PATCH https://api.invalid/private HTTP body"
+        )
+        == "safe prefix"
+    )
+
+
+def test_deterministic_summary_uses_safe_edit_result_field():
+    summary = deterministic_outcome_summary(
+        OutcomeSummaryInput(
+            plan_signature="a" * 64,
+            patch_outcome="patch applied",
+            test_failure_class="assertion_failure",
+            reflection_action="plan",
+        )
+    )
+
+    assert "edit_result=patch applied" in summary
+    assert "patch=" not in summary
 
 
 def test_plan_signature_binds_full_frame_and_ordered_edit_transaction():

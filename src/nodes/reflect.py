@@ -395,11 +395,11 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 frame=frame,
                 reason="missing_explicit_decision_frame",
             )
-        state.attempt_outcome_summary = await summarize_attempt_outcome(
-            state,
-            llm=llm_call,
-        )
         break
 
+    state.attempt_outcome_summary = await summarize_attempt_outcome(
+        state,
+        llm=llm_call,
+    )
     state.current_phase = Phase.PLAN
     return state
