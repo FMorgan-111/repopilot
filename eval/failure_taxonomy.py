@@ -32,6 +32,7 @@ from typing import Any
 
 if __package__:
     from .safe_contracts import (
+        has_model_gateway_failure_code,
         has_structured_model_gateway_failure,
         has_verified_agent_success,
         is_model_gateway_error_text,
@@ -39,6 +40,7 @@ if __package__:
     )
 else:  # Support `python eval/failure_taxonomy.py`.
     from safe_contracts import (
+        has_model_gateway_failure_code,
         has_structured_model_gateway_failure,
         has_verified_agent_success,
         is_model_gateway_error_text,
@@ -119,14 +121,18 @@ def classify_attempt(failure_kind: str, error_log: str) -> str:
 
 
 def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    """Classify a whole sample: its decisive (terminal) failure and per-attempt
-    categories. The decisive category is the LAST attempt's — that's what the
-    run ultimately died on."""
+    """Classify a sample by explicit terminal evidence, then its last attempt."""
     official_resolved = normalize_official_resolved(
         sample.get("official_resolved")
     )
-    payload = sample.get("agent_payload") or {}
-    attempts = payload.get("fix_attempts") or []
+    payload = sample.get("agent_payload")
+    payload = payload if isinstance(payload, dict) else {}
+    raw_attempts = payload.get("fix_attempts")
+    attempts = (
+        [attempt for attempt in raw_attempts if isinstance(attempt, dict)]
+        if isinstance(raw_attempts, list)
+        else []
+    )
     if has_verified_agent_success(sample):
         return {
             "id": sample.get("id"),
@@ -135,20 +141,15 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
             "official_resolved": official_resolved,
         }
 
-    stored_class = sample.get("failure_class")
-    if stored_class in CATEGORIES and stored_class not in {"agent_success", "resolved"}:
-        return {
-            "id": sample.get("id"),
-            "decisive": stored_class,
-            "attempts": [],
-            "official_resolved": official_resolved,
-        }
-
-    if has_structured_model_gateway_failure(sample):
+    per_attempt = [
+        classify_attempt(a.get("failure_kind", ""), a.get("error_log", ""))
+        for a in attempts
+    ]
+    if has_model_gateway_failure_code(sample):
         return {
             "id": sample.get("id"),
             "decisive": "model_gateway_infra",
-            "attempts": [],
+            "attempts": per_attempt,
             "official_resolved": official_resolved,
         }
 
@@ -169,32 +170,46 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": sample.get("id"),
             "decisive": terminal_class,
-            "attempts": [],
+            "attempts": per_attempt,
             "official_resolved": official_resolved,
         }
 
-    per_attempt = [
-        classify_attempt(a.get("failure_kind", ""), a.get("error_log", ""))
-        for a in attempts
-    ]
+    stored_class = sample.get("failure_class")
+    if stored_class in CATEGORIES and stored_class not in {"agent_success", "resolved"}:
+        return {
+            "id": sample.get("id"),
+            "decisive": stored_class,
+            "attempts": per_attempt,
+            "official_resolved": official_resolved,
+        }
+
     if per_attempt:
-        decisive = per_attempt[-1]
+        return {
+            "id": sample.get("id"),
+            "decisive": per_attempt[-1],
+            "attempts": per_attempt,
+            "official_resolved": official_resolved,
+        }
+
+    # No attempt was recorded. Prefer an explicit terminal error over historical
+    # invocation metadata, because a later non-model failure may have ended the run.
+    err = terminal_error.lower()
+    if "search blocks that do not exist" in err or "search block" in err:
+        decisive = "search_not_found"  # search-content hallucination
+    elif "re-emitting patches that already failed" in err:
+        decisive = "search_not_found"  # dead-patch (repeated bad anchor)
+    elif "no relevant files" in err or "locate" in err or "context collection" in err:
+        decisive = "other"  # pre-patch (localization) failure
+    elif "readtimeout" in err or "timed out" in err or "infrastructure" in err:
+        decisive = "infra"
+    elif "generate fix plan" in err:
+        decisive = "infra"
+    elif terminal_error:
+        decisive = "other"
+    elif has_structured_model_gateway_failure(sample):
+        decisive = "model_gateway_infra"
     else:
-        # No attempt recorded — the gate cleared the patch in PLAN before it
-        # reached EXECUTE. Classify from the top-level failure_reason.
-        err = (sample.get("error") or "").lower()
-        if "search blocks that do not exist" in err or "search block" in err:
-            decisive = "search_not_found"  # search-content hallucination
-        elif "re-emitting patches that already failed" in err:
-            decisive = "search_not_found"  # dead-patch (repeated bad anchor)
-        elif "no relevant files" in err or "locate" in err or "context collection" in err:
-            decisive = "other"  # pre-patch (localization) failure
-        elif "readtimeout" in err or "timed out" in err or "infrastructure" in err:
-            decisive = "infra"
-        elif "generate fix plan" in err:
-            decisive = "infra"
-        else:
-            decisive = "other"
+        decisive = "other"
     return {
         "id": sample.get("id"),
         "decisive": decisive,

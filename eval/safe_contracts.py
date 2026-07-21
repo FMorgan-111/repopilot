@@ -35,6 +35,22 @@ _EVALUATOR_RE = re.compile(
     r"(?![A-Za-z0-9])"
 )
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[^\s,;]+")
+_QUERY_SECRET_RE = re.compile(
+    r"(?i)([?&](?:api[-_]?key|access[-_]?token|token|key|authorization)=)"
+    r"[^&#\s;]+"
+)
+_QUOTED_FIELD_SECRET_RE = re.compile(
+    r"(?i)(\b(?:authorization|proxy-authorization|x-api-key|api[-_]?key|"
+    r"access[-_]?token|token)\b\s*[:=]\s*|"
+    r"[\"'](?:authorization|proxy-authorization|x-api-key|api[-_]?key|"
+    r"access[-_]?token|token)[\"']\s*[:=]\s*)"
+    r"([\"'])(?:Bearer\s+)?[^\"']*\2"
+)
+_ASSIGNED_SECRET_RE = re.compile(
+    r"(?i)((?<![?&])\b(?:authorization|proxy-authorization|x-api-key|api[-_]?key|"
+    r"access[-_]?token|token)\b\s*[:=]\s*)"
+    r"(?:Bearer\s+)?(?![\"'])[^\s,;]+"
+)
 _SK_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
 _ARCHIVE_PAYLOAD_RE = re.compile(r"(?:PK\\x03\\x04|PK\x03\x04)")
 _FORBIDDEN_TEST_TREE_PARTS = frozenset(
@@ -128,6 +144,14 @@ def sanitize_output_text(value: Any, limit: int = 2_000) -> str:
     if not isinstance(value, (str, int, float, bool)):
         return ""
     text = str(value).replace("\r\n", "\n").replace("\r", "\n")
+    text = _QUERY_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _QUOTED_FIELD_SECRET_RE.sub(
+        lambda match: (
+            f"{match.group(1)}{match.group(2)}[REDACTED]{match.group(2)}"
+        ),
+        text,
+    )
+    text = _ASSIGNED_SECRET_RE.sub(r"\1[REDACTED]", text)
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
     text = _SK_RE.sub("[REDACTED]", text)
     boundaries = [
@@ -335,11 +359,6 @@ def has_structured_model_gateway_failure(sample: Any) -> bool:
     """Recognize only allowlisted, bounded model failure evidence."""
     if not isinstance(sample, dict):
         return False
-    if any(
-        sample.get(key) == "model_gateway_infra"
-        for key in ("failure_code", "model_failure_code")
-    ):
-        return True
     payload = sample.get("agent_payload")
     payload = payload if isinstance(payload, dict) else {}
     sequences = (
@@ -360,3 +379,14 @@ def has_structured_model_gateway_failure(sample: Any) -> bool:
             ):
                 return True
     return False
+
+
+def has_model_gateway_failure_code(sample: Any) -> bool:
+    """Recognize an explicit terminal gateway code without inspecting history."""
+    return bool(
+        isinstance(sample, dict)
+        and any(
+            sample.get(key) == "model_gateway_infra"
+            for key in ("failure_code", "model_failure_code")
+        )
+    )

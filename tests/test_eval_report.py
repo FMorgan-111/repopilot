@@ -4,6 +4,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from eval import report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -403,6 +405,28 @@ def test_report_sanitizes_all_agent_row_and_replay_error_fields():
     assert "FAIL_TO_PASS" not in markdown
     assert "PK\\x03\\x04" not in markdown
     assert "| no | 0 | 0 |" in markdown
+
+
+@pytest.mark.parametrize("field", ["final_phase", "replay_error"])
+@pytest.mark.parametrize(
+    "secret_text",
+    [
+        "x-api-key: plain-secret-987654321",
+        "Authorization: plain-secret-987654321",
+        "api_key=plain-secret-987654321",
+        "access_token: 'plain-secret-987654321'",
+        "https://example.test/?token=plain-secret-987654321&ok=1",
+    ],
+)
+def test_report_redacts_plain_secrets_from_terminal_fields(field, secret_text):
+    result = agent_v2_result()
+    result["replay"] = None
+    result[field] = secret_text
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "plain-secret-987654321" not in markdown
+    assert "[REDACTED]" in markdown
 
 
 def test_report_sanitizes_clean_legacy_sample_id():

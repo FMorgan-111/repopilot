@@ -5,6 +5,7 @@ import pytest
 from eval.safe_contracts import (
     has_verified_coverage_proof,
     normalize_official_resolved,
+    sanitize_output_text,
     validate_safe_coverage_proof,
 )
 
@@ -134,3 +135,37 @@ def test_safe_coverage_contract_rejects_control_characters_in_test_id():
 )
 def test_official_resolved_accepts_only_actual_booleans(value, expected):
     assert normalize_official_resolved(value) is expected
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("Bearer plain-secret-987654321", "Bearer [REDACTED]"),
+        ("Authorization: plain-secret-987654321", "Authorization: [REDACTED]"),
+        ("x-api-key: plain-secret-987654321", "x-api-key: [REDACTED]"),
+        ("api_key=plain-secret-987654321", "api_key=[REDACTED]"),
+        ("api-key: plain-secret-987654321", "api-key: [REDACTED]"),
+        ("token=plain-secret-987654321", "token=[REDACTED]"),
+        ("access_token=plain-secret-987654321", "access_token=[REDACTED]"),
+        (
+            "https://example.test/?access_token=plain-secret-987654321&ok=1",
+            "https://example.test/?access_token=[REDACTED]&ok=1",
+        ),
+        (
+            '{"api_key": "plain-secret-987654321", "ok": true}',
+            '{"api_key": "[REDACTED]", "ok": true}',
+        ),
+        (
+            "access_token: 'plain-secret-987654321' # keep-comment",
+            "access_token: '[REDACTED]' # keep-comment",
+        ),
+        (
+            'API_KEY="plain-secret-987654321"',
+            'API_KEY="[REDACTED]"',
+        ),
+    ],
+)
+def test_output_sanitizer_redacts_plain_secret_forms_without_breaking_structure(
+    value, expected
+):
+    assert sanitize_output_text(value) == expected

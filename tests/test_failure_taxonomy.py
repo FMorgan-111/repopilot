@@ -188,6 +188,83 @@ def test_safe_model_failure_code_is_model_gateway_infra():
     assert classify_sample(sample)["decisive"] == "model_gateway_infra"
 
 
+def test_coverage_model_gateway_code_is_terminal_without_attempts():
+    sample = {
+        "id": "a",
+        "success": False,
+        "coverage_failure_reason": "model_gateway_infra",
+    }
+
+    assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+@pytest.mark.parametrize(
+    "terminal_evidence",
+    [
+        {"failure_code": "model_gateway_infra"},
+        {"coverage_failure_reason": "model_gateway_infra"},
+        {"error": "Failed to generate fix plan: HTTPStatusError"},
+    ],
+)
+def test_explicit_terminal_gateway_evidence_overrides_prior_attempt(
+    terminal_evidence,
+):
+    sample = {
+        "id": "a",
+        "success": False,
+        "failure_class": "other",
+        "agent_payload": {
+            "fix_attempts": [
+                {"failure_kind": "test_failed", "error_log": "FAILED prior attempt"}
+            ]
+        },
+        **terminal_evidence,
+    }
+
+    assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+def test_final_attempt_overrides_historical_model_gateway_invocation():
+    sample = {
+        "id": "a",
+        "success": False,
+        "model_invocations": [
+            {
+                "node": "plan_fix",
+                "status": "error",
+                "error_class": "HTTPStatusError",
+            }
+        ],
+        "agent_payload": {
+            "fix_attempts": [
+                {"failure_kind": "test_failed", "error_log": "FAILED test_widget"}
+            ]
+        },
+    }
+
+    classified = classify_sample(sample)
+
+    assert classified["decisive"] == "test_failed"
+    assert classified["attempts"] == ["test_failed"]
+
+
+def test_terminal_error_overrides_historical_model_gateway_invocation():
+    sample = {
+        "id": "a",
+        "success": False,
+        "error": "No relevant files could be located or read.",
+        "model_invocations": [
+            {
+                "node": "plan_fix",
+                "status": "error",
+                "error_class": "HTTPStatusError",
+            }
+        ],
+    }
+
+    assert classify_sample(sample)["decisive"] == "other"
+
+
 @pytest.mark.parametrize(
     "invocation",
     [
