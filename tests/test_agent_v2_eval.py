@@ -547,6 +547,27 @@ async def test_eval_serializes_success_only_with_verified_coverage(
     assert result["agent_success"] is expected
 
 
+async def test_eval_does_not_coerce_string_success_to_true(monkeypatch):
+    async def fake_agent(*args, **kwargs):
+        return {
+            "success": "false",
+            "final_phase": "DONE",
+            "run_id": "coverage-run",
+            "trace_id": "coverage-run",
+            "coverage_status": "generated_verified",
+            "coverage_proof": coverage_proof(),
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda run_id: {})
+    monkeypatch.setattr(agent_v2_harness, "load_run", lambda run_id: None)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(sample_record(), 0)
+
+    assert result["success"] is False
+    assert result["agent_success"] is False
+
+
 async def test_eval_artifacts_drop_credentials_evaluator_fields_and_archive_payloads(
     monkeypatch, tmp_path
 ):
@@ -687,6 +708,37 @@ def test_result_writer_downgrades_unproven_agent_success(tmp_path):
     [stored] = json.loads(path.read_text(encoding="utf-8"))
     assert stored["success"] is False
     assert stored["agent_success"] is False
+
+
+def test_result_writer_downgrades_structurally_incomplete_coverage(tmp_path):
+    path = tmp_path / "results.json"
+    proof = coverage_proof()
+    proof["test_files"] = ["vendor/tests/test_auth.py"]
+    proof["argv"] = ["pytest", "vendor/tests/test_auth.py"]
+    proof["test_content_digests"] = {
+        "vendor/tests/test_auth.py": proof["test_content_digests"].pop(
+            "tests/test_auth.py"
+        )
+    }
+    for run in proof["base_runs"]:
+        run["failing_test_ids"] = ["vendor/tests/test_auth.py::test_login"]
+    results = [
+        {
+            "id": "unsafe-success",
+            "mode": "agent_v2",
+            "success": True,
+            "agent_success": True,
+            "coverage_status": "generated_verified",
+            "coverage_proof": proof,
+        }
+    ]
+
+    agent_v2_harness._write_results_with_fallback(results, path)
+
+    [stored] = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["success"] is False
+    assert stored["agent_success"] is False
+    assert stored["coverage_proof"] is None
 
 
 async def test_run_swe_bench_eval_selects_dataset_and_writes_predictions(

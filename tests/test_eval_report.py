@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -331,17 +332,98 @@ def test_report_cli_forwards_result_and_summary_paths(tmp_path):
     assert "RepoPilot Eval Summary" in summary_path.read_text(encoding="utf-8")
 
 
-def test_markdown_renders_only_safe_coverage_proof_fields():
+def test_report_cli_uses_custom_results_file_mtime(tmp_path):
+    results_path = tmp_path / "custom-results.json"
+    summary_path = tmp_path / "summary.md"
+    results_path.write_text(json.dumps([success_first_result()]), encoding="utf-8")
+    custom_mtime = 1_700_000_000
+    os.utime(results_path, (custom_mtime, custom_mtime))
+
+    report.main(
+        [
+            "--results-file",
+            str(results_path),
+            "--summary-file",
+            str(summary_path),
+        ]
+    )
+
+    assert f"**Date**: {float(custom_mtime)}" in summary_path.read_text(
+        encoding="utf-8"
+    )
+
+
+def test_markdown_rejects_coverage_proof_with_unexpected_fields():
     result = success_first_result()
     result["coverage_proof"]["raw_logs"] = "secret full raw test logs"
 
     markdown = report.generate_markdown([result], report.compute_metrics([result]))
 
-    assert "tests/test_auth.py" in markdown
-    assert "assertion_failure" in markdown
-    assert "tests/test_auth.py::test_login" in markdown
-    assert "a" * 64 in markdown
+    assert "- Proof: none" in markdown
+    assert report.compute_metrics([result])["agent_v2"]["agent_successes"] == 0
     assert "secret full raw test logs" not in markdown
+
+
+def test_report_normalizes_official_resolved_to_bool_or_none():
+    values = [True, False, "true", "false", 1, 0, None]
+    results = []
+    for index, value in enumerate(values):
+        result = agent_v2_result()
+        result["id"] = f"sample-{index}"
+        result["official_resolved"] = value
+        results.append(result)
+
+    metrics = report.compute_metrics(results)["agent_v2"]
+
+    assert metrics["official_scored_samples"] == 2
+    assert metrics["official_resolved"] == 1
+    assert metrics["official_resolved_rate"] == 0.5
+
+
+def test_report_sanitizes_all_agent_row_and_replay_error_fields():
+    result = agent_v2_result()
+    sentinel = (
+        "sk-report-secret-123456789 FAIL_TO_PASS "
+        "archive.zip PK\\x03\\x04 evaluator bytes"
+    )
+    result.update(
+        {
+            "run_id": sentinel,
+            "final_phase": sentinel,
+            "turns_taken": sentinel,
+            "token_used": sentinel,
+            "replay": None,
+            "replay_error": sentinel,
+        }
+    )
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "sk-report-secret-123456789" not in markdown
+    assert "FAIL_TO_PASS" not in markdown
+    assert "PK\\x03\\x04" not in markdown
+    assert "| no | 0 | 0 |" in markdown
+
+
+def test_report_sanitizes_clean_legacy_sample_id():
+    sentinel = (
+        "sk-legacy-secret-123456789 FAIL_TO_PASS "
+        "archive.zip PK\\x03\\x04 evaluator bytes"
+    )
+    result = {
+        "id": sentinel,
+        "file_recall": {"k1": 0.0, "k3": 0.0, "k5": 0.0},
+        "patch_apply": False,
+        "has_tests_changed": False,
+        "test_pass": None,
+        "token_usage": {"cost": 0.0, "input": 0, "output": 0},
+    }
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "sk-legacy-secret-123456789" not in markdown
+    assert "FAIL_TO_PASS" not in markdown
+    assert "PK\\x03\\x04" not in markdown
 
 
 def test_markdown_redacts_legacy_credentials_evaluator_and_archive_payloads():

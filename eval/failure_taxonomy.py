@@ -30,6 +30,21 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
+if __package__:
+    from .safe_contracts import (
+        has_structured_model_gateway_failure,
+        has_verified_agent_success,
+        is_model_gateway_error_text,
+        normalize_official_resolved,
+    )
+else:  # Support `python eval/failure_taxonomy.py`.
+    from safe_contracts import (
+        has_structured_model_gateway_failure,
+        has_verified_agent_success,
+        is_model_gateway_error_text,
+        normalize_official_resolved,
+    )
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS = REPO_ROOT / "eval" / "eval_results.json"
 
@@ -62,7 +77,7 @@ def classify_attempt(failure_kind: str, error_log: str) -> str:
         return "opus_no_progress_limit"
     if kind == "patch_gate_rejected" or "patchgate" in low or "patch gate" in low:
         return "patch_gate_rejected"
-    if kind == "model_gateway_infra" or (
+    if kind == "model_gateway_infra" or is_model_gateway_error_text(log) or (
         ("model" in low or "gateway" in low or "llm" in low)
         and any(marker in low for marker in ("503", "502", "504", "timeout", "timed out"))
     ):
@@ -107,10 +122,12 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
     """Classify a whole sample: its decisive (terminal) failure and per-attempt
     categories. The decisive category is the LAST attempt's — that's what the
     run ultimately died on."""
-    official_resolved = sample.get("official_resolved")
+    official_resolved = normalize_official_resolved(
+        sample.get("official_resolved")
+    )
     payload = sample.get("agent_payload") or {}
     attempts = payload.get("fix_attempts") or []
-    if sample.get("success"):
+    if has_verified_agent_success(sample):
         return {
             "id": sample.get("id"),
             "decisive": "agent_success",
@@ -123,6 +140,14 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
         return {
             "id": sample.get("id"),
             "decisive": stored_class,
+            "attempts": [],
+            "official_resolved": official_resolved,
+        }
+
+    if has_structured_model_gateway_failure(sample):
+        return {
+            "id": sample.get("id"),
+            "decisive": "model_gateway_infra",
             "attempts": [],
             "official_resolved": official_resolved,
         }

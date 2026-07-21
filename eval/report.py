@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import statistics
 from collections import Counter
 from pathlib import Path
@@ -18,22 +17,28 @@ from typing import Any
 
 if __package__:
     from .failure_taxonomy import summarize as summarize_failures
+    from .safe_contracts import (
+        has_verified_coverage_proof,
+        normalize_official_resolved,
+        safe_float,
+        safe_int,
+        sanitize_output_text,
+        validate_safe_coverage_proof,
+    )
 else:  # Support `python eval/report.py` and imports from the eval directory.
     from failure_taxonomy import summarize as summarize_failures
+    from safe_contracts import (
+        has_verified_coverage_proof,
+        normalize_official_resolved,
+        safe_float,
+        safe_int,
+        sanitize_output_text,
+        validate_safe_coverage_proof,
+    )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 SUMMARY_PATH = REPO_ROOT / "eval" / "eval_summary.md"
-_VERIFIED_COVERAGE_STATUSES = {"existing_verified", "generated_verified"}
-_EVALUATOR_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:gold[_ -]?patch|test[_ -]?patch|"
-    r"fail[_ -]?to[_ -]?pass|pass[_ -]?to[_ -]?pass)"
-    r"(?![A-Za-z0-9])"
-)
-_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[^\s,;]+")
-_SK_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
-_ARCHIVE_PAYLOAD_RE = re.compile(r"(?:PK\\x03\\x04|PK\x03\x04)")
-
 _AGENT_RESULT_DEFAULTS: dict[str, Any] = {
     "models_used": [],
     "escalated": False,
@@ -54,83 +59,43 @@ _AGENT_RESULT_DEFAULTS: dict[str, Any] = {
 
 
 def _safe_text(value: Any, limit: int = 2_000) -> str:
-    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
-    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
-    text = _SK_RE.sub("[REDACTED]", text)
-    boundaries = [
-        match.start()
-        for match in (_EVALUATOR_RE.search(text), _ARCHIVE_PAYLOAD_RE.search(text))
-        if match is not None
-    ]
-    if boundaries:
-        text = text[: min(boundaries)]
-    return text.strip()[:limit]
-
-
-def _safe_coverage_run(value: Any) -> dict[str, Any]:
-    run = value if isinstance(value, dict) else {}
-    return {
-        "outcome": _safe_text(run.get("outcome"), 40),
-        "failing_test_ids": [
-            _safe_text(item, 500)
-            for item in (run.get("failing_test_ids") or [])[:100]
-            if _safe_text(item, 500)
-        ],
-        "assertion_fingerprint": _safe_text(
-            run.get("assertion_fingerprint"), 128
-        ),
-    }
+    return sanitize_output_text(value, limit)
 
 
 def _safe_coverage_proof(value: Any) -> dict[str, Any] | None:
-    if not isinstance(value, dict):
-        return None
-    status = _safe_text(value.get("status"), 40)
-    test_files = [
-        _safe_text(item, 500)
-        for item in (value.get("test_files") or [])[:16]
-        if _safe_text(item, 500)
-    ]
-    if status not in _VERIFIED_COVERAGE_STATUSES or not test_files:
-        return None
-    proof = {
-        "source": _safe_text(value.get("source"), 40),
-        "status": status,
-        "test_files": test_files,
-        "fixed_runs": [
-            _safe_coverage_run(item)
-            for item in (value.get("fixed_runs") or [])[:2]
-        ],
-        "base_runs": [
-            _safe_coverage_run(item)
-            for item in (value.get("base_runs") or [])[:2]
-        ],
-    }
-    fixed_runs = proof["fixed_runs"]
-    base_runs = proof["base_runs"]
-    if len(fixed_runs) != 2 or len(base_runs) != 2:
-        return None
-    if any(run["outcome"] != "pass" for run in fixed_runs):
-        return None
-    if any(
-        run["outcome"] != "assertion_failure"
-        or not run["failing_test_ids"]
-        or not run["assertion_fingerprint"]
-        for run in base_runs
-    ):
-        return None
-    if (
-        base_runs[0]["failing_test_ids"] != base_runs[1]["failing_test_ids"]
-        or base_runs[0]["assertion_fingerprint"]
-        != base_runs[1]["assertion_fingerprint"]
-    ):
-        return None
-    return proof
+    return validate_safe_coverage_proof(value)
+
+
+def _safe_text_list(value: Any, *, limit: int, maximum: int) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    values = [_safe_text(item, limit) for item in value[:maximum]]
+    return [item for item in values if item]
 
 
 def _normalize_result(value: dict[str, Any]) -> dict[str, Any]:
     result = dict(value)
     if not _is_agent_v2_result(result):
+        result["id"] = _safe_text(result.get("id"), 500)
+        result["error"] = _safe_text(result.get("error")) or None
+        raw_recall = result.get("file_recall")
+        raw_recall = raw_recall if isinstance(raw_recall, dict) else {}
+        result["file_recall"] = {
+            key: safe_float(raw_recall.get(key)) for key in ("k1", "k3", "k5")
+        }
+        result["patch_apply"] = result.get("patch_apply") is True
+        result["has_tests_changed"] = result.get("has_tests_changed") is True
+        raw_test_pass = result.get("test_pass")
+        result["test_pass"] = (
+            raw_test_pass if type(raw_test_pass) is bool else None
+        )
+        raw_usage = result.get("token_usage")
+        raw_usage = raw_usage if isinstance(raw_usage, dict) else {}
+        result["token_usage"] = {
+            "cost": max(0.0, safe_float(raw_usage.get("cost"))),
+            "input": max(0, safe_int(raw_usage.get("input"))),
+            "output": max(0, safe_int(raw_usage.get("output"))),
+        }
         return result
     for key, default in _AGENT_RESULT_DEFAULTS.items():
         if key not in result:
@@ -138,7 +103,39 @@ def _normalize_result(value: dict[str, Any]) -> dict[str, Any]:
     result["attempt_outcome_summary"] = _safe_text(
         result.get("attempt_outcome_summary"), 200
     )
-    status = result.get("coverage_status")
+    for key, limit in (
+        ("id", 500),
+        ("model", 300),
+        ("commit_sha", 300),
+        ("run_id", 300),
+        ("trace_id", 300),
+        ("final_phase", 100),
+        ("replay_error", 2_000),
+        ("escalation_reason", 100),
+        ("coverage_test_command", 2_000),
+        ("coverage_failure_reason", 100),
+    ):
+        result[key] = _safe_text(result.get(key), limit)
+    result["models_used"] = _safe_text_list(
+        result.get("models_used"), limit=300, maximum=100
+    )
+    result["turns_taken"] = max(0, safe_int(result.get("turns_taken")))
+    result["token_used"] = max(0, safe_int(result.get("token_used")))
+    result["unique_evidence_count"] = max(
+        0, safe_int(result.get("unique_evidence_count"))
+    )
+    result["max_consecutive_no_progress"] = max(
+        0, safe_int(result.get("max_consecutive_no_progress"))
+    )
+    result["test_generation_attempts"] = max(
+        0, safe_int(result.get("test_generation_attempts"))
+    )
+    result["waiting_for_user"] = result.get("waiting_for_user") is True
+    result["escalated"] = result.get("escalated") is True
+    result["official_resolved"] = normalize_official_resolved(
+        result.get("official_resolved")
+    )
+    status = _safe_text(result.get("coverage_status"), 40)
     if status not in {
         "pending",
         "existing_verified",
@@ -148,13 +145,11 @@ def _normalize_result(value: dict[str, Any]) -> dict[str, Any]:
         status = "pending"
     result["coverage_status"] = status
     result["coverage_proof"] = _safe_coverage_proof(result.get("coverage_proof"))
-    verified = bool(
-        status in _VERIFIED_COVERAGE_STATUSES
-        and result["coverage_proof"]
-        and result["coverage_proof"]["status"] == status
+    verified = has_verified_coverage_proof(
+        status, result["coverage_proof"]
     )
     claimed_success = result.get("agent_success", result.get("success", False))
-    result["agent_success"] = bool(claimed_success and verified)
+    result["agent_success"] = bool(claimed_success is True and verified)
     result["success"] = result["agent_success"]
     result["error"] = _safe_text(result.get("error")) or None
     return result
@@ -220,7 +215,11 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
             if result.get("official_resolved") is not None
         ]
         official_resolved = len(
-            [result for result in official_results if result.get("official_resolved")]
+            [
+                result
+                for result in official_results
+                if result.get("official_resolved") is True
+            ]
         )
         by_evaluation_mode[evaluation_mode] = {
             "samples": len(mode_results),
@@ -309,7 +308,11 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
         if result.get("official_resolved") is not None
     ]
     official_resolved = len(
-        [result for result in official_results if result.get("official_resolved")]
+        [
+            result
+            for result in official_results
+            if result.get("official_resolved") is True
+        ]
     )
 
     return {
@@ -362,12 +365,12 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
             "escalation_reasons": dict(sorted(escalation_reasons.items())),
             "tool_statuses": dict(sorted(tool_statuses.items())),
             "unique_evidence_count": sum(
-                max(0, int(result.get("unique_evidence_count") or 0))
+                max(0, safe_int(result.get("unique_evidence_count")))
                 for result in agent_v2_results
             ),
             "max_consecutive_no_progress": max(
                 (
-                    max(0, int(result.get("max_consecutive_no_progress") or 0))
+                    max(0, safe_int(result.get("max_consecutive_no_progress")))
                     for result in agent_v2_results
                 ),
                 default=0,
@@ -378,7 +381,7 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
                     [result for result in agent_v2_results if result.get("coverage_proof")]
                 ),
                 "test_generation_attempts": sum(
-                    max(0, int(result.get("test_generation_attempts") or 0))
+                    max(0, safe_int(result.get("test_generation_attempts")))
                     for result in agent_v2_results
                 ),
             },
@@ -387,14 +390,22 @@ def compute_metrics(results: list[dict]) -> dict[str, Any]:
     }
 
 
-def generate_markdown(results: list[dict], metrics: dict) -> str:
+def generate_markdown(
+    results: list[dict],
+    metrics: dict,
+    results_path: Path | str = RESULTS_PATH,
+) -> str:
     """Generate eval summary markdown."""
     results = [_normalize_result(result) for result in results]
     legacy_results = [r for r in results if not _is_agent_v2_result(r)]
     agent_v2_results = [r for r in results if _is_agent_v2_result(r)]
     lines: list[str] = []
     lines.append("# RepoPilot Eval Summary\n")
-    lines.append(f"**Date**: {Path(RESULTS_PATH).stat().st_mtime if RESULTS_PATH.exists() else 'N/A'}\n")
+    source_path = Path(results_path)
+    source_mtime: float | str = (
+        source_path.stat().st_mtime if source_path.exists() else "N/A"
+    )
+    lines.append(f"**Date**: {source_mtime}\n")
     lines.append(f"**Samples evaluated**: {metrics['total_samples']}\n")
     lines.append(f"**Errors**: {metrics['errors']} ({', '.join(metrics['error_ids']) if metrics['error_ids'] else 'none'})\n")
     models = sorted(
@@ -486,7 +497,7 @@ def generate_markdown(results: list[dict], metrics: dict) -> str:
             tp = "✗"
         cost_val = r.get("token_usage", {}).get("cost", 0)
         lines.append(
-            f"| {i+1} | `{r['id'][:60]}` "
+            f"| {i+1} | `{_safe_text(r.get('id'), 60)}` "
             f"| {fr['k1']:.2f} | {fr['k3']:.2f} | {fr['k5']:.2f} "
             f"| {pa} | {tp} | ${cost_val:.6f} |\n"
         )
@@ -600,11 +611,11 @@ def _append_agent_v2_results(lines: list[str], results: list[dict[str, Any]]) ->
         lines.append(
             f"| `{_safe_text(result.get('id', ''), 60)}` "
             f"| {_evaluation_mode(result)} "
-            f"| `{result.get('run_id', '')}` "
-            f"| {result.get('final_phase', '')} "
+            f"| `{_safe_text(result.get('run_id'), 300)}` "
+            f"| {_markdown_table_cell(result.get('final_phase'))} "
             f"| {waiting} "
-            f"| {result.get('turns_taken', 0)} "
-            f"| {result.get('token_used', 0)} "
+            f"| {max(0, safe_int(result.get('turns_taken')))} "
+            f"| {max(0, safe_int(result.get('token_used')))} "
             f"| {error} |\n"
         )
 
@@ -658,8 +669,9 @@ def _append_replay_diagnostics(
         run_id = _safe_text(result.get("run_id", ""), 300)
         lines.append(f"### {_safe_text(result.get('id', ''), 300)} (`{run_id}`)\n\n")
         replay = result.get("replay")
-        if not replay:
-            lines.append(f"- Replay unavailable: {result.get('replay_error') or 'missing'}\n")
+        if not isinstance(replay, dict) or not replay:
+            replay_error = _safe_text(result.get("replay_error")) or "missing"
+            lines.append(f"- Replay unavailable: {replay_error}\n")
             continue
 
         lines.append(f"- Final phase: {_safe_text(replay.get('current_phase', ''), 100)}\n")
@@ -718,7 +730,7 @@ def _diagnostic_summary(replay: dict[str, Any]) -> list[str]:
             and diagnostic.get("event") == "phase"
             and diagnostic.get("status") == "timeout"
         ):
-            timeout = diagnostic.get("phase_timeout_seconds", "")
+            timeout = _safe_text(diagnostic.get("phase_timeout_seconds", ""), 100)
             summaries.append(f"Planner timeout: plan_fix exceeded {timeout}s.")
     return summaries
 
@@ -836,7 +848,7 @@ def main(argv: list[str] | None = None) -> None:
 
     print_summary(metrics)
 
-    md = generate_markdown(results, metrics)
+    md = generate_markdown(results, metrics, results_path=results_path)
     summary_path.parent.mkdir(parents=True, exist_ok=True)
     summary_path.write_text(md, encoding="utf-8")
     print(f"\nMarkdown report saved to {summary_path}")

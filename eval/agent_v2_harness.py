@@ -40,11 +40,16 @@ _swe_bench = importlib.import_module("eval.swe_bench")
 build_agent_seed = _swe_bench.build_agent_seed
 load_verified_samples = _swe_bench.load_verified_samples
 write_predictions = _swe_bench.write_predictions
+_safe_contracts = importlib.import_module("eval.safe_contracts")
+has_verified_coverage_proof = _safe_contracts.has_verified_coverage_proof
+safe_int = _safe_contracts.safe_int
+safe_float = _safe_contracts.safe_float
+sanitize_output_text = _safe_contracts.sanitize_output_text
+validate_safe_coverage_proof = _safe_contracts.validate_safe_coverage_proof
 
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 MAX_SAMPLES = 5
-_VERIFIED_COVERAGE_STATUSES = {"existing_verified", "generated_verified"}
 _ARCHIVE_DIFF_RE = re.compile(
     r"(?im)^diff --git a/\S+\.(?:7z|bz2|egg|gz|rar|tar|tgz|whl|xz|zip) "
 )
@@ -55,21 +60,16 @@ def _configured_model() -> str:
 
 
 def _safe_text(value: Any, limit: int = 2_000) -> str:
-    return sanitize_evaluator_text(redact_secrets(str(value or "")))[:limit]
+    sanitized = sanitize_evaluator_text(redact_secrets(str(value or "")))
+    return sanitize_output_text(sanitized, limit)
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+    return safe_int(value, default)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+    return safe_float(value, default)
 
 
 def _as_mapping(value: Any) -> dict[str, Any]:
@@ -158,20 +158,14 @@ def _safe_coverage_proof(value: Any) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         return None
     proof = validated.model_dump(mode="json")
-    status = _safe_text(proof.get("status"), 40)
-    if status not in _VERIFIED_COVERAGE_STATUSES:
-        return None
-    test_files = [
-        _safe_text(item, 500)
-        for item in proof.get("test_files") or []
-        if _safe_text(item, 500)
-    ][:16]
-    if not test_files:
-        return None
-    return {
+    projected = {
         "source": _safe_text(proof.get("source"), 40),
-        "status": status,
-        "test_files": test_files,
+        "status": _safe_text(proof.get("status"), 40),
+        "test_files": [
+            _safe_text(item, 500)
+            for item in proof.get("test_files") or []
+            if _safe_text(item, 500)
+        ][:16],
         "fixed_runs": [
             _safe_coverage_run(item) for item in (proof.get("fixed_runs") or [])[:2]
         ],
@@ -179,31 +173,7 @@ def _safe_coverage_proof(value: Any) -> dict[str, Any] | None:
             _safe_coverage_run(item) for item in (proof.get("base_runs") or [])[:2]
         ],
     }
-
-
-def _has_verified_coverage_proof(status: Any, proof: Any) -> bool:
-    if status not in _VERIFIED_COVERAGE_STATUSES or not isinstance(proof, dict):
-        return False
-    if proof.get("status") != status or not proof.get("test_files"):
-        return False
-    fixed_runs = proof.get("fixed_runs") or []
-    base_runs = proof.get("base_runs") or []
-    if len(fixed_runs) != 2 or len(base_runs) != 2:
-        return False
-    if any(run.get("outcome") != "pass" for run in fixed_runs):
-        return False
-    if any(
-        run.get("outcome") != "assertion_failure"
-        or not run.get("failing_test_ids")
-        or not run.get("assertion_fingerprint")
-        for run in base_runs
-    ):
-        return False
-    return (
-        base_runs[0].get("failing_test_ids") == base_runs[1].get("failing_test_ids")
-        and base_runs[0].get("assertion_fingerprint")
-        == base_runs[1].get("assertion_fingerprint")
-    )
+    return validate_safe_coverage_proof(projected)
 
 
 def _max_consecutive_no_progress(values: list[Any], current: int = 0) -> int:
@@ -451,11 +421,14 @@ def _write_results_with_fallback(
     for value in results:
         result = dict(value)
         if result.get("mode") == "agent_v2":
-            verified = _has_verified_coverage_proof(
+            result["coverage_proof"] = validate_safe_coverage_proof(
+                result.get("coverage_proof")
+            )
+            verified = has_verified_coverage_proof(
                 result.get("coverage_status"), result.get("coverage_proof")
             )
             claimed = result.get("agent_success", result.get("success", False))
-            result["agent_success"] = bool(claimed and verified)
+            result["agent_success"] = bool(claimed is True and verified)
             result["success"] = result["agent_success"]
         serialized_results.append(result)
     contents = json.dumps(serialized_results, indent=2, ensure_ascii=False)
@@ -640,8 +613,8 @@ async def evaluate_agent_v2_sample(
 
     safe_fields = _safe_result_fields(payload, saved_state, replay)
     terminal_success = bool(
-        payload.get("success")
-        and _has_verified_coverage_proof(
+        payload.get("success") is True
+        and has_verified_coverage_proof(
             safe_fields["coverage_status"], safe_fields["coverage_proof"]
         )
     )
@@ -661,7 +634,7 @@ async def evaluate_agent_v2_sample(
         "agent_success": terminal_success,
         # Filled only by an official scorer import; never inferred internally.
         "official_resolved": None,
-        "waiting_for_user": payload.get("waiting_for_user", False),
+        "waiting_for_user": payload.get("waiting_for_user") is True,
         "final_phase": _safe_text(payload.get("final_phase", ""), 100),
         "run_id": _safe_text(run_id, 300),
         "trace_id": _safe_text(payload.get("trace_id", ""), 300),

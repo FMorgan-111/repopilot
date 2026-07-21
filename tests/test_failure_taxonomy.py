@@ -13,6 +13,41 @@ from src.model_policy import record_progress
 from src.state import PatchEdit
 
 
+def verified_coverage():
+    return {
+        "coverage_status": "generated_verified",
+        "coverage_proof": {
+            "source": "generated",
+            "status": "generated_verified",
+            "test_files": ["tests/test_auth.py"],
+            "fixed_runs": [
+                {
+                    "outcome": "pass",
+                    "failing_test_ids": [],
+                    "assertion_fingerprint": "",
+                },
+                {
+                    "outcome": "pass",
+                    "failing_test_ids": [],
+                    "assertion_fingerprint": "",
+                },
+            ],
+            "base_runs": [
+                {
+                    "outcome": "assertion_failure",
+                    "failing_test_ids": ["tests/test_auth.py::test_login"],
+                    "assertion_fingerprint": "a" * 64,
+                },
+                {
+                    "outcome": "assertion_failure",
+                    "failing_test_ids": ["tests/test_auth.py::test_login"],
+                    "assertion_fingerprint": "a" * 64,
+                },
+            ],
+        },
+    }
+
+
 def test_wrong_file_path():
     assert classify_attempt(
         "patch_apply_failed",
@@ -76,12 +111,25 @@ def test_sample_decisive_is_last_attempt():
 
 
 def test_sample_resolved():
-    assert classify_sample({"id": "a", "success": True})["decisive"] == "agent_success"
+    assert classify_sample(
+        {"id": "a", "success": True, **verified_coverage()}
+    )["decisive"] == "agent_success"
+
+
+def test_sample_success_without_strict_coverage_is_not_agent_success():
+    classified = classify_sample({"id": "a", "success": True})
+
+    assert classified["decisive"] != "agent_success"
 
 
 def test_official_resolved_is_not_inferred_from_agent_success():
     classified = classify_sample(
-        {"id": "a", "success": True, "official_resolved": None}
+        {
+            "id": "a",
+            "success": True,
+            "official_resolved": None,
+            **verified_coverage(),
+        }
     )
 
     assert classified["decisive"] == "agent_success"
@@ -102,6 +150,72 @@ def test_success_first_terminal_failure_labels(sample, expected):
     sample = {"id": "a", "success": False, **sample}
 
     assert classify_sample(sample)["decisive"] == expected
+
+
+def test_real_generate_plan_http_status_error_is_model_gateway_infra():
+    sample = {
+        "id": "a",
+        "success": False,
+        "error": "Failed to generate fix plan: HTTPStatusError",
+    }
+
+    assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+def test_structured_model_invocation_error_is_model_gateway_infra():
+    sample = {
+        "id": "a",
+        "success": False,
+        "model_invocations": [
+            {
+                "node": "plan_fix",
+                "status": "error",
+                "error_class": "HTTPStatusError",
+            }
+        ],
+    }
+
+    assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+def test_safe_model_failure_code_is_model_gateway_infra():
+    sample = {
+        "id": "a",
+        "success": False,
+        "failure_code": "model_gateway_infra",
+    }
+
+    assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+@pytest.mark.parametrize(
+    "invocation",
+    [
+        {"node": "commit", "status": "error", "error_class": "HTTPStatusError"},
+        {"node": "plan_fix", "status": "ok", "error_class": "HTTPStatusError"},
+        {"node": "plan_fix", "status": "error", "error_class": "ValidationError"},
+    ],
+)
+def test_structured_model_gateway_detection_is_allowlisted(invocation):
+    classified = classify_sample(
+        {
+            "id": "a",
+            "success": False,
+            "error": "Failed to generate fix plan: ValidationError",
+            "model_invocations": [invocation],
+        }
+    )
+
+    assert classified["decisive"] != "model_gateway_infra"
+
+
+@pytest.mark.parametrize("value", ["true", "false", 1, 0, [], {}])
+def test_taxonomy_does_not_score_non_boolean_official_result(value):
+    classified = classify_sample(
+        {"id": "a", "success": False, "official_resolved": value}
+    )
+
+    assert classified["official_resolved"] is None
 
 
 def test_sample_no_attempts_prepatch_locate_failure():
@@ -127,7 +241,12 @@ def test_sample_no_attempts_hallucination_gate_is_search_not_found():
 
 def test_summarize_distribution():
     results = [
-        {"id": "1", "success": True, "agent_payload": {"fix_attempts": []}},
+        {
+            "id": "1",
+            "success": True,
+            "agent_payload": {"fix_attempts": []},
+            **verified_coverage(),
+        },
         {"id": "2", "success": False, "agent_payload": {"fix_attempts": [
             {"failure_kind": "test_failed", "error_log": "FAILED"}]}},
         {"id": "3", "success": False, "agent_payload": {"fix_attempts": [
