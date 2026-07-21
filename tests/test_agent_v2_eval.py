@@ -1,9 +1,56 @@
 import inspect
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from eval import agent_v2_harness, swe_bench
+
+
+def coverage_proof():
+    return {
+        "source": "generated",
+        "status": "generated_verified",
+        "test_files": ["tests/test_auth.py"],
+        "argv": ["pytest", "tests/test_auth.py"],
+        "fixed_runs": [
+            {
+                "exit_code": 0,
+                "outcome": "pass",
+                "failing_test_ids": [],
+                "assertion_fingerprint": "",
+                "summary": "1 passed in 0.01s raw log must not be reported",
+            },
+            {
+                "exit_code": 0,
+                "outcome": "pass",
+                "failing_test_ids": [],
+                "assertion_fingerprint": "",
+                "summary": "1 passed in 0.02s raw log must not be reported",
+            },
+        ],
+        "base_runs": [
+            {
+                "exit_code": 1,
+                "outcome": "assertion_failure",
+                "failing_test_ids": ["tests/test_auth.py::test_login"],
+                "assertion_fingerprint": "a" * 64,
+                "summary": "full assertion output must not be reported",
+            },
+            {
+                "exit_code": 1,
+                "outcome": "assertion_failure",
+                "failing_test_ids": ["tests/test_auth.py::test_login"],
+                "assertion_fingerprint": "a" * 64,
+                "summary": "full assertion output must not be reported",
+            },
+        ],
+        "base_ref": "b" * 40,
+        "patch_sha256": "c" * 64,
+        "patch_gate_fingerprint": "d" * 64,
+        "manifest_fingerprint": "e" * 64,
+        "test_content_digests": {"tests/test_auth.py": "f" * 64},
+    }
 
 
 def test_agent_v2_eval_public_defaults_are_100000():
@@ -125,6 +172,23 @@ def test_legacy_harness_api_key_falls_back_to_empty(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert harness._get_llm_api_key() == ""
+
+
+@pytest.mark.parametrize(
+    ("enabled", "key", "expected"),
+    [
+        ("0", "escalation-secret", False),
+        ("1", "", False),
+        ("1", "escalation-secret", True),
+    ],
+)
+def test_eval_escalation_requires_explicit_flag_and_key(
+    monkeypatch, enabled, key, expected
+):
+    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", enabled)
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", key)
+
+    assert agent_v2_harness.escalation_is_configured() is expected
 
 
 async def test_legacy_harness_llm_request_resolves_api_key_at_request_time(
@@ -305,55 +369,241 @@ async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatc
             "skip_commit": True,
         }
     ]
-    assert result == {
-        "id": "acme/widget#7:8",
-        "mode": "agent_v2",
-        "evaluation_mode": "end_to_end",
-        "model": "test-model",
-        "commit_sha": "deadbeef",
-        "repo": "acme/widget",
-        "issue_url": "https://github.com/acme/widget/issues/7",
-        "issue_title": "Login crash",
-        "actual_files": ["src/auth.py"],
-        "has_tests_changed": True,
-        "success": False,
+    assert result["id"] == "acme/widget#7:8"
+    assert result["evaluation_mode"] == "end_to_end"
+    assert result["model"] == "test-model"
+    assert result["commit_sha"] == "deadbeef"
+    assert result["actual_files"] == ["src/auth.py"]
+    assert result["success"] is False
+    assert result["agent_success"] is False
+    assert result["coverage_status"] == "pending"
+    assert result["coverage_proof"] is None
+    assert result["models_used"] == ["test-model"]
+    assert result["error"] == "Patch failed tests."
+    assert result["replay"]["timeline"][0]["stage"] == "reflect"
+    assert "agent_payload" not in result
+
+
+async def test_eval_result_exposes_safe_success_first_fields(monkeypatch):
+    proof = coverage_proof()
+    long_summary = "Generated a stable login regression. " + ("x" * 240)
+    payload = {
+        "success": True,
         "waiting_for_user": False,
-        "final_phase": "FAILED",
-        "run_id": "abc123def456",
-        "trace_id": "abc123def456",
-        "turns_taken": 4,
+        "final_phase": "DONE",
+        "run_id": "safe-run",
+        "trace_id": "safe-run",
+        "turns_taken": 7,
         "token_used": 1234,
-        "error": "Patch failed tests.",
-        "agent_payload": {
+        "model_patch": "diff --git a/src/auth.py b/src/auth.py\n",
+        "escalated": True,
+        "escalation_reason": "repeated_edit",
+        "coverage_status": "generated_verified",
+        "coverage_test_files": ["tests/test_auth.py"],
+        "coverage_test_command": "pytest tests/test_auth.py",
+        "coverage_proof": proof,
+        "coverage_failure_reason": "",
+        "test_generation_attempts": 1,
+        "attempt_outcome_summary": long_summary,
+        "model_history": [
+            {
+                "model": "gemini-3.5-flash:stable",
+                "provider": "primary",
+                "node": "plan",
+                "elapsed_seconds": 1.5,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "status": "ok",
+                "error_class": "",
+            },
+            {
+                "model": "claude-opus-4-8:stable",
+                "provider": "escalation",
+                "node": "test_generation",
+                "elapsed_seconds": 2.5,
+                "input_tokens": 120,
+                "output_tokens": 40,
+                "status": "ok",
+                "error_class": "",
+            },
+        ],
+        "tool_history": [
+            {
+                "action": "read_symbol",
+                "args_fingerprint": "1" * 64,
+                "status": "ok",
+                "evidence_id": "ev_1",
+                "error_class": "",
+            },
+            {
+                "action": "read_symbol",
+                "args_fingerprint": "1" * 64,
+                "status": "duplicate",
+                "evidence_id": None,
+                "error_class": "",
+            },
+        ],
+        "evidence": [
+            {"evidence_id": "ev_1", "fingerprint": "9" * 64},
+            {"evidence_id": "ev_2", "fingerprint": "9" * 64},
+        ],
+        "no_progress_history": [
+            {"kind": "repeated_edit", "fingerprint": "8" * 64, "node": "plan"},
+            {"kind": "repeated_edit", "fingerprint": "8" * 64, "node": "plan"},
+        ],
+    }
+
+    async def fake_agent(*args, **kwargs):
+        return payload
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda run_id: {})
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_run",
+        lambda run_id: SimpleNamespace(
+            model_history=[],
+            tool_history=[],
+            evidence=[],
+            no_progress_history=[],
+            no_progress_rounds=0,
+            attempt_outcome_summary="",
+            coverage_status="pending",
+            coverage_test_files=[],
+            coverage_test_command="",
+            coverage_proof=None,
+            coverage_failure_reason="",
+            test_generation_attempts=0,
+        ),
+    )
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(sample_record(), 0)
+
+    assert result["success"] is True
+    assert result["agent_success"] is True
+    assert result["official_resolved"] is None
+    assert result["models_used"] == [
+        "gemini-3.5-flash:stable",
+        "claude-opus-4-8:stable",
+    ]
+    assert len(result["model_invocations"]) == 2
+    assert len(result["tool_invocations"]) == 2
+    assert result["unique_evidence_count"] == 1
+    assert result["max_consecutive_no_progress"] == 2
+    assert result["attempt_outcome_summary"].startswith(
+        "Generated a stable login regression."
+    )
+    assert len(result["attempt_outcome_summary"]) == 200
+    assert result["coverage_status"] == "generated_verified"
+    assert result["coverage_test_files"] == ["tests/test_auth.py"]
+    assert result["coverage_test_command"] == "pytest tests/test_auth.py"
+    assert result["coverage_proof"]["fixed_runs"] == [
+        {"outcome": "pass", "failing_test_ids": [], "assertion_fingerprint": ""},
+        {"outcome": "pass", "failing_test_ids": [], "assertion_fingerprint": ""},
+    ]
+    assert "summary" not in json.dumps(result["coverage_proof"])
+    assert result["coverage_failure_reason"] == ""
+    assert result["test_generation_attempts"] == 1
+
+
+@pytest.mark.parametrize(
+    ("status", "proof", "expected"),
+    [
+        ("pending", None, False),
+        ("existing_verified", None, False),
+        ("failed", coverage_proof(), False),
+        (
+            "generated_verified",
+            {
+                "source": "generated",
+                "status": "generated_verified",
+                "test_files": ["tests/test_auth.py"],
+            },
+            False,
+        ),
+        ("generated_verified", coverage_proof(), True),
+    ],
+)
+async def test_eval_serializes_success_only_with_verified_coverage(
+    monkeypatch, status, proof, expected
+):
+    async def fake_agent(*args, **kwargs):
+        return {
+            "success": True,
+            "final_phase": "DONE",
+            "run_id": "coverage-run",
+            "trace_id": "coverage-run",
+            "coverage_status": status,
+            "coverage_proof": proof,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda run_id: {})
+    monkeypatch.setattr(agent_v2_harness, "load_run", lambda run_id: None)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(sample_record(), 0)
+
+    assert result["success"] is expected
+    assert result["agent_success"] is expected
+
+
+async def test_eval_artifacts_drop_credentials_evaluator_fields_and_archive_payloads(
+    monkeypatch, tmp_path
+):
+    secret = "sk-test-secret-123456789"
+    archive_payload = "setuptools-33.1.1.zip PK\\x03\\x04 generated bytes"
+
+    async def fake_agent(*args, **kwargs):
+        return {
             "success": False,
-            "waiting_for_user": False,
             "final_phase": "FAILED",
-            "run_id": "abc123def456",
-            "trace_id": "abc123def456",
-            "error": "Patch failed tests.",
-            "turns_taken": 4,
-            "token_used": 1234,
-            "decision_warnings": [{"frame_id": "df_0001"}],
-        },
-        "replay": {
-            "run_id": "abc123def456",
-            "issue_url": "https://github.com/acme/widget/issues/7",
-            "current_phase": "FAILED",
-            "timeline": [
+            "run_id": "unsafe-run",
+            "trace_id": "unsafe-run",
+            "turns_taken": secret,
+            "token_used": secret,
+            "error": f"Bearer {secret} FAIL_TO_PASS {archive_payload}",
+            "model_history": [
                 {
-                    "index": 1,
-                    "type": "decision_frame",
-                    "frame_id": "df_0001",
-                    "stage": "reflect",
-                    "summary": "Patch failed because the root cause was wrong.",
-                    "recommended_action": "plan",
-                    "route": {"route": "plan_fix"},
-                    "warnings": [{"frame_id": "df_0001"}],
+                    "model": "safe-model",
+                    "provider": "primary",
+                    "node": "plan",
+                    "elapsed_seconds": secret,
+                    "input_tokens": secret,
+                    "output_tokens": secret,
+                    "status": "error",
+                    "error_class": "GatewayError",
                 }
             ],
-        },
-        "replay_error": None,
-    }
+            "model_patch": (
+                "diff --git a/gold_patch.zip b/gold_patch.zip\n"
+                f"+Authorization: Bearer {secret}\n+{archive_payload}\n"
+            ),
+            "generated_zip_raw_payload": archive_payload,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda run_id: {})
+    monkeypatch.setattr(agent_v2_harness, "load_run", lambda run_id: None)
+    monkeypatch.setattr(agent_v2_harness, "_configured_model", lambda: secret)
+
+    async def fake_seed(*args, **kwargs):
+        return {"repo_path": "/tmp/safe-eval"}
+
+    monkeypatch.setattr(agent_v2_harness, "_build_eval_seed", fake_seed)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(), 0
+    )
+    results_path = tmp_path / "results.json"
+    predictions_path = tmp_path / "predictions.jsonl"
+    agent_v2_harness._write_results_with_fallback([result], results_path)
+    swe_bench.write_predictions([result], predictions_path)
+    rendered = results_path.read_text() + predictions_path.read_text()
+
+    assert secret not in rendered
+    assert "FAIL_TO_PASS" not in rendered
+    assert archive_payload not in rendered
+    assert "generated_zip_raw_payload" not in rendered
 
 
 async def test_seeded_eval_is_labeled_oracle_even_when_gold_seed_is_unavailable(
@@ -414,7 +664,29 @@ async def test_run_agent_v2_eval_writes_results(monkeypatch, tmp_path):
             "success": True,
         }
     ]
-    assert json.loads(results_path.read_text(encoding="utf-8")) == results
+    stored = json.loads(results_path.read_text(encoding="utf-8"))
+    assert stored[0]["success"] is False
+    assert stored[0]["agent_success"] is False
+
+
+def test_result_writer_downgrades_unproven_agent_success(tmp_path):
+    path = tmp_path / "results.json"
+    results = [
+        {
+            "id": "unsafe-success",
+            "mode": "agent_v2",
+            "success": True,
+            "agent_success": True,
+            "coverage_status": "pending",
+            "coverage_proof": None,
+        }
+    ]
+
+    agent_v2_harness._write_results_with_fallback(results, path)
+
+    [stored] = json.loads(path.read_text(encoding="utf-8"))
+    assert stored["success"] is False
+    assert stored["agent_success"] is False
 
 
 async def test_run_swe_bench_eval_selects_dataset_and_writes_predictions(
@@ -572,7 +844,9 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
         }
     ]
     fallback_path = repopilot_home / "eval" / "eval_results.json"
-    assert json.loads(fallback_path.read_text(encoding="utf-8")) == results
+    stored = json.loads(fallback_path.read_text(encoding="utf-8"))
+    assert stored[0]["success"] is False
+    assert stored[0]["agent_success"] is False
     assert not requested_path.exists()
 
 
@@ -638,7 +912,9 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(
             "success": True,
         }
     ]
-    assert json.loads(results_path.read_text(encoding="utf-8")) == results
+    stored = json.loads(results_path.read_text(encoding="utf-8"))
+    assert stored[0]["success"] is False
+    assert stored[0]["agent_success"] is False
 
 
 async def test_run_agent_v2_eval_does_not_mask_results_when_memory_cleanup_raises(
@@ -678,7 +954,9 @@ async def test_run_agent_v2_eval_does_not_mask_results_when_memory_cleanup_raise
             "success": True,
         }
     ]
-    assert json.loads(results_path.read_text(encoding="utf-8")) == results
+    stored = json.loads(results_path.read_text(encoding="utf-8"))
+    assert stored[0]["success"] is False
+    assert stored[0]["agent_success"] is False
     captured = capsys.readouterr()
     assert "Warning: failed to close shared memory store: RuntimeError: memory cleanup failed" in captured.err
 

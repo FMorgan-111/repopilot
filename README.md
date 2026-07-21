@@ -52,7 +52,9 @@ model. RepoPilot prefers `sqlite-vec`; on Python builds that cannot load SQLite
 extensions (including some macOS builds), it emits a warning and uses the
 persistent NumPy cosine-search backend instead.
 
-Set your tokens:
+Inject tokens through the process environment or your deployment's runtime
+secret store. Do not put real credentials in `.env.example`, source files,
+evaluation results, or shell history:
 
 ```bash
 export GITHUB_TOKEN=ghp_...
@@ -60,6 +62,20 @@ export LLM_API_KEY=sk-...
 export OPENAI_BASE_URL=https://linoapi.com.cn/v1
 export LLM_MODEL=gemini-3.5-flash:stable  # optional; this is the default
 ```
+
+Success-first escalation is off by default. It activates only when both the
+explicit flag and a separately injected escalation key are present:
+
+```bash
+export REPOPILOT_ESCALATION_ENABLED=1
+export LLM_ESCALATION_MODEL=claude-opus-4-8:stable
+export LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1
+# Inject LLM_ESCALATION_API_KEY with the runtime secret store.
+```
+
+`REPOPILOT_ESCALATION_AFTER_NO_PROGRESS=2` is the default bounded trigger.
+Without the flag or key, evaluation remains Gemini-only and does not incur an
+escalation call.
 
 Run it:
 
@@ -308,11 +324,22 @@ python -u eval/agent_v2_harness.py \
   --predictions-file eval/swe_bench_predictions.jsonl
 ```
 
+Generate a replay-safe summary from any result path:
+
+```bash
+python eval/report.py \
+  --results-file eval/success_first_10.json \
+  --summary-file eval/success_first_10_summary.md
+```
+
 Each instance is cloned and checked out at its exact 40-character
 `base_commit` before local code search, patching, and testing. The issue seed
 contains no gold patch, test patch, or evaluator-only fields. A RepoPilot
-`success` value describes the agent run; the benchmark's final resolved rate
-comes only from the official SWE-bench harness:
+`agent_success` (and the compatibility `success` field) is true only when
+`coverage_status` is `existing_verified` or `generated_verified` and a
+nonempty differential `coverage_proof` is present. It is not benchmark
+resolution. Official `resolved` status comes only from the SWE-bench harness
+and is reported separately:
 
 ```bash
 python -m swebench.harness.run_evaluation \

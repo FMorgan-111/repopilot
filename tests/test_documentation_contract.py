@@ -17,12 +17,31 @@ def test_readme_documents_installation_memory_and_selected_model():
     assert "NumPy" in readme
 
 
-def test_env_example_uses_openai_compatible_gemini_defaults():
+def test_env_example_exposes_safe_primary_and_escalation_defaults():
     example = _read(".env.example")
 
-    assert "LLM_API_KEY=***" in example
+    assert "LLM_API_KEY=" in example
     assert "OPENAI_BASE_URL=https://linoapi.com.cn/v1" in example
     assert "LLM_MODEL=gemini-3.5-flash:stable" in example
+    assert "LLM_ESCALATION_MODEL=claude-opus-4-8:stable" in example
+    assert "LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1" in example
+    assert "LLM_ESCALATION_API_KEY=" in example
+    assert "REPOPILOT_ESCALATION_ENABLED=0" in example
+    assert "REPOPILOT_ESCALATION_AFTER_NO_PROGRESS=2" in example
+    assert "sk-" not in example
+
+
+def test_readme_documents_runtime_only_secrets_and_eval_success_boundaries():
+    readme = _read("README.md")
+
+    assert "runtime secret store" in readme
+    assert "REPOPILOT_ESCALATION_ENABLED=1" in readme
+    assert "LLM_ESCALATION_API_KEY" in readme
+    assert "--results-file" in readme
+    assert "--summary-file" in readme
+    assert "agent_success" in readme
+    assert "Official `resolved`" in readme
+    assert "coverage_proof" in readme
 
 
 def test_contributor_guide_uses_package_metadata_instead_of_manual_dependency_fixes():

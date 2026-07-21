@@ -1,6 +1,8 @@
 """Failure taxonomy classifier — the fine-grained mapping is the whole value,
 so pin each category to a representative error log."""
 
+import pytest
+
 from eval.failure_taxonomy import (
     classify_attempt,
     classify_sample,
@@ -74,7 +76,32 @@ def test_sample_decisive_is_last_attempt():
 
 
 def test_sample_resolved():
-    assert classify_sample({"id": "a", "success": True})["decisive"] == "resolved"
+    assert classify_sample({"id": "a", "success": True})["decisive"] == "agent_success"
+
+
+def test_official_resolved_is_not_inferred_from_agent_success():
+    classified = classify_sample(
+        {"id": "a", "success": True, "official_resolved": None}
+    )
+
+    assert classified["decisive"] == "agent_success"
+    assert classified["official_resolved"] is None
+
+
+@pytest.mark.parametrize(
+    ("sample", "expected"),
+    [
+        ({"error": "opus_no_progress_limit"}, "opus_no_progress_limit"),
+        ({"error": "PatchGate rejected unsafe scope"}, "patch_gate_rejected"),
+        ({"error": "model gateway returned 503"}, "model_gateway_infra"),
+        ({"coverage_failure_reason": "coverage_infra"}, "coverage_infra"),
+        ({"coverage_failure_reason": "test_generation_failed"}, "test_generation_failed"),
+    ],
+)
+def test_success_first_terminal_failure_labels(sample, expected):
+    sample = {"id": "a", "success": False, **sample}
+
+    assert classify_sample(sample)["decisive"] == expected
 
 
 def test_sample_no_attempts_prepatch_locate_failure():
@@ -109,11 +136,11 @@ def test_summarize_distribution():
     ]
     s = summarize(results)
     assert s["n_samples"] == 3
-    assert s["resolved"] == 1
-    assert abs(s["resolve_rate"] - 1 / 3) < 1e-6
+    assert s["agent_success"] == 1
+    assert abs(s["agent_success_rate"] - 1 / 3) < 1e-6
     assert s["decisive"]["test_failed"] == 1
     assert s["decisive"]["wrong_file_path"] == 1
-    assert s["decisive"]["resolved"] == 1
+    assert s["decisive"]["agent_success"] == 1
 
 
 async def test_verify_infrastructure_error_does_not_consume_retry_budget():

@@ -7,7 +7,8 @@ model B). This is the observability layer: you cannot optimize what you cannot
 measure, and a bare ``FAILED`` tells you nothing about where to invest.
 
 Categories (a failed attempt maps to exactly one):
-  - resolved            : the run succeeded (terminal, not a failure)
+  - agent_success       : internal run succeeded with differential coverage
+  - resolved            : official evaluator resolved the prediction
   - wrong_file_path     : patch targeted a file absent from the repo
   - invalid_diff        : model emitted a unified diff the executor rejects
   - search_not_found    : search block does not exist (anchor hallucination)
@@ -33,7 +34,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RESULTS = REPO_ROOT / "eval" / "eval_results.json"
 
 CATEGORIES = [
+    "agent_success",
     "resolved",
+    "opus_no_progress_limit",
+    "patch_gate_rejected",
+    "model_gateway_infra",
+    "coverage_infra",
+    "test_generation_failed",
     "wrong_file_path",
     "invalid_diff",
     "empty_patch",
@@ -51,6 +58,19 @@ def classify_attempt(failure_kind: str, error_log: str) -> str:
     log = (error_log or "")
     low = log.lower()
 
+    if kind == "opus_no_progress_limit" or "opus_no_progress_limit" in low:
+        return "opus_no_progress_limit"
+    if kind == "patch_gate_rejected" or "patchgate" in low or "patch gate" in low:
+        return "patch_gate_rejected"
+    if kind == "model_gateway_infra" or (
+        ("model" in low or "gateway" in low or "llm" in low)
+        and any(marker in low for marker in ("503", "502", "504", "timeout", "timed out"))
+    ):
+        return "model_gateway_infra"
+    if kind == "coverage_infra" or "coverage_infra" in low:
+        return "coverage_infra"
+    if kind == "test_generation_failed" or "test_generation_failed" in low:
+        return "test_generation_failed"
     if kind == "infra_error" or "infrastructure error" in low:
         return "infra"
     if "readtimeout" in low or "timed out" in low or "remoteprotocolerror" in low:
@@ -87,10 +107,46 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
     """Classify a whole sample: its decisive (terminal) failure and per-attempt
     categories. The decisive category is the LAST attempt's — that's what the
     run ultimately died on."""
+    official_resolved = sample.get("official_resolved")
     payload = sample.get("agent_payload") or {}
     attempts = payload.get("fix_attempts") or []
     if sample.get("success"):
-        return {"id": sample.get("id"), "decisive": "resolved", "attempts": ["resolved"]}
+        return {
+            "id": sample.get("id"),
+            "decisive": "agent_success",
+            "attempts": ["agent_success"],
+            "official_resolved": official_resolved,
+        }
+
+    stored_class = sample.get("failure_class")
+    if stored_class in CATEGORIES and stored_class not in {"agent_success", "resolved"}:
+        return {
+            "id": sample.get("id"),
+            "decisive": stored_class,
+            "attempts": [],
+            "official_resolved": official_resolved,
+        }
+
+    coverage_reason = str(
+        sample.get("coverage_failure_reason")
+        or payload.get("coverage_failure_reason")
+        or ""
+    ).lower()
+    terminal_error = str(sample.get("error") or payload.get("error") or "")
+    terminal_class = classify_attempt(coverage_reason, terminal_error)
+    if terminal_class in {
+        "opus_no_progress_limit",
+        "patch_gate_rejected",
+        "model_gateway_infra",
+        "coverage_infra",
+        "test_generation_failed",
+    }:
+        return {
+            "id": sample.get("id"),
+            "decisive": terminal_class,
+            "attempts": [],
+            "official_resolved": official_resolved,
+        }
 
     per_attempt = [
         classify_attempt(a.get("failure_kind", ""), a.get("error_log", ""))
@@ -114,7 +170,12 @@ def classify_sample(sample: dict[str, Any]) -> dict[str, Any]:
             decisive = "infra"
         else:
             decisive = "other"
-    return {"id": sample.get("id"), "decisive": decisive, "attempts": per_attempt}
+    return {
+        "id": sample.get("id"),
+        "decisive": decisive,
+        "attempts": per_attempt,
+        "official_resolved": official_resolved,
+    }
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -125,11 +186,20 @@ def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     for c in classified:
         attempt_totals.update(c["attempts"])
     n = len(results)
-    resolved = decisive.get("resolved", 0)
+    agent_success = decisive.get("agent_success", 0)
+    officially_scored = [
+        item for item in classified if item.get("official_resolved") is not None
+    ]
+    resolved = sum(item.get("official_resolved") is True for item in officially_scored)
     return {
         "n_samples": n,
+        "agent_success": agent_success,
+        "agent_success_rate": (agent_success / n) if n else 0.0,
+        "official_scored_samples": len(officially_scored),
         "resolved": resolved,
-        "resolve_rate": (resolved / n) if n else 0.0,
+        "resolve_rate": (
+            resolved / len(officially_scored) if officially_scored else None
+        ),
         "decisive": {cat: decisive.get(cat, 0) for cat in CATEGORIES if decisive.get(cat)},
         "attempt_totals": {
             cat: attempt_totals.get(cat, 0) for cat in CATEGORIES if attempt_totals.get(cat)
@@ -144,9 +214,16 @@ def format_summary(summary: dict[str, Any], label: str = "") -> str:
     lines.append(head)
     lines.append("=" * len(head))
     lines.append(
-        f"resolved: {summary['resolved']}/{summary['n_samples']} "
-        f"({summary['resolve_rate']:.0%})"
+        f"agent_success: {summary['agent_success']}/{summary['n_samples']} "
+        f"({summary['agent_success_rate']:.0%})"
     )
+    if summary["official_scored_samples"]:
+        lines.append(
+            f"official resolved: {summary['resolved']}/"
+            f"{summary['official_scored_samples']} ({summary['resolve_rate']:.0%})"
+        )
+    else:
+        lines.append("official resolved: not scored")
     lines.append("\ndecisive failure (what each run finally died on):")
     for cat in CATEGORIES:
         c = summary["decisive"].get(cat)
@@ -165,8 +242,9 @@ def format_diff(a: dict[str, Any], b: dict[str, Any], la: str, lb: str) -> str:
     """Side-by-side decisive-failure comparison of two runs."""
     lines = [f"Run comparison: {la}  vs  {lb}", "=" * 40]
     lines.append(
-        f"resolve rate: {a['resolve_rate']:.0%} ({a['resolved']}/{a['n_samples']})"
-        f"  vs  {b['resolve_rate']:.0%} ({b['resolved']}/{b['n_samples']})"
+        f"agent success rate: {a['agent_success_rate']:.0%} "
+        f"({a['agent_success']}/{a['n_samples']})  vs  "
+        f"{b['agent_success_rate']:.0%} ({b['agent_success']}/{b['n_samples']})"
     )
     lines.append(f"\n{'category':18s} {la:>8s} {lb:>8s}  Δ")
     for cat in CATEGORIES:

@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -80,6 +81,63 @@ def agent_v2_result():
     }
 
 
+def success_first_result():
+    result = agent_v2_result()
+    result.update(
+        {
+            "id": "acme/widget#11:12",
+            "success": True,
+            "agent_success": True,
+            "official_resolved": None,
+            "models_used": [
+                "gemini-3.5-flash:stable",
+                "claude-opus-4-8:stable",
+            ],
+            "escalated": True,
+            "escalation_reason": "repeated_edit",
+            "model_invocations": [
+                {"model": "gemini-3.5-flash:stable", "status": "ok"},
+                {"model": "claude-opus-4-8:stable", "status": "ok"},
+            ],
+            "tool_invocations": [
+                {"action": "read_symbol", "status": "ok"},
+                {"action": "read_symbol", "status": "duplicate"},
+                {"action": "run_targeted_test", "status": "rejected"},
+            ],
+            "unique_evidence_count": 2,
+            "max_consecutive_no_progress": 2,
+            "attempt_outcome_summary": "Verified a focused regression.",
+            "coverage_status": "generated_verified",
+            "coverage_test_files": ["tests/test_auth.py"],
+            "coverage_test_command": "pytest tests/test_auth.py",
+            "coverage_proof": {
+                "source": "generated",
+                "status": "generated_verified",
+                "test_files": ["tests/test_auth.py"],
+                "fixed_runs": [
+                    {"outcome": "pass", "failing_test_ids": [], "assertion_fingerprint": ""},
+                    {"outcome": "pass", "failing_test_ids": [], "assertion_fingerprint": ""},
+                ],
+                "base_runs": [
+                    {
+                        "outcome": "assertion_failure",
+                        "failing_test_ids": ["tests/test_auth.py::test_login"],
+                        "assertion_fingerprint": "a" * 64,
+                    },
+                    {
+                        "outcome": "assertion_failure",
+                        "failing_test_ids": ["tests/test_auth.py::test_login"],
+                        "assertion_fingerprint": "a" * 64,
+                    },
+                ],
+            },
+            "coverage_failure_reason": "",
+            "test_generation_attempts": 1,
+        }
+    )
+    return result
+
+
 def test_report_imports_when_run_from_eval_directory():
     subprocess.run(
         [sys.executable, "-c", "import report"],
@@ -97,7 +155,8 @@ def test_generate_markdown_includes_agent_v2_replay_diagnostics():
     markdown = report.generate_markdown(results, metrics)
 
     assert "| agent_v2_samples | 1 |" in markdown
-    assert "| agent_v2_combined_all_modes_resolved_rate | 0.000 |" in markdown
+    assert "| agent_v2_combined_all_modes_agent_success_rate | 0.000 |" in markdown
+    assert "| official_resolved_rate | N/A (not scored) |" in markdown
     assert "| agent_v2_waiting_for_user | 0 |" in markdown
     assert "**Models**: claude-sonnet-5:stable" in markdown
     assert "**Commits**: deadbeef" in markdown
@@ -198,6 +257,111 @@ def test_generate_markdown_surfaces_plan_fix_phase_timeout():
     assert "plan_fix exceeded 150.0s" in markdown
 
 
+def test_success_first_metrics_aggregate_models_tools_escalation_and_coverage():
+    result = success_first_result()
+
+    metrics = report.compute_metrics([result])
+
+    agent = metrics["agent_v2"]
+    assert agent["agent_successes"] == 1
+    assert agent["official_scored_samples"] == 0
+    assert agent["official_resolved"] == 0
+    assert agent["by_model"] == {
+        "claude-opus-4-8:stable": {
+            "samples": 1,
+            "invocations": 1,
+            "agent_successes": 1,
+        },
+        "gemini-3.5-flash:stable": {
+            "samples": 1,
+            "invocations": 1,
+            "agent_successes": 1,
+        },
+    }
+    assert agent["escalation_reasons"] == {"repeated_edit": 1}
+    assert agent["tool_statuses"] == {"duplicate": 1, "ok": 1, "rejected": 1}
+    assert agent["unique_evidence_count"] == 2
+    assert agent["max_consecutive_no_progress"] == 2
+    assert agent["coverage"] == {
+        "statuses": {"generated_verified": 1},
+        "proofs": 1,
+        "test_generation_attempts": 1,
+    }
+
+
+def test_report_loads_legacy_result_with_safe_defaults(tmp_path):
+    path = tmp_path / "legacy.json"
+    path.write_text(
+        json.dumps([{"id": "legacy", "mode": "agent_v2", "success": False}]),
+        encoding="utf-8",
+    )
+
+    [loaded] = report.load_results(path)
+
+    assert loaded["models_used"] == []
+    assert loaded["model_invocations"] == []
+    assert loaded["tool_invocations"] == []
+    assert loaded["unique_evidence_count"] == 0
+    assert loaded["max_consecutive_no_progress"] == 0
+    assert loaded["attempt_outcome_summary"] == ""
+    assert loaded["coverage_status"] == "pending"
+    assert loaded["coverage_test_files"] == []
+    assert loaded["coverage_test_command"] == ""
+    assert loaded["coverage_proof"] is None
+    assert loaded["coverage_failure_reason"] == ""
+    assert loaded["test_generation_attempts"] == 0
+    assert loaded["official_resolved"] is None
+
+
+def test_report_cli_forwards_result_and_summary_paths(tmp_path):
+    results_path = tmp_path / "results.json"
+    summary_path = tmp_path / "summary.md"
+    results_path.write_text(json.dumps([success_first_result()]), encoding="utf-8")
+
+    report.main(
+        [
+            "--results-file",
+            str(results_path),
+            "--summary-file",
+            str(summary_path),
+        ]
+    )
+
+    assert summary_path.exists()
+    assert "RepoPilot Eval Summary" in summary_path.read_text(encoding="utf-8")
+
+
+def test_markdown_renders_only_safe_coverage_proof_fields():
+    result = success_first_result()
+    result["coverage_proof"]["raw_logs"] = "secret full raw test logs"
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "tests/test_auth.py" in markdown
+    assert "assertion_failure" in markdown
+    assert "tests/test_auth.py::test_login" in markdown
+    assert "a" * 64 in markdown
+    assert "secret full raw test logs" not in markdown
+
+
+def test_markdown_redacts_legacy_credentials_evaluator_and_archive_payloads():
+    result = agent_v2_result()
+    result["model"] = "sk-test-secret-123456789"
+    result["models_used"] = ["sk-test-secret-123456789"]
+    result["commit_sha"] = "Bearer sk-test-secret-123456789"
+    result["error"] = (
+        "Bearer sk-test-secret-123456789 FAIL_TO_PASS "
+        "setuptools-33.1.1.zip PK\\x03\\x04 generated bytes"
+    )
+    result["replay"]["timeline"][0]["summary"] = result["error"]
+
+    markdown = report.generate_markdown([result], report.compute_metrics([result]))
+
+    assert "sk-test-secret-123456789" not in markdown
+    assert "FAIL_TO_PASS" not in markdown
+    assert "PK\\x03\\x04 generated bytes" not in markdown
+
+
 def test_agent_v2_metrics_and_reports_separate_evaluation_modes(capsys):
     legacy = agent_v2_result()
     legacy.update(
@@ -214,7 +378,7 @@ def test_agent_v2_metrics_and_reports_separate_evaluation_modes(capsys):
             },
         }
     )
-    explicit_end_to_end = agent_v2_result()
+    explicit_end_to_end = success_first_result()
     explicit_end_to_end.update(
         {
             "id": "acme/widget#8:9",
@@ -241,7 +405,7 @@ def test_agent_v2_metrics_and_reports_separate_evaluation_modes(capsys):
             },
         }
     )
-    oracle_success = agent_v2_result()
+    oracle_success = success_first_result()
     oracle_success.update(
         {
             "id": "acme/widget#12:13",
@@ -261,37 +425,46 @@ def test_agent_v2_metrics_and_reports_separate_evaluation_modes(capsys):
     by_mode = metrics["agent_v2"]["by_evaluation_mode"]
     assert by_mode["end_to_end"] == {
         "samples": 2,
+        "agent_successes": 1,
+        "agent_success_rate": 0.5,
+        "official_scored_samples": 0,
+        "official_resolved": 0,
+        "official_resolved_rate": None,
         "successes": 1,
         "success_rate": 0.5,
-        "resolved_rate": 0.5,
-        "failure_taxonomy": {"resolved": 1, "test_failed": 1},
+        "failure_taxonomy": {"agent_success": 1, "test_failed": 1},
         "models": ["a-model", "z-model"],
         "commits": ["commit-1", "commit-2"],
     }
     assert by_mode["oracle_files"] == {
         "samples": 2,
+        "agent_successes": 1,
+        "agent_success_rate": 0.5,
+        "official_scored_samples": 0,
+        "official_resolved": 0,
+        "official_resolved_rate": None,
         "successes": 1,
         "success_rate": 0.5,
-        "resolved_rate": 0.5,
-        "failure_taxonomy": {"resolved": 1, "wrong_file_path": 1},
+        "failure_taxonomy": {"agent_success": 1, "wrong_file_path": 1},
         "models": ["oracle-a", "oracle-b"],
         "commits": ["oracle-1", "oracle-2"],
     }
     assert "## Agent V2 Evaluation Modes" in markdown
-    assert "| end_to_end | 2 | a-model, z-model | commit-1, commit-2 | 1/2 (50.0%) | resolved: 1; test_failed: 1 |" in markdown
-    assert "| oracle_files | 2 | oracle-a, oracle-b | oracle-1, oracle-2 | 1/2 (50.0%) | resolved: 1; wrong_file_path: 1 |" in markdown
-    assert "agent_v2_success_rate" not in markdown
-    assert "agent_v2_combined_all_modes_resolved_rate" in markdown
+    assert "| end_to_end | 2 | a-model, z-model | commit-1, commit-2 | 1/2 (50.0%) | not scored | agent_success: 1; test_failed: 1 |" in markdown
+    assert "| oracle_files | 2 | oracle-a, oracle-b | oracle-1, oracle-2 | 1/2 (50.0%) | not scored | agent_success: 1; wrong_file_path: 1 |" in markdown
+    assert "agent_v2_combined_all_modes_agent_success_rate" in markdown
+    assert "official_resolved_rate | N/A (not scored)" in markdown
     assert "| Sample ID | Evaluation Mode | Run ID |" in markdown
-    assert "agent_v2 all modes combined: 2/4 resolved (50.0%)" in terminal
+    assert "agent_v2 all modes combined: 2/4 agent_success (50.0%)" in terminal
+    assert "official resolved: not scored" in terminal
     assert (
         "agent_v2 end_to_end: samples=2 | models=a-model, z-model | "
-        "commits=commit-1, commit-2 | resolved=1/2 (50.0%) | "
-        "decisive taxonomy=resolved: 1; test_failed: 1"
+        "commits=commit-1, commit-2 | agent_success=1/2 (50.0%) | "
+        "decisive taxonomy=agent_success: 1; test_failed: 1"
     ) in terminal
     assert (
         "agent_v2 oracle_files: samples=2 | models=oracle-a, oracle-b | "
-        "commits=oracle-1, oracle-2 | resolved=1/2 (50.0%) | "
-        "decisive taxonomy=resolved: 1; wrong_file_path: 1"
+        "commits=oracle-1, oracle-2 | agent_success=1/2 (50.0%) | "
+        "decisive taxonomy=agent_success: 1; wrong_file_path: 1"
     ) in terminal
     assert "agent_v2:     2/4 success" not in terminal
