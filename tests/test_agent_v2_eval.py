@@ -254,6 +254,13 @@ def swe_bench_sample():
     )
 
 
+def swe_bench_sample_with_id(instance_id):
+    sample = swe_bench_sample()
+    sample["id"] = instance_id
+    sample["instance_id"] = instance_id
+    return sample
+
+
 async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
     monkeypatch,
 ):
@@ -794,6 +801,153 @@ async def test_run_swe_bench_eval_selects_dataset_and_writes_predictions(
         "model_name_or_path": "gemini-3.5-flash:stable",
         "model_patch": "diff --git",
     }
+
+
+async def test_run_swe_bench_eval_selects_requested_ids_in_caller_order(
+    monkeypatch, tmp_path
+):
+    available = [
+        swe_bench_sample_with_id("acme__widget-1"),
+        swe_bench_sample_with_id("acme__widget-2"),
+        swe_bench_sample_with_id("acme__widget-3"),
+    ]
+    load_calls = []
+
+    def fake_load(count, seed):
+        load_calls.append((count, seed))
+        return available[:count]
+
+    async def fake_evaluate(selected, idx, **kwargs):
+        return {
+            "id": selected["id"],
+            "instance_id": selected["instance_id"],
+            "success": False,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "load_verified_samples", fake_load)
+    monkeypatch.setattr(
+        agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate
+    )
+
+    results = await agent_v2_harness.run_agent_v2_eval(
+        n_samples=1,
+        dataset="swe-bench-verified",
+        dataset_seed=29,
+        sample_ids=["acme__widget-3", "acme__widget-1"],
+        results_path=tmp_path / "results.json",
+    )
+
+    assert [result["instance_id"] for result in results] == [
+        "acme__widget-3",
+        "acme__widget-1",
+    ]
+    assert load_calls[0][0] >= len(available)
+    assert load_calls[0][1] == 29
+
+
+async def test_run_swe_bench_eval_rejects_unknown_requested_id(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_samples",
+        lambda count, seed: [swe_bench_sample_with_id("acme__widget-1")],
+    )
+
+    with pytest.raises(ValueError, match="unknown SWE-bench instance ID"):
+        await agent_v2_harness.run_agent_v2_eval(
+            dataset="swe-bench-verified",
+            sample_ids=["acme__missing-9"],
+            results_path=tmp_path / "results.json",
+        )
+
+
+async def test_run_swe_bench_eval_rejects_duplicate_requested_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_samples",
+        lambda count, seed: [swe_bench_sample_with_id("acme__widget-1")],
+    )
+
+    with pytest.raises(ValueError, match="duplicate SWE-bench instance ID"):
+        await agent_v2_harness.run_agent_v2_eval(
+            dataset="swe-bench-verified",
+            sample_ids=["acme__widget-1", "acme__widget-1"],
+            results_path=tmp_path / "results.json",
+        )
+
+
+async def test_run_swe_bench_eval_without_requested_ids_keeps_seed_selection(
+    monkeypatch, tmp_path
+):
+    sample = swe_bench_sample_with_id("acme__widget-seeded")
+    load_calls = []
+
+    def fake_load(count, seed):
+        load_calls.append((count, seed))
+        return [sample]
+
+    async def fake_evaluate(selected, idx, **kwargs):
+        return {
+            "id": selected["id"],
+            "instance_id": selected["instance_id"],
+            "success": False,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "load_verified_samples", fake_load)
+    monkeypatch.setattr(
+        agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate
+    )
+
+    results = await agent_v2_harness.run_agent_v2_eval(
+        n_samples=2,
+        dataset="swe-bench-verified",
+        dataset_seed=31,
+        results_path=tmp_path / "results.json",
+    )
+
+    assert load_calls == [(2, 31)]
+    assert [result["instance_id"] for result in results] == [
+        "acme__widget-seeded"
+    ]
+
+
+def test_agent_v2_eval_cli_forwards_sample_ids_and_results_path(
+    monkeypatch, tmp_path
+):
+    calls = []
+    ids_path = tmp_path / "sample_ids.txt"
+    ids_path.write_text(
+        "acme__widget-3\n\n  acme__widget-1  \n", encoding="utf-8"
+    )
+    results_path = tmp_path / "selected_results.json"
+
+    async def fake_run_agent_v2_eval(**kwargs):
+        calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        agent_v2_harness, "run_agent_v2_eval", fake_run_agent_v2_eval
+    )
+
+    agent_v2_harness.main(
+        [
+            "--dataset",
+            "swe-bench-verified",
+            "--sample-ids-file",
+            str(ids_path),
+            "--results-file",
+            str(results_path),
+        ]
+    )
+
+    assert calls[0]["sample_ids"] == [
+        "acme__widget-3",
+        "acme__widget-1",
+    ]
+    assert calls[0]["results_path"] == results_path
 
 
 async def test_predictions_file_requires_swe_bench_dataset(tmp_path):

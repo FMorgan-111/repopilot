@@ -684,6 +684,7 @@ async def run_agent_v2_eval(
     dataset: str = "custom",
     dataset_seed: int = 17,
     predictions_path: Path | str | None = None,
+    sample_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     try:
         if predictions_path is not None and dataset != "swe-bench-verified":
@@ -691,8 +692,41 @@ async def run_agent_v2_eval(
                 "predictions_path requires dataset='swe-bench-verified'"
             )
         if dataset == "swe-bench-verified":
-            samples = load_verified_samples(n_samples, dataset_seed)
+            if sample_ids is None:
+                samples = load_verified_samples(n_samples, dataset_seed)
+            else:
+                available = load_verified_samples(sys.maxsize, dataset_seed)
+                duplicate = next(
+                    (
+                        instance_id
+                        for index, instance_id in enumerate(sample_ids)
+                        if instance_id in sample_ids[:index]
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    raise ValueError(
+                        f"duplicate SWE-bench instance ID: {duplicate}"
+                    )
+                samples_by_id = {
+                    sample["instance_id"]: sample for sample in available
+                }
+                unknown = next(
+                    (
+                        instance_id
+                        for instance_id in sample_ids
+                        if instance_id not in samples_by_id
+                    ),
+                    None,
+                )
+                if unknown is not None:
+                    raise ValueError(f"unknown SWE-bench instance ID: {unknown}")
+                samples = [samples_by_id[instance_id] for instance_id in sample_ids]
         elif dataset == "custom":
+            if sample_ids is not None:
+                raise ValueError(
+                    "sample_ids requires dataset='swe-bench-verified'"
+                )
             samples = load_samples(
                 n_samples,
                 sample_id=sample_id,
@@ -752,9 +786,20 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--dataset-seed", type=int, default=17)
     parser.add_argument("--predictions-file", type=str, default=None)
+    parser.add_argument("--sample-ids-file", type=str, default=None)
+    parser.add_argument("--results-file", type=str, default=None)
     args = parser.parse_args(argv)
 
     samples_path = Path(args.samples_file) if args.samples_file else SAMPLES_PATH
+    sample_ids = None
+    if args.sample_ids_file:
+        sample_ids = [
+            line.strip()
+            for line in Path(args.sample_ids_file)
+            .read_text(encoding="utf-8")
+            .splitlines()
+            if line.strip()
+        ]
     asyncio.run(
         run_agent_v2_eval(
             n_samples=args.samples,
@@ -765,6 +810,10 @@ def main(argv: list[str] | None = None) -> None:
             dataset=args.dataset,
             dataset_seed=args.dataset_seed,
             predictions_path=args.predictions_file,
+            sample_ids=sample_ids,
+            results_path=(
+                Path(args.results_file) if args.results_file else RESULTS_PATH
+            ),
         )
     )
 
