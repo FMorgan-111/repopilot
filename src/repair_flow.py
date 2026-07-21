@@ -451,6 +451,15 @@ def build_target_context(state: AgentState, plan: RepairPlan) -> list[Evidence]:
     return evidence
 
 
+def read_exact_checkout_text(state: AgentState, file_path: str) -> str:
+    """Read one confined regular UTF-8 file from the exact prepared checkout."""
+    root = _validate_checkout(state)
+    path = canonical_repo_path(file_path)
+    if is_sensitive_repo_path(path):
+        raise RepairContextError("target file is a sensitive repository path")
+    return _decode_utf8(_read_regular_no_follow(root, path))
+
+
 def _safe_generated_text(value: str) -> str:
     redacted = redact_secrets(value)
     return _EVALUATOR_FIELD_RE.sub("[REDACTED_EVALUATOR_FIELD]", redacted)
@@ -573,7 +582,10 @@ async def _call_schema(
         state.token_usage += _estimate_tokens(system, current_user, response_text)
         if tool_step is not None and tool_step.handled:
             if tool_step.stop_reason:
-                raise ReasoningStop(tool_step.stop_reason)
+                raise ReasoningStop(
+                    tool_step.stop_reason,
+                    code=tool_step.stop_reason,
+                )
             counter[0] += 1
             current_user = (
                 reprompt(tool_step.evidence_ids)

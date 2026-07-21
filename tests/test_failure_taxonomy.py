@@ -357,3 +357,27 @@ async def test_assertion_signature_resets_when_failing_test_identity_changes():
 
     assert state.assertion_no_progress_rounds == 0
     assert state.assertion_diversity_required is False
+
+
+async def test_assertion_signature_ignores_object_memory_addresses():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=5,
+        current_phase=new_agent.Phase.VERIFY,
+    )
+    for address in ("0x7ffdeadbeef", "0x1a2b3c4d"):
+        state.current_phase = new_agent.Phase.VERIFY
+        state.fix_attempts.append(
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log=(
+                    "FAILED tests/test_widget.py::test_identity - AssertionError: "
+                    f"expected <Widget object at {address}> actual ready"
+                ),
+            )
+        )
+        state = await new_agent.verify_fix(state)
+        record_progress(state)
+
+    assert state.assertion_no_progress_rounds == 1
+    assert state.assertion_diversity_required is True

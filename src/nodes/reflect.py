@@ -15,7 +15,12 @@ from ..escalation import (
 )
 from ..llm import llm_call
 from ..model_policy import apply_escalation, should_escalate
-from ..outcome_summary import sanitize_outcome_summary, summarize_attempt_outcome
+from ..outcome_summary import (
+    build_outcome_summary_input,
+    deterministic_outcome_summary,
+    sanitize_outcome_summary,
+    summarize_attempt_outcome,
+)
 from ..reasoning_loop import (
     prompt_with_new_evidence,
     record_opus_no_progress,
@@ -233,14 +238,17 @@ async def _finalize_reflection(
     *,
     phase: Phase,
     failure_reason: str = "",
+    allow_model_summary: bool = True,
 ) -> AgentState:
     """Summarize one completed reflection loop exactly once before routing."""
+    summary = (
+        await summarize_attempt_outcome(state, llm=llm_call)
+        if allow_model_summary
+        else deterministic_outcome_summary(build_outcome_summary_input(state))
+    )
     state.attempt_outcome_summary = sanitize_outcome_summary(
         state,
-        await summarize_attempt_outcome(
-            state,
-            llm=llm_call,
-        ),
+        summary,
     )
     if failure_reason:
         state.failure_reason = failure_reason
@@ -253,6 +261,13 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
     state = _as_state(state)
     apply_escalation(state, should_escalate(state))
     if _is_budget_exceeded(state):
+        if state.fix_attempts:
+            return await _finalize_reflection(
+                state,
+                phase=Phase.FAILURE,
+                failure_reason="Token budget exceeded before reflection.",
+                allow_model_summary=False,
+            )
         state.failure_reason = "Token budget exceeded before reflection."
         state.current_phase = Phase.FAILURE
         return state

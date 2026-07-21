@@ -16,6 +16,7 @@ from .model_policy import (
     should_escalate,
 )
 from .state import AgentState, _record_node_diagnostic
+from .summary_safety import sanitize_summary_text
 from .tool_policy import ToolIntent
 from .tool_router import ToolRouteResult
 
@@ -75,9 +76,14 @@ _FORBIDDEN_REASONING_RE = re.compile(
 class ReasoningStop(RuntimeError):
     """A validated model/tool stop decision from a bounded reasoning call."""
 
-    def __init__(self, reason: str) -> None:
-        self.reason = reason
-        super().__init__(reason)
+    def __init__(self, reason: str, *, code: str = "model_stop") -> None:
+        self.reason = sanitize_summary_text(reason, 200) or "model_stop"
+        self.code = (
+            code
+            if code in {"model_stop", "tool_round_limit", "opus_no_progress_limit"}
+            else "model_stop"
+        )
+        super().__init__(self.reason)
 
 
 class ValidationError(ValueError):
@@ -152,6 +158,9 @@ def response_tool_intent(response: dict[str, Any]) -> ToolIntent | None:
         raise ValueError("structured response mixed tool and outcome variants")
     if raw_intent is None:
         raise ValueError("tool response omitted tool_intent")
+    expected_keys = {"kind", "tool_intent"} if kind == "tool" else {"tool_intent"}
+    if set(response) != expected_keys:
+        raise ValueError("structured response mixed tool and outcome variants")
     outcome_fields = (
         "plan",
         "patch",

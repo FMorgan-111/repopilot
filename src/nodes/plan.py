@@ -30,6 +30,7 @@ from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
     generate_opus_repair,
+    read_exact_checkout_text,
     request_verified_edit_correction,
 )
 from ..reasoning_loop import (
@@ -57,6 +58,7 @@ from ..state import (
     _remember,
 )
 from ..tool_router import route_tool_intent
+from .verify import _test_failure_class
 
 PLAN_ISSUE_BODY_LIMIT = 2500
 # The planner needs to see real function bodies, not just import headers. At
@@ -254,6 +256,54 @@ def _planned_edits_repeat_failure(state: AgentState) -> bool:
         _edit_key(edit) in failed_keys
         for edit in state.patch_edits
     )
+
+
+def _enclosing_symbol_for_search(state: AgentState, edit: Any) -> str | None:
+    if not edit.search or not edit.file_path.endswith(".py"):
+        return None
+    try:
+        source = read_exact_checkout_text(state, edit.file_path)
+        if source.count(edit.search) != 1:
+            return None
+        line = source.count("\n", 0, source.index(edit.search)) + 1
+        tree = ast.parse(source)
+    except (OSError, SyntaxError, ValueError):
+        return None
+
+    candidates: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST, prefix: tuple[str, ...] = ()) -> None:
+        for child in ast.iter_child_nodes(node):
+            child_prefix = prefix
+            if isinstance(child, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                end_line = getattr(child, "end_lineno", child.lineno)
+                child_prefix = (*prefix, child.name)
+                if child.lineno <= line <= end_line:
+                    candidates.append((len(child_prefix), ".".join(child_prefix)))
+            visit(child, child_prefix)
+
+    visit(tree)
+    if not candidates:
+        return None
+    return max(candidates)[1]
+
+
+def _prior_assertion_symbols(state: AgentState) -> tuple[set[str], bool]:
+    symbols: set[str] = set()
+    unresolved = False
+    for attempt in state.fix_attempts:
+        if attempt.success or _test_failure_class(attempt) != "assertion_failure":
+            continue
+        for edit in attempt.patch_edits:
+            if edit.node_target:
+                symbols.add(edit.node_target)
+                continue
+            symbol = _enclosing_symbol_for_search(state, edit)
+            if symbol is None:
+                unresolved = True
+            else:
+                symbols.add(symbol)
+    return symbols, unresolved
 
 
 # How many times we let the planner re-emit a known-dead patch before failing
@@ -914,7 +964,10 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         try:
             print("  [plan] Calling LLM for fix plan...", file=sys.stderr, flush=True)
             if two_stage_repair:
-                reasoning_tool_counter[0] = calls_this_round
+                reasoning_tool_counter[0] = max(
+                    reasoning_tool_counter[0],
+                    calls_this_round,
+                )
                 repair_plan, verified_batch = await generate_opus_repair(
                     state,
                     build_escalation_packet(state),
@@ -1068,7 +1121,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 response_tokens_estimate=response_tokens_estimate,
             )
             if isinstance(exc, ReasoningStop):
-                state.failure_reason = exc.reason
+                state.failure_reason = exc.code
                 state.current_phase = Phase.FAILURE
                 return state
             if immediate_reason and invoked_provider == "primary":
@@ -1272,20 +1325,18 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state.current_phase = Phase.PLAN
             else:
                 state.search_correction_context = ""  # resolved; stop feeding it
-                prior_assertion_symbols = {
-                    edit.node_target
-                    for attempt in state.fix_attempts
-                    if not attempt.success
-                    and attempt.failure_kind == "assertion_failure"
-                    for edit in attempt.patch_edits
-                    if edit.node_target
-                }
+                prior_assertion_symbols, unresolved_assertion_target = (
+                    _prior_assertion_symbols(state)
+                )
                 assertion_target_not_diversified = (
                     state.assertion_diversity_required
-                    and any(
-                        not edit.node_target
-                        or edit.node_target in prior_assertion_symbols
-                        for edit in state.patch_edits
+                    and (
+                        unresolved_assertion_target
+                        or any(
+                            not edit.node_target
+                            or edit.node_target in prior_assertion_symbols
+                            for edit in state.patch_edits
+                        )
                     )
                 )
                 if assertion_target_not_diversified:

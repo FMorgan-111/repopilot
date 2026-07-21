@@ -101,6 +101,12 @@ def _failure_signature_payload(attempt: FixAttempt, failure_class: str) -> dict[
         ):
             continue
         normalized = re.sub(r"(?:[A-Za-z]:)?/(?:[^\s:]+/)+", "<path>/", line)
+        normalized = re.sub(r"\b0x[0-9a-fA-F]+\b", "<address>", normalized)
+        normalized = re.sub(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}\b",
+            "<runtime-id>",
+            normalized,
+        )
         normalized = re.sub(r":\d+(?=[:\s])", ":<line>", normalized)
         normalized = re.sub(
             r"\b\d{4}-\d{2}-\d{2}[T ][0-9:.+-]+Z?\b",

@@ -2,6 +2,7 @@
 final-attempt force-execute (solution 2) in plan_fix / reflect_on_failure."""
 
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -286,6 +287,103 @@ async def test_assertion_diversity_accepts_distinct_explicit_node_target(monkeyp
     assert result.current_phase == new_agent.Phase.EXECUTE
     assert result.patch_edits[0].node_target == "other_helper"
     assert result.assertion_diversity_required is False
+
+
+@pytest.mark.parametrize(
+    ("prior_search", "candidate_symbol", "expected_phase"),
+    [
+        ("    value = 1\n", "f", new_agent.Phase.PLAN),
+        ("    value = 1\n", "g", new_agent.Phase.EXECUTE),
+        ("    return value\n", "g", new_agent.Phase.PLAN),
+    ],
+)
+async def test_assertion_diversity_resolves_prior_search_to_exact_ast_symbol(
+    tmp_path,
+    monkeypatch,
+    prior_search,
+    candidate_symbol,
+    expected_phase,
+):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    source = (
+        "def f():\n"
+        "    value = 1\n"
+        "    return value\n\n"
+        "def g():\n"
+        "    value = 2\n"
+        "    return value\n"
+    )
+    (repo / "module.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    async def fake_llm_call(system, user):
+        return json.dumps(
+            {
+                "kind": "plan",
+                "plan": f"Target {candidate_symbol}.",
+                "patch": "",
+                "patch_edits": [
+                    {
+                        "file": "module.py",
+                        "node_target": candidate_symbol,
+                        "replace": (
+                            f"def {candidate_symbol}():\n"
+                            "    return 'new'\n"
+                        ),
+                    }
+                ],
+                "files": ["module.py"],
+                "test_command": "pytest",
+                "decision_frame": {
+                    "stage": "plan",
+                    "summary": f"Target {candidate_symbol}.",
+                    "recommended_action": "execute",
+                    "risk": "low",
+                    "confidence": 0.8,
+                },
+            }
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = _base_state(
+        assertion_diversity_required=True,
+        repo_path=str(repo),
+        repo_ref=ref,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="module.py",
+                        search=prior_search,
+                        replace="    return 'wrong'\n",
+                    )
+                ],
+                error_log="AssertionError: inferred assertion failure",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == expected_phase
+    assert result.assertion_diversity_required is (
+        expected_phase == new_agent.Phase.PLAN
+    )
 
 
 async def test_plan_prompt_includes_failed_edits(monkeypatch):

@@ -129,3 +129,29 @@ Follow-up GREEN evidence:
 ## Concerns
 
 - None known. The full suite has one pre-existing optional sqlite-vec fallback warning, unrelated to this task.
+
+## Second formal re-review follow-up
+
+The second formal re-review identified five Important invariants and one Minor
+stop-reason boundary. Tests were added first and produced behavioral RED:
+`9 failed, 95 passed`, with no collection failure. The failures covered the
+cross-retry global tool cap, untagged tool exclusivity, exact AST symbol recovery,
+budget-terminal reflection finalization, volatile object addresses, and safe
+model-stop persistence.
+
+The narrow fixes:
+
+- keep one monotonically increasing eight-tool counter across outer PLAN, Opus retries, RepairPlan, VerifiedEdit, and correction calls; the ninth request deterministically stops;
+- require untagged tool responses to contain exactly `tool_intent` and tagged tools exactly `kind` plus `tool_intent`;
+- resolve prior Python search anchors against the confined exact checkout and enclosing AST symbol, use inferred assertion classification, and fail closed when the symbol cannot be proven uniquely;
+- finalize a budget-terminal completed REFLECT attempt exactly once with the deterministic summary fallback and no auxiliary model call;
+- normalize memory addresses and UUID-shaped runtime IDs out of assertion signatures; and
+- sanitize model stop detail while persisting only fixed safe stop codes.
+
+Final evidence:
+
+- focused re-review reproduction: `104 passed`;
+- expanded relevant suite: `253 passed`;
+- full suite: `815 passed, 2 skipped, 1 warning in 22.96s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.

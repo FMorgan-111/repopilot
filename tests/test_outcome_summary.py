@@ -3,6 +3,7 @@ import json
 import pytest
 
 from src.nodes.plan import build_plan_user_prompt
+from src.nodes import reflect as reflect_node
 from src.escalation import build_escalation_packet, render_escalation_packet
 from src.outcome_summary import (
     MAX_OUTCOME_SUMMARY_CHARS,
@@ -53,6 +54,51 @@ def make_reflect_state(**updates):
     }
     values.update(updates)
     return AgentState(**values)
+
+
+@pytest.mark.asyncio
+async def test_budget_exhausted_reflect_with_attempt_uses_deterministic_summary_only(
+    monkeypatch,
+):
+    model_calls = 0
+
+    async def forbidden_llm(*args, **kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("budget terminal must not call a model")
+
+    monkeypatch.setattr(reflect_node, "llm_call", forbidden_llm)
+    state = make_reflect_state(token_usage=100_000, token_budget=100_000)
+
+    result = await reflect_node.reflect_on_failure(state)
+
+    assert result.current_phase == Phase.FAILURE
+    assert result.failure_reason == "Token budget exceeded before reflection."
+    assert result.attempt_outcome_summary
+    assert model_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_budget_exhausted_reflect_without_attempt_does_not_summarize(monkeypatch):
+    model_calls = 0
+
+    async def forbidden_llm(*args, **kwargs):
+        nonlocal model_calls
+        model_calls += 1
+        raise AssertionError("no completed attempt exists")
+
+    monkeypatch.setattr(reflect_node, "llm_call", forbidden_llm)
+    state = make_reflect_state(
+        token_usage=100_000,
+        token_budget=100_000,
+        fix_attempts=[],
+    )
+
+    result = await reflect_node.reflect_on_failure(state)
+
+    assert result.current_phase == Phase.FAILURE
+    assert result.attempt_outcome_summary == ""
+    assert model_calls == 0
 
 
 @pytest.mark.asyncio

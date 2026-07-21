@@ -8,7 +8,11 @@ from src import graph, model_policy, new_agent, run_store
 from src.evidence import EvidenceStore
 from src.http_client import LLMResponseError
 from src.nodes import plan as plan_node
-from src.reasoning_loop import response_tool_intent, validate_reasoning_response
+from src.reasoning_loop import (
+    ReasoningStop,
+    response_tool_intent,
+    validate_reasoning_response,
+)
 from src.state import FileInfo, PatchEdit, RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -280,6 +284,117 @@ def test_discriminated_reasoning_response_rejects_ambiguous_variants(
 def test_legacy_reflect_response_rejects_evaluator_raw_or_mixed_payload(response):
     with pytest.raises(ValueError, match="structured response"):
         validate_reasoning_response(response, outcome_kind="reflect")
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"what_went_wrong": "mixed"},
+        {"decision_frame": {"stage": "reflect"}},
+        {"target_files": ["src/widget.py"]},
+        {"plan": "mixed"},
+        {"stop_reason": "mixed"},
+    ],
+)
+def test_untagged_legacy_tool_requires_exactly_one_top_level_key(extra):
+    response = {
+        "tool_intent": {
+            "action": "search_text",
+            "args": {"text": "sentinel"},
+            "reason": "find source",
+            "expected_evidence": "source location",
+        },
+        **extra,
+    }
+
+    with pytest.raises(ValueError, match="mixed tool and outcome"):
+        validate_reasoning_response(response, outcome_kind="reflect")
+
+
+async def test_plan_persists_fixed_model_stop_code_without_secret_reason(monkeypatch):
+    async def stopped(*args, **kwargs):
+        raise ReasoningStop("Bearer sk-model-stop-secret-sentinel")
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", stopped)
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.failure_reason == "model_stop"
+    assert "model-stop-secret-sentinel" not in result.model_dump_json()
+
+
+async def test_plan_opus_retries_share_one_monotonic_eight_tool_counter(monkeypatch):
+    original_generate = plan_node.generate_opus_repair
+    router_calls = 0
+    responses = []
+    for index in range(7):
+        responses.append(
+            {
+                "kind": "tool",
+                "tool_intent": {
+                    "action": "search_text",
+                    "args": {"text": f"first-round-{index}"},
+                    "reason": "collect bounded evidence",
+                    "expected_evidence": "source",
+                },
+            }
+        )
+    responses.append({"kind": "repair_plan", "root_cause": "invalid incomplete"})
+    for index in range(2):
+        responses.append(
+            {
+                "kind": "tool",
+                "tool_intent": {
+                    "action": "search_text",
+                    "args": {"text": f"retry-{index}"},
+                    "reason": "collect bounded evidence",
+                    "expected_evidence": "source",
+                },
+            }
+        )
+
+    async def fake_inner_llm(*args, **kwargs):
+        return responses.pop(0)
+
+    async def fake_router(state, intent, *, calls_this_round):
+        nonlocal router_calls
+        router_calls += 1
+        added = EvidenceStore(state).add(
+            tool="search_text",
+            summary=f"tool {router_calls}",
+            content=f"unique-tool-evidence-{router_calls}",
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id=added.evidence.evidence_id,
+            made_progress=True,
+            control_action="",
+        )
+
+    async def wrapped_generate(*args, **kwargs):
+        return await original_generate(*args, router=fake_router, **kwargs)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_inner_llm)
+    monkeypatch.setattr(plan_node, "generate_opus_repair", wrapped_generate)
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert router_calls == 8
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.failure_reason == "tool_round_limit"
 
 
 def test_evaluator_only_payload_never_enters_safe_evidence_or_prompt():
