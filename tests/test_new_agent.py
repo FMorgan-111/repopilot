@@ -434,9 +434,30 @@ def test_llm_phase_timeouts_cover_retry_window():
     assert graph.PHASE_TIMEOUTS["locate_code"] >= 180.0
     assert graph.PHASE_TIMEOUTS["plan_fix"] >= llm_retry_window + planner_margin
     assert graph.PHASE_TIMEOUTS["execute_fix"] >= 600.0
+    assert graph.PHASE_TIMEOUTS["ensure_coverage"] >= 1200.0
     assert graph.PHASE_TIMEOUTS["reflect_on_failure"] >= llm_retry_window + planner_margin
     assert graph.PHASE_TIMEOUTS["commit_fix"] >= 600.0
     assert graph.PHASE_TIMEOUTS["handle_failure"] >= 60.0
+
+
+async def test_verify_success_always_routes_to_coverage():
+    for skip_commit in (False, True):
+        state = new_agent.AgentState(
+            issue_url="https://github.com/acme/widget/issues/7",
+            current_phase=new_agent.Phase.VERIFY,
+            skip_commit=skip_commit,
+            fix_attempts=[
+                new_agent.FixAttempt(test_result="passed", success=True)
+            ],
+        )
+        result = await new_agent.verify_fix(state)
+        assert result.current_phase == new_agent.Phase.COVERAGE
+        assert graph.route_from_state(result) == "ensure_coverage"
+
+
+def test_coverage_phase_is_registered_as_a_graph_entry_point():
+    assert new_agent._entry_point_for_phase(new_agent.Phase.COVERAGE) == "ensure_coverage"
+    assert new_agent.ensure_coverage is not None
 
 
 async def test_fallback_graph_records_phase_timeout_diagnostic(monkeypatch):

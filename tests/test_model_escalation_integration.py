@@ -126,7 +126,7 @@ async def test_empty_gemini_completion_escalates_to_accepted_opus_edit_and_passe
     )
     state.current_phase = new_agent.Phase.VERIFY
     state = await new_agent.verify_fix(state)
-    assert state.current_phase == new_agent.Phase.DONE
+    assert state.current_phase == new_agent.Phase.COVERAGE
 
 
 async def test_reserve_boundary_uses_opus_without_calling_primary(monkeypatch):

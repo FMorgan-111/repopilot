@@ -336,6 +336,8 @@ def validate_patch_batch(
     state: AgentState,
     plan: RepairPlan,
     batch: VerifiedEditBatch,
+    *,
+    test_only: bool = False,
 ) -> PatchGateResult:
     """Simulate a complete edit batch and authorize its exact resulting diff."""
     issues: list[PatchGateIssue] = []
@@ -363,6 +365,18 @@ def validate_patch_batch(
         except ValueError:
             issues.append(_issue("scope_violation", str(raw_path), "Target path is not canonical and repository-relative."))
             continue
+        if test_only:
+            from .coverage_gate import is_allowed_test_path
+
+            if not is_allowed_test_path(root, path):
+                issues.append(
+                    _issue(
+                        "scope_violation",
+                        path,
+                        "Test-only PatchGate mode rejects every non-test path.",
+                    )
+                )
+                continue
         artifact_issue = _generated_or_binary_issue(path)
         if artifact_issue is not None:
             issues.append(artifact_issue)

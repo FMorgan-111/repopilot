@@ -21,6 +21,7 @@ from .graph import (
 )
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
+from .nodes.coverage import ensure_coverage
 from .nodes.execute import apply_patch, execute_fix, git_clone, git_diff, run_pytest
 from .nodes.failure import handle_failure
 from .nodes.locate import locate_code
@@ -34,6 +35,7 @@ from .state import (
     DEFAULT_AGENT_V2_TOKEN_BUDGET,
     AgentState,
     ConversationTurn,
+    CoverageProof,
     DecisionFrame,
     FileInfo,
     FinalReport,
@@ -45,6 +47,7 @@ from .state import (
     PatchEdit,
     Phase,
     ToolCall,
+    TestRunFingerprint,
     _as_state,
     _estimate_tokens,
     _extract_json_object,
@@ -64,6 +67,7 @@ __all__ = [
     "END",
     "AgentState",
     "ConversationTurn",
+    "CoverageProof",
     "DecisionFrame",
     "FallbackCompiledGraph",
     "FallbackStateGraph",
@@ -78,6 +82,7 @@ __all__ = [
     "Phase",
     "StateGraph",
     "ToolCall",
+    "TestRunFingerprint",
     "Tracer",
     "_as_state",
     "_estimate_tokens",
@@ -97,6 +102,7 @@ __all__ = [
     "commit_fix",
     "create_pr",
     "execute_fix",
+    "ensure_coverage",
     "final_report_from_state",
     "git_clone",
     "git_diff",
@@ -198,6 +204,7 @@ def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
             "reflect_on_failure": _w("reflect_on_failure", reflect_on_failure),
             "execute_fix": _w("execute_fix", execute_fix),
             "verify_fix": _w("verify_fix", verify_fix),
+            "ensure_coverage": _w("ensure_coverage", ensure_coverage),
             "commit_fix": _w("commit_fix", commit_fix),
             "handle_failure": _w("handle_failure", handle_failure),
         }.items():
@@ -217,6 +224,7 @@ def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
     graph.add_node("plan_fix", _w("plan_fix", plan_fix, record_route_decision=True))
     graph.add_node("execute_fix", _w("execute_fix", execute_fix, record_route_decision=True))
     graph.add_node("verify_fix", _w("verify_fix", verify_fix, record_route_decision=True))
+    graph.add_node("ensure_coverage", _w("ensure_coverage", ensure_coverage, record_route_decision=True))
     graph.add_node("reflect_on_failure", _w("reflect_on_failure", reflect_on_failure, record_route_decision=True))
     graph.add_node("commit_fix", _w("commit_fix", commit_fix, record_route_decision=True))
     graph.add_node("handle_failure", _w("handle_failure", handle_failure, record_route_decision=True))
@@ -227,6 +235,7 @@ def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
         "reflect_on_failure",
         "execute_fix",
         "verify_fix",
+        "ensure_coverage",
         "commit_fix",
         "handle_failure",
     ]:
@@ -240,6 +249,7 @@ def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
                 "reflect_on_failure": "reflect_on_failure",
                 "execute_fix": "execute_fix",
                 "verify_fix": "verify_fix",
+                "ensure_coverage": "ensure_coverage",
                 "commit_fix": "commit_fix",
                 "handle_failure": "handle_failure",
                 END: END,
@@ -257,6 +267,7 @@ def _entry_point_for_phase(phase: Phase) -> str:
         Phase.REFLECT: "reflect_on_failure",
         Phase.EXECUTE: "execute_fix",
         Phase.VERIFY: "verify_fix",
+        Phase.COVERAGE: "ensure_coverage",
         Phase.COMMIT: "commit_fix",
         Phase.FAILURE: "handle_failure",
     }.get(phase)
@@ -312,6 +323,15 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 for event in state.no_progress_history
             ],
             "human_input_request": state.human_input_request,
+            "coverage_status": state.coverage_status,
+            "coverage_test_files": state.coverage_test_files,
+            "coverage_test_command": state.coverage_test_command,
+            "coverage_failure_reason": state.coverage_failure_reason,
+            "coverage_proof": (
+                state.coverage_proof.model_dump(mode="json")
+                if state.coverage_proof
+                else None
+            ),
             "model_patch": git_diff(state.repo_path),
             "error": state.failure_reason or None,
         }
@@ -506,6 +526,12 @@ def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> N
             "node_diagnostics": state.node_diagnostics if state else [],
             "pending_human_input": state.pending_human_input if state else False,
             "human_input_request": state.human_input_request if state else {},
+            "coverage_status": state.coverage_status if state else "pending",
+            "coverage_proof": (
+                state.coverage_proof.model_dump(mode="json")
+                if state and state.coverage_proof
+                else None
+            ),
         }
         p.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
         import sys

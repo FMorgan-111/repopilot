@@ -220,12 +220,10 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
     latest = state.fix_attempts[-1]
     await _record_episode_best_effort(state, latest)
     if latest.success:
-        # In benchmark/eval mode we have no write access to upstream repos, so a
-        # verified test pass is the terminal success — skip the PR step.
         state.last_assertion_failure_signature = ""
         state.assertion_no_progress_rounds = 0
         state.assertion_diversity_required = False
-        state.current_phase = Phase.DONE if state.skip_commit else Phase.COMMIT
+        state.current_phase = Phase.COVERAGE
         return state
 
     failure_class = _test_failure_class(latest)

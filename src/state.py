@@ -134,6 +134,7 @@ class Phase(str, Enum):
     REFLECT = "REFLECT"
     EXECUTE = "EXECUTE"
     VERIFY = "VERIFY"
+    COVERAGE = "COVERAGE"
     COMMIT = "COMMIT"
     WAITING_FOR_USER = "WAITING_FOR_USER"
     FAILURE = "FAILURE"
@@ -510,6 +511,35 @@ class VerifiedEditBatch(BaseModel):
     edits: list[VerifiedEdit] = Field(min_length=1, max_length=16)
 
 
+CoverageStatus = Literal[
+    "pending", "existing_verified", "generated_verified", "failed"
+]
+
+
+class TestRunFingerprint(BaseModel):
+    """Bounded, non-sensitive evidence from one targeted test execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    exit_code: int
+    outcome: Literal["pass", "assertion_failure", "infra"]
+    failing_test_ids: list[str] = Field(default_factory=list, max_length=100)
+    assertion_fingerprint: str = Field(default="", max_length=64)
+    summary: str = Field(default="", max_length=500)
+
+
+class CoverageProof(BaseModel):
+    """Persistable differential proof without raw process output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: Literal["existing", "generated"]
+    test_files: list[str] = Field(max_length=16)
+    argv: list[str] = Field(max_length=64)
+    fixed_runs: list[TestRunFingerprint] = Field(min_length=2, max_length=2)
+    base_runs: list[TestRunFingerprint] = Field(min_length=2, max_length=2)
+
+
 class ToolSandboxConfig(BaseModel):
     """Persisted immutable OCI boundary for repository-controlled commands."""
 
@@ -694,6 +724,12 @@ class AgentState(BaseModel):
     patch_content: str = ""
     patch_edits: list[PatchEdit] = Field(default_factory=list)
     test_command: str = ""
+    coverage_status: CoverageStatus = "pending"
+    coverage_test_files: list[str] = Field(default_factory=list)
+    coverage_test_command: str = ""
+    coverage_failure_reason: str = ""
+    test_generation_attempts: int = Field(default=0, ge=0, le=2)
+    coverage_proof: CoverageProof | None = None
     repo_path: str = ""
     repo_ref: str = ""
     branch_name: str = ""
@@ -742,8 +778,7 @@ class AgentState(BaseModel):
         default_factory=list, max_length=20_000
     )
     tool_sandbox_config: ToolSandboxConfig | None = None
-    # Benchmark/eval mode: a verified test pass routes straight to DONE instead
-    # of opening a PR (we have no write access to upstream repos under eval).
+    # Benchmark/eval mode skips COMMIT only after differential coverage proof.
     skip_commit: bool = False
     _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
 

@@ -27,6 +27,7 @@ PHASE_TIMEOUTS: dict[str, float] = {
     "plan_fix": 360.0,
     "execute_fix": 600.0,
     "verify_fix": 15.0,
+    "ensure_coverage": 1200.0,
     "reflect_on_failure": 360.0,
     "commit_fix": 600.0,
     "handle_failure": 60.0,
@@ -177,6 +178,8 @@ def _route_for_phase(phase: Phase) -> str:
         return "execute_fix"
     if phase == Phase.VERIFY:
         return "verify_fix"
+    if phase == Phase.COVERAGE:
+        return "ensure_coverage"
     if phase == Phase.COMMIT:
         return "commit_fix"
     if phase == Phase.WAITING_FOR_USER:
