@@ -9,7 +9,7 @@ import tarfile
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Literal
+from typing import Iterator, Literal, Mapping
 
 from pydantic import BaseModel
 
@@ -381,7 +381,13 @@ def _validate_generated_snapshot(state: AgentState, workspace: Path) -> None:
 
 
 @contextmanager
-def _disposable_test_snapshot(state: AgentState) -> Iterator[SandboxPaths]:
+def disposable_test_snapshot(
+    state: AgentState,
+    *,
+    apply_approved_changes: bool = True,
+    test_overlays: Mapping[str, bytes] | None = None,
+) -> Iterator[SandboxPaths]:
+    """Yield a fresh exact-base archive snapshot, optionally with its approved diff."""
     with tempfile.TemporaryDirectory(prefix="repopilot-tool-sandbox-") as directory:
         sandbox = SandboxPaths.create(Path(directory) / "private")
         archive = sandbox.root / "base.tar"
@@ -406,8 +412,8 @@ def _disposable_test_snapshot(state: AgentState) -> Iterator[SandboxPaths]:
             raise RuntimeError("exact-base snapshot creation failed")
         _extract_safe_archive(archive, sandbox.workspace)
         base_manifest = _scan_snapshot(sandbox.workspace)
-        patch = _approved_patch(state)
-        if state.tool_patch_approval is not None:
+        patch = _approved_patch(state) if apply_approved_changes else ""
+        if apply_approved_changes and state.tool_patch_approval is not None:
             _preflight_approved_manifest(
                 base_manifest,
                 state.tool_patch_approval.changed_manifest,
@@ -432,12 +438,46 @@ def _disposable_test_snapshot(state: AgentState) -> Iterator[SandboxPaths]:
         actual_changes = _changed_manifest(base_manifest, current_manifest)
         expected_changes = (
             state.tool_patch_approval.changed_manifest
-            if state.tool_patch_approval is not None
+            if apply_approved_changes and state.tool_patch_approval is not None
             else []
         )
         if tuple(actual_changes) != tuple(expected_changes):
             raise ValueError("snapshot changes do not match approved manifest")
-        _validate_generated_snapshot(state, sandbox.workspace)
+        if apply_approved_changes:
+            _validate_generated_snapshot(state, sandbox.workspace)
+        for raw_path, content in (test_overlays or {}).items():
+            path = canonical_repo_path(raw_path)
+            if (
+                is_sensitive_repo_path(path)
+                or not isinstance(content, bytes)
+                or len(content) > 512_000
+            ):
+                raise ValueError("unsafe disposable test overlay")
+            destination = sandbox.workspace / path
+            current = sandbox.workspace
+            for part in Path(path).parts[:-1]:
+                current = current / part
+                if current.is_symlink():
+                    raise ValueError("disposable test overlay crosses a symlink")
+                current.mkdir(exist_ok=True)
+            if destination.is_symlink() or (
+                destination.exists() and not destination.is_file()
+            ):
+                raise ValueError("disposable test overlay target is unsafe")
+            resolved = destination.resolve(strict=False)
+            if not resolved.is_relative_to(sandbox.workspace.resolve()):
+                raise ValueError("disposable test overlay escaped workspace")
+            destination.write_bytes(content)
+        locked_manifest = _scan_snapshot(sandbox.workspace)
+        yield sandbox
+        if _scan_snapshot(sandbox.workspace) != locked_manifest:
+            raise ValueError("disposable test snapshot manifest drifted during execution")
+
+
+@contextmanager
+def _disposable_test_snapshot(state: AgentState) -> Iterator[SandboxPaths]:
+    """Backward-compatible private wrapper for existing targeted-test routing."""
+    with disposable_test_snapshot(state, apply_approved_changes=True) as sandbox:
         yield sandbox
 
 

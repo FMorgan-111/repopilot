@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from .evaluator_safety import sanitize_evaluator_text
 from .coverage_gate import (
     ChangedTarget,
     CoverageCandidate,
@@ -24,15 +25,15 @@ from .patch_gate import apply_approved_patch, validate_patch_batch
 from .repo_paths import canonical_repo_path
 from .state import (
     AgentState,
+    CoverageProof,
     GeneratedTestApproval,
+    PatchEdit,
     RepairPlan,
+    ToolPatchApproval,
     VerifiedEditBatch,
+    tool_manifest_fingerprint,
 )
 
-_EVALUATOR_ONLY_RE = re.compile(
-    r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|fail[_ -]?to[_ -]?pass|"
-    r"pass[_ -]?to[_ -]?pass|instance[_ -]?id|evaluator|grading|oracle)\b"
-)
 _SYSTEM_PROMPT = (
     "Return only one JSON object matching VerifiedEditBatch with key 'edits'. "
     "Each edit must modify or create only an established Python test path. "
@@ -46,8 +47,7 @@ _PROMPT_LIMIT = 32_000
 
 def _safe_text(value: object, *, limit: int) -> str:
     text = redact_secrets(str(value or ""))
-    text = _EVALUATOR_ONLY_RE.sub("[REDACTED_EVALUATOR_FIELD]", text)
-    return text[:limit]
+    return sanitize_evaluator_text(text)[:limit]
 
 
 def _target_evidence(root: Path, targets: list[ChangedTarget]) -> list[dict[str, object]]:
@@ -203,17 +203,121 @@ def _refresh_diff(state: AgentState) -> None:
     state.patch_content = git_diff(state.repo_path)
 
 
+@dataclass(frozen=True)
+class _ProductionState:
+    active_repair_plan: RepairPlan | None
+    patch_edits: list[PatchEdit]
+    tool_patch_approval: ToolPatchApproval | None
+    patch_content: str
+    coverage_status: str
+    coverage_test_files: list[str]
+    coverage_test_command: str
+    coverage_failure_reason: str
+    coverage_proof: CoverageProof | None
+    generated_test_approvals: list[GeneratedTestApproval]
+
+
+def _capture_production_state(state: AgentState) -> _ProductionState:
+    return _ProductionState(
+        active_repair_plan=(
+            state.active_repair_plan.model_copy(deep=True)
+            if state.active_repair_plan
+            else None
+        ),
+        patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+        tool_patch_approval=(
+            state.tool_patch_approval.model_copy(deep=True)
+            if state.tool_patch_approval
+            else None
+        ),
+        patch_content=state.patch_content,
+        coverage_status=state.coverage_status,
+        coverage_test_files=list(state.coverage_test_files),
+        coverage_test_command=state.coverage_test_command,
+        coverage_failure_reason=state.coverage_failure_reason,
+        coverage_proof=(
+            state.coverage_proof.model_copy(deep=True)
+            if state.coverage_proof
+            else None
+        ),
+        generated_test_approvals=[
+            item.model_copy(deep=True) for item in state.generated_test_approvals
+        ],
+    )
+
+
+def _restore_production_state(state: AgentState, saved: _ProductionState) -> None:
+    state.active_repair_plan = (
+        saved.active_repair_plan.model_copy(deep=True)
+        if saved.active_repair_plan
+        else None
+    )
+    state.patch_edits = [edit.model_copy(deep=True) for edit in saved.patch_edits]
+    state.tool_patch_approval = (
+        saved.tool_patch_approval.model_copy(deep=True)
+        if saved.tool_patch_approval
+        else None
+    )
+    state.patch_content = saved.patch_content
+    state.coverage_status = saved.coverage_status  # type: ignore[assignment]
+    state.coverage_test_files = list(saved.coverage_test_files)
+    state.coverage_test_command = saved.coverage_test_command
+    state.coverage_failure_reason = saved.coverage_failure_reason
+    state.coverage_proof = (
+        saved.coverage_proof.model_copy(deep=True) if saved.coverage_proof else None
+    )
+    state.generated_test_approvals = [
+        item.model_copy(deep=True) for item in saved.generated_test_approvals
+    ]
+
+
+def _combined_approval(
+    state: AgentState,
+    saved: _ProductionState,
+    generated: ToolPatchApproval,
+) -> ToolPatchApproval:
+    production = saved.tool_patch_approval
+    if production is None or production.base_ref != state.repo_ref:
+        raise ValueError("generated tests require an existing production approval")
+    full_patch = state.patch_content
+    entries = {item.path: item for item in production.changed_manifest}
+    entries.update({item.path: item for item in generated.changed_manifest})
+    manifest = [entries[path] for path in sorted(entries)]
+    patch_sha256 = hashlib.sha256(full_patch.encode("utf-8")).hexdigest()
+    payload = json.dumps(
+        {
+            "base_ref": state.repo_ref,
+            "production_gate": production.patch_gate_fingerprint,
+            "generated_gate": generated.patch_gate_fingerprint,
+            "patch_sha256": patch_sha256,
+            "manifest": [item.model_dump(mode="json") for item in manifest],
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return ToolPatchApproval(
+        base_ref=state.repo_ref,
+        patch_sha256=patch_sha256,
+        patch_gate_fingerprint=hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        changed_manifest=manifest,
+        manifest_fingerprint=tool_manifest_fingerprint(manifest),
+    )
+
+
 async def run_test_generation_attempts(
     state: AgentState,
     rejection_reason: str,
 ) -> CoverageDecision:
     """Try at most twice; only a differential proof can return verified."""
     root = Path(state.repo_path).resolve(strict=True)
+    production = _capture_production_state(state)
     reason = _safe_text(rejection_reason, limit=300) or "no_coverage_candidate"
     last = _failed(reason)
 
     while state.test_generation_attempts < 2:
         state.test_generation_attempts += 1
+        _restore_production_state(state, production)
         snapshot: dict[str, bytes | None] = {}
         applied = False
         try:
@@ -229,17 +333,9 @@ async def run_test_generation_attempts(
                 snapshot = _snapshot_test_files(root, paths)
                 changed = apply_approved_patch(state)
                 applied = True
-                approval = state.tool_patch_approval
-                if approval is None:
+                generated_approval = state.tool_patch_approval
+                if generated_approval is None:
                     raise RuntimeError("generated test lacks exact PatchGate approval")
-                state.generated_test_approvals = [
-                    GeneratedTestApproval(
-                        path=path,
-                        content_sha256=hashlib.sha256((root / path).read_bytes()).hexdigest(),
-                        patch_gate_fingerprint=approval.patch_gate_fingerprint,
-                    )
-                    for path in changed
-                ]
                 candidate = CoverageCandidate(
                     test_files=changed,
                     argv=["python", "-m", "pytest", *changed, "-q"],
@@ -248,6 +344,20 @@ async def run_test_generation_attempts(
                 state.coverage_test_files = list(changed)
                 state.coverage_test_command = " ".join(candidate.argv)
                 _refresh_diff(state)
+                combined = _combined_approval(state, production, generated_approval)
+                state.tool_patch_approval = combined
+                state.generated_test_approvals = [
+                    GeneratedTestApproval(
+                        path=path,
+                        content_sha256=hashlib.sha256((root / path).read_bytes()).hexdigest(),
+                        patch_gate_fingerprint=combined.patch_gate_fingerprint,
+                    )
+                    for path in changed
+                ]
+                state.active_repair_plan = production.active_repair_plan
+                state.patch_edits = [
+                    edit.model_copy(deep=True) for edit in production.patch_edits
+                ]
                 decision = await validate_differential_coverage(state, candidate)
                 last = decision
                 if decision.verified:
@@ -265,10 +375,14 @@ async def run_test_generation_attempts(
                 except (OSError, RuntimeError):
                     reason = "generated_test_rollback_failed"
                     last = _failed(reason)
-                state.generated_test_approvals = []
-                _refresh_diff(state)
-                state.patch_edits = []
-                state.tool_patch_approval = None
+                    _restore_production_state(state, production)
+                    state.coverage_status = "failed"
+                    state.coverage_failure_reason = reason
+                    state.coverage_proof = None
+                    state.pr_url = None
+                    return last
+            if not last.verified:
+                _restore_production_state(state, production)
 
         if state.test_generation_attempts == 1 and state.active_provider == "primary":
             if escalation_is_configured():
@@ -280,6 +394,7 @@ async def run_test_generation_attempts(
                     ),
                 )
 
+    _restore_production_state(state, production)
     state.coverage_status = "failed"
     state.coverage_failure_reason = last.reason
     return last

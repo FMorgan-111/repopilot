@@ -10,7 +10,6 @@ import ast
 import asyncio
 import hashlib
 import json
-import os
 import re
 import shlex
 import shutil
@@ -22,13 +21,19 @@ from typing import Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .evaluator_safety import contains_evaluator_only, sanitize_evaluator_text
 from .model_provider import redact_secrets
 from .repo_paths import canonical_repo_path
 from .state import (
     AgentState,
+    CoverageProof,
     CoverageStatus,
     TestRunFingerprint,
+    tool_manifest_fingerprint,
 )
+from .safe_subprocess import run_oci_process
+from .tool_policy import fixed_test_argv
+from .tool_router import disposable_test_snapshot
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _SAFE_OPTION_RE = re.compile(
@@ -36,15 +41,44 @@ _SAFE_OPTION_RE = re.compile(
     r"--maxfail=[0-9]+)"
 )
 _TEST_NAME_RE = re.compile(r"(?:test_.+|.+_test)\.py\Z", re.IGNORECASE)
-_EVALUATOR_ONLY_RE = re.compile(
-    r"(?i)(?<![A-Za-z0-9])(?:gold[_ -]?patch|test[_ -]?patch|"
-    r"fail[_ -]?to[_ -]?pass|pass[_ -]?to[_ -]?pass|instance[_ -]?id|"
-    r"evaluator|grading|oracle)(?![A-Za-z0-9])"
-)
 _FAILED_PYTEST_RE = re.compile(
-    r"(?m)^(?:FAILED|ERROR)\s+(.+?(?:::[^\s]+)+)(?:\s+-|\s*$)"
+    r"(?m)^FAILED\s+(.+?(?:::[^\s]+)+)(?:\s+-|\s*$)"
 )
-_FAILED_UNITTEST_RE = re.compile(r"(?m)^(?:FAIL|ERROR):\s+([^\s(]+)(?:\s+\(([^)]+)\))?")
+_FAILED_UNITTEST_RE = re.compile(r"(?m)^FAIL:\s+([^\s(]+)(?:\s+\(([^)]+)\))?")
+_ERROR_REPORT_RE = re.compile(
+    r"(?im)^(?:ERROR(?:\s|:)|.*\berror at (?:setup|teardown)\b)"
+)
+_FORBIDDEN_TEST_TREE_PARTS = frozenset(
+    {
+        ".cache",
+        ".circleci",
+        ".github",
+        ".gitlab",
+        ".mypy_cache",
+        ".nox",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        "__pycache__",
+        "build",
+        "ci",
+        "config",
+        "configs",
+        "dependencies",
+        "dependency",
+        "dist",
+        "generated",
+        "htmlcov",
+        "node_modules",
+        "site-packages",
+        "third_party",
+        "vendor",
+        "venv",
+        "workflow",
+        "workflows",
+    }
+)
 _INFRA_MARKERS = (
     "error collecting",
     "importerror",
@@ -236,7 +270,7 @@ def is_allowed_test_path(repo_root: Path, file_path: str) -> bool:
         return False
     if (
         not root.is_dir()
-        or _EVALUATOR_ONLY_RE.search(relative)
+        or contains_evaluator_only(relative)
         or not _TEST_NAME_RE.fullmatch(Path(relative).name)
     ):
         return False
@@ -249,6 +283,8 @@ def is_allowed_test_path(repo_root: Path, file_path: str) -> bool:
         return False
 
     parts = Path(relative).parts
+    if any(part.casefold() in _FORBIDDEN_TEST_TREE_PARTS for part in parts[:-1]):
+        return False
     test_root_index = next(
         (index for index, part in enumerate(parts[:-1]) if part.casefold() in {"test", "tests"}),
         None,
@@ -344,6 +380,47 @@ def _authorize_candidate_files(
             raise ValueError("existing candidate differs from its exact base file")
 
 
+def coverage_proof_matches_state(state: AgentState, proof: CoverageProof) -> bool:
+    """Validate every persisted proof binding against the current approved diff."""
+    try:
+        root = _exact_repo_root(Path(state.repo_path))
+        approval = state.tool_patch_approval
+        if approval is None or state.coverage_status != proof.status:
+            return False
+        if (
+            proof.base_ref != state.repo_ref
+            or approval.base_ref != state.repo_ref
+            or hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+            != approval.patch_sha256
+            or proof.patch_sha256 != approval.patch_sha256
+            or proof.patch_gate_fingerprint != approval.patch_gate_fingerprint
+            or proof.manifest_fingerprint != approval.manifest_fingerprint
+            or tool_manifest_fingerprint(approval.changed_manifest)
+            != approval.manifest_fingerprint
+        ):
+            return False
+        for file_path, expected in proof.test_content_digests.items():
+            if not is_allowed_test_path(root, file_path):
+                return False
+            path = root / file_path
+            if (
+                path.is_symlink()
+                or not path.is_file()
+                or hashlib.sha256(path.read_bytes()).hexdigest() != expected
+            ):
+                return False
+        candidate = CoverageCandidate(
+            test_files=proof.test_files,
+            argv=proof.argv,
+            source=proof.source,
+        )
+        _validate_candidate(root, candidate)
+        _authorize_candidate_files(state, root, state.repo_ref, candidate)
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
 def _candidate_from_command(
     root: Path,
     command: str,
@@ -428,7 +505,7 @@ def _normalize_test_id(test_id: str, repo_path: Path) -> str:
     if normalized.startswith(root):
         normalized = normalized[len(root) :]
     normalized = re.sub(r"^(?:/private)?/tmp/[^\s:]+/", "", normalized)
-    return _EVALUATOR_ONLY_RE.sub("[REDACTED_EVALUATOR_FIELD]", normalized)
+    return sanitize_evaluator_text(normalized)
 
 
 def normalize_test_result(
@@ -441,13 +518,21 @@ def normalize_test_result(
         return TestRunFingerprint(exit_code=0, outcome="pass", summary="pass")
 
     lowered = output.casefold()
-    pytest_ids = [_normalize_test_id(item, repo_path) for item in _FAILED_PYTEST_RE.findall(output)]
+    pytest_ids = [
+        normalized
+        for item in _FAILED_PYTEST_RE.findall(output)
+        if (normalized := _normalize_test_id(item, repo_path))
+    ]
     unittest_ids = []
     for name, owner in _FAILED_UNITTEST_RE.findall(output):
-        unittest_ids.append(f"{owner}.{name}" if owner else name)
+        normalized = _normalize_test_id(f"{owner}.{name}" if owner else name, repo_path)
+        if normalized:
+            unittest_ids.append(normalized)
     failing_ids = sorted(set([*pytest_ids, *unittest_ids]))
     has_assertion = any(marker in lowered for marker in _ASSERTION_MARKERS)
-    has_infra = any(marker in lowered for marker in _INFRA_MARKERS)
+    has_infra = bool(_ERROR_REPORT_RE.search(output)) or any(
+        marker in lowered for marker in _INFRA_MARKERS
+    )
     if not failing_ids or has_infra or not has_assertion:
         return TestRunFingerprint(
             exit_code=exit_code,
@@ -524,32 +609,47 @@ def temporary_base_checkout(repo_path: Path, base_ref: str) -> Iterator[Path]:
 
 
 async def _run_candidate(root: Path, argv: list[str]) -> TestRunFingerprint:
-    def run() -> subprocess.CompletedProcess[str]:
-        environment = os.environ.copy()
-        environment["PYTHONDONTWRITEBYTECODE"] = "1"
-        return subprocess.run(
-            argv,
-            cwd=root,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            env=environment,
-        )
+    raise RuntimeError("repository tests may not execute in a host worktree")
 
-    try:
-        result = await asyncio.to_thread(run)
-    except (OSError, subprocess.SubprocessError):
-        return TestRunFingerprint(
-            exit_code=-1,
-            outcome="infra",
-            summary="infra; execution_failed",
-        )
-    return normalize_test_result(
-        result.returncode,
-        f"{result.stdout}\n{result.stderr}",
-        root,
+
+async def _run_isolated_candidate(
+    state: AgentState,
+    candidate: CoverageCandidate,
+    *,
+    apply_approved_changes: bool,
+) -> TestRunFingerprint:
+    root = Path(state.repo_path).resolve(strict=True)
+    config = state.tool_sandbox_config
+    if config is None:
+        raise ValueError("coverage requires a configured OCI sandbox")
+    argv, _normalized = fixed_test_argv(root, state, candidate.argv)
+    overlays = (
+        {
+            path: (root / path).read_bytes()
+            for path in candidate.test_files
+        }
+        if candidate.source == "generated" and not apply_approved_changes
+        else None
     )
+    with disposable_test_snapshot(
+        state,
+        apply_approved_changes=apply_approved_changes,
+        test_overlays=overlays,
+    ) as sandbox:
+        result = await asyncio.to_thread(
+            run_oci_process,
+            argv,
+            sandbox=sandbox,
+            config=config,
+            timeout=300,
+            max_output_bytes=8_000,
+        )
+        fingerprint = normalize_test_result(
+            result.returncode,
+            f"{result.stdout}\n{result.stderr}",
+            sandbox.workspace,
+        )
+    return fingerprint
 
 
 def _decision(
@@ -605,18 +705,30 @@ async def validate_differential_coverage(
     except (OSError, RuntimeError, ValueError):
         return _decision(candidate, "coverage_infra")
 
-    fixed_runs = [await _run_candidate(root, list(candidate.argv)) for _ in range(2)]
+    try:
+        fixed_runs = [
+            await _run_isolated_candidate(
+                state,
+                candidate,
+                apply_approved_changes=True,
+            )
+            for _ in range(2)
+        ]
+    except (OSError, RuntimeError, ValueError):
+        return _decision(candidate, "coverage_infra")
     if any(run.outcome != "pass" for run in fixed_runs):
         return _decision(candidate, "fixed_does_not_pass", fixed_runs=fixed_runs)
 
     base_runs: list[TestRunFingerprint] = []
     try:
-        with temporary_base_checkout(root, ref) as base_root:
-            for file_path in candidate.test_files:
-                _copy_test_to_base(root, base_root, file_path)
-            base_runs = [
-                await _run_candidate(base_root, list(candidate.argv)) for _ in range(2)
-            ]
+        base_runs = [
+            await _run_isolated_candidate(
+                state,
+                candidate,
+                apply_approved_changes=False,
+            )
+            for _ in range(2)
+        ]
     except (OSError, RuntimeError, ValueError):
         return _decision(candidate, "coverage_infra", fixed_runs=fixed_runs)
 
@@ -672,6 +784,7 @@ __all__ = [
     "CoverageCandidate",
     "CoverageDecision",
     "collect_changed_targets",
+    "coverage_proof_matches_state",
     "discover_coverage_candidates",
     "is_allowed_test_path",
     "normalize_test_result",

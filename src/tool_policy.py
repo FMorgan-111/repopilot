@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import shlex
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Literal
 
@@ -304,6 +305,18 @@ def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str
             continue
         raise ValueError("non_selector_argument")
     return argv, " ".join(shlex.quote(token) for token in tokens)
+
+
+def fixed_test_argv(
+    root: Path,
+    state: AgentState,
+    command: Sequence[str],
+) -> tuple[list[str], str]:
+    """Public fixed-argv boundary shared by targeted tools and coverage proof."""
+    if isinstance(command, (str, bytes, bytearray)):
+        raise ValueError("fixed test command must be an argv sequence")
+    tokens = list(command)
+    return _test_argv(root, state, shlex.join(tokens))
 
 
 class ToolPolicy:

@@ -630,3 +630,28 @@ def test_generated_test_marker_must_belong_to_the_same_new_file_diff(tmp_path):
     )
 
     assert decision.approved is False
+
+
+def test_public_fixed_test_argv_uses_sandbox_python_and_preserves_selector(tmp_path):
+    import src.tool_policy as policy
+
+    root, commit = _repo(tmp_path)
+    state = _state(
+        root,
+        commit,
+        test_command="python -m pytest tests/test_widget.py -q",
+    )
+    argv, normalized = policy.fixed_test_argv(
+        root,
+        state,
+        ["python", "-m", "pytest", "tests/test_widget.py", "-q"],
+    )
+    assert argv == [
+        "/usr/bin/python3",
+        "-P",
+        "-m",
+        "pytest",
+        "tests/test_widget.py",
+        "-q",
+    ]
+    assert normalized == "python -m pytest tests/test_widget.py -q"

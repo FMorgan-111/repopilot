@@ -593,6 +593,46 @@ def test_snapshot_scan_rejects_postpatch_symlink(tmp_path):
         _scan_snapshot(workspace)
 
 
+def test_public_disposable_snapshot_can_select_exact_base_or_approved_fixed(
+    tmp_path,
+):
+    root, commit = _repo(tmp_path)
+    source = root / "src" / "widget.py"
+    source.write_text(source.read_text().replace("'old'", "'fixed'"))
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", commit, "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    content = source.read_bytes()
+    manifest = [
+        SnapshotManifestEntry(
+            path="src/widget.py",
+            change="modified",
+            mode="100644",
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            size=len(content),
+        )
+    ]
+    state = _state(
+        root,
+        commit,
+        patch_content=patch,
+        tool_patch_approval=_approval(commit, patch, manifest),
+    )
+    import src.tool_router as router
+
+    with router.disposable_test_snapshot(
+        state, apply_approved_changes=False
+    ) as base:
+        assert "'old'" in (base.workspace / "src" / "widget.py").read_text()
+    with router.disposable_test_snapshot(
+        state, apply_approved_changes=True
+    ) as fixed:
+        assert "'fixed'" in (fixed.workspace / "src" / "widget.py").read_text()
+
+
 async def test_sensitive_delete_and_public_add_suppresses_all_diff_evidence(tmp_path):
     root, _ = _repo(tmp_path)
     secret = "propagated-secret-sentinel"

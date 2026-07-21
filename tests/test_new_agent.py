@@ -343,6 +343,59 @@ def test_agent_payload_excludes_untracked_generated_archives(tmp_path):
     assert "setuptools-33.1.1.zip" not in payload["model_patch"]
 
 
+def test_agent_payload_suppresses_diff_after_generated_test_rollback_failure(
+    tmp_path,
+):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    (tmp_path / "base.py").write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "base.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_leaked.py").write_text("LEAKED = True\n")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+        coverage_status="failed",
+        coverage_failure_reason="generated_test_rollback_failed",
+        failure_reason="test_generation_failed:generated_test_rollback_failed",
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert payload["model_patch"] == ""
+    assert "test_leaked.py" not in json.dumps(payload)
+
+
+def test_agent_payload_never_exports_evaluator_only_patch_values(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    (tmp_path / "base.py").write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "base.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    sentinel = "RAW-GOLD-PATCH-5519"
+    (tmp_path / "base.py").write_text(f"gold_patch={sentinel}\n")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+    assert sentinel not in json.dumps(payload)
+    assert "gold_patch" not in payload["model_patch"].casefold()
+
+
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
     visited = []
 

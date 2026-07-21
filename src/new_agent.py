@@ -19,6 +19,7 @@ from .graph import (
     route_from_state,
     run_graph,
 )
+from .evaluator_safety import safe_prediction_patch
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.coverage import ensure_coverage
@@ -332,7 +333,11 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 if state.coverage_proof
                 else None
             ),
-            "model_patch": git_diff(state.repo_path),
+            "model_patch": safe_prediction_patch(
+                ""
+                if state.coverage_failure_reason == "generated_test_rollback_failed"
+                else git_diff(state.repo_path)
+            ),
             "error": state.failure_reason or None,
         }
     )

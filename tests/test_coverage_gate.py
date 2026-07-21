@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,34 @@ from src.coverage_gate import (
     temporary_base_checkout,
     validate_differential_coverage,
 )
-from src.state import AgentState, TestRunFingerprint as RunFingerprint
+from src.safe_subprocess import BoundedProcessResult
+from src.state import (
+    AgentState,
+    SnapshotManifestEntry,
+    ToolPatchApproval,
+    ToolSandboxConfig,
+    GeneratedTestApproval,
+    tool_manifest_fingerprint,
+)
+
+
+_IMAGE = "registry.example/repopilot-tests@sha256:" + "2" * 64
+
+
+@pytest.fixture(autouse=True)
+def _mock_coverage_oci(monkeypatch):
+    def fake_oci(argv, *, sandbox, **_kwargs):
+        fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
+        if fixed:
+            return BoundedProcessResult(list(argv), 0, "1 passed", "")
+        return BoundedProcessResult(
+            list(argv),
+            1,
+            "FAILED tests/test_maths.py::test_answer - AssertionError: expected 2 got 1",
+            "",
+        )
+
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", fake_oci)
 
 
 def _git(root: Path, *args: str) -> str:
@@ -53,6 +81,35 @@ def differential_repo(tmp_path: Path):
         repo_path=str(root),
         repo_ref=base_ref,
         test_command="python -m pytest tests/test_maths.py -q",
+        tool_sandbox_config=ToolSandboxConfig(
+            backend="docker",
+            image=_IMAGE,
+            python_executable="/usr/bin/python3",
+        ),
+    )
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", base_ref, "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    content = (root / "src" / "maths.py").read_bytes()
+    manifest = [
+        SnapshotManifestEntry(
+            path="src/maths.py",
+            change="modified",
+            mode="100644",
+            content_sha256=hashlib.sha256(content).hexdigest(),
+            size=len(content),
+        )
+    ]
+    state.patch_content = patch
+    state.tool_patch_approval = ToolPatchApproval(
+        base_ref=base_ref,
+        patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+        patch_gate_fingerprint="a" * 64,
+        changed_manifest=manifest,
+        manifest_fingerprint=tool_manifest_fingerprint(manifest),
     )
     candidate = CoverageCandidate(
         test_files=["tests/test_maths.py"],
@@ -60,6 +117,150 @@ def differential_repo(tmp_path: Path):
         source="existing",
     )
     return root, base_ref, state, candidate
+
+
+@pytest.mark.asyncio
+async def test_differential_coverage_never_runs_repository_code_on_host(
+    differential_repo,
+    monkeypatch,
+):
+    root, _base_ref, state, candidate = differential_repo
+    workspaces: list[Path] = []
+    sentinel = "host-credential-must-not-leak"
+    monkeypatch.setenv("COVERAGE_HOST_SENTINEL", sentinel)
+
+    async def forbidden_host(*_args, **_kwargs):
+        pytest.fail("host test runner was called")
+
+    def fake_oci(argv, *, sandbox, config, **_kwargs):
+        assert config == state.tool_sandbox_config
+        assert sandbox.workspace != root
+        assert argv[:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
+        workspaces.append(sandbox.workspace)
+        fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
+        if fixed:
+            return BoundedProcessResult(list(argv), 0, "1 passed", "")
+        return BoundedProcessResult(
+            list(argv),
+            1,
+            (
+                "FAILED tests/test_maths.py::test_answer - "
+                f"AssertionError: expected 2 got 1 {sentinel}"
+            ),
+            "",
+        )
+
+    monkeypatch.setattr("src.coverage_gate._run_candidate", forbidden_host)
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", fake_oci, raising=False)
+    decision = await validate_differential_coverage(state, candidate)
+
+    assert decision.verified is True
+    assert len(workspaces) == 4
+    assert len({str(path) for path in workspaces}) == 4
+    assert sentinel not in decision.model_dump_json()
+    assert sentinel not in state.model_dump_json()
+
+
+@pytest.mark.asyncio
+async def test_differential_coverage_rejects_snapshot_manifest_drift(
+    differential_repo,
+    monkeypatch,
+):
+    _root, _base_ref, state, candidate = differential_repo
+
+    def mutating_oci(argv, *, sandbox, **_kwargs):
+        (sandbox.workspace / "tests" / "test_maths.py").write_text("mutated")
+        return BoundedProcessResult(list(argv), 0, "1 passed", "")
+
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", mutating_oci, raising=False)
+    decision = await validate_differential_coverage(state, candidate)
+    assert decision.verified is False
+    assert decision.reason == "coverage_infra"
+    assert state.coverage_proof is None
+
+
+@pytest.mark.asyncio
+async def test_differential_coverage_missing_oci_never_falls_back_to_host(
+    differential_repo,
+    monkeypatch,
+):
+    _root, _base_ref, state, candidate = differential_repo
+    state.tool_sandbox_config = None
+
+    async def forbidden_host(*_args, **_kwargs):
+        pytest.fail("host fallback was called")
+
+    monkeypatch.setattr("src.coverage_gate._run_candidate", forbidden_host)
+    decision = await validate_differential_coverage(state, candidate)
+    assert decision.verified is False
+    assert decision.reason == "coverage_infra"
+
+
+@pytest.mark.asyncio
+async def test_generated_candidate_is_overlaid_on_base_snapshot_only(
+    differential_repo,
+    monkeypatch,
+):
+    root, _base_ref, state, _existing = differential_repo
+    generated = root / "tests" / "test_generated.py"
+    generated.write_text(
+        "from src.maths import answer\n\n"
+        "def test_generated():\n    assert answer() == 2\n",
+        encoding="utf-8",
+    )
+    from src.nodes.execute import git_diff
+
+    full_patch = git_diff(str(root))
+    approval = state.tool_patch_approval
+    assert approval is not None
+    generated_bytes = generated.read_bytes()
+    generated_entry = SnapshotManifestEntry(
+        path="tests/test_generated.py",
+        change="added",
+        mode="100644",
+        content_sha256=hashlib.sha256(generated_bytes).hexdigest(),
+        size=len(generated_bytes),
+    )
+    manifest = [*approval.changed_manifest, generated_entry]
+    combined_fingerprint = "7" * 64
+    state.patch_content = full_patch
+    state.tool_patch_approval = ToolPatchApproval(
+        base_ref=state.repo_ref,
+        patch_sha256=hashlib.sha256(full_patch.encode()).hexdigest(),
+        patch_gate_fingerprint=combined_fingerprint,
+        changed_manifest=manifest,
+        manifest_fingerprint=tool_manifest_fingerprint(manifest),
+    )
+    state.coverage_test_files = ["tests/test_generated.py"]
+    state.generated_test_approvals = [
+        GeneratedTestApproval(
+            path="tests/test_generated.py",
+            content_sha256=generated_entry.content_sha256,
+            patch_gate_fingerprint=combined_fingerprint,
+        )
+    ]
+    candidate = CoverageCandidate(
+        test_files=["tests/test_generated.py"],
+        argv=["python", "-m", "pytest", "tests/test_generated.py", "-q"],
+        source="generated",
+    )
+
+    def generated_oci(argv, *, sandbox, **_kwargs):
+        assert (sandbox.workspace / "tests" / "test_generated.py").is_file()
+        fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
+        if fixed:
+            return BoundedProcessResult(list(argv), 0, "1 passed", "")
+        return BoundedProcessResult(
+            list(argv),
+            1,
+            "FAILED tests/test_generated.py::test_generated - AssertionError: expected 2 got 1",
+            "",
+        )
+
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", generated_oci)
+    decision = await validate_differential_coverage(state, candidate)
+    assert decision.verified is True
+    assert decision.status == "generated_verified"
 
 
 @pytest.mark.asyncio
@@ -87,10 +288,10 @@ async def test_differential_coverage_rejects_base_that_also_passes(
 ):
     _root, _base_ref, state, candidate = differential_repo
 
-    async def passing(*_):
-        return RunFingerprint(exit_code=0, outcome="pass", summary="pass")
+    def passing(argv, **_kwargs):
+        return BoundedProcessResult(list(argv), 0, "1 passed", "")
 
-    monkeypatch.setattr("src.coverage_gate._run_candidate", passing)
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", passing)
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "base_also_passes"
@@ -98,11 +299,17 @@ async def test_differential_coverage_rejects_base_that_also_passes(
 
 @pytest.mark.asyncio
 async def test_differential_coverage_rejects_fixed_failure(differential_repo):
-    root, _base_ref, state, candidate = differential_repo
-    (root / "src" / "maths.py").write_text(
-        "def answer():\n    return 3\n", encoding="utf-8"
+    _root, _base_ref, state, candidate = differential_repo
+    from unittest.mock import patch
+
+    failing = BoundedProcessResult(
+        list(candidate.argv),
+        1,
+        "FAILED tests/test_maths.py::test_answer - AssertionError: wrong fixed result",
+        "",
     )
-    decision = await validate_differential_coverage(state, candidate)
+    with patch("src.coverage_gate.run_oci_process", return_value=failing):
+        decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "fixed_does_not_pass"
 
@@ -114,10 +321,10 @@ async def test_differential_coverage_rejects_infrastructure_error(
 ):
     _root, _base_ref, state, candidate = differential_repo
 
-    async def infra(*_):
-        return RunFingerprint(exit_code=1, outcome="infra", summary="infra")
+    def infra(argv, **_kwargs):
+        return BoundedProcessResult(list(argv), 1, "ERROR collecting tests", "")
 
-    monkeypatch.setattr("src.coverage_gate._run_candidate", infra)
+    monkeypatch.setattr("src.coverage_gate.run_oci_process", infra)
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "fixed_does_not_pass"
@@ -242,6 +449,44 @@ def test_normalize_assertion_text_containing_not_found_is_not_infra(tmp_path: Pa
         tmp_path,
     )
     assert result.outcome == "assertion_failure"
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (
+            "FAILED tests/test_bug.py::test_bug - AssertionError: expected 2 got 1",
+            "assertion_failure",
+        ),
+        (
+            "FAIL: test_bug (tests.test_bug.Case.test_bug)\nAssertionError: expected 2 got 1",
+            "assertion_failure",
+        ),
+        (
+            "ERROR tests/test_bug.py::test_bug - AssertionError during teardown",
+            "infra",
+        ),
+        (
+            "ERROR: test_bug (tests.test_bug.Case.test_bug)\nAssertionError in setUp",
+            "infra",
+        ),
+        (
+            "ERROR at setup of test_bug\nAssertionError: fixture exploded",
+            "infra",
+        ),
+        (
+            "ERROR collecting tests/test_bug.py\nAssertionError while importing",
+            "infra",
+        ),
+    ],
+)
+def test_normalize_only_accepts_terminal_assertion_failures(
+    tmp_path,
+    output,
+    expected,
+):
+    result = normalize_test_result(1, output, tmp_path)
+    assert result.outcome == expected
 
 
 def test_collect_changed_targets_uses_python_symbols(differential_repo):

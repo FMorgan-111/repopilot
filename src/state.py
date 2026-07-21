@@ -20,6 +20,7 @@ from pydantic import (
     model_validator,
 )
 
+from .evaluator_safety import sanitize_evaluator_text
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
 
@@ -524,8 +525,44 @@ class TestRunFingerprint(BaseModel):
     exit_code: int
     outcome: Literal["pass", "assertion_failure", "infra"]
     failing_test_ids: list[str] = Field(default_factory=list, max_length=100)
-    assertion_fingerprint: str = Field(default="", max_length=64)
+    assertion_fingerprint: str = Field(
+        default="", pattern=r"^(?:|[0-9a-f]{64})$"
+    )
     summary: str = Field(default="", max_length=500)
+
+    @field_validator("failing_test_ids", mode="before")
+    @classmethod
+    def _sanitize_failing_test_ids(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            raise ValueError("test run IDs must be an array")
+        return [
+            sanitized
+            for item in value
+            if (sanitized := sanitize_evaluator_text(item))
+        ]
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _sanitize_summary(cls, value: Any) -> str:
+        return sanitize_evaluator_text(value)[:500]
+
+    @model_validator(mode="after")
+    def _require_outcome_evidence(self) -> "TestRunFingerprint":
+        if any(not item or len(item) > 500 for item in self.failing_test_ids):
+            raise ValueError("test run IDs must be non-empty and bounded")
+        if self.outcome == "pass" and (
+            self.exit_code != 0
+            or self.failing_test_ids
+            or self.assertion_fingerprint
+        ):
+            raise ValueError("passing run cannot carry failure evidence")
+        if self.outcome == "assertion_failure" and (
+            self.exit_code == 0
+            or not self.failing_test_ids
+            or not self.assertion_fingerprint
+        ):
+            raise ValueError("assertion run requires IDs and fingerprint")
+        return self
 
 
 class CoverageProof(BaseModel):
@@ -534,10 +571,56 @@ class CoverageProof(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     source: Literal["existing", "generated"]
-    test_files: list[str] = Field(max_length=16)
-    argv: list[str] = Field(max_length=64)
+    status: Literal["existing_verified", "generated_verified"]
+    test_files: list[str] = Field(min_length=1, max_length=16)
+    argv: list[str] = Field(min_length=2, max_length=64)
     fixed_runs: list[TestRunFingerprint] = Field(min_length=2, max_length=2)
     base_runs: list[TestRunFingerprint] = Field(min_length=2, max_length=2)
+    base_ref: str = Field(pattern=r"^[0-9a-f]{40}$")
+    patch_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    test_content_digests: dict[str, str] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _require_differential_proof(self) -> "CoverageProof":
+        canonical = [canonical_repo_path(path) for path in self.test_files]
+        if canonical != self.test_files or len(canonical) != len(set(canonical)):
+            raise ValueError("coverage test files must be canonical and unique")
+        if self.source == "existing" and self.status != "existing_verified":
+            raise ValueError("coverage source and status disagree")
+        if self.source == "generated" and self.status != "generated_verified":
+            raise ValueError("coverage source and status disagree")
+        if any(run.outcome != "pass" for run in self.fixed_runs):
+            raise ValueError("coverage proof requires two fixed passes")
+        if any(run.outcome != "assertion_failure" for run in self.base_runs):
+            raise ValueError("coverage proof requires two base assertion failures")
+        first, second = self.base_runs
+        if (
+            first.failing_test_ids != second.failing_test_ids
+            or first.assertion_fingerprint != second.assertion_fingerprint
+        ):
+            raise ValueError("base assertion proof must be stable")
+        if set(self.test_content_digests) != set(self.test_files) or any(
+            not re.fullmatch(r"[0-9a-f]{64}", digest)
+            for digest in self.test_content_digests.values()
+        ):
+            raise ValueError("coverage test digests must bind every candidate")
+        prefix = (
+            1
+            if self.argv[:1] == ["pytest"]
+            else 3
+            if self.argv[:3] == ["python", "-m", "pytest"]
+            else 0
+        )
+        selectors = {
+            token.split("::", 1)[0]
+            for token in self.argv[prefix:]
+            if prefix and not token.startswith("-")
+        }
+        if not prefix or selectors != set(self.test_files):
+            raise ValueError("coverage argv must exactly select its test files")
+        return self
 
 
 class ToolSandboxConfig(BaseModel):
@@ -781,6 +864,16 @@ class AgentState(BaseModel):
     # Benchmark/eval mode skips COMMIT only after differential coverage proof.
     skip_commit: bool = False
     _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
+
+    @field_validator("coverage_proof", mode="before")
+    @classmethod
+    def _drop_legacy_or_incomplete_coverage_proof(cls, value: Any) -> Any:
+        if value is None or isinstance(value, CoverageProof):
+            return value
+        try:
+            return CoverageProof.model_validate(value)
+        except (TypeError, ValueError):
+            return None
 
     @field_validator("escalation_reason", mode="before")
     @classmethod
