@@ -9,10 +9,14 @@ on:
         required: true
         options:
           - checkpoint_5
-          - baseline_10
+          - baseline_50
 
 permissions:
   contents: read
+
+concurrency:
+  group: swe-bench-oci-evaluation
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -68,6 +72,7 @@ jobs:
       REPOPILOT_ESCALATION_ENABLED: "1"
       REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"
       REPOPILOT_HOME: ${{ runner.temp }}/repopilot-home
+      HF_HOME: ${{ runner.temp }}/public-hf-cache
     steps:
       - name: Check out RepoPilot
         uses: actions/checkout@v4
@@ -78,6 +83,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Restore public SWE-bench dataset cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ runner.temp }}/public-hf-cache
+            ${{ runner.temp }}/repopilot-home/eval/datasets
+          key: swe-bench-verified-main-v1
 
       - name: Install evaluation dependencies
         run: python -m pip install -e ".[memory,eval]"

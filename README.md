@@ -320,9 +320,65 @@ python -u eval/agent_v2_harness.py \
   --dataset-seed 17 \
   --samples 10 \
   --max-retries 3 \
-  --token-budget 50000 \
+  --token-budget 100000 \
   --predictions-file eval/swe_bench_predictions.jsonl
 ```
+
+This local command is useful for inference diagnostics, but it is not the
+authoritative success-rate evaluation because it does not prove the required
+per-instance OCI boundary or run the official scorer.
+
+#### Authoritative OCI matrix evaluation
+
+The manual `SWE-bench OCI Evaluation` workflow runs exactly one official
+SWE-bench image per matrix job, pins RepoPilot tool execution to that image's
+local `sha256:` identity, and limits model concurrency to two jobs. The
+five checkpoint IDs are a subset of the fixed 50-instance baseline. The
+checkpoint must pass its infrastructure and artifact checks before starting
+that baseline, whose final score denominator is exactly 50.
+
+Before the first run:
+
+1. Revoke any API key that has appeared in a terminal transcript, chat, log,
+   attachment, or commit.
+2. Merge `.github/workflows/swe-bench-oci-eval.yml` to the repository's default
+   branch, `master`, through an explicitly authorized PR. GitHub cannot
+   manually dispatch a workflow that exists only on a feature branch.
+3. Store newly rotated values as GitHub repository secrets named
+   `LLM_API_KEY` and `LLM_ESCALATION_API_KEY`. Do not pass values as workflow
+   inputs, command arguments, cache keys, or repository files.
+
+Dispatch and inspect the checkpoint:
+
+```bash
+gh workflow run swe-bench-oci-eval.yml --ref fix/release-readiness-20260717 -f mode=checkpoint_5
+gh run list --workflow=swe-bench-oci-eval.yml --limit 5
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID \
+  --name swe-bench-oci-checkpoint_5 \
+  --dir ARTIFACT_DIR/checkpoint_5
+```
+
+Only after `checkpoint_5/summary.md` confirms all five requested artifacts,
+valid hashes, matching commit identity, digest-pinned usable runtimes, and a
+terminal official status for every non-infrastructure instance, run the fixed
+50-instance baseline:
+
+```bash
+gh workflow run swe-bench-oci-eval.yml --ref fix/release-readiness-20260717 -f mode=baseline_50
+gh run list --workflow=swe-bench-oci-eval.yml --limit 5
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID \
+  --name swe-bench-oci-baseline_50 \
+  --dir ARTIFACT_DIR/baseline_50
+```
+
+Each instance upload contains only `result.json`, `prediction.jsonl`,
+`official_result.json`, and `manifest.json`. The aggregate contains ordered
+`results.json`, `predictions.jsonl`, `official_results.json`, and `summary.md`.
+Raw official logs, evaluator patches, model credentials, RepoPilot home data,
+and target repositories are not uploaded. Generated evaluation outputs are
+workflow artifacts and are not committed to Git.
 
 Generate a replay-safe summary from any result path:
 
@@ -334,12 +390,13 @@ python eval/report.py \
 
 Each instance is cloned and checked out at its exact 40-character
 `base_commit` before local code search, patching, and testing. The issue seed
-contains no gold patch, test patch, or evaluator-only fields. A RepoPilot
-`agent_success` (and the compatibility `success` field) is true only when
+contains no gold patch, test patch, or evaluator-only fields.
+The primary benchmark score is the official `resolved` status from the
+SWE-bench harness. The auditable secondary engineering score is RepoPilot's
+`agent_success` (and compatibility `success` field), which is true only when
 `coverage_status` is `existing_verified` or `generated_verified` and a
 nonempty differential `coverage_proof` is present. It is not benchmark
-resolution. Official `resolved` status comes only from the SWE-bench harness
-and is reported separately:
+resolution:
 
 ```bash
 python -m swebench.harness.run_evaluation \
@@ -352,7 +409,9 @@ python -m swebench.harness.run_evaluation \
 Official scoring requires Docker and may download large repository images.
 If Docker or an image build is unavailable, keep the prediction JSONL and
 report scoring as infrastructure-blocked instead of counting it as a model
-failure.
+failure. Likewise, `agent_success` is RepoPilot's strict internal coverage
+verdict, `resolved` is only the official harness verdict, and
+`scorer_infra`/OCI failures are not unresolved model outcomes.
 
 GitHub API responses remain fresh for 600 seconds by default. On retryable
 network, timeout, 429, 502, 503, or 504 errors, RepoPilot may serve an older
