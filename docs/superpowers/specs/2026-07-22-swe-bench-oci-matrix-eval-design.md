@@ -205,6 +205,12 @@ The mode maps to a tracked ID file. Arbitrary instance IDs are not accepted from
 workflow input. The job matrix is created from the selected file and preserves
 its exact order in the aggregate report.
 
+GitHub exposes manual dispatch only after the workflow file exists on the
+repository's default branch. Therefore implementation and review happen on the
+feature branch, then the workflow must be merged through an authorized PR before
+the live checkpoint can be dispatched. The feature branch never adds a
+secret-bearing `pull_request` or arbitrary `push` trigger as a workaround.
+
 Each instance artifact contains:
 
 ```text
