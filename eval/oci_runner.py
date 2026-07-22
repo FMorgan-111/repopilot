@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,6 +41,13 @@ _OFFICIAL_IMAGE_RE = re.compile(
     r"swebench/sweb\.eval\.x86_64\.[a-z0-9][a-z0-9_.-]*:latest"
 )
 _IMAGE_SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")
+_PULL_RETRY_DELAYS = (5.0, 20.0)
+_TRANSIENT_PULL_RE = re.compile(
+    r"(?:\b(?:429|500|502|503|504)\b|"
+    r"timed?\s*out|timeout|connection reset|temporary failure|"
+    r"tls handshake timeout|unexpected eof|network is unreachable|i/o timeout)",
+    re.IGNORECASE,
+)
 
 
 class CommandRunner(Protocol):
@@ -148,19 +156,31 @@ def _official_image(
     return image
 
 
+def _is_transient_pull_failure(result: BoundedProcessResult) -> bool:
+    diagnostic = f"{result.stdout}\n{result.stderr}"
+    return bool(_TRANSIENT_PULL_RE.search(diagnostic))
+
+
 def _pull_and_pin_image(
     image: str,
     command_runner: CommandRunner,
 ) -> str:
-    pulled = command_runner(
-        ["docker", "pull", "--platform=linux/amd64", image],
-        cwd=REPO_ROOT,
-        timeout=1_800,
-        max_output_bytes=32_000,
-        decode_errors="strict",
-    )
-    if pulled.returncode:
-        raise OciImageInfrastructureError("official image pull failed")
+    for attempt in range(len(_PULL_RETRY_DELAYS) + 1):
+        pulled = command_runner(
+            ["docker", "pull", "--platform=linux/amd64", image],
+            cwd=REPO_ROOT,
+            timeout=1_800,
+            max_output_bytes=32_000,
+            decode_errors="strict",
+        )
+        if not pulled.returncode:
+            break
+        if (
+            attempt == len(_PULL_RETRY_DELAYS)
+            or not _is_transient_pull_failure(pulled)
+        ):
+            raise OciImageInfrastructureError("official image pull failed")
+        time.sleep(_PULL_RETRY_DELAYS[attempt])
     inspected = command_runner(
         ["docker", "image", "inspect", "--format={{.Id}}", image],
         cwd=REPO_ROOT,

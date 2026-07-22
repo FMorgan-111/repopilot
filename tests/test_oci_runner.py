@@ -11,7 +11,9 @@ from eval import oci_runner
 from eval.oci_contract import RuntimeRecord, TESTBED_PYTHON, write_model
 from eval.oci_runner import (
     CredentialIsolationError,
+    OciImageInfrastructureError,
     generate_instance,
+    _pull_and_pin_image,
     prepare_instance,
     score_instance,
 )
@@ -63,6 +65,77 @@ def _test_spec_factory(row, *, namespace):
     assert row == {"instance_id": INSTANCE_ID}
     assert namespace == "swebench"
     return SimpleNamespace(instance_image_key=OFFICIAL_IMAGE)
+
+
+def test_pull_retries_transient_failures_with_bounded_schedule(
+    monkeypatch,
+) -> None:
+    pulls = 0
+    sleeps: list[float] = []
+
+    def command_runner(argv, **kwargs):
+        nonlocal pulls
+        if argv[1] == "pull":
+            pulls += 1
+            if pulls < 3:
+                return BoundedProcessResult(
+                    list(argv), 1, "", "HTTP 503 unavailable"
+                )
+            return BoundedProcessResult(list(argv), 0, "pulled", "")
+        return BoundedProcessResult(list(argv), 0, IMAGE_SHA, "")
+
+    monkeypatch.setattr(oci_runner.time, "sleep", sleeps.append)
+
+    assert _pull_and_pin_image(OFFICIAL_IMAGE, command_runner) == IMAGE_SHA
+    assert pulls == 3
+    assert sleeps == [5.0, 20.0]
+
+
+def test_pull_does_not_retry_permanent_authentication_failure(monkeypatch) -> None:
+    pulls = 0
+    sleeps: list[float] = []
+
+    def command_runner(argv, **kwargs):
+        nonlocal pulls
+        if argv[1] == "pull":
+            pulls += 1
+            return BoundedProcessResult(
+                list(argv), 1, "", "unauthorized: authentication required"
+            )
+        raise AssertionError("inspect must not run after failed pull")
+
+    monkeypatch.setattr(oci_runner.time, "sleep", sleeps.append)
+
+    with pytest.raises(OciImageInfrastructureError, match="official image pull failed"):
+        _pull_and_pin_image(OFFICIAL_IMAGE, command_runner)
+
+    assert pulls == 1
+    assert sleeps == []
+
+
+def test_pull_raises_after_bounded_transient_retries(monkeypatch) -> None:
+    pulls = 0
+    inspected = False
+    sleeps: list[float] = []
+
+    def command_runner(argv, **kwargs):
+        nonlocal pulls, inspected
+        if argv[1] == "pull":
+            pulls += 1
+            return BoundedProcessResult(
+                list(argv), 1, "", "429 Too Many Requests"
+            )
+        inspected = True
+        raise AssertionError("inspect must not run after failed pull")
+
+    monkeypatch.setattr(oci_runner.time, "sleep", sleeps.append)
+
+    with pytest.raises(OciImageInfrastructureError, match="official image pull failed"):
+        _pull_and_pin_image(OFFICIAL_IMAGE, command_runner)
+
+    assert pulls == 3
+    assert sleeps == [5.0, 20.0]
+    assert inspected is False
 
 
 def test_prepare_pulls_official_image_and_preflights_digest(tmp_path: Path) -> None:
