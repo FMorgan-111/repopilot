@@ -45,7 +45,7 @@ _PULL_RETRY_DELAYS = (5.0, 20.0)
 _TRANSIENT_PULL_RE = re.compile(
     r"(?:\b(?:429|500|502|503|504)\b|"
     r"timed?\s*out|timeout|connection reset|temporary failure|"
-    r"tls handshake timeout|unexpected eof|network is unreachable|i/o timeout)",
+    r"tls handshake timeout|unexpected eof|network (?:is )?unreachable|i/o timeout)",
     re.IGNORECASE,
 )
 

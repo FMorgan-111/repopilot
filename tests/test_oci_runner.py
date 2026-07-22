@@ -91,6 +91,28 @@ def test_pull_retries_transient_failures_with_bounded_schedule(
     assert sleeps == [5.0, 20.0]
 
 
+def test_pull_retries_network_unreachable_without_is(monkeypatch) -> None:
+    pulls = 0
+    sleeps: list[float] = []
+
+    def command_runner(argv, **kwargs):
+        nonlocal pulls
+        if argv[1] == "pull":
+            pulls += 1
+            if pulls < 3:
+                return BoundedProcessResult(
+                    list(argv), 1, "", "network unreachable"
+                )
+            return BoundedProcessResult(list(argv), 0, "pulled", "")
+        return BoundedProcessResult(list(argv), 0, IMAGE_SHA, "")
+
+    monkeypatch.setattr(oci_runner.time, "sleep", sleeps.append)
+
+    assert _pull_and_pin_image(OFFICIAL_IMAGE, command_runner) == IMAGE_SHA
+    assert pulls == 3
+    assert sleeps == [5.0, 20.0]
+
+
 def test_pull_does_not_retry_permanent_authentication_failure(monkeypatch) -> None:
     pulls = 0
     sleeps: list[float] = []
