@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import math
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,6 +46,47 @@ class VerifiedPayload:
     official: OfficialResult
 
 
+def _discover_manifest_paths(artifacts_dir: Path) -> list[Path]:
+    root = Path(artifacts_dir)
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise ArtifactContractError("artifact root unavailable") from exc
+    manifests: list[Path] = []
+    for entry in entries:
+        if entry.is_symlink() or not entry.is_dir():
+            raise ArtifactContractError("unexpected artifact root entry")
+        manifest = entry / "manifest.json"
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ArtifactContractError("artifact bundle manifest missing")
+        manifests.append(manifest)
+    return manifests
+
+
+def _model_usage(result: dict[str, Any]) -> tuple[int, float]:
+    tokens = 0
+    elapsed = 0.0
+    invocations = result.get("model_invocations", [])
+    if not isinstance(invocations, list):
+        return tokens, elapsed
+    for invocation in invocations:
+        if not isinstance(invocation, dict):
+            continue
+        for key in ("input_tokens", "output_tokens"):
+            value = invocation.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                tokens += value
+        duration = invocation.get("elapsed_seconds")
+        if (
+            isinstance(duration, (int, float))
+            and not isinstance(duration, bool)
+            and math.isfinite(float(duration))
+            and duration > 0
+        ):
+            elapsed += float(duration)
+    return tokens, elapsed
+
+
 def _assert_safe_tree(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -76,9 +118,7 @@ def parse_safe_payloads(
             (directory / "result.json").read_text(encoding="utf-8")
         )
         prediction_lines = (
-            (directory / "prediction.jsonl")
-            .read_text(encoding="utf-8")
-            .splitlines()
+            (directory / "prediction.jsonl").read_text(encoding="utf-8").splitlines()
         )
         official = OfficialResult.model_validate_json(
             (directory / "official_result.json").read_text(encoding="utf-8")
@@ -173,11 +213,37 @@ def _summary(
         item.result.get("agent_success") is True for _manifest, item in ordered
     )
     official_resolved = sum(item.official.resolved for _manifest, item in ordered)
-    infrastructure = sum(
-        manifest.runtime_status != "ready"
-        or item.official.status == "scorer_infra"
-        or item.result.get("failure_class") == "infra"
+    official_terminal = sum(
+        item.official.status != "scorer_infra" for _manifest, item in ordered
+    )
+    non_infrastructure = sum(
+        manifest.runtime_status == "ready"
+        and item.official.status != "scorer_infra"
+        and item.result.get("failure_class") != "infra"
         for manifest, item in ordered
+    )
+    infrastructure = requested - non_infrastructure
+    agreements = sum(
+        item.official.status != "scorer_infra"
+        and (item.result.get("agent_success") is True) == item.official.resolved
+        for _manifest, item in ordered
+    )
+    usage = [_model_usage(item.result) for _manifest, item in ordered]
+    model_tokens = sum(tokens for tokens, _elapsed in usage)
+    model_elapsed = sum(elapsed for _tokens, elapsed in usage)
+    within_budget = sum(tokens <= 100_000 for tokens, _elapsed in usage)
+    official_score = 100.0 * official_resolved / requested
+    resolution_component = 80.0 * official_resolved / requested
+    infrastructure_component = 10.0 * non_infrastructure / requested
+    agreement_component = (
+        5.0 * agreements / official_terminal if official_terminal else 0.0
+    )
+    budget_component = 5.0 * within_budget / requested
+    engineering_score = (
+        resolution_component
+        + infrastructure_component
+        + agreement_component
+        + budget_component
     )
     failure_counts = Counter(
         str(item.result.get("failure_class") or "unknown")
@@ -200,9 +266,15 @@ def _summary(
         f"| Completed | {completed} |",
         f"| Internal success | {internal_success} |",
         f"| Official resolved | {official_resolved} |",
+        f"| Official score | {official_score:.2f}/100 |",
+        f"| Official terminal coverage | {official_terminal}/{requested} |",
+        f"| Internal/official agreement | {agreements}/{official_terminal} |",
         f"| Infrastructure failure | {infrastructure} |",
+        f"| Model tokens | {model_tokens} |",
+        f"| Model elapsed seconds | {model_elapsed:.3f} |",
         f"| Primary model invocations | {model_counts[PRIMARY_MODEL]} |",
         f"| Escalation model invocations | {model_counts[ESCALATION_MODEL]} |",
+        f"| Engineering score | {engineering_score:.2f}/100 |",
         "",
         "## Failure taxonomy",
         "",
@@ -243,7 +315,7 @@ def aggregate_artifacts(
 ) -> Path:
     """Verify all matrix bundles and emit tracked-order combined outputs."""
     expected_ids = load_mode_instance_ids(mode, repo_root)
-    manifests = list(Path(artifacts_dir).glob("*/manifest.json"))
+    manifests = _discover_manifest_paths(artifacts_dir)
     bundles_by_id: dict[str, Path] = {}
     for manifest_path in manifests:
         try:

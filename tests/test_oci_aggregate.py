@@ -40,23 +40,38 @@ def test_aggregate_cli_accepts_baseline_50(monkeypatch, tmp_path: Path) -> None:
 
     monkeypatch.setattr(oci_aggregate, "aggregate_artifacts", fake_aggregate)
 
-    assert oci_aggregate.main([
-        "--mode", "baseline_50",
-        "--artifacts-dir", str(tmp_path / "artifacts"),
-        "--output-dir", str(tmp_path / "combined"),
-        "--expected-commit", COMMIT_SHA,
-    ]) == 0
+    assert (
+        oci_aggregate.main(
+            [
+                "--mode",
+                "baseline_50",
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+                "--output-dir",
+                str(tmp_path / "combined"),
+                "--expected-commit",
+                COMMIT_SHA,
+            ]
+        )
+        == 0
+    )
     assert seen["mode"] == "baseline_50"
 
 
 def test_aggregate_cli_rejects_retired_baseline_10(tmp_path: Path) -> None:
     with pytest.raises(SystemExit):
-        oci_aggregate.main([
-            "--mode", "baseline_10",
-            "--artifacts-dir", str(tmp_path / "artifacts"),
-            "--output-dir", str(tmp_path / "combined"),
-            "--expected-commit", COMMIT_SHA,
-        ])
+        oci_aggregate.main(
+            [
+                "--mode",
+                "baseline_10",
+                "--artifacts-dir",
+                str(tmp_path / "artifacts"),
+                "--output-dir",
+                str(tmp_path / "combined"),
+                "--expected-commit",
+                COMMIT_SHA,
+            ]
+        )
 
 
 def _completed_output(
@@ -64,6 +79,11 @@ def _completed_output(
     instance_id: str,
     *,
     resolved: bool = False,
+    official_status: str | None = None,
+    agent_success: bool | None = None,
+    input_tokens: object = 10,
+    output_tokens: object = 5,
+    elapsed_seconds: object = 1.0,
 ) -> tuple[Path, Path]:
     output_dir = root / "output"
     artifact_dir = root / "artifact"
@@ -85,16 +105,16 @@ def _completed_output(
         "model": PRIMARY_MODEL,
         "model_patch": "diff --git a/a.py b/a.py\n",
         "success": resolved,
-        "agent_success": resolved,
+        "agent_success": resolved if agent_success is None else agent_success,
         "failure_class": "success" if resolved else "tests",
         "model_invocations": [
             {
                 "model": PRIMARY_MODEL,
                 "provider": "openai-compatible",
                 "node": "plan",
-                "elapsed_seconds": 1.0,
-                "input_tokens": 10,
-                "output_tokens": 5,
+                "elapsed_seconds": elapsed_seconds,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
                 "status": "ok",
                 "error_class": "",
             }
@@ -104,12 +124,14 @@ def _completed_output(
         json.dumps([result]) + "\n", encoding="utf-8"
     )
     write_predictions([result], output_dir / "prediction.jsonl")
+    status = official_status or ("resolved" if resolved else "unresolved")
     official = OfficialResult(
         instance_id=instance_id,
-        status="resolved" if resolved else "unresolved",
-        submitted=True,
-        completed=True,
-        resolved=resolved,
+        status=status,
+        submitted=status != "scorer_infra",
+        completed=status in {"resolved", "unresolved"},
+        resolved=status == "resolved",
+        error_class="DockerUnavailable" if status == "scorer_infra" else "",
     )
     write_model(output_dir / "official_result.json", official)
     return runtime_path, artifact_dir
@@ -120,10 +142,16 @@ def _package(
     instance_id: str,
     *,
     resolved: bool = False,
+    official_status: str | None = None,
+    agent_success: bool | None = None,
 ) -> Path:
-    work = artifacts_root / f"work-{instance_id}"
+    work = artifacts_root.parent / f"work-{instance_id}"
     runtime_path, artifact_dir = _completed_output(
-        work, instance_id, resolved=resolved
+        work,
+        instance_id,
+        resolved=resolved,
+        official_status=official_status,
+        agent_success=agent_success,
     )
     package_instance(runtime_path, runtime_path.parent, artifact_dir)
     destination = artifacts_root / f"bundle-{instance_id}"
@@ -132,9 +160,7 @@ def _package(
 
 
 def test_package_copies_only_safe_hash_bound_files(tmp_path: Path) -> None:
-    runtime_path, artifact_dir = _completed_output(
-        tmp_path / "work", "owner__repo-1"
-    )
+    runtime_path, artifact_dir = _completed_output(tmp_path / "work", "owner__repo-1")
     (runtime_path.parent / "raw.log").write_text(
         "raw evaluator output", encoding="utf-8"
     )
@@ -178,9 +204,7 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
         (summary_path.parent / "results.json").read_text(encoding="utf-8")
     )
     official = json.loads(
-        (summary_path.parent / "official_results.json").read_text(
-            encoding="utf-8"
-        )
+        (summary_path.parent / "official_results.json").read_text(encoding="utf-8")
     )
     assert [item["instance_id"] for item in results] == instance_ids
     assert [item["instance_id"] for item in official] == instance_ids
@@ -189,6 +213,93 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
     assert "Internal success | 1" in summary
     assert "Official resolved | 1" in summary
     assert "Infrastructure failure | 0" in summary
+    assert "| Official score | 50.00/100 |" in summary
+    assert "| Official terminal coverage | 2/2 |" in summary
+    assert "| Internal/official agreement | 2/2 |" in summary
+    assert "| Model tokens | 30 |" in summary
+    assert "| Model elapsed seconds | 2.000 |" in summary
+    assert "| Engineering score | 60.00/100 |" in summary
+    assert summary.index("| Official score |") < summary.index("| Engineering score |")
+
+
+def test_aggregate_keeps_scorer_infrastructure_in_requested_denominator(
+    tmp_path: Path,
+) -> None:
+    instance_ids = ["owner__repo-1", "owner__repo-2"]
+    repo_root = _repo_root(tmp_path, instance_ids)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(artifacts, instance_ids[0], resolved=True)
+    _package(
+        artifacts,
+        instance_ids[1],
+        official_status="scorer_infra",
+        agent_success=False,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Official score | 50.00/100 |" in summary
+    assert "| Official terminal coverage | 1/2 |" in summary
+    assert "| Internal/official agreement | 1/1 |" in summary
+    assert "| Infrastructure failure | 1 |" in summary
+
+
+def test_model_usage_ignores_invalid_numeric_projections() -> None:
+    result = {
+        "model_invocations": [
+            {
+                "input_tokens": True,
+                "output_tokens": -3,
+                "elapsed_seconds": float("nan"),
+            },
+            {
+                "input_tokens": 4,
+                "output_tokens": 2.5,
+                "elapsed_seconds": float("inf"),
+            },
+            {
+                "input_tokens": 6,
+                "output_tokens": 7,
+                "elapsed_seconds": 1.25,
+            },
+        ]
+    }
+
+    assert oci_aggregate._model_usage(result) == (17, 1.25)
+    assert oci_aggregate._model_usage({"model_invocations": {}}) == (0, 0.0)
+
+
+def test_aggregate_rejects_root_symlink_to_external_valid_bundle(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    external = tmp_path / "external"
+    external.mkdir()
+    bundle = _package(external, instance_id)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    try:
+        (artifacts / "linked-bundle").symlink_to(bundle, target_is_directory=True)
+    except OSError:
+        pytest.skip("operating system denied symlink creation")
+
+    with pytest.raises(ArtifactContractError):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
 
 
 @pytest.mark.parametrize(
@@ -201,11 +312,12 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
         "hash",
         "unsafe_file",
         "unsafe_dir",
+        "root_file",
+        "root_dir_without_manifest",
+        "root_symlink",
     ],
 )
-def test_aggregate_rejects_invalid_artifact_sets(
-    tmp_path: Path, mutation: str
-) -> None:
+def test_aggregate_rejects_invalid_artifact_sets(tmp_path: Path, mutation: str) -> None:
     instance_id = "owner__repo-1"
     repo_root = _repo_root(tmp_path, [instance_id])
     artifacts = tmp_path / "artifacts"
@@ -227,8 +339,17 @@ def test_aggregate_rejects_invalid_artifact_sets(
         (bundle / "prediction.jsonl").write_text("{}\n", encoding="utf-8")
     elif mutation == "unsafe_file":
         (bundle / "raw.log").write_text("unsafe", encoding="utf-8")
-    else:
+    elif mutation == "unsafe_dir":
         (bundle / "raw").mkdir()
+    elif mutation == "root_file":
+        (artifacts / "unexpected.txt").write_text("unsafe", encoding="utf-8")
+    elif mutation == "root_dir_without_manifest":
+        (artifacts / "unmanifested").mkdir()
+    else:
+        try:
+            (artifacts / "linked-bundle").symlink_to(bundle, target_is_directory=True)
+        except OSError:
+            pytest.skip("operating system denied symlink creation")
 
     with pytest.raises(ArtifactContractError):
         aggregate_artifacts(
