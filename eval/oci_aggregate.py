@@ -103,10 +103,15 @@ def _assert_bound_directory(
 
 def _read_snapshot_file(bundle_fd: int, filename: str) -> bytes:
     nofollow = getattr(os, "O_NOFOLLOW", None)
-    if nofollow is None:
+    nonblock = getattr(os, "O_NONBLOCK", None)
+    if nofollow is None or nonblock is None:
         raise ArtifactContractError("no-follow artifact traversal unavailable")
     try:
-        file_fd = os.open(filename, os.O_RDONLY | nofollow, dir_fd=bundle_fd)
+        file_fd = os.open(
+            filename,
+            os.O_RDONLY | nofollow | nonblock,
+            dir_fd=bundle_fd,
+        )
     except OSError as exc:
         raise ArtifactContractError("artifact file unavailable") from exc
     try:

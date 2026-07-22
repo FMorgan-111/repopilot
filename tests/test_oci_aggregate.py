@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -410,6 +411,62 @@ def test_aggregate_rejects_bundle_replaced_during_bound_check(
             repo_root=repo_root,
         )
     assert raced is True
+
+
+def test_snapshot_file_open_uses_nonblocking_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(artifacts, instance_id)
+    real_open = os.open
+    observed_flags: list[int] = []
+
+    def checking_open(path, flags, *args, **kwargs):
+        if path == "result.json":
+            observed_flags.append(flags)
+            raise OSError("stop before opening payload")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", checking_open)
+
+    with pytest.raises(ArtifactContractError):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+    assert observed_flags
+    assert observed_flags[0] & os.O_NONBLOCK
+
+
+def test_aggregate_rejects_fifo_payload_without_blocking(tmp_path: Path) -> None:
+    mkfifo = getattr(os, "mkfifo", None)
+    if mkfifo is None:
+        pytest.skip("operating system does not provide mkfifo")
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    (bundle / "result.json").unlink()
+    mkfifo(bundle / "result.json")
+
+    started = time.monotonic()
+    with pytest.raises(ArtifactContractError, match="artifact file set mismatch"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+    assert time.monotonic() - started < 1.0
 
 
 def test_aggregate_rejects_root_symlink_to_external_valid_bundle(
