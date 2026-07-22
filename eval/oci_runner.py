@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,11 +18,13 @@ from eval.oci_contract import (
     REPO_ROOT,
     TESTBED_PYTHON,
     EvalMode,
+    InstanceManifest,
     OfficialResult,
     RuntimeRecord,
     RuntimeStatus,
     require_mode_instance,
     write_model,
+    sha256_file,
 )
 from eval.swe_bench import load_verified_instance
 from src.safe_subprocess import (
@@ -525,6 +528,45 @@ def score_instance(
     return result
 
 
+def package_instance(
+    runtime_path: Path,
+    output_dir: Path,
+    artifact_dir: Path,
+) -> InstanceManifest:
+    """Copy only validated safe payloads and bind their exact bytes."""
+    from eval.oci_aggregate import SAFE_PAYLOAD_FILES, parse_safe_payloads
+
+    runtime = _load_runtime(runtime_path)
+    output_dir = Path(output_dir)
+    artifact_dir = Path(artifact_dir)
+    if artifact_dir.exists() and any(artifact_dir.iterdir()):
+        raise ValueError("artifact directory must be empty")
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    for filename in SAFE_PAYLOAD_FILES:
+        source = output_dir / filename
+        if source.is_symlink() or not source.is_file():
+            raise ValueError(f"safe artifact source unavailable: {filename}")
+        shutil.copyfile(source, artifact_dir / filename)
+    parse_safe_payloads(
+        artifact_dir,
+        expected_instance_id=runtime.instance_id,
+        expected_commit=runtime.commit_sha,
+    )
+    manifest = InstanceManifest(
+        mode=runtime.mode,
+        instance_id=runtime.instance_id,
+        commit_sha=runtime.commit_sha,
+        runtime_status=runtime.status,
+        image_sha=runtime.image_sha,
+        files={
+            filename: sha256_file(artifact_dir / filename)
+            for filename in SAFE_PAYLOAD_FILES
+        },
+    )
+    write_model(artifact_dir / "manifest.json", manifest)
+    return manifest
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -543,6 +585,12 @@ def _parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(command, help=help_text)
         subparser.add_argument("--runtime", type=Path, required=True)
         subparser.add_argument("--output-dir", type=Path, required=True)
+    package = subparsers.add_parser(
+        "package", help="package one sanitized hash-bound artifact"
+    )
+    package.add_argument("--runtime", type=Path, required=True)
+    package.add_argument("--output-dir", type=Path, required=True)
+    package.add_argument("--artifact-dir", type=Path, required=True)
     return parser
 
 
@@ -557,6 +605,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "score":
         score_instance(args.runtime, args.output_dir)
+        return 0
+    if args.command == "package":
+        package_instance(args.runtime, args.output_dir, args.artifact_dir)
         return 0
     raise AssertionError(f"unhandled command: {args.command}")
 

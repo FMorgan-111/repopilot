@@ -318,7 +318,7 @@ git commit -m "feat(eval): run and score one OCI benchmark instance"
 - Produces: `aggregate_artifacts(mode: EvalMode, artifacts_dir: Path, output_dir: Path, *, expected_commit: str) -> Path`
 - Produces: CLI `package` and `python -m eval.oci_aggregate --mode MODE --artifacts-dir DIR --output-dir DIR --expected-commit SHA`
 
-- [ ] **Step 1: Write failing tests for safe packaging and hostile artifact rejection**
+- [x] **Step 1: Write failing tests for safe packaging and hostile artifact rejection**
 
 ```python
 def test_package_copies_only_safe_files(tmp_path, completed_instance):
@@ -340,13 +340,13 @@ def test_aggregate_rejects_invalid_bundle(tmp_path, valid_bundles, mutation):
         aggregate_artifacts("checkpoint_5", valid_bundles, tmp_path / "out", expected_commit=SHA)
 ```
 
-- [ ] **Step 2: Run tests and confirm packaging/aggregation failures**
+- [x] **Step 2: Run tests and confirm packaging/aggregation failures**
 
 Run: `pytest tests/test_oci_runner.py tests/test_oci_aggregate.py -q`
 
 Expected: FAIL because package and aggregate interfaces are absent.
 
-- [ ] **Step 3: Implement safe bundle validation and ordered outputs**
+- [x] **Step 3: Implement safe bundle validation and ordered outputs**
 
 ```python
 SAFE_ARTIFACT_FILES = (
@@ -368,13 +368,13 @@ def _verify_bundle(bundle: Path, expected_id: str, expected_commit: str) -> Veri
 
 Packaging parses every source file through its strict schema, scans allowed strings for secret/evaluator-only markers, copies only the three safe payloads, hashes copied bytes, and writes the manifest last. Aggregation walks the tracked ID order, rejects missing/duplicate/extra/cross-commit/cross-model/hash-mismatched bundles, and writes `results.json`, `predictions.jsonl`, `official_results.json`, and `summary.md` atomically. Infrastructure failures count separately from official unresolved outcomes.
 
-- [ ] **Step 4: Run focused tests and make them pass**
+- [x] **Step 4: Run focused tests and make them pass**
 
 Run: `pytest tests/test_oci_runner.py tests/test_oci_aggregate.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit artifact handling**
+- [x] **Step 5: Commit artifact handling**
 
 ```bash
 git add eval/oci_runner.py eval/oci_aggregate.py tests/test_oci_runner.py tests/test_oci_aggregate.py

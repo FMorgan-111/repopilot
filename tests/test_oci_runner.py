@@ -445,3 +445,39 @@ def test_score_cli_forwards_runtime_and_output(monkeypatch, tmp_path: Path) -> N
 
     assert exit_code == 0
     assert seen == {"runtime": runtime_path, "output_dir": tmp_path}
+
+
+def test_package_cli_forwards_only_explicit_directories(
+    monkeypatch, tmp_path: Path
+) -> None:
+    seen: dict[str, Path] = {}
+    runtime_path = tmp_path / "runtime.json"
+    artifact_dir = tmp_path / "upload"
+
+    def fake_package(runtime, output_dir, artifact):
+        seen.update(
+            runtime=runtime,
+            output_dir=output_dir,
+            artifact_dir=artifact,
+        )
+
+    monkeypatch.setattr(oci_runner, "package_instance", fake_package)
+
+    exit_code = oci_runner.main(
+        [
+            "package",
+            "--runtime",
+            str(runtime_path),
+            "--output-dir",
+            str(tmp_path),
+            "--artifact-dir",
+            str(artifact_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert seen == {
+        "runtime": runtime_path,
+        "output_dir": tmp_path,
+        "artifact_dir": artifact_dir,
+    }

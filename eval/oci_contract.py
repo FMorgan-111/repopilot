@@ -153,6 +153,8 @@ class InstanceManifest(BaseModel):
     mode: EvalMode
     instance_id: str
     commit_sha: str
+    dataset_name: Literal["SWE-bench/SWE-bench_Verified"] = DATASET_NAME
+    dataset_revision: Literal["main"] = DATASET_REVISION
     runtime_status: RuntimeStatus
     image_sha: str
     primary_model: Literal["gemini-3.5-flash:stable"] = PRIMARY_MODEL
