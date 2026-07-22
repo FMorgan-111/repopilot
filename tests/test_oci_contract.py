@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from eval.oci_contract import (
     InstanceManifest,
     OfficialResult,
+    REPO_ROOT,
     RuntimeRecord,
     load_mode_instance_ids,
     require_mode_instance,
@@ -50,13 +51,35 @@ def test_mode_ids_preserve_tracked_order(tmp_path: Path) -> None:
     assert load_mode_instance_ids("checkpoint_5", tmp_path) == ("b", "a")
 
 
+def test_baseline_50_is_fixed_unique_and_preserves_historical_sets() -> None:
+    baseline_50 = load_mode_instance_ids("baseline_50")
+    baseline_10 = tuple(
+        line.strip()
+        for line in (REPO_ROOT / "eval" / "baseline_10_ids.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    )
+    checkpoint_5 = load_mode_instance_ids("checkpoint_5")
+
+    assert len(baseline_50) == 50
+    assert len(set(baseline_50)) == 50
+    assert baseline_50[:10] == baseline_10
+    assert set(checkpoint_5) <= set(baseline_50)
+
+
+def test_retired_baseline_10_is_not_a_public_mode() -> None:
+    with pytest.raises(ValueError, match="unsupported evaluation mode"):
+        load_mode_instance_ids("baseline_10")
+
+
 def test_mode_ids_reject_duplicates(tmp_path: Path) -> None:
     eval_dir = tmp_path / "eval"
     eval_dir.mkdir()
-    (eval_dir / "baseline_10_ids.txt").write_text("a\na\n", encoding="utf-8")
+    (eval_dir / "baseline_50_ids.txt").write_text("a\na\n", encoding="utf-8")
 
     with pytest.raises(ValueError, match="duplicate"):
-        load_mode_instance_ids("baseline_10", tmp_path)
+        load_mode_instance_ids("baseline_50", tmp_path)
 
 
 def test_require_mode_instance_rejects_untracked_id(tmp_path: Path) -> None:

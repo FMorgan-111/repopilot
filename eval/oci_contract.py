@@ -19,7 +19,7 @@ PRIMARY_MODEL = "gemini-3.5-flash:stable"
 ESCALATION_MODEL = "claude-opus-4-8:stable"
 TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
 
-EvalMode = Literal["checkpoint_5", "baseline_10"]
+EvalMode = Literal["checkpoint_5", "baseline_50"]
 RuntimeStatus = Literal[
     "ready", "dataset_infra", "oci_image_infra", "oci_boundary_infra"
 ]
@@ -29,7 +29,7 @@ OfficialStatus = Literal[
 
 _MODE_FILES: dict[str, str] = {
     "checkpoint_5": "checkpoint_5_ids.txt",
-    "baseline_10": "baseline_10_ids.txt",
+    "baseline_50": "baseline_50_ids.txt",
 }
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")

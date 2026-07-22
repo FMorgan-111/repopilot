@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from eval import oci_aggregate
 from eval.oci_aggregate import ArtifactContractError, aggregate_artifacts
 from eval.oci_contract import OfficialResult, RuntimeRecord, sha256_file, write_model
 from eval.oci_runner import package_instance
@@ -24,6 +25,38 @@ def _repo_root(tmp_path: Path, instance_ids: list[str]) -> Path:
         "\n".join(instance_ids) + "\n", encoding="utf-8"
     )
     return root
+
+
+def test_aggregate_cli_accepts_baseline_50(monkeypatch, tmp_path: Path) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_aggregate(mode, artifacts_dir, output_dir, *, expected_commit):
+        seen.update(
+            mode=mode,
+            artifacts_dir=artifacts_dir,
+            output_dir=output_dir,
+            expected_commit=expected_commit,
+        )
+
+    monkeypatch.setattr(oci_aggregate, "aggregate_artifacts", fake_aggregate)
+
+    assert oci_aggregate.main([
+        "--mode", "baseline_50",
+        "--artifacts-dir", str(tmp_path / "artifacts"),
+        "--output-dir", str(tmp_path / "combined"),
+        "--expected-commit", COMMIT_SHA,
+    ]) == 0
+    assert seen["mode"] == "baseline_50"
+
+
+def test_aggregate_cli_rejects_retired_baseline_10(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        oci_aggregate.main([
+            "--mode", "baseline_10",
+            "--artifacts-dir", str(tmp_path / "artifacts"),
+            "--output-dir", str(tmp_path / "combined"),
+            "--expected-commit", COMMIT_SHA,
+        ])
 
 
 def _completed_output(

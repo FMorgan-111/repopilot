@@ -208,38 +208,30 @@ def test_prepare_records_failed_locked_boundary_without_host_fallback(
     assert record.image_sha == ""
 
 
-def test_prepare_cli_accepts_only_mode_instance_and_output(
-    monkeypatch, tmp_path: Path
+@pytest.mark.parametrize("mode", ["checkpoint_5", "baseline_50"])
+def test_prepare_cli_accepts_public_modes(
+    monkeypatch, tmp_path: Path, mode: str
 ) -> None:
     seen: dict[str, object] = {}
 
-    def fake_prepare(mode, instance_id, output_dir):
-        seen.update(
-            mode=mode,
-            instance_id=instance_id,
-            output_dir=output_dir,
-        )
+    def fake_prepare(selected_mode, instance_id, output_dir):
+        seen.update(mode=selected_mode, instance_id=instance_id, output_dir=output_dir)
 
     monkeypatch.setattr(oci_runner, "prepare_instance", fake_prepare)
 
-    exit_code = oci_runner.main(
-        [
-            "prepare",
-            "--mode",
-            "checkpoint_5",
-            "--instance-id",
-            INSTANCE_ID,
-            "--output-dir",
-            str(tmp_path),
-        ]
-    )
+    assert oci_runner.main([
+        "prepare", "--mode", mode, "--instance-id", INSTANCE_ID,
+        "--output-dir", str(tmp_path),
+    ]) == 0
+    assert seen["mode"] == mode
 
-    assert exit_code == 0
-    assert seen == {
-        "mode": "checkpoint_5",
-        "instance_id": INSTANCE_ID,
-        "output_dir": tmp_path,
-    }
+
+def test_prepare_cli_rejects_retired_baseline_10(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit):
+        oci_runner.main([
+            "prepare", "--mode", "baseline_10", "--instance-id", INSTANCE_ID,
+            "--output-dir", str(tmp_path),
+        ])
 
 
 async def test_generate_uses_exact_limits_and_temporary_oci_environment(

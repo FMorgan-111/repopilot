@@ -574,7 +574,7 @@ def _parser() -> argparse.ArgumentParser:
         "prepare", help="prepare one immutable OCI runtime"
     )
     prepare.add_argument(
-        "--mode", choices=("checkpoint_5", "baseline_10"), required=True
+        "--mode", choices=("checkpoint_5", "baseline_50"), required=True
     )
     prepare.add_argument("--instance-id", required=True)
     prepare.add_argument("--output-dir", type=Path, required=True)

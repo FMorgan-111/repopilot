@@ -297,7 +297,7 @@ def aggregate_artifacts(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--mode", choices=("checkpoint_5", "baseline_10"), required=True
+        "--mode", choices=("checkpoint_5", "baseline_50"), required=True
     )
     parser.add_argument("--artifacts-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
