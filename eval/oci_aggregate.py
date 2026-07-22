@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import math
+import os
+import stat
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +22,6 @@ from eval.oci_contract import (
     InstanceManifest,
     OfficialResult,
     load_mode_instance_ids,
-    sha256_file,
 )
 from eval.safe_contracts import sanitize_output_text
 from eval.swe_bench import atomic_write_text
@@ -46,44 +48,188 @@ class VerifiedPayload:
     official: OfficialResult
 
 
+@dataclass(frozen=True)
+class _BundleSnapshot:
+    bundle_name: str
+    manifest: bytes
+    result: bytes
+    prediction: bytes
+    official: bytes
+
+    def file_bytes(self, filename: str) -> bytes:
+        try:
+            return {
+                "manifest.json": self.manifest,
+                "result.json": self.result,
+                "prediction.jsonl": self.prediction,
+                "official_result.json": self.official,
+            }[filename]
+        except KeyError as exc:  # pragma: no cover - manifest contract is strict
+            raise ArtifactContractError("unknown artifact snapshot file") from exc
+
+
 def _discover_manifest_paths(artifacts_dir: Path) -> list[Path]:
     root = Path(artifacts_dir)
+    return [
+        root / snapshot.bundle_name / "manifest.json"
+        for snapshot in _snapshot_artifacts(root)
+    ]
+
+
+def _directory_open_flags() -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    directory = getattr(os, "O_DIRECTORY", None)
+    if nofollow is None or directory is None:
+        raise ArtifactContractError("no-follow artifact traversal unavailable")
+    return os.O_RDONLY | nofollow | directory
+
+
+def _same_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return left.st_dev == right.st_dev and left.st_ino == right.st_ino
+
+
+def _assert_bound_directory(
+    parent_fd: int,
+    entry_name: str,
+    opened: os.stat_result,
+) -> None:
     try:
-        entries = list(root.iterdir())
+        current = os.stat(entry_name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
-        raise ArtifactContractError("artifact root unavailable") from exc
-    manifests: list[Path] = []
-    for entry in entries:
-        if entry.is_symlink() or not entry.is_dir():
+        raise ArtifactContractError("artifact bundle changed during snapshot") from exc
+    if not stat.S_ISDIR(current.st_mode) or not _same_identity(opened, current):
+        raise ArtifactContractError("artifact bundle changed during snapshot")
+
+
+def _read_snapshot_file(bundle_fd: int, filename: str) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise ArtifactContractError("no-follow artifact traversal unavailable")
+    try:
+        file_fd = os.open(filename, os.O_RDONLY | nofollow, dir_fd=bundle_fd)
+    except OSError as exc:
+        raise ArtifactContractError("artifact file unavailable") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise ArtifactContractError("artifact file set mismatch")
+        chunks: list[bytes] = []
+        while chunk := os.read(file_fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ArtifactContractError("artifact file unavailable") from exc
+    finally:
+        os.close(file_fd)
+
+
+def _snapshot_bundle(root_fd: int, bundle_name: str) -> _BundleSnapshot:
+    try:
+        bundle_fd = os.open(
+            bundle_name,
+            _directory_open_flags(),
+            dir_fd=root_fd,
+        )
+    except OSError as exc:
+        raise ArtifactContractError("unexpected artifact root entry") from exc
+    try:
+        opened = os.fstat(bundle_fd)
+        if not stat.S_ISDIR(opened.st_mode):
             raise ArtifactContractError("unexpected artifact root entry")
-        manifest = entry / "manifest.json"
-        if manifest.is_symlink() or not manifest.is_file():
-            raise ArtifactContractError("artifact bundle manifest missing")
-        manifests.append(manifest)
-    return manifests
+        _assert_bound_directory(root_fd, bundle_name, opened)
+        try:
+            names = frozenset(os.listdir(bundle_fd))
+        except OSError as exc:
+            raise ArtifactContractError("artifact bundle unavailable") from exc
+        if names != SAFE_ARTIFACT_FILES:
+            raise ArtifactContractError("artifact file set mismatch")
+        files = {
+            filename: _read_snapshot_file(bundle_fd, filename)
+            for filename in SAFE_ARTIFACT_FILES
+        }
+        try:
+            final_names = frozenset(os.listdir(bundle_fd))
+        except OSError as exc:
+            raise ArtifactContractError("artifact bundle unavailable") from exc
+        if final_names != SAFE_ARTIFACT_FILES:
+            raise ArtifactContractError("artifact file set mismatch")
+        _assert_bound_directory(root_fd, bundle_name, opened)
+        return _BundleSnapshot(
+            bundle_name=bundle_name,
+            manifest=files["manifest.json"],
+            result=files["result.json"],
+            prediction=files["prediction.jsonl"],
+            official=files["official_result.json"],
+        )
+    finally:
+        os.close(bundle_fd)
 
 
-def _model_usage(result: dict[str, Any]) -> tuple[int, float]:
-    tokens = 0
-    elapsed = 0.0
+def _snapshot_artifacts(artifacts_dir: Path) -> list[_BundleSnapshot]:
+    root = Path(artifacts_dir)
+    try:
+        root_fd = os.open(root, _directory_open_flags())
+    except (ArtifactContractError, OSError) as exc:
+        if isinstance(exc, ArtifactContractError):
+            raise
+        raise ArtifactContractError("artifact root unavailable") from exc
+    try:
+        opened = os.fstat(root_fd)
+        if not stat.S_ISDIR(opened.st_mode):
+            raise ArtifactContractError("artifact root unavailable")
+        try:
+            bundle_names = os.listdir(root_fd)
+        except OSError as exc:
+            raise ArtifactContractError("artifact root unavailable") from exc
+        snapshots = [
+            _snapshot_bundle(root_fd, bundle_name) for bundle_name in bundle_names
+        ]
+        try:
+            final_names = os.listdir(root_fd)
+            current = os.stat(root, follow_symlinks=False)
+        except OSError as exc:
+            raise ArtifactContractError(
+                "artifact root changed during snapshot"
+            ) from exc
+        if (
+            frozenset(final_names) != frozenset(bundle_names)
+            or not stat.S_ISDIR(current.st_mode)
+            or not _same_identity(opened, current)
+        ):
+            raise ArtifactContractError("artifact root changed during snapshot")
+        return snapshots
+    finally:
+        os.close(root_fd)
+
+
+def _model_invocations(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     invocations = result.get("model_invocations", [])
     if not isinstance(invocations, list):
-        return tokens, elapsed
+        return ()
+    return tuple(
+        invocation for invocation in invocations if isinstance(invocation, dict)
+    )
+
+
+def _model_usage(
+    source: dict[str, Any] | tuple[dict[str, Any], ...],
+) -> tuple[int, float]:
+    tokens = 0
+    elapsed = 0.0
+    invocations = _model_invocations(source) if isinstance(source, dict) else source
     for invocation in invocations:
-        if not isinstance(invocation, dict):
-            continue
         for key in ("input_tokens", "output_tokens"):
             value = invocation.get(key)
             if isinstance(value, int) and not isinstance(value, bool) and value > 0:
                 tokens += value
         duration = invocation.get("elapsed_seconds")
-        if (
-            isinstance(duration, (int, float))
-            and not isinstance(duration, bool)
-            and math.isfinite(float(duration))
-            and duration > 0
-        ):
-            elapsed += float(duration)
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            continue
+        try:
+            projected_duration = float(duration)
+        except (OverflowError, ValueError):
+            continue
+        if math.isfinite(projected_duration) and projected_duration > 0:
+            elapsed += projected_duration
     return tokens, elapsed
 
 
@@ -105,25 +251,19 @@ def _assert_safe_tree(value: Any) -> None:
             raise ArtifactContractError("unsafe string in artifact")
 
 
-def parse_safe_payloads(
-    directory: Path,
+def _parse_safe_payload_bytes(
+    result_bytes: bytes,
+    prediction_bytes: bytes,
+    official_bytes: bytes,
     *,
     expected_instance_id: str,
     expected_commit: str,
 ) -> VerifiedPayload:
-    """Parse the three uploadable payloads and enforce cross-file identity."""
-    directory = Path(directory)
     try:
-        result_payload = json.loads(
-            (directory / "result.json").read_text(encoding="utf-8")
-        )
-        prediction_lines = (
-            (directory / "prediction.jsonl").read_text(encoding="utf-8").splitlines()
-        )
-        official = OfficialResult.model_validate_json(
-            (directory / "official_result.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError, TypeError) as exc:
+        result_payload = json.loads(result_bytes)
+        prediction_lines = prediction_bytes.decode("utf-8").splitlines()
+        official = OfficialResult.model_validate_json(official_bytes)
+    except (UnicodeError, ValueError, TypeError) as exc:
         raise ArtifactContractError("invalid safe artifact payload") from exc
     if (
         not isinstance(result_payload, list)
@@ -163,24 +303,39 @@ def parse_safe_payloads(
     return VerifiedPayload(result=result, prediction=prediction, official=official)
 
 
+def parse_safe_payloads(
+    directory: Path,
+    *,
+    expected_instance_id: str,
+    expected_commit: str,
+) -> VerifiedPayload:
+    """Parse the three uploadable payloads and enforce cross-file identity."""
+    directory = Path(directory)
+    try:
+        result_bytes = (directory / "result.json").read_bytes()
+        prediction_bytes = (directory / "prediction.jsonl").read_bytes()
+        official_bytes = (directory / "official_result.json").read_bytes()
+    except OSError as exc:
+        raise ArtifactContractError("invalid safe artifact payload") from exc
+    return _parse_safe_payload_bytes(
+        result_bytes,
+        prediction_bytes,
+        official_bytes,
+        expected_instance_id=expected_instance_id,
+        expected_commit=expected_commit,
+    )
+
+
 def _verify_bundle(
-    bundle: Path,
+    snapshot: _BundleSnapshot,
     *,
     expected_instance_id: str,
     expected_commit: str,
     mode: EvalMode,
 ) -> tuple[InstanceManifest, VerifiedPayload]:
-    entries = list(bundle.iterdir())
-    names = frozenset(path.name for path in entries)
-    if names != SAFE_ARTIFACT_FILES or any(
-        path.is_symlink() or not path.is_file() for path in entries
-    ):
-        raise ArtifactContractError("artifact file set mismatch")
     try:
-        manifest = InstanceManifest.model_validate_json(
-            (bundle / "manifest.json").read_text(encoding="utf-8")
-        )
-    except (OSError, ValueError) as exc:
+        manifest = InstanceManifest.model_validate_json(snapshot.manifest)
+    except ValueError as exc:
         raise ArtifactContractError("invalid artifact manifest") from exc
     if (
         manifest.mode != mode
@@ -191,11 +346,13 @@ def _verify_bundle(
     ):
         raise ArtifactContractError("artifact manifest identity mismatch")
     for filename, expected_hash in manifest.files.items():
-        actual_hash = sha256_file(bundle / filename)
+        actual_hash = hashlib.sha256(snapshot.file_bytes(filename)).hexdigest()
         if not hmac.compare_digest(actual_hash, expected_hash):
             raise ArtifactContractError(f"artifact hash mismatch: {filename}")
-    payload = parse_safe_payloads(
-        bundle,
+    payload = _parse_safe_payload_bytes(
+        snapshot.result,
+        snapshot.prediction,
+        snapshot.official,
         expected_instance_id=expected_instance_id,
         expected_commit=expected_commit,
     )
@@ -228,7 +385,8 @@ def _summary(
         and (item.result.get("agent_success") is True) == item.official.resolved
         for _manifest, item in ordered
     )
-    usage = [_model_usage(item.result) for _manifest, item in ordered]
+    invocation_groups = [_model_invocations(item.result) for _manifest, item in ordered]
+    usage = [_model_usage(invocations) for invocations in invocation_groups]
     model_tokens = sum(tokens for tokens, _elapsed in usage)
     model_elapsed = sum(elapsed for _tokens, elapsed in usage)
     within_budget = sum(tokens <= 100_000 for tokens, _elapsed in usage)
@@ -251,9 +409,9 @@ def _summary(
     )
     model_counts = Counter(
         str(invocation.get("model"))
-        for _manifest, item in ordered
-        for invocation in item.result.get("model_invocations", [])
-        if isinstance(invocation, dict) and invocation.get("model")
+        for invocations in invocation_groups
+        for invocation in invocations
+        if invocation.get("model")
     )
     lines = [
         f"# SWE-bench OCI evaluation: {mode}",
@@ -315,18 +473,16 @@ def aggregate_artifacts(
 ) -> Path:
     """Verify all matrix bundles and emit tracked-order combined outputs."""
     expected_ids = load_mode_instance_ids(mode, repo_root)
-    manifests = _discover_manifest_paths(artifacts_dir)
-    bundles_by_id: dict[str, Path] = {}
-    for manifest_path in manifests:
+    snapshots = _snapshot_artifacts(artifacts_dir)
+    bundles_by_id: dict[str, _BundleSnapshot] = {}
+    for snapshot in snapshots:
         try:
-            manifest = InstanceManifest.model_validate_json(
-                manifest_path.read_text(encoding="utf-8")
-            )
-        except (OSError, ValueError) as exc:
+            manifest = InstanceManifest.model_validate_json(snapshot.manifest)
+        except ValueError as exc:
             raise ArtifactContractError("invalid discovered manifest") from exc
         if manifest.instance_id in bundles_by_id:
             raise ArtifactContractError("duplicate instance artifact")
-        bundles_by_id[manifest.instance_id] = manifest_path.parent
+        bundles_by_id[manifest.instance_id] = snapshot
     if set(bundles_by_id) != set(expected_ids):
         raise ArtifactContractError("missing or extra instance artifact")
 

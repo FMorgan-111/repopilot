@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from eval.swe_bench import write_predictions
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
+_DEFAULT_MODEL_INVOCATIONS = object()
 
 
 def _repo_root(tmp_path: Path, instance_ids: list[str]) -> Path:
@@ -84,6 +86,7 @@ def _completed_output(
     input_tokens: object = 10,
     output_tokens: object = 5,
     elapsed_seconds: object = 1.0,
+    model_invocations: object = _DEFAULT_MODEL_INVOCATIONS,
 ) -> tuple[Path, Path]:
     output_dir = root / "output"
     artifact_dir = root / "artifact"
@@ -107,18 +110,22 @@ def _completed_output(
         "success": resolved,
         "agent_success": resolved if agent_success is None else agent_success,
         "failure_class": "success" if resolved else "tests",
-        "model_invocations": [
-            {
-                "model": PRIMARY_MODEL,
-                "provider": "openai-compatible",
-                "node": "plan",
-                "elapsed_seconds": elapsed_seconds,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "status": "ok",
-                "error_class": "",
-            }
-        ],
+        "model_invocations": (
+            [
+                {
+                    "model": PRIMARY_MODEL,
+                    "provider": "openai-compatible",
+                    "node": "plan",
+                    "elapsed_seconds": elapsed_seconds,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "status": "ok",
+                    "error_class": "",
+                }
+            ]
+            if model_invocations is _DEFAULT_MODEL_INVOCATIONS
+            else model_invocations
+        ),
     }
     (output_dir / "result.json").write_text(
         json.dumps([result]) + "\n", encoding="utf-8"
@@ -144,6 +151,10 @@ def _package(
     resolved: bool = False,
     official_status: str | None = None,
     agent_success: bool | None = None,
+    input_tokens: object = 10,
+    output_tokens: object = 5,
+    elapsed_seconds: object = 1.0,
+    model_invocations: object = _DEFAULT_MODEL_INVOCATIONS,
 ) -> Path:
     work = artifacts_root.parent / f"work-{instance_id}"
     runtime_path, artifact_dir = _completed_output(
@@ -152,6 +163,10 @@ def _package(
         resolved=resolved,
         official_status=official_status,
         agent_success=agent_success,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        elapsed_seconds=elapsed_seconds,
+        model_invocations=model_invocations,
     )
     package_instance(runtime_path, runtime_path.parent, artifact_dir)
     destination = artifacts_root / f"bundle-{instance_id}"
@@ -250,6 +265,7 @@ def test_aggregate_keeps_scorer_infrastructure_in_requested_denominator(
     assert "| Official terminal coverage | 1/2 |" in summary
     assert "| Internal/official agreement | 1/1 |" in summary
     assert "| Infrastructure failure | 1 |" in summary
+    assert "| Engineering score | 55.00/100 |" in summary
 
 
 def test_model_usage_ignores_invalid_numeric_projections() -> None:
@@ -275,6 +291,125 @@ def test_model_usage_ignores_invalid_numeric_projections() -> None:
 
     assert oci_aggregate._model_usage(result) == (17, 1.25)
     assert oci_aggregate._model_usage({"model_invocations": {}}) == (0, 0.0)
+
+
+def test_model_usage_ignores_overflowing_duration() -> None:
+    result = {
+        "model_invocations": [
+            {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "elapsed_seconds": 10**400,
+            }
+        ]
+    }
+
+    assert oci_aggregate._model_usage(result) == (0, 0.0)
+
+
+def test_aggregate_ignores_non_list_model_invocations(tmp_path: Path) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(artifacts, instance_id, model_invocations=None)
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Model tokens | 0 |" in summary
+    assert "| Model elapsed seconds | 0.000 |" in summary
+    assert "| Primary model invocations | 0 |" in summary
+
+
+@pytest.mark.parametrize(
+    ("input_tokens", "expected_score"),
+    [(100_000, "20.00"), (100_001, "15.00")],
+)
+def test_engineering_score_has_exact_token_budget_threshold(
+    tmp_path: Path,
+    input_tokens: int,
+    expected_score: str,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        input_tokens=input_tokens,
+        output_tokens=0,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert f"| Model tokens | {input_tokens} |" in summary
+    assert f"| Engineering score | {expected_score}/100 |" in summary
+
+
+def test_aggregate_rejects_bundle_replaced_during_bound_check(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    probe = tmp_path / "symlink-probe"
+    try:
+        probe.symlink_to(tmp_path, target_is_directory=True)
+    except OSError:
+        pytest.skip("operating system denied symlink creation")
+    probe.unlink()
+
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+
+    external_root = tmp_path / "external"
+    external_artifacts = external_root / "artifacts"
+    external_artifacts.mkdir(parents=True)
+    external_bundle = _package(external_artifacts, instance_id, resolved=True)
+    moved_bundle = tmp_path / "moved-bundle"
+    real_stat = os.stat
+    raced = False
+
+    def racing_stat(path, *args, **kwargs):
+        nonlocal raced
+        if not raced and (
+            (path == bundle and kwargs.get("follow_symlinks") is not False)
+            or (path == bundle.name and kwargs.get("dir_fd") is not None)
+        ):
+            raced = True
+            bundle.rename(moved_bundle)
+            bundle.symlink_to(external_bundle, target_is_directory=True)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", racing_stat)
+
+    with pytest.raises(
+        ArtifactContractError, match="artifact bundle changed during snapshot"
+    ):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+    assert raced is True
 
 
 def test_aggregate_rejects_root_symlink_to_external_valid_bundle(
