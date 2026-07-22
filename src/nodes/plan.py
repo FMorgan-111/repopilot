@@ -30,18 +30,18 @@ from ..outcome_summary import (
 )
 from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
-from ..repair_flow import (
-    RepairContextError,
-    generate_opus_repair,
-    resolve_search_target_symbol,
-    request_verified_edit_correction,
-)
 from ..reasoning_loop import (
     ReasoningStop,
     prompt_with_new_evidence,
     record_opus_no_progress,
     route_reasoning_tool,
     validate_reasoning_response,
+)
+from ..repair_flow import (
+    RepairContextError,
+    generate_opus_repair,
+    request_verified_edit_correction,
+    resolve_search_target_symbol,
 )
 from ..schemas import PlanDecision
 from ..state import (

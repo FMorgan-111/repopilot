@@ -19,7 +19,13 @@ from pydantic import (
 from .evidence import EvidenceStore
 from .http_client import LLMResponseError
 from .model_provider import redact_secrets
-from .state import AgentState, Evidence, FixAttempt, ModelInvocation, _issue_search_terms
+from .state import (
+    AgentState,
+    Evidence,
+    FixAttempt,
+    ModelInvocation,
+    _issue_search_terms,
+)
 
 ISSUE_TITLE_LIMIT = 500
 ISSUE_BODY_LIMIT = 4_000

@@ -18,10 +18,10 @@ from src.http_client import (
     _get_llm_client,
     _get_llm_model,
     _is_retryable_github,
-    is_retryable_github_error,
     _is_retryable_llm,
     _reset_llm_client,
     github_request,
+    is_retryable_github_error,
     llm_request,
     llm_retry_budget_seconds,
 )

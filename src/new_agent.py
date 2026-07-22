@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
+from .evaluator_safety import safe_prediction_patch
 from .graph import (
     END,
     FallbackCompiledGraph,
@@ -19,8 +21,6 @@ from .graph import (
     route_from_state,
     run_graph,
 )
-from .evaluator_safety import safe_prediction_patch
-from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
 from .model_provider import get_model_config
 from .nodes.commit import commit_fix, create_pr, push_files
 from .nodes.coverage import ensure_coverage
@@ -48,8 +48,8 @@ from .state import (
     NoProgressEvent,
     PatchEdit,
     Phase,
-    ToolCall,
     TestRunFingerprint,
+    ToolCall,
     _as_state,
     _estimate_tokens,
     _extract_json_object,

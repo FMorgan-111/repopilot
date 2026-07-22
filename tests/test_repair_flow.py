@@ -15,6 +15,7 @@ from src.escalation import (
     render_escalation_packet,
 )
 from src.evidence import EvidenceStore
+from src.nodes.execute import _apply_patch_edits
 from src.reasoning_loop import ReasoningStop
 from src.repair_flow import (
     TARGET_CONTEXT_CONTENT_LIMIT,
@@ -23,7 +24,6 @@ from src.repair_flow import (
     generate_opus_repair,
     verified_edits_to_patch_edits,
 )
-from src.nodes.execute import _apply_patch_edits
 from src.state import AgentState, Evidence, FileInfo, Phase, RepairPlan
 
 

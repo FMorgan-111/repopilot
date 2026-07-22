@@ -12,9 +12,9 @@ from ..coverage_gate import (
     collect_changed_targets,
     coverage_proof_matches_state,
     discover_coverage_candidates,
+    validate_differential_coverage,
     validate_live_coverage_binding,
     validate_terminal_coverage_binding,
-    validate_differential_coverage,
 )
 from ..state import AgentState, CoverageProof, Phase, _as_state
 from ..test_generator import run_test_generation_attempts

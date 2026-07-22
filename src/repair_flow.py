@@ -27,16 +27,16 @@ from .escalation import (
 from .evidence import EvidenceStore
 from .llm import llm_call
 from .local_search import is_sensitive_repo_path
-from .model_provider import redact_secrets
 from .model_policy import apply_escalation, should_escalate
+from .model_provider import redact_secrets
 from .outcome_summary import MAX_OUTCOME_SUMMARY_CHARS, OUTCOME_SUMMARY_SECTION
 from .patch_match import locate_node_span
-from .repo_paths import canonical_repo_path
 from .reasoning_loop import (
     ReasoningStop,
     route_reasoning_tool,
     validate_reasoning_response,
 )
+from .repo_paths import canonical_repo_path
 from .state import (
     AgentState,
     Evidence,

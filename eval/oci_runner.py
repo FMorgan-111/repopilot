@@ -24,8 +24,8 @@ from eval.oci_contract import (
     RuntimeRecord,
     RuntimeStatus,
     require_mode_instance,
-    write_model,
     sha256_file,
+    write_model,
 )
 from eval.swe_bench import load_verified_instance
 from src.safe_subprocess import (

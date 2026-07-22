@@ -17,11 +17,12 @@ from src.state import (
     Phase,
     RepairPlan,
     ToolSandboxConfig,
-    TestRunFingerprint as RunFingerprint,
     VerifiedEdit,
     VerifiedEditBatch,
 )
-
+from src.state import (
+    TestRunFingerprint as RunFingerprint,
+)
 
 _IMAGE = "registry.example/repopilot-tests@sha256:" + "2" * 64
 

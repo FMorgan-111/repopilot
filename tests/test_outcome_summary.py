@@ -2,9 +2,9 @@ import json
 
 import pytest
 
-from src.nodes.plan import build_plan_user_prompt
-from src.nodes import reflect as reflect_node
 from src.escalation import build_escalation_packet, render_escalation_packet
+from src.nodes import reflect as reflect_node
+from src.nodes.plan import build_plan_user_prompt
 from src.outcome_summary import (
     MAX_OUTCOME_SUMMARY_CHARS,
     OutcomeSummaryInput,

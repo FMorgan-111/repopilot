@@ -1,7 +1,7 @@
-import src.new_agent as new_agent
 import subprocess
 from types import SimpleNamespace
 
+import src.new_agent as new_agent
 from src import repair_flow
 from src.nodes import plan as plan_node
 from src.state import FileInfo, RepairPlan, VerifiedEdit, VerifiedEditBatch

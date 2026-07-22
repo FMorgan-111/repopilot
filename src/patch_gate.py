@@ -16,12 +16,12 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from .local_search import is_sensitive_repo_path
 from .evaluator_safety import contains_evaluator_only
+from .local_search import is_sensitive_repo_path
 from .model_provider import redact_secrets
 from .patch_match import closest_region, leading_spaces, locate_node_span, reindent
-from .repo_paths import canonical_repo_path
 from .repair_flow import RepairContextError, _read_regular_no_follow
+from .repo_paths import canonical_repo_path
 from .state import (
     AgentState,
     PatchEdit,

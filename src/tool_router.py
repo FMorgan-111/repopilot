@@ -39,8 +39,8 @@ from .state import (
     ToolInvocation,
     tool_manifest_fingerprint,
 )
-from .tool_policy import ToolIntent, ToolPolicy
 from .test_path_policy import is_allowed_test_path
+from .tool_policy import ToolIntent, ToolPolicy
 
 
 class ToolRouteResult(BaseModel):

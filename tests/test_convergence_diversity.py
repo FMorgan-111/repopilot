@@ -7,12 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from src import new_agent
-from src import model_policy
+from src import model_policy, new_agent
 from src.evidence import EvidenceStore
+from src.nodes import execute as execute_node
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
-from src.nodes import execute as execute_node
 from src.state import PatchEdit
 
 

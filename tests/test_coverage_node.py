@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import subprocess
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -14,11 +14,13 @@ from src.state import (
     CoverageProof,
     Phase,
     SnapshotManifestEntry,
-    TestRunFingerprint as RunFingerprint,
     ToolPatchApproval,
     ToolSandboxConfig,
     VerifiedEditBatch,
     tool_manifest_fingerprint,
+)
+from src.state import (
+    TestRunFingerprint as RunFingerprint,
 )
 
 

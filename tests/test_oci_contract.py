@@ -8,16 +8,15 @@ import pytest
 from pydantic import ValidationError
 
 from eval.oci_contract import (
+    REPO_ROOT,
     InstanceManifest,
     OfficialResult,
-    REPO_ROOT,
     RuntimeRecord,
     load_mode_instance_ids,
     require_mode_instance,
     sha256_file,
     write_model,
 )
-
 
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64

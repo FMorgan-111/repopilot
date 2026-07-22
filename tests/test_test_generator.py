@@ -8,11 +8,14 @@ import pytest
 
 from src.coverage_gate import ChangedTarget, CoverageDecision
 from src.patch_gate import validate_patch_batch
-from src.state import AgentState, RepairPlan, VerifiedEdit, VerifiedEditBatch
 from src.state import (
+    AgentState,
     PatchEdit,
+    RepairPlan,
     SnapshotManifestEntry,
     ToolPatchApproval,
+    VerifiedEdit,
+    VerifiedEditBatch,
     tool_manifest_fingerprint,
 )
 from src.test_generator import (

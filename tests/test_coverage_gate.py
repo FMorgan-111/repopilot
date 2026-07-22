@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import subprocess
 import hashlib
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -17,13 +17,12 @@ from src.coverage_gate import (
 from src.safe_subprocess import BoundedProcessResult
 from src.state import (
     AgentState,
+    GeneratedTestApproval,
     SnapshotManifestEntry,
     ToolPatchApproval,
     ToolSandboxConfig,
-    GeneratedTestApproval,
     tool_manifest_fingerprint,
 )
-
 
 _IMAGE = "registry.example/repopilot-tests@sha256:" + "2" * 64
 

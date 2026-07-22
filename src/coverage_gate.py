@@ -27,6 +27,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .evaluator_safety import sanitize_evaluator_text
 from .model_provider import redact_secrets
 from .repo_paths import canonical_repo_path
+from .safe_subprocess import run_oci_process
 from .state import (
     AgentState,
     CoverageProof,
@@ -35,10 +36,9 @@ from .state import (
     TestRunFingerprint,
     tool_manifest_fingerprint,
 )
-from .safe_subprocess import run_oci_process
+from .test_path_policy import is_allowed_test_path, path_has_symlink
 from .tool_policy import fixed_test_argv
 from .tool_router import disposable_test_snapshot
-from .test_path_policy import is_allowed_test_path, path_has_symlink
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
 _SAFE_OPTION_RE = re.compile(

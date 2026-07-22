@@ -14,8 +14,10 @@ from src.state import (
     GeneratedTestApproval,
     SnapshotManifestEntry,
     ToolPatchApproval,
-    TestRunFingerprint as RunFingerprint,
     tool_manifest_fingerprint,
+)
+from src.state import (
+    TestRunFingerprint as RunFingerprint,
 )
 
 

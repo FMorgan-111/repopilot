@@ -8,12 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 from eval import oci_runner
-from eval.oci_contract import RuntimeRecord, TESTBED_PYTHON, write_model
+from eval.oci_contract import TESTBED_PYTHON, RuntimeRecord, write_model
 from eval.oci_runner import (
     CredentialIsolationError,
     OciImageInfrastructureError,
-    generate_instance,
     _pull_and_pin_image,
+    generate_instance,
     prepare_instance,
     score_instance,
 )

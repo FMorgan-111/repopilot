@@ -10,7 +10,6 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from .evaluator_safety import sanitize_evaluator_text
 from .coverage_gate import (
     ChangedTarget,
     CoverageCandidate,
@@ -18,12 +17,12 @@ from .coverage_gate import (
     collect_changed_targets,
     validate_differential_coverage,
 )
+from .evaluator_safety import sanitize_evaluator_text
 from .llm import llm_call
 from .model_policy import EscalationDecision, apply_escalation
 from .model_provider import escalation_is_configured, redact_secrets
 from .patch_gate import apply_approved_patch, validate_patch_batch
 from .repo_paths import canonical_repo_path
-from .test_path_policy import is_allowed_test_path
 from .state import (
     AgentState,
     CoverageProof,
@@ -34,6 +33,7 @@ from .state import (
     VerifiedEditBatch,
     tool_manifest_fingerprint,
 )
+from .test_path_policy import is_allowed_test_path
 
 _SYSTEM_PROMPT = (
     "Return only one JSON object matching VerifiedEditBatch with key 'edits'. "

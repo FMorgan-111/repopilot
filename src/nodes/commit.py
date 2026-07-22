@@ -7,8 +7,8 @@ from typing import Any
 
 import httpx
 
-from ..memory import _fire_and_forget, get_store
 from ..coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
+from ..memory import _fire_and_forget, get_store
 from ..state import AgentState, Phase, _as_state, _record_tool
 from ..tools import GITHUB_API, _headers
 
