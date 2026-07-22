@@ -40,6 +40,25 @@ _TOKENIZED_GITHUB_URL_RE = re.compile(
     r"https://x-access-token:[^@\s'\"\]]+@github[.]com/"
 )
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_EXACT_REF_FETCH_RETRY_DELAYS = (0.5, 1.0)
+_TRANSIENT_GIT_TRANSPORT_MARKERS = (
+    "ssl_error_syscall",
+    "connection reset",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "early eof",
+    "remote end hung up unexpectedly",
+    "http 502",
+    "http 503",
+    "http 504",
+    "requested url returned error: 502",
+    "requested url returned error: 503",
+    "requested url returned error: 504",
+    "operation timed out",
+    "connection timed out",
+    "timed out",
+)
 
 
 @dataclass(frozen=True)
@@ -227,6 +246,41 @@ async def _checked_git(args: list[str], timeout: float) -> _ProcResult:
     return result
 
 
+def _is_transient_git_transport_error(error: BaseException) -> bool:
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_GIT_TRANSPORT_MARKERS)
+
+
+async def _fetch_exact_ref(
+    cache_path: Path,
+    repo_ref: str,
+    retry_delays: tuple[float, ...],
+) -> None:
+    command = [
+        "git",
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        repo_ref,
+    ]
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            await _checked_git(command, 300)
+            return
+        except Exception as exc:
+            if (
+                not _is_transient_git_transport_error(exc)
+                or attempt == len(retry_delays)
+            ):
+                raise
+            await asyncio.sleep(max(0.0, retry_delays[attempt]))
+
+
 async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
     tokenized_url = _repo_url(state, include_token=True)
     safe_url = _repo_url(state, include_token=False)
@@ -286,7 +340,11 @@ async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
 
 
 async def _populate_ref_cache(
-    state: AgentState, cache_path: Path, repo_ref: str
+    state: AgentState,
+    cache_path: Path,
+    repo_ref: str,
+    *,
+    retry_delays: tuple[float, ...] = _EXACT_REF_FETCH_RETRY_DELAYS,
 ) -> None:
     await _checked_git(["git", "init", str(cache_path)], 60)
     await _checked_git(
@@ -302,19 +360,7 @@ async def _populate_ref_cache(
         60,
     )
     try:
-        await _checked_git(
-            [
-                "git",
-                "-C",
-                str(cache_path),
-                "fetch",
-                "--depth",
-                "1",
-                "origin",
-                repo_ref,
-            ],
-            300,
-        )
+        await _fetch_exact_ref(cache_path, repo_ref, retry_delays)
         await _checked_git(
             [
                 "git",

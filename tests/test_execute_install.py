@@ -2,8 +2,81 @@
 pytest runs."""
 
 import subprocess
+from types import SimpleNamespace
+
+import pytest
 
 from src.nodes import execute as execute_node
+
+
+@pytest.mark.parametrize("failures_before_success", [1, 2])
+@pytest.mark.parametrize(
+    "transient_error",
+    [
+        "LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection",
+        "HTTP 503 Service Unavailable",
+    ],
+)
+async def test_populate_ref_cache_retries_transient_exact_ref_fetch(
+    monkeypatch, tmp_path, failures_before_success, transient_error
+):
+    cache_path = tmp_path / "cache"
+    repo_ref = "a" * 40
+    fetch_attempts = 0
+
+    async def fake_checked_git(args, timeout):
+        nonlocal fetch_attempts
+        if "fetch" in args:
+            fetch_attempts += 1
+            if fetch_attempts <= failures_before_success:
+                raise RuntimeError(transient_error)
+        return execute_node._ProcResult(0, "", "")
+
+    async def fake_run_git(args, timeout, cwd=None):
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_checked_git", fake_checked_git)
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+
+    await execute_node._populate_ref_cache(
+        SimpleNamespace(owner="acme", repo="widget"),
+        cache_path,
+        repo_ref,
+        retry_delays=(0, 0),
+    )
+
+    assert fetch_attempts == failures_before_success + 1
+
+
+async def test_populate_ref_cache_does_not_retry_deterministic_fetch_error(
+    monkeypatch, tmp_path
+):
+    cache_path = tmp_path / "cache"
+    repo_ref = "a" * 40
+    fetch_attempts = 0
+
+    async def fake_checked_git(args, timeout):
+        nonlocal fetch_attempts
+        if "fetch" in args:
+            fetch_attempts += 1
+            raise RuntimeError(f"fatal: couldn't find remote ref {repo_ref}")
+        return execute_node._ProcResult(0, "", "")
+
+    async def fake_run_git(args, timeout, cwd=None):
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_checked_git", fake_checked_git)
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+
+    with pytest.raises(RuntimeError, match="couldn't find remote ref"):
+        await execute_node._populate_ref_cache(
+            SimpleNamespace(owner="acme", repo="widget"),
+            cache_path,
+            repo_ref,
+            retry_delays=(0, 0),
+        )
+
+    assert fetch_attempts == 1
 
 
 def test_pip_install_skipped_without_packaging_metadata(tmp_path):

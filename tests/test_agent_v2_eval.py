@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 import json
 from types import SimpleNamespace
@@ -803,6 +804,129 @@ async def test_run_swe_bench_eval_selects_dataset_and_writes_predictions(
     }
 
 
+async def test_run_swe_bench_eval_checkpoints_and_continues_after_sample_error(
+    monkeypatch, tmp_path, capsys
+):
+    samples = [
+        swe_bench_sample_with_id("acme__widget-1"),
+        swe_bench_sample_with_id("acme__widget-2"),
+        swe_bench_sample_with_id("acme__widget-3"),
+    ]
+    secret = "sample-secret-sentinel"
+    evaluator = "FAIL_TO_PASS evaluator-sentinel"
+    archive = "archive-payload-sentinel"
+    raw_log = "raw-log-sentinel"
+    result_snapshots = []
+    prediction_snapshots = []
+    original_result_writer = agent_v2_harness._write_results_with_fallback
+    original_prediction_writer = agent_v2_harness.write_predictions
+
+    async def fake_evaluate(selected, idx, **kwargs):
+        if idx == 1:
+            raise RuntimeError(
+                "LibreSSL SSL_connect: SSL_ERROR_SYSCALL "
+                f"{secret} {evaluator} {archive} {raw_log}"
+            )
+        return {
+            "id": selected["id"],
+            "mode": "agent_v2",
+            "instance_id": selected["instance_id"],
+            "base_commit": selected["base_commit"],
+            "model": "test-model",
+            "model_patch": f"diff --git sample-{idx}",
+            "success": False,
+            "agent_success": False,
+            "official_resolved": None,
+        }
+
+    def recording_result_writer(results, path):
+        result_snapshots.append([item["instance_id"] for item in results])
+        return original_result_writer(results, path)
+
+    def recording_prediction_writer(results, path):
+        prediction_snapshots.append([item["instance_id"] for item in results])
+        return original_prediction_writer(results, path)
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_samples",
+        lambda count, seed: samples,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_write_results_with_fallback",
+        recording_result_writer,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "write_predictions", recording_prediction_writer
+    )
+    monkeypatch.setattr(agent_v2_harness, "_configured_model", lambda: "test-model")
+
+    results_path = tmp_path / "results.json"
+    predictions_path = tmp_path / "predictions.jsonl"
+    results = await agent_v2_harness.run_agent_v2_eval(
+        n_samples=3,
+        dataset="swe-bench-verified",
+        results_path=results_path,
+        predictions_path=predictions_path,
+    )
+
+    assert [item["instance_id"] for item in results] == [
+        "acme__widget-1",
+        "acme__widget-2",
+        "acme__widget-3",
+    ]
+    failed = results[1]
+    assert failed["id"] == "acme__widget-2"
+    assert failed["base_commit"] == "a" * 40
+    assert failed["model"] == "test-model"
+    assert failed["model_patch"] == ""
+    assert failed["success"] is False
+    assert failed["agent_success"] is False
+    assert failed["official_resolved"] is None
+    assert failed["failure_class"] == "infra"
+    assert "evaluation" not in failed
+    assert result_snapshots == [
+        ["acme__widget-1"],
+        ["acme__widget-1", "acme__widget-2"],
+        ["acme__widget-1", "acme__widget-2", "acme__widget-3"],
+    ]
+    assert prediction_snapshots == result_snapshots
+
+    stored_results = json.loads(results_path.read_text(encoding="utf-8"))
+    predictions = [
+        json.loads(line)
+        for line in predictions_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [item["instance_id"] for item in stored_results] == [
+        "acme__widget-1",
+        "acme__widget-2",
+        "acme__widget-3",
+    ]
+    assert all(
+        set(item) == {"instance_id", "model_name_or_path", "model_patch"}
+        for item in predictions
+    )
+    assert predictions[1] == {
+        "instance_id": "acme__widget-2",
+        "model_name_or_path": "test-model",
+        "model_patch": "",
+    }
+
+    serialized = json.dumps(results) + results_path.read_text(encoding="utf-8")
+    serialized += predictions_path.read_text(encoding="utf-8")
+    captured = capsys.readouterr()
+    diagnostics = captured.out + captured.err
+    for sentinel in (secret, evaluator, archive, raw_log):
+        assert sentinel not in serialized
+        assert sentinel not in diagnostics
+    assert "gold patch must remain hidden" not in serialized
+    assert "test patch must remain hidden" not in serialized
+
+
 async def test_run_swe_bench_eval_selects_requested_ids_in_caller_order(
     monkeypatch, tmp_path
 ):
@@ -1056,33 +1180,66 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
     assert not requested_path.exists()
 
 
-async def test_run_agent_v2_eval_closes_shared_resources_when_sample_raises(
-    monkeypatch, tmp_path
+async def test_run_agent_v2_eval_records_sample_failure_and_preserves_cleanup_warning(
+    monkeypatch, tmp_path, capsys
 ):
     calls = []
 
     async def fake_evaluate(sample, idx, max_retries=3, token_budget=100000,
                             seed_gold_files=False):
-        raise RuntimeError("sample failed after partial work")
+        raise RuntimeError("sample-secret-sentinel")
 
     async def fake_close_llm_client():
         calls.append("llm")
 
     async def fake_close_store():
         calls.append("memory")
+        raise RuntimeError("cleanup failed")
 
     monkeypatch.setattr(agent_v2_harness, "load_samples", lambda n, sample_id=None, **kw: [sample_record()])
     monkeypatch.setattr(agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate)
     monkeypatch.setattr(agent_v2_harness, "close_llm_client", fake_close_llm_client)
     monkeypatch.setattr(agent_v2_harness, "close_store", fake_close_store, raising=False)
 
-    with pytest.raises(RuntimeError, match="sample failed after partial work"):
+    results = await agent_v2_harness.run_agent_v2_eval(
+        n_samples=1,
+        results_path=tmp_path / "agent_v2_results.json",
+    )
+
+    assert results[0]["id"] == "acme/widget#7:8"
+    assert results[0]["success"] is False
+    assert results[0]["agent_success"] is False
+    assert results[0]["official_resolved"] is None
+    assert calls == ["llm", "memory"]
+    captured = capsys.readouterr()
+    assert "cleanup failed" in captured.err
+    assert "sample-secret-sentinel" not in captured.out + captured.err
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [asyncio.CancelledError, KeyboardInterrupt, SystemExit],
+)
+async def test_run_agent_v2_eval_does_not_catch_base_exceptions(
+    monkeypatch, tmp_path, error_type
+):
+    async def fake_evaluate(sample, idx, **kwargs):
+        raise error_type()
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_samples",
+        lambda n, sample_id=None, **kwargs: [sample_record()],
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate
+    )
+
+    with pytest.raises(error_type):
         await agent_v2_harness.run_agent_v2_eval(
             n_samples=1,
             results_path=tmp_path / "agent_v2_results.json",
         )
-
-    assert calls == ["llm", "memory"]
 
 
 async def test_run_agent_v2_eval_does_not_mask_results_when_cleanup_raises(

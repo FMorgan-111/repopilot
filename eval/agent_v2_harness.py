@@ -34,7 +34,9 @@ CoverageProof = importlib.import_module("src.state").CoverageProof
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
-git_clone = importlib.import_module("src.nodes.execute").git_clone
+_execute = importlib.import_module("src.nodes.execute")
+git_clone = _execute.git_clone
+is_transient_git_transport_error = _execute._is_transient_git_transport_error
 classify_sample = importlib.import_module("eval.failure_taxonomy").classify_sample
 _swe_bench = importlib.import_module("eval.swe_bench")
 build_agent_seed = _swe_bench.build_agent_seed
@@ -673,6 +675,75 @@ async def evaluate_agent_v2_sample(
     return result
 
 
+def _safe_failed_sample_result(
+    sample: dict[str, Any],
+    error: Exception,
+    *,
+    seed_gold_files: bool,
+) -> dict[str, Any]:
+    issue = _as_mapping(sample.get("issue"))
+    repo = _as_mapping(sample.get("repo"))
+    is_swe_bench = sample.get("source") == "swe-bench-verified"
+    failure_class = (
+        "infra" if is_transient_git_transport_error(error) else "other"
+    )
+    safe_fields = _safe_result_fields({}, None, None)
+    safe_fields.update(
+        {
+            "coverage_status": "failed",
+            "coverage_failure_reason": failure_class,
+        }
+    )
+    result = {
+        "id": _safe_text(sample.get("id"), 500),
+        "mode": "agent_v2",
+        "evaluation_mode": (
+            "oracle_files" if seed_gold_files and not is_swe_bench else "end_to_end"
+        ),
+        "model": _safe_text(_configured_model(), 300),
+        "commit_sha": _current_commit_sha(),
+        "repo": _safe_text(f"{repo.get('owner', '')}/{repo.get('name', '')}", 500),
+        "issue_url": _safe_text(issue.get("url")),
+        "issue_title": _safe_text(issue.get("title")),
+        "success": False,
+        "agent_success": False,
+        "official_resolved": None,
+        "waiting_for_user": False,
+        "final_phase": "FAILED",
+        "run_id": "",
+        "trace_id": "",
+        "turns_taken": 0,
+        "token_used": 0,
+        "error": "Sample evaluation failed.",
+        "replay": None,
+        "replay_error": None,
+        **safe_fields,
+        "failure_class": failure_class,
+    }
+    if is_swe_bench:
+        result.update(
+            {
+                "instance_id": _safe_text(sample.get("instance_id"), 500),
+                "base_commit": _safe_text(sample.get("base_commit"), 100),
+                "model_patch": "",
+            }
+        )
+    else:
+        patch = _as_mapping(sample.get("patch"))
+        signals = _as_mapping(sample.get("signals"))
+        result.update(
+            {
+                "actual_files": [
+                    _safe_text(_as_mapping(file).get("path"), 500)
+                    for file in patch.get("files", [])
+                    if _as_mapping(file).get("path")
+                ],
+                "has_tests_changed": bool(signals.get("has_tests_changed", False)),
+            }
+        )
+    return result
+
+
 async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
     max_retries: int = 3,
@@ -740,24 +811,36 @@ async def run_agent_v2_eval(
             print(f"\n{'='*60}", flush=True)
             print(f"Agent v2 sample {i + 1}/{len(samples)}: {sample['id']}", flush=True)
             print(f"{'='*60}", flush=True)
-            results.append(
-                await evaluate_agent_v2_sample(
+            try:
+                result = await evaluate_agent_v2_sample(
                     sample,
                     i,
                     max_retries=max_retries,
                     token_budget=token_budget,
                     seed_gold_files=seed_gold_files,
                 )
-            )
+            except Exception as exc:
+                result = _safe_failed_sample_result(
+                    sample,
+                    exc,
+                    seed_gold_files=seed_gold_files,
+                )
+                print(
+                    "Warning: agent v2 sample failed; recorded a safe result "
+                    "and continued.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            results.append(result)
 
-        path = _write_results_with_fallback(results, results_path)
-        print(f"\nAgent v2 eval results saved to {path}", flush=True)
-        if predictions_path is not None:
-            prediction_file = write_predictions(results, Path(predictions_path))
-            print(
-                f"SWE-bench predictions saved to {prediction_file}",
-                flush=True,
-            )
+            path = _write_results_with_fallback(results, results_path)
+            print(f"\nAgent v2 eval results saved to {path}", flush=True)
+            if predictions_path is not None:
+                prediction_file = write_predictions(results, Path(predictions_path))
+                print(
+                    f"SWE-bench predictions saved to {prediction_file}",
+                    flush=True,
+                )
         return results
     finally:
         await _close_shared_resources()
