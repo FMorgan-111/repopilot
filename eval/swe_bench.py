@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import tempfile
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -12,6 +13,34 @@ from typing import Any
 
 DATASET_NAME = "SWE-bench/SWE-bench_Verified"
 DATASET_REVISION = "main"
+
+
+def atomic_write_text(path: Path, contents: str) -> Path:
+    """Durably replace a text file without truncating its prior contents."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        stream = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = -1
+        with stream:
+            stream.write(contents)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    return path
 
 
 def _json_list(value: Any) -> list[str]:
@@ -150,7 +179,6 @@ def write_predictions(
     results: Sequence[Mapping[str, Any]], path: Path
 ) -> Path:
     """Write only the schema accepted by the official SWE-bench harness."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     rows = [
         {
             "instance_id": item["instance_id"],
@@ -159,8 +187,8 @@ def write_predictions(
         }
         for item in results
     ]
-    path.write_text(
+    atomic_write_text(
+        path,
         "\n".join(json.dumps(row) for row in rows) + ("\n" if rows else ""),
-        encoding="utf-8",
     )
     return path

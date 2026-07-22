@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from eval import swe_bench
 
 
@@ -120,3 +122,34 @@ def test_write_predictions_uses_official_schema_without_evaluator_data(tmp_path)
         "model_patch": "diff --git a/src/auth.py b/src/auth.py\n",
     }
     assert "secret gold patch" not in written.read_text()
+
+
+def test_write_predictions_preserves_previous_checkpoint_when_replace_fails(
+    monkeypatch, tmp_path
+):
+    output_path = tmp_path / "predictions.jsonl"
+    previous = (
+        '{"instance_id":"old","model_name_or_path":"old-model",'
+        '"model_patch":"old-patch"}\n'
+    ).encode()
+    output_path.write_bytes(previous)
+
+    def fail_replace(source, destination):
+        raise OSError("prediction replace interrupted")
+
+    monkeypatch.setattr(swe_bench.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="prediction replace interrupted"):
+        swe_bench.write_predictions(
+            [
+                {
+                    "instance_id": "acme__widget-8",
+                    "model": "test-model",
+                    "model_patch": "new-patch",
+                }
+            ],
+            output_path,
+        )
+
+    assert output_path.read_bytes() == previous
+    assert list(tmp_path.glob(".*.tmp")) == []

@@ -42,6 +42,7 @@ _swe_bench = importlib.import_module("eval.swe_bench")
 build_agent_seed = _swe_bench.build_agent_seed
 load_verified_samples = _swe_bench.load_verified_samples
 write_predictions = _swe_bench.write_predictions
+atomic_write_text = _swe_bench.atomic_write_text
 _safe_contracts = importlib.import_module("eval.safe_contracts")
 has_verified_coverage_proof = _safe_contracts.has_verified_coverage_proof
 safe_int = _safe_contracts.safe_int
@@ -435,13 +436,11 @@ def _write_results_with_fallback(
         serialized_results.append(result)
     contents = json.dumps(serialized_results, indent=2, ensure_ascii=False)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(contents, encoding="utf-8")
+        atomic_write_text(path, contents)
         return path
     except OSError as exc:
         fallback_path = _fallback_results_path()
-        fallback_path.parent.mkdir(parents=True, exist_ok=True)
-        fallback_path.write_text(contents, encoding="utf-8")
+        atomic_write_text(fallback_path, contents)
         print(
             "Warning: failed to write agent v2 eval results to "
             f"{path}: {type(exc).__name__}: {exc}; wrote fallback to {fallback_path}",

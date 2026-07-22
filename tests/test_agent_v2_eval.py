@@ -1151,14 +1151,14 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
     monkeypatch.setattr(agent_v2_harness, "repopilot_home", lambda: repopilot_home)
 
     requested_path = tmp_path / "readonly" / "eval_results.json"
-    original_write_text = agent_v2_harness.Path.write_text
+    original_replace = swe_bench.os.replace
 
-    def fail_requested_path(self, data, *args, **kwargs):
-        if self == requested_path:
+    def fail_requested_path(source, destination):
+        if str(destination) == str(requested_path):
             raise OSError("read-only eval results")
-        return original_write_text(self, data, *args, **kwargs)
+        return original_replace(source, destination)
 
-    monkeypatch.setattr(agent_v2_harness.Path, "write_text", fail_requested_path)
+    monkeypatch.setattr(swe_bench.os, "replace", fail_requested_path)
 
     results = await agent_v2_harness.run_agent_v2_eval(
         n_samples=1,
@@ -1178,6 +1178,37 @@ async def test_run_agent_v2_eval_falls_back_when_results_path_write_fails(
     assert stored[0]["success"] is False
     assert stored[0]["agent_success"] is False
     assert not requested_path.exists()
+
+
+def test_result_writer_preserves_requested_and_fallback_checkpoints_when_replace_fails(
+    monkeypatch, tmp_path
+):
+    requested_path = tmp_path / "requested" / "results.json"
+    fallback_path = tmp_path / "home" / "eval" / "eval_results.json"
+    requested_path.parent.mkdir(parents=True)
+    fallback_path.parent.mkdir(parents=True)
+    requested_previous = b'[{"id":"requested-previous"}]'
+    fallback_previous = b'[{"id":"fallback-previous"}]'
+    requested_path.write_bytes(requested_previous)
+    fallback_path.write_bytes(fallback_previous)
+    monkeypatch.setattr(
+        agent_v2_harness, "repopilot_home", lambda: tmp_path / "home"
+    )
+
+    def fail_replace(source, destination):
+        raise OSError(f"replace interrupted for {destination}")
+
+    monkeypatch.setattr(swe_bench.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace interrupted"):
+        agent_v2_harness._write_results_with_fallback(
+            [{"id": "new-result"}], requested_path
+        )
+
+    assert requested_path.read_bytes() == requested_previous
+    assert fallback_path.read_bytes() == fallback_previous
+    assert list(requested_path.parent.glob(".*.tmp")) == []
+    assert list(fallback_path.parent.glob(".*.tmp")) == []
 
 
 async def test_run_agent_v2_eval_records_sample_failure_and_preserves_cleanup_warning(
