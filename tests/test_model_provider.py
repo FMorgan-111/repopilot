@@ -1,5 +1,7 @@
 """Contracts for primary and escalation model-provider configuration."""
 
+import pytest
+
 from src.model_provider import (
     escalation_is_configured,
     get_model_config,
@@ -8,10 +10,10 @@ from src.model_provider import (
 )
 
 
-def test_primary_config_keeps_legacy_environment_fallbacks(monkeypatch):
-    monkeypatch.delenv("LINOAPI_API_KEY", raising=False)
+def test_primary_config_pairs_generic_environment_only(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://primary.invalid/v1/")
+    monkeypatch.setenv("LLM_BASE_URL", "https://primary.invalid/v1/")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setenv("LLM_MODEL", "primary-model")
 
     config = get_model_config("primary")
@@ -22,9 +24,38 @@ def test_primary_config_keeps_legacy_environment_fallbacks(monkeypatch):
     assert config.api_key.get_secret_value() == "primary-sentinel-key"
 
 
+def test_primary_config_accepts_unambiguous_deprecated_openai_alias(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
+    monkeypatch.delenv("LLM_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://legacy.invalid/v1/")
+
+    with pytest.warns(DeprecationWarning, match="OPENAI_BASE_URL"):
+        config = get_model_config("primary")
+
+    assert config.base_url == "https://legacy.invalid/v1"
+
+
+def test_primary_config_rejects_conflicting_base_variables(monkeypatch):
+    monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
+    monkeypatch.setenv("LLM_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://other.invalid/v1")
+
+    with pytest.raises(ValueError, match="conflicting"):
+        get_model_config("primary")
+
+
+def test_primary_config_ignores_cross_vendor_keys_and_requires_llm_key(monkeypatch):
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LINOAPI_API_KEY", "lino-sentinel")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-sentinel")
+
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        get_model_config("primary")
+
+
 def test_escalation_config_uses_only_its_own_environment(monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.setenv("LLM_BASE_URL", "https://primary.invalid/v1")
     monkeypatch.setenv("LLM_MODEL", "primary-model")
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
     monkeypatch.setenv("LLM_ESCALATION_BASE_URL", "https://escalation.invalid/v1/")
@@ -47,6 +78,13 @@ def test_missing_escalation_key_never_falls_back_to_primary(monkeypatch):
     assert config.api_key.get_secret_value() == ""
 
 
+def test_whitespace_escalation_key_is_not_configured(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "   ")
+
+    assert escalation_is_configured() is False
+
+
 def test_escalation_requires_explicit_enablement_and_a_key(monkeypatch):
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
     monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
@@ -57,6 +95,47 @@ def test_escalation_requires_explicit_enablement_and_a_key(monkeypatch):
 
     monkeypatch.delenv("LLM_ESCALATION_API_KEY")
     assert escalation_is_configured() is False
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://provider.invalid/v1",
+        "https://user:password@provider.invalid/v1",
+        "https://provider.invalid/v1?api_key=secret",
+        "https://provider.invalid/v1#fragment",
+        "ftp://provider.invalid/v1",
+        "http://localhost.evil.invalid/v1",
+        "http://127.0.0.1.evil.invalid/v1",
+        "http://127.1/v1",
+        "http://2130706433/v1",
+        "https:///missing-host",
+    ],
+)
+def test_primary_config_rejects_unsafe_base_urls(monkeypatch, base_url):
+    monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
+    monkeypatch.setenv("LLM_BASE_URL", base_url)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    with pytest.raises(ValueError, match="base URL"):
+        get_model_config("primary")
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://localhost:8000/v1",
+        "http://127.0.0.1:8000/v1",
+        "http://[::1]:8000/v1",
+        "https://provider.invalid/v1",
+    ],
+)
+def test_primary_config_allows_https_and_exact_loopback_http(monkeypatch, base_url):
+    monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
+    monkeypatch.setenv("LLM_BASE_URL", base_url)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+
+    assert get_model_config("primary").base_url == base_url
 
 
 def test_sanitize_provider_error_redacts_bearer_query_and_header_values():

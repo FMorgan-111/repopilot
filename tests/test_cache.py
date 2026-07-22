@@ -198,3 +198,93 @@ async def test_cache_logs_metadata_without_cached_value(
     assert "stale_fallback" in caplog.text
     assert "fetch" in caplog.text
     assert "sentinel-secret-token" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_github_cache_same_token_hits_same_partition(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "token-same-sentinel")
+    sys.modules.pop("src.cache", None)
+    cache = importlib.import_module("src.cache")
+    calls = 0
+
+    @cache.cached
+    async def fetch_issue():
+        nonlocal calls
+        calls += 1
+        return {"number": 7}
+
+    assert await fetch_issue() == {"number": 7}
+    assert await fetch_issue() == {"number": 7}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_github_cache_token_rotation_misses_private_partition(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", "token-first-sentinel")
+    sys.modules.pop("src.cache", None)
+    cache = importlib.import_module("src.cache")
+    calls = 0
+
+    @cache.cached
+    async def fetch_issue():
+        nonlocal calls
+        calls += 1
+        return {"call": calls}
+
+    assert await fetch_issue() == {"call": 1}
+    monkeypatch.setenv("GITHUB_TOKEN", "token-second-sentinel")
+    assert await fetch_issue() == {"call": 2}
+    assert await fetch_issue() == {"call": 2}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_github_cache_anonymous_partition_is_separate(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    sys.modules.pop("src.cache", None)
+    cache = importlib.import_module("src.cache")
+    calls = 0
+
+    @cache.cached
+    async def fetch_issue():
+        nonlocal calls
+        calls += 1
+        return {"call": calls}
+
+    assert await fetch_issue() == {"call": 1}
+    monkeypatch.setenv("GITHUB_TOKEN", "token-authenticated-sentinel")
+    assert await fetch_issue() == {"call": 2}
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_github_cache_never_persists_or_logs_raw_token(
+    monkeypatch, tmp_path, caplog
+):
+    raw_token = "github-token-never-persist-sentinel"
+    monkeypatch.setenv("REPOPILOT_HOME", str(tmp_path))
+    monkeypatch.setenv("GITHUB_TOKEN", raw_token)
+    sys.modules.pop("src.cache", None)
+    cache = importlib.import_module("src.cache")
+
+    @cache.cached
+    async def fetch_issue():
+        return {"number": 7}
+
+    caplog.set_level(logging.INFO, logger="repopilot.cache")
+    await fetch_issue()
+    await fetch_issue()
+
+    key = cache._cache_key("fetch_issue")
+    files = list(cache.cache_dir().glob("*.json"))
+    assert key.startswith("github-auth-")
+    assert raw_token not in key
+    assert files
+    assert all(raw_token not in path.name for path in files)
+    assert all(raw_token not in path.read_text(encoding="utf-8") for path in files)
+    assert raw_token not in caplog.text

@@ -21,7 +21,8 @@ def test_env_example_exposes_safe_primary_and_escalation_defaults():
     example = _read(".env.example")
 
     assert "LLM_API_KEY=" in example
-    assert "OPENAI_BASE_URL=https://linoapi.com.cn/v1" in example
+    assert "LLM_BASE_URL=https://linoapi.com.cn/v1" in example
+    assert "OPENAI_BASE_URL=" not in example
     assert "LLM_MODEL=gemini-3.5-flash:stable" in example
     assert "LLM_ESCALATION_MODEL=claude-opus-4-8:stable" in example
     assert "LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1" in example

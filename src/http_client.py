@@ -20,11 +20,18 @@ from .model_provider import (
     ProviderName,
     escalation_is_configured,
     get_model_config,
+    get_model_name,
     sanitize_provider_error,
 )
 from .rate_limiter import get_github_limiter
 
-load_dotenv(override=True)
+
+def _load_dotenv_safely() -> None:
+    """Load optional local defaults without replacing process configuration."""
+    load_dotenv(override=False)
+
+
+_load_dotenv_safely()
 
 # ---------------------------------------------------------------------------
 # Module-level connection pool (shared across all callers)
@@ -48,6 +55,12 @@ LLM_STREAM_IDLE_TIMEOUT = 120.0
 # while the retry budget (320s) stays within the per-phase timeouts (see
 # test_llm_phase_timeouts_cover_retry_window).
 LLM_CALL_WALLCLOCK_TIMEOUT = 300.0
+LLM_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+LLM_MAX_SSE_EVENTS = 50_000
+LLM_MAX_CHOICES = 8
+LLM_MAX_CONTENT_BYTES = 4 * 1024 * 1024
+LLM_MAX_TOOL_CALLS = 64
+LLM_MAX_TOOL_ARGUMENT_BYTES = 2 * 1024 * 1024
 
 
 class LLMResponseError(RuntimeError):
@@ -178,7 +191,7 @@ def _get_llm_base_url() -> str:
 
 
 def _get_llm_model() -> str:
-    return get_model_config("primary").model
+    return get_model_name("primary")
 
 
 async def llm_request(
@@ -235,11 +248,11 @@ async def _llm_request_with_retry(
     async def _consume() -> dict:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
             if resp.status_code >= 400:
-                await resp.aread()
+                await _drain_bounded_response(resp)
                 resp.raise_for_status()
             content_type = resp.headers.get("content-type", "").lower()
             if "application/json" in content_type:
-                raw = await resp.aread()
+                raw = await _read_bounded_response(resp)
                 try:
                     response = json.loads(raw)
                 except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -251,6 +264,30 @@ async def _llm_request_with_retry(
     # wall-clock is a generous total backstop. On expiry asyncio.TimeoutError is
     # raised, which is intentionally NOT retryable — no doubling on a slow call.
     return await asyncio.wait_for(_consume(), timeout=LLM_CALL_WALLCLOCK_TIMEOUT)
+
+
+async def _bounded_response_chunks(resp: object):
+    total = 0
+    async for chunk in resp.aiter_bytes():
+        if not isinstance(chunk, bytes):
+            raise LLMResponseError("malformed chat completion response bytes")
+        total += len(chunk)
+        if total > LLM_MAX_RESPONSE_BYTES:
+            raise LLMResponseError("LLM response byte limit exceeded")
+        if chunk:
+            yield chunk
+
+
+async def _read_bounded_response(resp: object) -> bytes:
+    chunks: list[bytes] = []
+    async for chunk in _bounded_response_chunks(resp):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _drain_bounded_response(resp: object) -> None:
+    async for _ in _bounded_response_chunks(resp):
+        pass
 
 
 def _provider_error_message(error: object) -> str:
@@ -267,6 +304,11 @@ def _parse_chat_completion_json(payload: object) -> dict:
     choices = payload.get("choices")
     if not isinstance(choices, list) or not choices:
         raise LLMResponseError("empty chat completion response")
+    if len(choices) > LLM_MAX_CHOICES:
+        raise LLMResponseError("chat completion choice limit exceeded")
+    aggregate_content_bytes = 0
+    aggregate_tool_calls = 0
+    usable = False
     for choice in choices:
         if not isinstance(choice, dict):
             continue
@@ -278,8 +320,22 @@ def _parse_chat_completion_json(payload: object) -> dict:
         validated_tool_calls = (
             _validate_tool_calls(tool_calls) if tool_calls is not None else []
         )
+        aggregate_tool_calls += len(validated_tool_calls)
+        if aggregate_tool_calls > LLM_MAX_TOOL_CALLS:
+            raise LLMResponseError("chat completion tool call limit exceeded")
+        if isinstance(content, str):
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > LLM_MAX_CONTENT_BYTES:
+                raise LLMResponseError("chat completion content byte limit exceeded")
+            aggregate_content_bytes += content_bytes
+            if aggregate_content_bytes > LLM_MAX_CONTENT_BYTES:
+                raise LLMResponseError(
+                    "chat completion aggregate content byte limit exceeded"
+                )
         if (isinstance(content, str) and content) or validated_tool_calls:
-            return payload
+            usable = True
+    if usable:
+        return payload
     raise LLMResponseError("empty chat completion response")
 
 
@@ -293,6 +349,8 @@ def _provider_index(value: object, label: str) -> int:
 def _validate_tool_calls(tool_calls: object) -> list[dict]:
     if not isinstance(tool_calls, list):
         raise LLMResponseError("incomplete tool call structure")
+    if len(tool_calls) > LLM_MAX_TOOL_CALLS:
+        raise LLMResponseError("chat completion tool call limit exceeded")
     for call in tool_calls:
         if not isinstance(call, dict):
             raise LLMResponseError("incomplete tool call structure")
@@ -307,21 +365,59 @@ def _validate_tool_calls(tool_calls: object) -> list[dict]:
             or not isinstance(function.get("arguments"), str)
         ):
             raise LLMResponseError("incomplete tool call structure")
+        if (
+            len(function["arguments"].encode("utf-8"))
+            > LLM_MAX_TOOL_ARGUMENT_BYTES
+        ):
+            raise LLMResponseError("chat completion tool argument byte limit exceeded")
     return tool_calls
+
+
+async def _bounded_sse_lines(resp: object):
+    pending = bytearray()
+    async for chunk in _bounded_response_chunks(resp):
+        pending.extend(chunk)
+        while True:
+            newline = pending.find(b"\n")
+            if newline < 0:
+                break
+            raw_line = bytes(pending[:newline])
+            del pending[: newline + 1]
+            if raw_line.endswith(b"\r"):
+                raw_line = raw_line[:-1]
+            try:
+                yield raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise LLMResponseError("malformed SSE encoding") from exc
+    if pending:
+        try:
+            yield bytes(pending).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise LLMResponseError("malformed SSE encoding") from exc
 
 
 async def _consume_sse_chat_completion(resp: object) -> dict:
     choice_states: dict[int, dict] = {}
     usage: dict | None = None
+    event_count = 0
+    aggregate_content_bytes = 0
+    tool_call_count = 0
+    done_seen = False
 
-    async for line in resp.aiter_lines():
+    async for line in _bounded_sse_lines(resp):
         if not line.startswith("data:"):
             continue
         data = line[len("data:") :].strip()
         if not data:
             continue
+        event_count += 1
+        if event_count > LLM_MAX_SSE_EVENTS:
+            raise LLMResponseError("chat completion SSE event limit exceeded")
         if data == "[DONE]":
-            break
+            done_seen = True
+            continue
+        if done_seen:
+            continue
         try:
             event = json.loads(data)
         except json.JSONDecodeError as exc:
@@ -335,14 +431,19 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
         event_choices = event.get("choices") or []
         if not isinstance(event_choices, list):
             raise LLMResponseError("unsupported SSE choices shape")
+        if len(event_choices) > LLM_MAX_CHOICES:
+            raise LLMResponseError("chat completion choice limit exceeded")
         for position, choice in enumerate(event_choices):
             if not isinstance(choice, dict):
                 continue
             index = _provider_index(choice.get("index", position), "choice")
+            if index not in choice_states and len(choice_states) >= LLM_MAX_CHOICES:
+                raise LLMResponseError("chat completion choice limit exceeded")
             state = choice_states.setdefault(
                 index,
                 {
                     "content": [],
+                    "content_bytes": 0,
                     "role": "assistant",
                     "tool_calls": {},
                     "finish_reason": None,
@@ -354,8 +455,23 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
             if isinstance(delta.get("role"), str):
                 state["role"] = delta["role"]
             if isinstance(delta.get("content"), str):
+                chunk_bytes = len(delta["content"].encode("utf-8"))
+                if state["content_bytes"] + chunk_bytes > LLM_MAX_CONTENT_BYTES:
+                    raise LLMResponseError(
+                        "chat completion content byte limit exceeded"
+                    )
+                aggregate_content_bytes += chunk_bytes
+                if aggregate_content_bytes > LLM_MAX_CONTENT_BYTES:
+                    raise LLMResponseError(
+                        "chat completion aggregate content byte limit exceeded"
+                    )
                 state["content"].append(delta["content"])
-            _accumulate_tool_call_deltas(state["tool_calls"], delta.get("tool_calls"))
+                state["content_bytes"] += chunk_bytes
+            tool_call_count += _accumulate_tool_call_deltas(
+                state["tool_calls"],
+                delta.get("tool_calls"),
+                remaining=LLM_MAX_TOOL_CALLS - tool_call_count,
+            )
             if choice.get("finish_reason") is not None:
                 state["finish_reason"] = choice["finish_reason"]
 
@@ -386,18 +502,34 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
     return result
 
 
-def _accumulate_tool_call_deltas(states: dict[int, dict], deltas: object) -> None:
+def _accumulate_tool_call_deltas(
+    states: dict[int, dict],
+    deltas: object,
+    *,
+    remaining: int = LLM_MAX_TOOL_CALLS,
+) -> int:
     if deltas is None:
-        return
+        return 0
     if not isinstance(deltas, list):
         raise LLMResponseError("unsupported tool call delta shape")
+    created = 0
     for position, delta in enumerate(deltas):
         if not isinstance(delta, dict):
             continue
         index = _provider_index(delta.get("index", position), "tool call")
+        if index not in states:
+            if created >= remaining:
+                raise LLMResponseError("chat completion tool call limit exceeded")
+            created += 1
         state = states.setdefault(
             index,
-            {"id": "", "type": "", "name": "", "arguments": ""},
+            {
+                "id": "",
+                "type": "",
+                "name": "",
+                "arguments": "",
+                "argument_bytes": 0,
+            },
         )
         if isinstance(delta.get("id"), str):
             state["id"] += delta["id"]
@@ -408,7 +540,17 @@ def _accumulate_tool_call_deltas(states: dict[int, dict], deltas: object) -> Non
             if isinstance(function.get("name"), str):
                 state["name"] += function["name"]
             if isinstance(function.get("arguments"), str):
+                argument_bytes = len(function["arguments"].encode("utf-8"))
+                if (
+                    state["argument_bytes"] + argument_bytes
+                    > LLM_MAX_TOOL_ARGUMENT_BYTES
+                ):
+                    raise LLMResponseError(
+                        "chat completion tool argument byte limit exceeded"
+                    )
                 state["arguments"] += function["arguments"]
+                state["argument_bytes"] += argument_bytes
+    return created
 
 
 def _finalize_tool_calls(states: dict[int, dict]) -> list[dict]:

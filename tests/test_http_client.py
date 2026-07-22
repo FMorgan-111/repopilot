@@ -1,6 +1,7 @@
 """Tests for HTTP client retry logic."""
 
 import asyncio
+import json
 
 import httpx
 import pytest
@@ -9,6 +10,12 @@ from src.http_client import (
     LLM_CALL_WALLCLOCK_TIMEOUT,
     LLM_CONNECT_TIMEOUT,
     LLM_MAX_ATTEMPTS,
+    LLM_MAX_CHOICES,
+    LLM_MAX_CONTENT_BYTES,
+    LLM_MAX_RESPONSE_BYTES,
+    LLM_MAX_SSE_EVENTS,
+    LLM_MAX_TOOL_ARGUMENT_BYTES,
+    LLM_MAX_TOOL_CALLS,
     LLM_RETRY_BACKOFF_MAX_SECONDS,
     LLM_STREAM_IDLE_TIMEOUT,
     MAX_RETRIES,
@@ -58,12 +65,18 @@ class _FakeStreamCM:
         status=200,
         sse="",
         json_body=None,
+        raw_body=None,
+        byte_chunks=None,
         content_type="text/event-stream",
+        forbid_unbounded=False,
     ):
         self._raise = raise_exc
         self._status = status
         self._sse = sse
         self._json_body = json_body
+        self._raw_body = raw_body
+        self._byte_chunks = byte_chunks
+        self._forbid_unbounded = forbid_unbounded
         self.headers = {"content-type": content_type}
 
     async def __aenter__(self):
@@ -79,6 +92,10 @@ class _FakeStreamCM:
         return self._status
 
     async def aread(self):
+        if self._forbid_unbounded:
+            raise AssertionError("unbounded aread() must not be used")
+        if self._raw_body is not None:
+            return self._raw_body
         if self._json_body is not None:
             import json as _json
 
@@ -95,8 +112,48 @@ class _FakeStreamCM:
             )
 
     async def aiter_lines(self):
+        if self._forbid_unbounded:
+            raise AssertionError("unbounded aiter_lines() must not be used")
         for line in self._sse.split("\n"):
             yield line
+
+    async def aiter_bytes(self):
+        if self._byte_chunks is not None:
+            for chunk in self._byte_chunks:
+                yield chunk
+            return
+        if self._raw_body is not None:
+            yield self._raw_body
+            return
+        if self._json_body is not None:
+            yield json.dumps(self._json_body).encode()
+            return
+        yield self._sse.encode()
+
+
+def _padded_json(payload, size):
+    candidate = dict(payload)
+    candidate["padding"] = ""
+    raw = json.dumps(candidate, separators=(",", ":")).encode()
+    assert len(raw) <= size
+    candidate["padding"] = "x" * (size - len(raw))
+    raw = json.dumps(candidate, separators=(",", ":")).encode()
+    assert len(raw) == size
+    return raw
+
+
+def _stream_from_raw(monkeypatch, raw, *, status=200, content_type="text/event-stream", chunks=None):
+    monkeypatch.setattr(
+        httpx.AsyncClient,
+        "stream",
+        lambda self, method, url, **kwargs: _FakeStreamCM(
+            status=status,
+            raw_body=raw,
+            byte_chunks=chunks,
+            content_type=content_type,
+            forbid_unbounded=True,
+        ),
+    )
 
 
 async def test_close_llm_client_closes_cached_client_and_clears_global():
@@ -241,7 +298,8 @@ async def test_llm_request_uses_isolated_provider_configuration(monkeypatch):
 
     monkeypatch.setattr(httpx.AsyncClient, "stream", fake_stream)
     monkeypatch.setenv("LLM_API_KEY", "primary-sentinel-key")
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.setenv("LLM_BASE_URL", "https://primary.invalid/v1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
     monkeypatch.setenv("LLM_MODEL", "primary-model")
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-sentinel-key")
     monkeypatch.setenv("LLM_ESCALATION_BASE_URL", "https://escalation.invalid/v1")
@@ -296,6 +354,37 @@ async def test_escalation_without_a_key_never_constructs_an_http_client(monkeypa
         await llm_request([{"role": "user", "content": "escalate"}], provider="escalation")
 
 
+async def test_primary_without_llm_key_never_constructs_an_http_client(monkeypatch):
+    from src import http_client
+
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
+    monkeypatch.setenv("LINOAPI_API_KEY", "cross-vendor-sentinel")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "cross-vendor-sentinel")
+    monkeypatch.setattr(
+        http_client,
+        "_get_llm_client",
+        lambda *args, **kwargs: pytest.fail("HTTP client must not be constructed"),
+    )
+
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        await llm_request([{"role": "user", "content": "primary"}])
+
+
+def test_dotenv_loading_never_overrides_process_environment(monkeypatch):
+    from src import http_client
+
+    seen = {}
+
+    def fake_load_dotenv(*_args, **kwargs):
+        seen.update(kwargs)
+        return True
+
+    monkeypatch.setattr(http_client, "load_dotenv", fake_load_dotenv)
+    http_client._load_dotenv_safely()
+
+    assert seen.get("override") is False
+
+
 async def test_llm_request_preserves_stream_usage_and_finish_reason(monkeypatch):
     body = (
         'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
@@ -342,6 +431,311 @@ async def test_llm_request_accepts_non_stream_json_completion(monkeypatch):
     result = await llm_request([{"role": "user", "content": "hi"}])
 
     assert result == payload
+
+
+def test_llm_response_limits_are_explicit():
+    assert LLM_MAX_RESPONSE_BYTES == 8 * 1024 * 1024
+    assert LLM_MAX_SSE_EVENTS == 50_000
+    assert LLM_MAX_CHOICES == 8
+    assert LLM_MAX_CONTENT_BYTES == 4 * 1024 * 1024
+    assert LLM_MAX_TOOL_CALLS == 64
+    assert LLM_MAX_TOOL_ARGUMENT_BYTES == 2 * 1024 * 1024
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_json_response_byte_limit_is_inclusive(monkeypatch, extra):
+    payload = {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+    raw = _padded_json(payload, LLM_MAX_RESPONSE_BYTES + extra)
+    _stream_from_raw(monkeypatch, raw, content_type="application/json")
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="response byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_sse_response_byte_limit_is_inclusive(monkeypatch, extra):
+    completion = _sse("ok").encode()
+    padding_size = LLM_MAX_RESPONSE_BYTES + extra - len(completion)
+    padding = b":" + (b"x" * (padding_size - 2)) + b"\n"
+    raw = padding + completion
+    assert len(raw) == LLM_MAX_RESPONSE_BYTES + extra
+    _stream_from_raw(monkeypatch, raw)
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="response byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert result["choices"][0]["message"]["content"] == "ok"
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_error_response_body_is_streamed_with_same_byte_limit(monkeypatch, extra):
+    raw = b"x" * (LLM_MAX_RESPONSE_BYTES + extra)
+    _stream_from_raw(monkeypatch, raw, status=400, content_type="application/json")
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="response byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        with pytest.raises(httpx.HTTPStatusError):
+            await llm_request([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_sse_event_limit_is_inclusive(monkeypatch, extra):
+    event_count = LLM_MAX_SSE_EVENTS + extra
+    events = ['data: {"choices":[{"delta":{"content":"ok"}}]}\n\n']
+    events.extend('data: {"choices":[]}\n\n' for _ in range(event_count - 2))
+    events.append("data: [DONE]\n")
+    raw = "".join(events).encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="SSE event limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert result["choices"][0]["message"]["content"] == "ok"
+
+
+async def test_fragmented_sse_is_parsed_without_aiter_lines(monkeypatch):
+    raw = _sse("量子").encode()
+    chunks = [raw[index : index + 3] for index in range(0, len(raw), 3)]
+    _stream_from_raw(monkeypatch, raw, chunks=chunks)
+
+    result = await llm_request([{"role": "user", "content": "hi"}])
+
+    assert result["choices"][0]["message"]["content"] == "量子"
+
+
+async def test_sse_byte_limit_includes_chunks_after_done(monkeypatch):
+    completion = _sse("ok").encode()
+    tail = b"x" * LLM_MAX_RESPONSE_BYTES
+    _stream_from_raw(
+        monkeypatch,
+        completion + tail,
+        chunks=[completion, tail],
+    )
+
+    with pytest.raises(LLMResponseError, match="response byte limit"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize("count", [LLM_MAX_CHOICES, LLM_MAX_CHOICES + 1])
+async def test_json_choice_limit_is_inclusive(monkeypatch, count):
+    payload = {
+        "choices": [
+            {"index": index, "message": {"role": "assistant", "content": "x"}}
+            for index in range(count)
+        ]
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode()
+    _stream_from_raw(monkeypatch, raw, content_type="application/json")
+
+    if count > LLM_MAX_CHOICES:
+        with pytest.raises(LLMResponseError, match="choice limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        assert len((await llm_request([{"role": "user", "content": "hi"}]))["choices"]) == count
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_json_content_limit_is_inclusive(monkeypatch, extra):
+    content = "x" * (LLM_MAX_CONTENT_BYTES + extra)
+    raw = json.dumps(
+        {"choices": [{"message": {"role": "assistant", "content": content}}]},
+        separators=(",", ":"),
+    ).encode()
+    _stream_from_raw(monkeypatch, raw, content_type="application/json")
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="content byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["content"]) == len(content)
+
+
+async def test_json_aggregate_content_limit_rejects_multiple_choices(monkeypatch):
+    content = "x" * ((LLM_MAX_CONTENT_BYTES // 2) + 1)
+    payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": content}},
+            {"message": {"role": "assistant", "content": content}},
+        ]
+    }
+    _stream_from_raw(
+        monkeypatch,
+        json.dumps(payload, separators=(",", ":")).encode(),
+        content_type="application/json",
+    )
+
+    with pytest.raises(LLMResponseError, match="aggregate content byte limit"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize("count", [LLM_MAX_CHOICES, LLM_MAX_CHOICES + 1])
+async def test_sse_choice_limit_is_inclusive(monkeypatch, count):
+    choices = [
+        {"index": index, "delta": {"content": "x"}}
+        for index in range(count)
+    ]
+    raw = (
+        "data: "
+        + json.dumps({"choices": choices}, separators=(",", ":"))
+        + "\n\ndata: [DONE]\n"
+    ).encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    if count > LLM_MAX_CHOICES:
+        with pytest.raises(LLMResponseError, match="choice limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"]) == count
+
+
+async def test_sse_aggregate_content_limit_rejects_multiple_choices(monkeypatch):
+    content = "x" * ((LLM_MAX_CONTENT_BYTES // 2) + 1)
+    choices = [
+        {"index": 0, "delta": {"content": content}},
+        {"index": 1, "delta": {"content": content}},
+    ]
+    raw = (
+        "data: "
+        + json.dumps({"choices": choices}, separators=(",", ":"))
+        + "\n\ndata: [DONE]\n"
+    ).encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    with pytest.raises(LLMResponseError, match="aggregate content byte limit"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+def _tool_call(index, arguments="{}"):
+    return {
+        "index": index,
+        "id": f"call_{index}",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": arguments},
+    }
+
+
+@pytest.mark.parametrize("count", [LLM_MAX_TOOL_CALLS, LLM_MAX_TOOL_CALLS + 1])
+async def test_json_tool_call_limit_is_inclusive(monkeypatch, count):
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call(index) for index in range(count)],
+                }
+            }
+        ]
+    }
+    _stream_from_raw(
+        monkeypatch,
+        json.dumps(payload, separators=(",", ":")).encode(),
+        content_type="application/json",
+    )
+
+    if count > LLM_MAX_TOOL_CALLS:
+        with pytest.raises(LLMResponseError, match="tool call limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["tool_calls"]) == count
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_json_tool_argument_limit_is_inclusive(monkeypatch, extra):
+    arguments = "x" * (LLM_MAX_TOOL_ARGUMENT_BYTES + extra)
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call(0, arguments)],
+                }
+            }
+        ]
+    }
+    _stream_from_raw(
+        monkeypatch,
+        json.dumps(payload, separators=(",", ":")).encode(),
+        content_type="application/json",
+    )
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="tool argument byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == len(arguments)
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_sse_content_limit_is_inclusive(monkeypatch, extra):
+    raw = _sse("x" * (LLM_MAX_CONTENT_BYTES + extra)).encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="content byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["content"]) == LLM_MAX_CONTENT_BYTES
+
+
+@pytest.mark.parametrize("count", [LLM_MAX_TOOL_CALLS, LLM_MAX_TOOL_CALLS + 1])
+async def test_sse_tool_call_limit_is_inclusive(monkeypatch, count):
+    event = {
+        "choices": [
+            {
+                "delta": {
+                    "tool_calls": [_tool_call(index) for index in range(count)]
+                },
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    raw = ("data: " + json.dumps(event, separators=(",", ":")) + "\n\ndata: [DONE]\n").encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    if count > LLM_MAX_TOOL_CALLS:
+        with pytest.raises(LLMResponseError, match="tool call limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["tool_calls"]) == count
+
+
+@pytest.mark.parametrize("extra", [0, 1])
+async def test_sse_tool_argument_limit_is_inclusive(monkeypatch, extra):
+    event = {
+        "choices": [
+            {
+                "delta": {"tool_calls": [_tool_call(0, "x" * (LLM_MAX_TOOL_ARGUMENT_BYTES + extra))]},
+                "finish_reason": "tool_calls",
+            }
+        ]
+    }
+    raw = ("data: " + json.dumps(event, separators=(",", ":")) + "\n\ndata: [DONE]\n").encode()
+    _stream_from_raw(monkeypatch, raw)
+
+    if extra:
+        with pytest.raises(LLMResponseError, match="tool argument byte limit"):
+            await llm_request([{"role": "user", "content": "hi"}])
+    else:
+        result = await llm_request([{"role": "user", "content": "hi"}])
+        assert len(result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]) == LLM_MAX_TOOL_ARGUMENT_BYTES
 
 
 def test_llm_json_error_dict_fallback_redacts_every_secret_form():

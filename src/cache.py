@@ -8,7 +8,8 @@ Usage::
     async def read_issue(owner, repo, issue_number):
         ...
 
-Cache keys are derived from the function name and its arguments (MD5).
+Cache keys are derived from the function name, its arguments, and an anonymous
+or SHA-256-fingerprinted GitHub credential partition.
 Cache entries live under ``~/.repopilot/cache/``. They are fresh for
 *CACHE_TTL* seconds (default 600 s = 10 min) and may be used as stale fallback
 until *CACHE_STALE_TTL* seconds (default 86,400 s = 24 h).
@@ -66,7 +67,16 @@ def _cache_key(func_name: str, *args, **kwargs) -> str:
         sort_keys=True,
         default=str,
     )
-    return hashlib.md5(payload.encode()).hexdigest()
+    call_digest = hashlib.sha256(payload.encode()).hexdigest()
+    return f"{_github_credential_partition()}-{call_digest}"
+
+
+def _github_credential_partition() -> str:
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        return "github-anonymous"
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    return f"github-auth-{fingerprint}"
 
 
 def _cache_path(key: str) -> Path:

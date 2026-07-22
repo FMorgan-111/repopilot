@@ -59,9 +59,14 @@ evaluation results, or shell history:
 ```bash
 export GITHUB_TOKEN=ghp_...
 export LLM_API_KEY=sk-...
-export OPENAI_BASE_URL=https://linoapi.com.cn/v1
+export LLM_BASE_URL=https://linoapi.com.cn/v1
 export LLM_MODEL=gemini-3.5-flash:stable  # optional; this is the default
 ```
+
+`LLM_BASE_URL` is paired only with `LLM_API_KEY` and must use HTTPS, except
+for exact `localhost`, `127.0.0.1`, or `::1` development endpoints. The legacy
+`OPENAI_BASE_URL` name remains a deprecated alias only when `LLM_BASE_URL` is
+unset (or has the same value); conflicting values are rejected.
 
 Success-first escalation is off by default. It activates only when both the
 explicit flag and a separately injected escalation key are present:

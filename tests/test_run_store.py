@@ -1,4 +1,8 @@
 import json
+import os
+import stat
+
+import pytest
 
 from src import new_agent, run_store
 from src.state import Evidence, ModelInvocation, NoProgressEvent
@@ -141,6 +145,113 @@ def diagnostic_state(trace_id: str = "diag123"):
         }
     )
     return state
+
+
+@pytest.mark.parametrize(
+    "run_id",
+    [
+        "../escape",
+        "/absolute",
+        "nested/name",
+        r"nested\\name",
+        ".hidden",
+        "-leading",
+        "a" * 65,
+        "white space",
+        "unicode-运行",
+        "",
+    ],
+)
+def test_run_store_rejects_unsafe_run_ids_before_path_use(tmp_path, run_id):
+    with pytest.raises(ValueError, match="run_id"):
+        run_store.run_path(run_id, root_dir=tmp_path / "missing-root")
+
+    assert not (tmp_path / "missing-root").exists()
+
+
+@pytest.mark.parametrize("run_id", ["a", "A0", "run-1", "run_2", "z" * 64])
+def test_run_store_accepts_exact_safe_run_id_grammar(tmp_path, run_id):
+    assert run_store.run_path(run_id, root_dir=tmp_path) == (
+        tmp_path / "runs" / f"{run_id}.json"
+    )
+
+
+def test_run_store_rejects_symlinked_runs_directory(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "runs").symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="runs directory"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
+def test_run_store_rejects_non_directory_runs_path(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "runs").write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="runs directory"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_run_store_load_rejects_nonregular_run_file(tmp_path, kind):
+    root = tmp_path / "root"
+    directory = root / "runs"
+    directory.mkdir(parents=True)
+    target = directory / "safe-id.json"
+    if kind == "symlink":
+        outside = tmp_path / "outside.json"
+        outside.write_text("{}", encoding="utf-8")
+        target.symlink_to(outside)
+    else:
+        os.mkfifo(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        run_store.load_run("safe-id", root_dir=root)
+
+
+def test_save_run_is_atomic_and_uses_mode_0600(tmp_path):
+    root = tmp_path / "root"
+    saved = run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+    assert list(saved.parent.glob("*.tmp")) == []
+
+
+def test_save_run_replace_failure_preserves_previous_file_and_cleans_temp(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "root"
+    state = paused_state("safe-id")
+    saved = run_store.save_run(state, root_dir=root)
+    original = saved.read_bytes()
+    state.issue_url = "https://github.com/acme/widget/issues/999"
+
+    def fail_replace(*_args, **_kwargs):
+        raise OSError("injected replace failure")
+
+    monkeypatch.setattr(run_store.os, "replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failure"):
+        run_store.save_run(state, root_dir=root)
+
+    assert saved.read_bytes() == original
+    assert list(saved.parent.glob("*.tmp")) == []
+
+
+def test_run_store_rejects_oversized_regular_file(tmp_path):
+    root = tmp_path / "root"
+    directory = root / "runs"
+    directory.mkdir(parents=True)
+    target = directory / "safe-id.json"
+    with target.open("wb") as handle:
+        handle.truncate(run_store.MAX_RUN_FILE_BYTES + 1)
+
+    with pytest.raises(ValueError, match="size limit"):
+        run_store.load_run("safe-id", root_dir=root)
 
 
 def test_save_and_load_paused_run_preserves_pause_state(tmp_path):

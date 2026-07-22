@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
+import re
+import secrets
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -11,6 +15,9 @@ from .evaluator_safety import contains_evaluator_only
 from .home import repopilot_home
 from .state import AgentState
 from .summary_safety import sanitize_summary_text
+
+_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+MAX_RUN_FILE_BYTES = 8 * 1024 * 1024
 
 
 def default_runs_dir() -> Path:
@@ -23,25 +30,173 @@ def runs_dir(root_dir: Path | str | None = None) -> Path:
 
 
 def run_path(run_id: str, root_dir: Path | str | None = None) -> Path:
-    return runs_dir(root_dir=root_dir) / f"{run_id}.json"
+    _validate_run_id(run_id)
+    directory = runs_dir(root_dir=root_dir)
+    path = directory / f"{run_id}.json"
+    canonical_parent = directory.resolve(strict=False)
+    try:
+        path.resolve(strict=False).parent.relative_to(canonical_parent)
+    except ValueError as exc:
+        raise ValueError("run path must remain within the runs directory") from exc
+    return path
+
+
+def _validate_run_id(run_id: str) -> str:
+    if not isinstance(run_id, str) or not _RUN_ID_RE.fullmatch(run_id):
+        raise ValueError("run_id must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    return run_id
+
+
+def _open_runs_directory(
+    root_dir: Path | str | None,
+    *,
+    create: bool,
+) -> tuple[Path, int]:
+    directory = runs_dir(root_dir=root_dir)
+    if create:
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except FileExistsError:
+            pass
+    try:
+        info = directory.lstat()
+    except FileNotFoundError:
+        raise
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ValueError("runs directory must be a real directory, not a symlink")
+    canonical = directory.resolve(strict=True)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError as exc:
+        raise ValueError("runs directory could not be opened safely") from exc
+    opened = os.fstat(descriptor)
+    if not stat.S_ISDIR(opened.st_mode):
+        os.close(descriptor)
+        raise ValueError("runs directory must be a regular directory")
+    if directory.resolve(strict=True) != canonical:
+        os.close(descriptor)
+        raise ValueError("runs directory changed while it was opened")
+    return directory, descriptor
+
+
+def _read_run_bytes(run_id: str, root_dir: Path | str | None) -> bytes:
+    _validate_run_id(run_id)
+    _, directory_fd = _open_runs_directory(root_dir, create=False)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        try:
+            descriptor = os.open(
+                f"{run_id}.json",
+                flags,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            if isinstance(exc, FileNotFoundError):
+                raise
+            raise ValueError("run file must be a regular file") from exc
+        try:
+            opened = os.fstat(descriptor)
+            if not stat.S_ISREG(opened.st_mode):
+                raise ValueError("run file must be a regular file")
+            if opened.st_size > MAX_RUN_FILE_BYTES:
+                raise ValueError("run file exceeds the size limit")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    descriptor,
+                    min(64 * 1024, MAX_RUN_FILE_BYTES + 1 - total),
+                )
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > MAX_RUN_FILE_BYTES:
+                    raise ValueError("run file exceeds the size limit")
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(directory_fd)
+
+
+def _atomic_write_run(
+    run_id: str,
+    payload: bytes,
+    root_dir: Path | str | None,
+) -> Path:
+    if len(payload) > MAX_RUN_FILE_BYTES:
+        raise ValueError("run file exceeds the size limit")
+    path = run_path(run_id, root_dir=root_dir)
+    _, directory_fd = _open_runs_directory(root_dir, create=True)
+    temp_name = ""
+    descriptor = -1
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        for _ in range(16):
+            temp_name = f".{run_id}.{secrets.token_hex(12)}.tmp"
+            try:
+                descriptor = os.open(
+                    temp_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("could not allocate a unique run-store temporary file")
+        try:
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("short write while persisting run")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            descriptor = -1
+        os.replace(
+            temp_name,
+            f"{run_id}.json",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temp_name = ""
+        os.fsync(directory_fd)
+        return path
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        os.close(directory_fd)
 
 
 def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
     if not state.trace_id:
         raise ValueError("Cannot save a run without a trace_id.")
 
-    path = run_path(state.trace_id, root_dir=root_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _validate_run_id(state.trace_id)
     payload = state.model_dump(mode="json")
     payload = _clear_legacy_evaluator_patch_state(payload)
     payload["attempt_outcome_summary"] = _safe_outcome_summary(state)
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    return path
+    encoded = json.dumps(payload, indent=2).encode("utf-8")
+    return _atomic_write_run(state.trace_id, encoded, root_dir)
 
 
 def load_run(run_id: str, root_dir: Path | str | None = None) -> AgentState:
-    path = run_path(run_id, root_dir=root_dir)
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(_read_run_bytes(run_id, root_dir).decode("utf-8"))
     return AgentState.model_validate(_clear_legacy_evaluator_patch_state(data))
 
 
@@ -98,10 +253,22 @@ def list_runs(root_dir: Path | str | None = None) -> list[dict[str, Any]]:
     directory = runs_dir(root_dir=root_dir)
     if not directory.exists():
         return []
-    summaries = [
-        summarize_run(load_run(path.stem, root_dir=root_dir), path=path)
-        for path in sorted(directory.glob("*.json"), key=lambda item: item.stem)
-    ]
+    _, directory_fd = _open_runs_directory(root_dir, create=False)
+    try:
+        names = sorted(
+            entry.name
+            for entry in os.scandir(directory_fd)
+            if entry.name.endswith(".json")
+            and _RUN_ID_RE.fullmatch(entry.name[:-5])
+            and entry.is_file(follow_symlinks=False)
+        )
+    finally:
+        os.close(directory_fd)
+    summaries = []
+    for name in names:
+        run_id = name[:-5]
+        path = run_path(run_id, root_dir=root_dir)
+        summaries.append(summarize_run(load_run(run_id, root_dir=root_dir), path=path))
     return summaries
 
 
