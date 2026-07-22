@@ -391,7 +391,7 @@ git commit -m "feat(eval): aggregate hash-bound OCI results"
 - Consumes: Tasks 1-4 CLIs.
 - Produces: manual workflow `swe-bench-oci-eval.yml` with modes `checkpoint_5` and `baseline_10`.
 
-- [ ] **Step 1: Write failing textual workflow contract tests**
+- [x] **Step 1: Write failing textual workflow contract tests**
 
 ```python
 def test_workflow_is_manual_only_and_bounded() -> None:
@@ -412,13 +412,13 @@ def test_upload_uses_sanitized_bundle_only() -> None:
     assert "path: ${{ runner.temp }}/upload" in text
 ```
 
-- [ ] **Step 2: Run the workflow tests and confirm the file is missing**
+- [x] **Step 2: Run the workflow tests and confirm the file is missing**
 
 Run: `pytest tests/test_swe_bench_oci_workflow.py -q`
 
 Expected: FAIL because the workflow does not exist.
 
-- [ ] **Step 3: Implement the exact manual prepare/matrix/aggregate workflow**
+- [x] **Step 3: Implement the exact manual prepare/matrix/aggregate workflow**
 
 ```yaml
 on:
@@ -451,7 +451,7 @@ jobs:
 
 The prepare job emits the exact tracked ID list as JSON. The instance job installs pinned project/eval dependencies, uses `ubuntu-latest`, sets exact model/resource variables outside secret-bearing steps, uploads only `$RUNNER_TEMP/upload`, and uses `if: always()` for score/package/upload so classified failures still yield artifacts. The aggregate job downloads only this run's named artifacts, validates the current commit, writes combined outputs, and uploads the final bundle. No cache contains credentials or generated repository content.
 
-- [ ] **Step 4: Run workflow tests and YAML syntax validation**
+- [x] **Step 4: Run workflow tests and YAML syntax validation**
 
 Run: `pytest tests/test_swe_bench_oci_workflow.py -q`
 
@@ -461,7 +461,7 @@ Run: `ruby -e 'require "yaml"; YAML.load_file(".github/workflows/swe-bench-oci-e
 
 Expected: exit 0.
 
-- [ ] **Step 5: Commit the workflow**
+- [x] **Step 5: Commit the workflow**
 
 ```bash
 git add .github/workflows/swe-bench-oci-eval.yml tests/test_swe_bench_oci_workflow.py

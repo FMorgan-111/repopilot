@@ -1,0 +1,166 @@
+name: SWE-bench OCI Evaluation
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixed tracked evaluation set
+        type: choice
+        required: true
+        options:
+          - checkpoint_5
+          - baseline_10
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Check out RepoPilot
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install contract dependencies
+        run: python -m pip install -e .
+
+      - name: Build tracked instance matrix
+        id: matrix
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          from eval.oci_contract import load_mode_instance_ids
+
+          matrix = {"instance_id": list(load_mode_instance_ids(os.environ["MODE"]))}
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write("matrix=" + json.dumps(matrix, separators=(",", ":")) + "\n")
+          PY
+
+  instance:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      MODE: ${{ inputs.mode }}
+      INSTANCE_ID: ${{ matrix.instance_id }}
+      OPENAI_BASE_URL: https://linoapi.com.cn/v1
+      LLM_MODEL: gemini-3.5-flash:stable
+      LLM_ESCALATION_BASE_URL: https://linoapi.com.cn/v1
+      LLM_ESCALATION_MODEL: claude-opus-4-8:stable
+      REPOPILOT_ESCALATION_ENABLED: "1"
+      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"
+      REPOPILOT_HOME: ${{ runner.temp }}/repopilot-home
+    steps:
+      - name: Check out RepoPilot
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install evaluation dependencies
+        run: python -m pip install -e ".[memory,eval]"
+
+      - name: Prepare OCI runtime
+        run: |
+          python -m eval.oci_runner prepare \
+            --mode "$MODE" \
+            --instance-id "$INSTANCE_ID" \
+            --output-dir "$RUNNER_TEMP/instance"
+
+      - name: Generate patch
+        env:
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_ESCALATION_API_KEY: ${{ secrets.LLM_ESCALATION_API_KEY }}
+        run: |
+          python -m eval.oci_runner generate \
+            --runtime "$RUNNER_TEMP/instance/runtime.json" \
+            --output-dir "$RUNNER_TEMP/instance"
+
+      - name: Score prediction without model credentials
+        if: always()
+        run: |
+          python -m eval.oci_runner score \
+            --runtime "$RUNNER_TEMP/instance/runtime.json" \
+            --output-dir "$RUNNER_TEMP/instance"
+
+      - name: Package safe artifact
+        if: always()
+        run: |
+          python -m eval.oci_runner package \
+            --runtime "$RUNNER_TEMP/instance/runtime.json" \
+            --output-dir "$RUNNER_TEMP/instance" \
+            --artifact-dir "$RUNNER_TEMP/upload"
+
+      - name: Upload safe instance artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swe-bench-oci-instance-${{ matrix.instance_id }}
+          path: ${{ runner.temp }}/upload
+          if-no-files-found: error
+          retention-days: 30
+
+  aggregate:
+    if: always()
+    needs: [prepare, instance]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out RepoPilot
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install contract dependencies
+        run: python -m pip install -e .
+
+      - name: Download current-run instance artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: swe-bench-oci-instance-*
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Aggregate verified artifacts
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          python -m eval.oci_aggregate \
+            --mode "$MODE" \
+            --artifacts-dir "$RUNNER_TEMP/artifacts" \
+            --output-dir "$RUNNER_TEMP/combined" \
+            --expected-commit "${{ github.sha }}"
+
+      - name: Upload aggregate evaluation
+        uses: actions/upload-artifact@v4
+        with:
+          name: swe-bench-oci-${{ inputs.mode }}
+          path: ${{ runner.temp }}/combined
+          if-no-files-found: error
+          retention-days: 30
