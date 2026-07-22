@@ -102,6 +102,59 @@ def test_load_verified_samples_persists_dataset_and_revision(tmp_path):
     }
 
 
+def test_load_verified_rows_exposes_exact_official_rows(tmp_path):
+    calls = []
+
+    def loader(dataset_name, *, split, revision):
+        calls.append((dataset_name, split, revision))
+        return [_row("first"), _row("second")]
+
+    rows = swe_bench.load_verified_rows(
+        cache_path=tmp_path / "verified.jsonl",
+        dataset_loader=loader,
+    )
+
+    assert [row["instance_id"] for row in rows] == ["first", "second"]
+    assert rows[0]["test_patch"].startswith("diff --git")
+    assert calls == [
+        (swe_bench.DATASET_NAME, "test", swe_bench.DATASET_REVISION)
+    ]
+
+
+def test_load_verified_instance_returns_exact_requested_row(tmp_path):
+    def loader(dataset_name, *, split, revision):
+        return [_row("first"), _row("second")]
+
+    row = swe_bench.load_verified_instance(
+        "second",
+        cache_path=tmp_path / "verified.jsonl",
+        dataset_loader=loader,
+    )
+
+    assert row["instance_id"] == "second"
+
+
+def test_load_verified_instance_rejects_unknown_id(tmp_path):
+    with pytest.raises(ValueError, match="unknown SWE-bench Verified instance ID"):
+        swe_bench.load_verified_instance(
+            "missing",
+            cache_path=tmp_path / "verified.jsonl",
+            dataset_loader=lambda *args, **kwargs: [_row("known")],
+        )
+
+
+def test_load_verified_instance_rejects_duplicate_dataset_rows(tmp_path):
+    with pytest.raises(ValueError, match="duplicate SWE-bench Verified instance ID"):
+        swe_bench.load_verified_instance(
+            "duplicate",
+            cache_path=tmp_path / "verified.jsonl",
+            dataset_loader=lambda *args, **kwargs: [
+                _row("duplicate"),
+                _row("duplicate"),
+            ],
+        )
+
+
 def test_write_predictions_uses_official_schema_without_evaluator_data(tmp_path):
     results = [
         {

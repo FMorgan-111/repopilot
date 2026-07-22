@@ -55,7 +55,7 @@
 - Produces: `load_verified_instance(instance_id: str, *, dataset_loader=load_dataset) -> Mapping[str, Any]`
 - Produces: `RuntimeRecord`, `OfficialResult`, `InstanceManifest`, `sha256_file(path: Path) -> str`, and `write_model(path: Path, model: BaseModel) -> None`
 
-- [ ] **Step 1: Write contract tests that fail before the module exists**
+- [x] **Step 1: Write contract tests that fail before the module exists**
 
 ```python
 def test_mode_ids_preserve_tracked_order(tmp_path: Path) -> None:
@@ -77,13 +77,13 @@ def test_manifest_rejects_evaluator_only_fields() -> None:
         InstanceManifest.model_validate({**VALID_MANIFEST, "gold_patch": "secret"})
 ```
 
-- [ ] **Step 2: Run the new tests and confirm import/behavior failures**
+- [x] **Step 2: Run the new tests and confirm import/behavior failures**
 
 Run: `pytest tests/test_oci_contract.py tests/test_swe_bench.py -q`
 
 Expected: FAIL because `eval.oci_contract` and public exact-row loaders do not exist.
 
-- [ ] **Step 3: Implement the minimal strict schemas and mode loader**
+- [x] **Step 3: Implement the minimal strict schemas and mode loader**
 
 ```python
 EvalMode = Literal["checkpoint_5", "baseline_10"]
@@ -128,13 +128,13 @@ class InstanceManifest(BaseModel):
 
 Also reject blank/duplicate mode IDs, use an allowlist rather than arbitrary filenames, hash files by streaming bytes, write JSON atomically through a sibling temporary file, and expose exact dataset row lookup without leaking `test_patch` into agent inputs.
 
-- [ ] **Step 4: Run focused tests and make them pass**
+- [x] **Step 4: Run focused tests and make them pass**
 
 Run: `pytest tests/test_oci_contract.py tests/test_swe_bench.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit the contract**
+- [x] **Step 5: Commit the contract**
 
 ```bash
 git add eval/oci_contract.py eval/swe_bench.py tests/test_oci_contract.py tests/test_swe_bench.py

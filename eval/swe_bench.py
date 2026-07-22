@@ -114,6 +114,66 @@ def _default_cache_path() -> Path:
     return root / "eval" / "datasets" / "swe-bench-verified.jsonl"
 
 
+def load_verified_rows(
+    cache_path: Path | None = None,
+    dataset_loader: Callable[..., Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Load and cache the exact official SWE-bench Verified rows."""
+    path = cache_path or _default_cache_path()
+    if path.exists():
+        return [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line
+        ]
+    if dataset_loader is None:
+        from datasets import load_dataset
+
+        dataset_loader = load_dataset
+    rows = [
+        dict(item)
+        for item in dataset_loader(
+            DATASET_NAME,
+            split="test",
+            revision=DATASET_REVISION,
+        )
+    ]
+    atomic_write_text(
+        path,
+        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in rows),
+    )
+    atomic_write_text(
+        path.with_suffix(".metadata.json"),
+        json.dumps(
+            {"dataset": DATASET_NAME, "revision": DATASET_REVISION},
+            sort_keys=True,
+        ),
+    )
+    return rows
+
+
+def load_verified_instance(
+    instance_id: str,
+    cache_path: Path | None = None,
+    dataset_loader: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Return exactly one official row and reject ambiguous dataset state."""
+    matches = [
+        row
+        for row in load_verified_rows(cache_path, dataset_loader)
+        if str(row.get("instance_id")) == instance_id
+    ]
+    if not matches:
+        raise ValueError(
+            f"unknown SWE-bench Verified instance ID: {instance_id}"
+        )
+    if len(matches) > 1:
+        raise ValueError(
+            f"duplicate SWE-bench Verified instance ID: {instance_id}"
+        )
+    return matches[0]
+
+
 def load_verified_samples(
     count: int,
     seed: int,
@@ -121,39 +181,7 @@ def load_verified_samples(
     dataset_loader: Callable[..., Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Load official rows once, cache them locally, and normalize a selection."""
-    path = cache_path or _default_cache_path()
-    if path.exists():
-        rows = [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line
-        ]
-    else:
-        if dataset_loader is None:
-            from datasets import load_dataset
-
-            dataset_loader = load_dataset
-        rows = list(
-            dataset_loader(
-                DATASET_NAME,
-                split="test",
-                revision=DATASET_REVISION,
-            )
-        )
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(
-            "".join(
-                json.dumps(dict(item), ensure_ascii=False) + "\n" for item in rows
-            ),
-            encoding="utf-8",
-        )
-        path.with_suffix(".metadata.json").write_text(
-            json.dumps(
-                {"dataset": DATASET_NAME, "revision": DATASET_REVISION},
-                sort_keys=True,
-            ),
-            encoding="utf-8",
-        )
+    rows = load_verified_rows(cache_path, dataset_loader)
     return [
         normalize_verified_row(item)
         for item in select_diverse(rows, count=count, seed=seed)
