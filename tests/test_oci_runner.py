@@ -521,13 +521,25 @@ def test_score_invokes_official_harness_and_projects_resolved_result(
         tmp_path,
         scorer=fake_scorer,
         command_runner=_docker_alias_runner(tags, commands),
+        row_loader=_row_loader,
     )
 
     assert result.status == "resolved"
     assert result.submitted is True
     assert result.completed is True
     assert result.resolved is True
-    assert seen["dataset_name"] == "SWE-bench/SWE-bench_Verified"
+    scorer_dataset = Path(str(seen["dataset_name"]))
+    assert scorer_dataset.is_file()
+    assert scorer_dataset.suffix == ".jsonl"
+    assert scorer_dataset.parent == tmp_path / "official-scorer"
+    assert str(seen["dataset_name"]) != "SWE-bench/SWE-bench_Verified"
+    [scorer_row] = [
+        json.loads(line)
+        for line in scorer_dataset.read_text(encoding="utf-8").splitlines()
+    ]
+    assert scorer_row == OFFICIAL_ROW
+    assert verified_row_sha256(scorer_row) == ROW_SHA
+    assert scorer_dataset.stat().st_mode & 0o777 == 0o600
     assert seen["instance_ids"] == [INSTANCE_ID]
     assert seen["max_workers"] == 1
     assert seen["force_rebuild"] is False
@@ -586,6 +598,7 @@ def test_score_uses_verified_run_local_alias_when_latest_is_retargeted(
         tmp_path,
         scorer=fake_scorer,
         command_runner=_docker_alias_runner(tags, commands),
+        row_loader=_row_loader,
     )
 
     assert result.status == "resolved"
@@ -617,6 +630,7 @@ def test_score_fails_closed_when_run_local_alias_changes_during_scoring(
         tmp_path,
         scorer=fake_scorer,
         command_runner=_docker_alias_runner(tags, commands),
+        row_loader=_row_loader,
     )
 
     assert result.status == "scorer_infra"
@@ -624,6 +638,65 @@ def test_score_fails_closed_when_run_local_alias_changes_during_scoring(
     assert all(
         image == OFFICIAL_IMAGE or image == IMAGE_SHA for image in tags
     )
+
+
+def test_score_rejects_dataset_row_digest_mismatch_without_calling_scorer(
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    scorer_called = False
+    wrong_row = {**OFFICIAL_ROW, "problem_statement": "mutable replacement"}
+
+    def forbidden_scorer(**kwargs):
+        nonlocal scorer_called
+        scorer_called = True
+        raise AssertionError("official scorer must not run")
+
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=forbidden_scorer,
+        command_runner=lambda argv, **kwargs: pytest.fail(
+            "Docker must not run before row validation"
+        ),
+        row_loader=lambda _instance_id: wrong_row,
+    )
+
+    assert result.status == "scorer_infra"
+    assert result.error_class == "ValueError"
+    assert scorer_called is False
+
+
+def test_score_fails_closed_when_private_dataset_write_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    scorer_called = False
+
+    def fail_write(path, contents):
+        raise OSError("private dataset unavailable")
+
+    def forbidden_scorer(**kwargs):
+        nonlocal scorer_called
+        scorer_called = True
+        raise AssertionError("official scorer must not run")
+
+    monkeypatch.setattr(oci_runner, "atomic_write_text", fail_write)
+
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=forbidden_scorer,
+        command_runner=lambda argv, **kwargs: pytest.fail(
+            "Docker must not run before private dataset write"
+        ),
+        row_loader=_row_loader,
+    )
+
+    assert result.status == "scorer_infra"
+    assert result.error_class == "OSError"
+    assert scorer_called is False
 
 
 def test_infrastructure_runtime_skips_official_scorer(tmp_path: Path) -> None:

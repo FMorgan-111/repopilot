@@ -27,7 +27,12 @@ from eval.oci_contract import (
     sha256_file,
     write_model,
 )
-from eval.swe_bench import load_verified_instance, verified_row_sha256
+from eval.swe_bench import (
+    atomic_write_text,
+    load_verified_instance,
+    serialize_verified_rows,
+    verified_row_sha256,
+)
 from src.safe_subprocess import (
     BoundedProcessResult,
     ProcessTimeoutError,
@@ -537,6 +542,7 @@ def score_instance(
     *,
     scorer: Callable[..., Path] = _official_scorer,
     command_runner: CommandRunner = run_bounded_process,
+    row_loader: Callable[[str], Mapping[str, Any]] = load_verified_instance,
 ) -> OfficialResult:
     """Run the official scorer only in a model-credential-free environment."""
     _require_credential_free_scorer_env()
@@ -549,8 +555,7 @@ def score_instance(
         return result
 
     prediction_path = (output_dir / "prediction.jsonl").resolve()
-    scorer_dir = output_dir / "official-scorer"
-    scorer_dir.mkdir(parents=True, exist_ok=True)
+    scorer_dir = (output_dir / "official-scorer").resolve()
     run_id = (
         f"repopilot-{runtime.commit_sha[:12]}-"
         f"{hashlib.sha256(runtime.instance_id.encode()).hexdigest()[:12]}"
@@ -563,6 +568,19 @@ def score_instance(
     alias_created = False
     original_cwd = Path.cwd()
     try:
+        row = row_loader(runtime.instance_id)
+        if not hmac.compare_digest(
+            verified_row_sha256(row), runtime.row_sha256
+        ):
+            raise ValueError("runtime dataset row digest mismatch")
+        scorer_dir.mkdir(parents=True, exist_ok=True)
+        scorer_dir.chmod(0o700)
+        scorer_dataset = scorer_dir / "pinned-dataset.jsonl"
+        atomic_write_text(
+            scorer_dataset,
+            serialize_verified_rows([row]).decode("utf-8"),
+        )
+        scorer_dataset.chmod(0o600)
         _run_image_alias_command(
             ["docker", "image", "tag", runtime.image_sha, scorer_alias],
             command_runner,
@@ -572,7 +590,7 @@ def score_instance(
         os.chdir(scorer_dir)
         try:
             report_path = scorer(
-                dataset_name="SWE-bench/SWE-bench_Verified",
+                dataset_name=str(scorer_dataset),
                 split="test",
                 instance_ids=[runtime.instance_id],
                 predictions_path=str(prediction_path),
