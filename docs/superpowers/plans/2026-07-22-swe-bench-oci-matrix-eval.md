@@ -154,7 +154,7 @@ git commit -m "feat(eval): define fixed OCI evaluation contract"
 - Produces: `prepare_instance(mode: EvalMode, instance_id: str, output_dir: Path, *, command_runner=run_bounded_process) -> RuntimeRecord`
 - Produces: CLI `python -m eval.oci_runner prepare --mode MODE --instance-id ID --output-dir DIR`
 
-- [ ] **Step 1: Write failing tests for image derivation, digest pinning, limits, and fail-closed behavior**
+- [x] **Step 1: Write failing tests for image derivation, digest pinning, limits, and fail-closed behavior**
 
 ```python
 def test_prepare_pulls_official_image_and_preflights_digest(monkeypatch, tmp_path):
@@ -181,13 +181,13 @@ def test_resource_limits_are_operator_owned(monkeypatch):
     assert (config.memory, config.cpus, config.pids_limit) == ("4g", 2.0, 256)
 ```
 
-- [ ] **Step 2: Run the focused tests and confirm failures**
+- [x] **Step 2: Run the focused tests and confirm failures**
 
 Run: `pytest tests/test_oci_runner.py tests/test_safe_subprocess.py -q`
 
 Expected: FAIL because prepare logic and resource variables are absent.
 
-- [ ] **Step 3: Implement official image preparation and boundary preflight**
+- [x] **Step 3: Implement official image preparation and boundary preflight**
 
 ```python
 def _official_image(row: Mapping[str, Any]) -> str:
@@ -209,13 +209,13 @@ def _inspect_sha(image: str, command_runner: CommandRunner) -> str:
 
 Extend `tool_sandbox_config_from_env()` to parse bounded memory/CPU/PID values. Build the preflight `ToolSandboxConfig` with the exact global constraints and call the existing `run_oci_process()` to run the testbed Python import check. Catch only classified infrastructure exceptions, write `runtime.json`, return exit status zero for recorded infrastructure outcomes, and never invoke host pytest or repository code.
 
-- [ ] **Step 4: Run focused tests and make them pass**
+- [x] **Step 4: Run focused tests and make them pass**
 
 Run: `pytest tests/test_oci_runner.py tests/test_safe_subprocess.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit image preparation**
+- [x] **Step 5: Commit image preparation**
 
 ```bash
 git add eval/oci_runner.py src/safe_subprocess.py tests/test_oci_runner.py tests/test_safe_subprocess.py

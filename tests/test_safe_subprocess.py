@@ -113,6 +113,21 @@ def test_operator_oci_configuration_is_validated_and_persistable(monkeypatch):
     assert config.project_executables == (("npm", "/usr/bin/npm"),)
 
 
+def test_operator_oci_configuration_reads_bounded_resource_limits(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_TOOL_OCI_BACKEND", "docker")
+    monkeypatch.setenv("REPOPILOT_TOOL_OCI_IMAGE", _IMAGE)
+    monkeypatch.setenv("REPOPILOT_TOOL_MEMORY", "4g")
+    monkeypatch.setenv("REPOPILOT_TOOL_CPUS", "2.0")
+    monkeypatch.setenv("REPOPILOT_TOOL_PIDS_LIMIT", "256")
+
+    config = tool_sandbox_config_from_env()
+
+    assert config is not None
+    assert config.memory == "4g"
+    assert config.cpus == 2.0
+    assert config.pids_limit == 256
+
+
 def test_partial_operator_oci_configuration_fails_closed(monkeypatch):
     monkeypatch.setenv("REPOPILOT_TOOL_OCI_BACKEND", "docker")
     monkeypatch.delenv("REPOPILOT_TOOL_OCI_IMAGE", raising=False)

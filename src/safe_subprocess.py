@@ -177,6 +177,9 @@ def tool_sandbox_config_from_env() -> ToolSandboxConfig | None:
             "REPOPILOT_TOOL_PYTHON_EXECUTABLE", "/usr/bin/python3"
         ).strip(),
         project_executables=project_executables,
+        memory=os.getenv("REPOPILOT_TOOL_MEMORY", "1g").strip(),
+        cpus=os.getenv("REPOPILOT_TOOL_CPUS", "1.0").strip(),
+        pids_limit=os.getenv("REPOPILOT_TOOL_PIDS_LIMIT", "128").strip(),
     )
 
 
