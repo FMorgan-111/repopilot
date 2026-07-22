@@ -160,3 +160,88 @@ git diff --check origin/master...HEAD
 - Advisory locking uses POSIX `flock`, matching the Linux OCI runner and macOS
   development environments. Native Windows execution is not part of this OCI
   evaluation contract.
+
+## Post-review remediation
+
+The follow-up security review identified four gaps in the initial Task 2
+implementation. They are closed as follows:
+
+- Structural approval checks still run before clone, while the existing
+  `patch_gate.revalidate_approved_patch` now runs after the exact checkout is
+  available and before any patch mutation. The happy-path fixture now obtains
+  a real PatchGate approval instead of fabricating approval fields. Fingerprint,
+  plan, edit, and exact-base tampering all fail before the mutation helper is
+  reached.
+- Cache lock acquisition now polls `flock(LOCK_EX | LOCK_NB)` with short async
+  sleeps. Descriptor ownership is tracked explicitly, so cancellation closes
+  the waiter's descriptor without unlocking the holder's lock, and only a
+  successfully acquired lock is released.
+- A real unsafe-host subprocess probe verifies that the actual child process
+  receives none of the model, GitHub, cloud, Actions, or CI sentinels. The
+  environment-gated Docker integration now invokes the complete `execute_fix`
+  OCI path: repository setup and test sentinels execute in the container's
+  `/tmp`, secrets are absent there, and the corresponding host paths remain
+  absent.
+- Cache and mutable-worktree rebuild paths use a checked removal helper. It
+  rejects symlink/non-directory roots, requires the platform's symlink-safe
+  `rmtree`, propagates removal errors, and verifies the root is absent before
+  rebuild continues. The legacy venv cleanup paths are outside this cache and
+  worktree remediation scope.
+
+### Follow-up RED evidence
+
+The canonical-tamper, injected-removal-failure, real child-environment, and
+gated integration selection produced:
+
+```text
+5 failed, 1 passed, 1 skipped in 0.71s
+```
+
+All four canonical tamper variants reached the patch mutation helper, and the
+cache path silently continued to repopulation after the injected removal
+failure. The real child-environment probe already passed because the original
+minimal-environment implementation was correct; the live OCI integration was
+skipped without its explicit environment gate.
+
+The cancellation test was run separately and did not complete within 15
+seconds: the cancelled `asyncio.to_thread(flock)` waiter remained stranded on
+the blocking acquisition. This process hang was the expected RED evidence.
+
+### Follow-up GREEN and final evidence
+
+The new focused cases after implementation:
+
+```text
+7 passed, 1 skipped in 1.70s
+```
+
+The broader execution, PatchGate, policy, router, installation, and subprocess
+regression set:
+
+```text
+261 passed, 1 skipped in 15.30s
+```
+
+Full project suite:
+
+```text
+1192 passed, 2 skipped, 1 warning in 38.96s
+```
+
+The warning remains the existing sqlite-vec/NumPy fallback warning. The live
+Docker integration remains intentionally environment-gated and was skipped on
+this workstation; its hostile setup/test and secret-boundary assertions will
+run in the dedicated OCI gate.
+
+Follow-up static and diff gates:
+
+```text
+.venv/bin/python -m ruff check src/ tests/ eval/ --select=E,F,I --ignore=E501
+All checks passed!
+
+git diff --check
+(no output; exit 0)
+```
+
+The follow-up remediation is kept in a separate commit. No push was made, and
+the user's existing `run_trace.py` modification remains unstaged and untouched.

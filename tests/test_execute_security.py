@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import shlex
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,13 +13,14 @@ import pytest
 
 from src import tool_policy
 from src.nodes import execute as execute_node
+from src.patch_gate import validate_patch_batch
 from src.safe_subprocess import BoundedProcessResult, minimal_subprocess_env
 from src.state import (
     AgentState,
-    SnapshotManifestEntry,
-    ToolPatchApproval,
+    RepairPlan,
     ToolSandboxConfig,
-    tool_manifest_fingerprint,
+    VerifiedEdit,
+    VerifiedEditBatch,
 )
 
 _IMAGE = "registry.example/repopilot-tests@sha256:" + "7" * 64
@@ -42,52 +46,49 @@ def _approved_state(tmp_path: Path, *, command: str) -> AgentState:
     source = root / "src" / "widget.py"
     source.write_text("def answer():\n    return 1\n", encoding="utf-8")
     (root / "tests" / "test_widget.py").write_text(
-        "from src.widget import answer\n\ndef test_answer():\n    assert answer() == 2\n",
+        "from src.widget import answer\n\n"
+        "def test_answer():\n"
+        "    assert answer() == 2\n",
         encoding="utf-8",
     )
     _git(root, "add", "--all")
     _git(root, "commit", "-qm", "base")
     ref = _git(root, "rev-parse", "HEAD")
-    source.write_text("def answer():\n    return 2\n", encoding="utf-8")
-    patch = subprocess.run(
-        ["git", "-C", str(root), "diff", "--binary", ref, "--"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    content = source.read_bytes()
-    manifest = (
-        SnapshotManifestEntry(
-            path="src/widget.py",
-            change="modified",
-            mode="100644",
-            content_sha256=hashlib.sha256(content).hexdigest(),
-            size=len(content),
-        ),
+    plan = RepairPlan(
+        root_cause="answer returns the old value",
+        target_files=["src/widget.py"],
+        target_symbols=["answer"],
+        required_behavior="answer returns two",
+        regression_test_strategy="run the focused answer test",
     )
-    source.write_text("def answer():\n    return 1\n", encoding="utf-8")
-    return AgentState(
+    state = AgentState(
         issue_url="https://github.com/acme/widget/issues/1",
         owner="acme",
         repo="widget",
         repo_path=str(root),
         repo_ref=ref,
         trace_id="abc123def456",
-        patch_content=patch,
         test_command=command,
+        active_repair_plan=plan,
         tool_sandbox_config=ToolSandboxConfig(
             backend="docker",
             image=_IMAGE,
             python_executable="/sandbox/bin/python",
         ),
-        tool_patch_approval=ToolPatchApproval(
-            base_ref=ref,
-            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
-            patch_gate_fingerprint="e" * 64,
-            changed_manifest=manifest,
-            manifest_fingerprint=tool_manifest_fingerprint(manifest),
-        ),
     )
+    batch = VerifiedEditBatch(
+        edits=[
+            VerifiedEdit(
+                file_path="src/widget.py",
+                search="return 1",
+                replace="return 2",
+                intent="return the corrected answer",
+            )
+        ]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+    assert state.tool_patch_approval is not None
+    return state
 
 
 @pytest.mark.parametrize("unsafe_value", [None, "", "0", "true", "01", "1 "])
@@ -244,6 +245,53 @@ async def test_oci_execute_ignores_hostile_test_text_and_uses_fixed_full_suite(
     assert result.fix_attempts[-1].success is False
 
 
+@pytest.mark.parametrize(
+    "tamper_kind",
+    ["fingerprint", "plan", "edit", "base"],
+)
+async def test_oci_revalidates_canonical_approval_before_patch_mutation(
+    tmp_path, monkeypatch, tamper_kind
+):
+    state = _approved_state(tmp_path, command="pytest tests/test_widget.py -q")
+    source = Path(state.repo_path) / "src" / "widget.py"
+    patch_mutation_called = False
+
+    if tamper_kind == "fingerprint":
+        assert state.tool_patch_approval is not None
+        state.tool_patch_approval = state.tool_patch_approval.model_copy(
+            update={"patch_gate_fingerprint": "f" * 64}
+        )
+    elif tamper_kind == "plan":
+        assert state.active_repair_plan is not None
+        state.active_repair_plan = state.active_repair_plan.model_copy(
+            update={"required_behavior": "tampered plan"}
+        )
+    elif tamper_kind == "edit":
+        state.patch_edits[0].replace = "return 3"
+    else:
+        source.write_text(
+            source.read_text(encoding="utf-8") + "# tampered base\n",
+            encoding="utf-8",
+        )
+    before = source.read_bytes()
+
+    def forbidden_patch_mutation(_state):
+        nonlocal patch_mutation_called
+        patch_mutation_called = True
+        raise AssertionError("patch mutation reached before canonical revalidation")
+
+    monkeypatch.setattr(
+        "src.patch_gate.apply_approved_patch", forbidden_patch_mutation
+    )
+
+    result = await execute_node.execute_fix(state)
+
+    assert patch_mutation_called is False
+    assert source.read_bytes() == before
+    assert result.fix_attempts[-1].failure_kind == "infra_error"
+    assert "PatchGate" in result.fix_attempts[-1].error_log
+
+
 def test_legacy_host_helpers_receive_only_minimal_environment(tmp_path, monkeypatch):
     monkeypatch.setenv("LLM_API_KEY", "model-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
@@ -283,6 +331,60 @@ def test_legacy_host_helpers_receive_only_minimal_environment(tmp_path, monkeypa
             "CI",
         )
     )
+
+
+async def test_explicit_unsafe_host_child_receives_real_minimal_environment(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / "repo"
+    root.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "test@example.invalid")
+    _git(root, "config", "user.name", "Test")
+    source = root / "value.py"
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    probe = root / "environment_probe.py"
+    secret_keys = [
+        "LLM_API_KEY",
+        "GITHUB_TOKEN",
+        "AWS_SECRET_ACCESS_KEY",
+        "GITHUB_ACTIONS",
+        "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+        "CI",
+    ]
+    probe.write_text(
+        "import json, os\n"
+        "print(json.dumps("
+        f"{{key: os.environ.get(key) for key in {secret_keys!r}}}, "
+        "sort_keys=True))\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "--all")
+    _git(root, "commit", "-qm", "base")
+    source.write_text("VALUE = 2\n", encoding="utf-8")
+    patch = subprocess.run(
+        ["git", "-C", str(root), "diff", "--binary", "HEAD", "--"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    _git(root, "checkout", "--", "value.py")
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+    for key in secret_keys:
+        monkeypatch.setenv(key, f"host-{key.lower()}-sentinel")
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        repo_path=str(root),
+        trace_id="abc123def456",
+        patch_content=patch,
+        test_command=shlex.join([sys.executable, probe.name]),
+    )
+
+    result = await execute_node.execute_fix(state)
+
+    assert result.fix_attempts[-1].success is True
+    child_environment = json.loads(result.fix_attempts[-1].error_log.strip())
+    assert child_environment == {key: None for key in secret_keys}
 
 
 def test_mutable_checkout_and_venv_paths_use_only_trace_sha256(monkeypatch, tmp_path):
@@ -367,6 +469,74 @@ async def test_cache_lock_rejects_world_writable_lock_directory(tmp_path):
     with pytest.raises(RuntimeError, match="lock directory is unsafe"):
         async with execute_node._cache_lock(cache):
             raise AssertionError("unsafe cache lock was acquired")
+
+
+async def test_cancelled_cache_lock_waiter_never_strands_an_acquisition(tmp_path):
+    cache = tmp_path / "repos" / "acme-widget"
+    holder_ready = asyncio.Event()
+    release_holder = asyncio.Event()
+
+    async def hold_lock():
+        async with execute_node._cache_lock(cache):
+            holder_ready.set()
+            await release_holder.wait()
+
+    async def wait_for_lock():
+        async with execute_node._cache_lock(cache):
+            raise AssertionError("cancelled waiter acquired the cache lock")
+
+    holder = asyncio.create_task(hold_lock())
+    await holder_ready.wait()
+    waiter = asyncio.create_task(wait_for_lock())
+    await asyncio.sleep(0.05)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=0.5)
+    release_holder.set()
+    await holder
+
+    async with asyncio.timeout(0.5):
+        async with execute_node._cache_lock(cache):
+            pass
+
+
+async def test_cache_rebuild_stops_when_checked_removal_fails(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    work = tmp_path / "work"
+    (cache / ".git").mkdir(parents=True)
+    ref = "a" * 40
+    removal_called = False
+
+    async def unhealthy(_path):
+        return False
+
+    def failed_removal(path, *, ignore_errors=False):
+        nonlocal removal_called
+        removal_called = True
+        if ignore_errors:
+            return
+        raise OSError(f"injected removal failure: {path}")
+
+    failed_removal.avoids_symlink_attacks = True
+
+    async def forbidden_repopulation(*_args, **_kwargs):
+        raise AssertionError("cache repopulation reached after removal failure")
+
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", unhealthy)
+    monkeypatch.setattr(execute_node.shutil, "rmtree", failed_removal)
+    monkeypatch.setattr(execute_node, "_populate_ref_cache", forbidden_repopulation)
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        owner="acme",
+        repo="widget",
+        repo_ref=ref,
+        trace_id="abc123def456",
+    )
+
+    with pytest.raises(RuntimeError, match="checked cache removal failed"):
+        await execute_node._git_clone_locked(state, ref, cache, str(work))
+
+    assert removal_called is True
 
 
 async def test_reset_failure_and_dirty_status_fail_closed(monkeypatch, tmp_path):

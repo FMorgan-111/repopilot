@@ -51,6 +51,7 @@ _TOKENIZED_GITHUB_URL_RE = re.compile(
 )
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _EXACT_REF_FETCH_RETRY_DELAYS = (0.5, 1.0)
+_CACHE_LOCK_POLL_SECONDS = 0.01
 _TRANSIENT_GIT_TRANSPORT_MARKERS = (
     "ssl_error_syscall",
     "connection reset",
@@ -152,6 +153,7 @@ async def _cache_lock(cache_path: Path):
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(lock_path, flags, 0o600)
+    acquired = False
     try:
         lock_info = os.fstat(fd)
         if (
@@ -161,13 +163,42 @@ async def _cache_lock(cache_path: Path):
             or bool(lock_info.st_mode & 0o022)
         ):
             raise RuntimeError("repository cache lock is not a regular file")
-        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                await asyncio.sleep(_CACHE_LOCK_POLL_SECONDS)
         yield
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+def _checked_remove_tree(path: str | Path) -> None:
+    """Remove one known cache tree without following links or hiding failures."""
+    target = Path(path)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"refusing to remove non-directory cache path: {target}")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError("checked cache removal requires symlink-safe rmtree")
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise RuntimeError(f"checked cache removal failed: {target}") from exc
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(f"checked cache removal did not remove path: {target}")
 
 
 def _validated_repo_ref(state: AgentState) -> str:
@@ -488,7 +519,7 @@ async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
             result = await _run_git_async(command, timeout=300)
         except asyncio.TimeoutError:
             last_error = f"clone timed out: {' '.join(command[:4])}..."
-            shutil.rmtree(cache_path, ignore_errors=True)
+            _checked_remove_tree(cache_path)
             continue
         if result.returncode == 0:
             try:
@@ -505,13 +536,13 @@ async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
                     60,
                 )
             except Exception:
-                shutil.rmtree(cache_path, ignore_errors=True)
+                _checked_remove_tree(cache_path)
                 raise
             return
         last_error = _redact_sensitive_error_text(
             (result.stderr or result.stdout).strip()
         )
-        shutil.rmtree(cache_path, ignore_errors=True)
+        _checked_remove_tree(cache_path)
     raise RuntimeError(last_error)
 
 
@@ -544,7 +575,7 @@ async def _git_clone_locked(
             await _reset_work_tree_async(work, repo_ref)
             return work
         _repo_cache_event("ref_mismatch", state, target="worktree")
-        shutil.rmtree(work, ignore_errors=True)
+        _checked_remove_tree(work)
 
     if repo_ref and (cache_path / ".git").exists():
         if (
@@ -554,14 +585,14 @@ async def _git_clone_locked(
             _repo_cache_event("object_hit", state)
         else:
             _repo_cache_event("ref_mismatch", state, target="object_cache")
-            shutil.rmtree(cache_path, ignore_errors=True)
+            _checked_remove_tree(cache_path)
 
     if repo_ref and not (cache_path / ".git").exists():
         _repo_cache_event("remote_fetch", state)
         try:
             await _populate_ref_cache(state, cache_path, repo_ref)
         except Exception:
-            shutil.rmtree(cache_path, ignore_errors=True)
+            _checked_remove_tree(cache_path)
             raise
 
     if not repo_ref:
@@ -572,7 +603,7 @@ async def _git_clone_locked(
             _repo_cache_event("remote_fetch", state)
             await _populate_live_cache(state, cache_path)
 
-    shutil.rmtree(work, ignore_errors=True)
+    _checked_remove_tree(work)
     try:
         await _clone_local_repo_async(cache_path, work)
         expected_head = repo_ref or await _worktree_head(str(cache_path))
@@ -582,8 +613,8 @@ async def _git_clone_locked(
         return work
     except (subprocess.CalledProcessError, asyncio.TimeoutError, RuntimeError):
         _repo_cache_event("rebuild", state)
-        shutil.rmtree(cache_path, ignore_errors=True)
-        shutil.rmtree(work, ignore_errors=True)
+        _checked_remove_tree(cache_path)
+        _checked_remove_tree(work)
         if repo_ref:
             await _populate_ref_cache(state, cache_path, repo_ref)
         else:
@@ -1303,6 +1334,10 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 state.current_phase = Phase.VERIFY
                 return state
             cloned_during_execute = True
+        if execution_mode == "oci":
+            from ..patch_gate import revalidate_approved_patch
+
+            revalidate_approved_patch(state)
         if execution_mode == "unsafe_host" and (
             cloned_during_execute or state.repo_ref
         ):
