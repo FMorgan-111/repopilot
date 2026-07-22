@@ -89,6 +89,25 @@ def test_gate_accepts_exact_search_without_mutating_and_builds_approval(tmp_path
     revalidate_approved_patch(state)
 
 
+def test_gate_approval_survives_resolved_search_target_metadata(tmp_path):
+    source = b"class Nominal:\n    def _setup(self):\n        return 1\n"
+    root, ref = _repo(tmp_path, {"src/a.py": source.decode()})
+    plan = _plan("src/a.py")
+    state = _state(root, ref, plan)
+    batch = VerifiedEditBatch(
+        edits=[_edit("src/a.py", search="return 1", replace="return 2", before=source)]
+    )
+    assert validate_patch_batch(state, plan, batch).accepted
+
+    state.patch_edits[0].resolved_target_symbol = "Nominal._setup"
+
+    revalidate_approved_patch(state)
+    apply_approved_patch(state)
+    assert (root / "src/a.py").read_text(encoding="utf-8") == source.decode().replace(
+        "return 1", "return 2"
+    )
+
+
 def test_gate_accepts_unique_node_and_intentional_new_text_file_atomically(tmp_path):
     source = b"def value():\n    return 1\n"
     root, ref = _repo(tmp_path, {"src/a.py": source.decode()})

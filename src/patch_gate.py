@@ -316,6 +316,19 @@ def _patch_text(
     return b"".join(chunks).decode("utf-8")
 
 
+def _approval_edit_payload(edit: PatchEdit) -> dict[str, str | bool]:
+    """Serialize only fields that define the exact approved mutation."""
+    return {
+        "file_path": edit.file_path,
+        "search": edit.search,
+        "replace": edit.replace,
+        "replace_all": edit.replace_all,
+        "node_target": edit.node_target,
+        "expected_content_sha256": edit.expected_content_sha256,
+        "exact_only": edit.exact_only,
+    }
+
+
 def _fingerprint(
     state: AgentState,
     plan: RepairPlan,
@@ -326,7 +339,7 @@ def _fingerprint(
     payload = {
         "base_ref": state.repo_ref.lower(),
         "plan": plan.model_dump(mode="json"),
-        "ordered_exact_edits": [edit.model_dump(mode="json") for edit in edits],
+        "ordered_exact_edits": [_approval_edit_payload(edit) for edit in edits],
         "result_manifest": [entry.model_dump(mode="json") for entry in manifest],
         "patch_sha256": patch_sha256,
     }
