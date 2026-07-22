@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
+
 WORKFLOW = Path(".github/workflows/swe-bench-oci-eval.yml")
 
 
@@ -19,42 +21,140 @@ def _named_step(text: str, name: str) -> str:
     return match.group("body")
 
 
-def test_workflow_is_manual_only_with_fixed_modes() -> None:
-    text = _workflow_text()
+def _mapping_block(text: str, key: str, indent: int) -> str:
+    lines = text.splitlines()
+    target = f"{' ' * indent}{key}:"
+    starts = [
+        index
+        for index, line in enumerate(lines)
+        if line == target or line.startswith(f"{target} ")
+    ]
+    assert len(starts) == 1, f"expected one {target!r} mapping, found {len(starts)}"
 
-    assert "workflow_dispatch:" in text
-    assert "pull_request:" not in text
-    assert re.search(r"(?m)^\s*push:", text) is None
-    assert "checkpoint_5" in text
-    assert "baseline_50" in text
-    assert "baseline_10" not in text
-    assert "type: choice" in text
+    start = starts[0]
+    end = start + 1
+    while end < len(lines):
+        line = lines[end]
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        end += 1
+    return "\n".join(lines[start:end])
+
+
+def _assert_manual_workflow_contract(text: str) -> None:
+    triggers = _mapping_block(text, "on", 0)
+    assert re.findall(r"(?m)^  ([a-zA-Z_-]+):", triggers) == ["workflow_dispatch"]
+
+    dispatch = _mapping_block(triggers, "workflow_dispatch", 2)
+    inputs = _mapping_block(dispatch, "inputs", 4)
+    mode = _mapping_block(inputs, "mode", 6)
+    assert "        type: choice" in mode
+    options = _mapping_block(mode, "options", 8)
+    assert [line.strip() for line in options.splitlines()[1:] if line.strip()] == [
+        "- checkpoint_5",
+        "- baseline_50",
+    ]
+
+
+def _assert_workflow_concurrency_contract(text: str) -> None:
+    concurrency = _mapping_block(text, "concurrency", 0)
+    fields = {}
+    for line in concurrency.splitlines()[1:]:
+        if line.strip() and len(line) - len(line.lstrip()) == 2:
+            key, value = line.strip().split(":", 1)
+            fields[key] = value.strip()
+    assert fields == {
+        "group": "swe-bench-oci-evaluation",
+        "cancel-in-progress": "false",
+        "queue": "max",
+    }
+
+
+def _assert_public_dataset_cache_contract(text: str) -> None:
+    cache = _named_step(text, "Restore public SWE-bench dataset cache")
+    assert re.findall(r"(?m)^        ([a-zA-Z_-]+):", cache) == ["uses", "with"]
+    assert re.findall(r"(?m)^        uses: (.+)$", cache) == ["actions/cache@v4"]
+    assert re.findall(r"(?m)^          key: (.+)$", cache) == [
+        "swe-bench-verified-main-v1"
+    ]
+
+    with_block = _mapping_block(cache, "with", 8)
+    assert re.findall(r"(?m)^          ([a-zA-Z_-]+):", with_block) == [
+        "path",
+        "key",
+    ]
+    path = _mapping_block(with_block, "path", 10)
+    assert path.splitlines()[0] == "          path: |"
+    assert [line.strip() for line in path.splitlines()[1:] if line.strip()] == [
+        "${{ runner.temp }}/public-hf-cache",
+        "${{ runner.temp }}/repopilot-home/eval/datasets",
+    ]
+
+
+def test_workflow_is_manual_only_with_fixed_modes() -> None:
+    _assert_manual_workflow_contract(_workflow_text())
+
+
+def test_manual_workflow_contract_rejects_extra_trigger_or_mode() -> None:
+    text = _workflow_text()
+    mutations = (
+        text.replace(
+            "  workflow_dispatch:\n",
+            "  schedule:\n    - cron: '0 0 * * *'\n  workflow_dispatch:\n",
+            1,
+        ),
+        text.replace(
+            "          - baseline_50\n",
+            "          - baseline_50\n          - experimental\n",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            _assert_manual_workflow_contract(mutation)
 
 
 def test_workflow_serializes_eval_runs_without_cancelling() -> None:
-    text = _workflow_text()
+    _assert_workflow_concurrency_contract(_workflow_text())
 
-    assert "group: swe-bench-oci-evaluation" in text
-    assert "cancel-in-progress: false" in text
+
+def test_workflow_concurrency_contract_rejects_job_local_lookalike() -> None:
+    text = _workflow_text()
+    original_root = _mapping_block(text, "concurrency", 0)
+    valid_root = original_root
+    if "  queue: max" not in valid_root:
+        valid_root += "\n  queue: max"
+    without_root = text.replace(original_root, "", 1)
+    job_local = "\n".join(f"    {line}" for line in valid_root.splitlines())
+    mutation = without_root.replace("  instance:\n", f"  instance:\n{job_local}\n", 1)
+
+    with pytest.raises(AssertionError):
+        _assert_workflow_concurrency_contract(mutation)
 
 
 def test_workflow_cache_is_public_dataset_only() -> None:
-    text = _workflow_text()
-    cache = _named_step(text, "Restore public SWE-bench dataset cache")
+    _assert_public_dataset_cache_contract(_workflow_text())
 
-    assert "actions/cache@v4" in cache
-    assert "swe-bench-verified-main-v1" in cache
-    assert "public-hf-cache" in cache
-    assert "repopilot-home/eval/datasets" in cache
-    for forbidden in (
-        "llm_api_key",
-        "llm_escalation_api_key",
-        "prediction",
-        "result.json",
-        "target checkout",
-        "docker",
-    ):
-        assert forbidden not in cache.casefold()
+
+def test_public_dataset_cache_contract_rejects_near_matches() -> None:
+    text = _workflow_text()
+    mutations = (
+        text.replace("actions/cache@v4", "actions/cache@v4-extra", 1),
+        text.replace(
+            "key: swe-bench-verified-main-v1",
+            "key: swe-bench-verified-main-v1-extra",
+            1,
+        ),
+        text.replace(
+            "            ${{ runner.temp }}/repopilot-home/eval/datasets\n",
+            "            ${{ runner.temp }}/repopilot-home/eval/datasets\n"
+            "            ${{ runner.temp }}/repopilot-home\n",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            _assert_public_dataset_cache_contract(mutation)
 
 
 def test_workflow_uses_one_instance_per_job_and_two_way_bound() -> None:

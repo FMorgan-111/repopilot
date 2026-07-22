@@ -17,6 +17,7 @@ permissions:
 concurrency:
   group: swe-bench-oci-evaluation
   cancel-in-progress: false
+  queue: max
 
 jobs:
   prepare:
