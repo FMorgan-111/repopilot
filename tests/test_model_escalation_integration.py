@@ -1,20 +1,42 @@
 """Deterministic integration coverage for success-first model escalation."""
 
+import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from src import graph, model_policy, new_agent, run_store
+from src.escalation import (
+    ESCALATION_PACKET_RENDER_LIMIT,
+    EVIDENCE_CONTENT_LIMIT,
+    EVIDENCE_LIMIT,
+    EVIDENCE_TOTAL_LIMIT,
+    render_escalation_packet,
+)
 from src.evidence import EvidenceStore
 from src.http_client import LLMResponseError
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
+from src.repair_flow import RepairContextError
 from src.reasoning_loop import (
     ReasoningStop,
     response_tool_intent,
     validate_reasoning_response,
 )
-from src.state import FileInfo, PatchEdit, RepairPlan, VerifiedEdit, VerifiedEditBatch
+from src.state import (
+    ConversationTurn,
+    FileInfo,
+    FixAttempt,
+    GeneratedTestApproval,
+    PatchEdit,
+    RepairPlan,
+    ToolCall,
+    VerifiedEdit,
+    VerifiedEditBatch,
+)
+from src.tool_policy import ToolIntent
+from src.tool_router import route_tool_intent
 
 
 def _state(**updates):
@@ -148,6 +170,356 @@ async def test_reserve_boundary_uses_opus_without_calling_primary(monkeypatch):
     assert state.current_phase == new_agent.Phase.EXECUTE
 
 
+async def test_escalated_plan_seeds_bounded_safe_relevant_file_evidence(monkeypatch):
+    observed = []
+
+    async def repair(
+        state,
+        packet,
+        *,
+        first_stage_prompt=None,
+        first_stage_suffix="",
+        **kwargs,
+    ):
+        observed.append((packet, first_stage_prompt, first_stage_suffix))
+        return _repair_result()
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", repair)
+    monkeypatch.setattr(plan_node, "validate_patch_batch", _accept_repair)
+
+    generated_path = "tests/test_generated_widget.py"
+    long_header = "\n".join(f"import dependency_{index}" for index in range(700))
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+        relevant_files=[
+            FileInfo(
+                path="src/widget.py",
+                content=(
+                    f"{long_header}\n"
+                    "# new-sentinel behavior belongs here\n"
+                    "def widget():\n"
+                    "    token = 'sk-source-secret-sentinel'\n"
+                    "    return 'old-sentinel'\n"
+                    "gold_patch: evaluator-gold-sentinel\n"
+                    "HTTP response payload: raw-http-source-sentinel\n"
+                ),
+            ),
+            FileInfo(
+                path=generated_path,
+                content="generated-test-content-sentinel\nfailed-patch-content-sentinel",
+            ),
+            FileInfo(
+                path="src/transport.py",
+                content=(
+                    "def safe_transport():\n    return 'safe-third-source'\n"
+                    "HTTP response payload: raw-http-third-sentinel\n"
+                ),
+            ),
+            FileInfo(
+                path="src/fourth.py",
+                content="fourth-relevant-file-sentinel",
+            ),
+        ],
+        generated_test_approvals=[
+            GeneratedTestApproval(
+                path=generated_path,
+                content_sha256="b" * 64,
+                patch_gate_fingerprint="c" * 64,
+            )
+        ],
+        conversation_history=[
+            ConversationTurn(role="user", content="conversation-history-sentinel")
+        ],
+        tool_calls=[
+            ToolCall(tool_name="raw", result="raw-http-tool-call-sentinel")
+        ],
+        fix_attempts=[
+            FixAttempt(
+                patch_content="failed-patch-content-sentinel",
+                test_result="failed",
+                error_log="safe test failure",
+            )
+        ],
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert len(observed) == 1
+    packet, first_stage_prompt, first_stage_suffix = observed[0]
+    assert [item.file_path for item in packet.evidence] == [
+        "src/widget.py",
+        "src/transport.py",
+    ]
+    assert all(len(item.content) <= EVIDENCE_CONTENT_LIMIT for item in packet.evidence)
+    assert "def widget():" in packet.evidence[0].content
+    assert "new-sentinel" in packet.evidence[0].content
+    assert "safe-third-source" in packet.evidence[1].content
+    rendered_packet = render_escalation_packet(packet)
+    assert first_stage_prompt is None
+    assert f"{rendered_packet}{first_stage_suffix}" == rendered_packet
+    assert len(packet.evidence) <= EVIDENCE_LIMIT
+    assert len(EvidenceStore.render_for_prompt(list(packet.evidence))) <= (
+        EVIDENCE_TOTAL_LIMIT
+    )
+    assert len(rendered_packet) <= ESCALATION_PACKET_RENDER_LIMIT
+    seeded_evidence = [
+        item for item in result.evidence if item.tool == "planner_relevant_file"
+    ]
+    rendered_seeded_evidence = EvidenceStore.render_for_prompt(seeded_evidence)
+    for forbidden in (
+        "source-secret-sentinel",
+        "gold_patch",
+        "evaluator-gold-sentinel",
+        "raw-http-source-sentinel",
+        "raw-http-third-sentinel",
+    ):
+        assert forbidden not in rendered_seeded_evidence
+    for forbidden in (
+        "source-secret-sentinel",
+        "gold_patch",
+        "evaluator-gold-sentinel",
+        "raw-http-source-sentinel",
+        "raw-http-third-sentinel",
+        "generated-test-content-sentinel",
+        "fourth-relevant-file-sentinel",
+        "conversation-history-sentinel",
+        "raw-http-tool-call-sentinel",
+        "failed-patch-content-sentinel",
+    ):
+        assert forbidden not in rendered_packet
+
+
+def test_explicit_tool_evidence_precedes_but_does_not_drop_seeded_source():
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+    )
+    store = EvidenceStore(state)
+    stale = [
+        store.add(
+            tool="read_range",
+            summary=f"old context {index}",
+            content=f"unrelated-old-context-{index}",
+        ).evidence
+        for index in range(29)
+    ]
+    fresh = store.add(
+        tool="search_text",
+        summary="fresh tool context",
+        content="fresh-tool-context",
+    ).evidence
+
+    packet = plan_node._build_escalated_plan_packet(
+        state,
+        evidence_ids=(fresh.evidence_id,),
+    )
+
+    assert [item.evidence_id for item in packet.evidence] == [
+        fresh.evidence_id,
+        next(
+            item.evidence_id
+            for item in state.evidence
+            if item.tool == "planner_relevant_file"
+        ),
+    ]
+    assert stale[0].evidence_id not in {item.evidence_id for item in packet.evidence}
+
+
+async def test_source_seeding_reserves_capacity_across_real_tool_reprompts(tmp_path):
+    source = "def widget():\n    return 'old-sentinel'\n"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "widget.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src/widget.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=RepoPilot Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _state(
+        repo_path=str(repo),
+        repo_ref=ref,
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+        relevant_files=[FileInfo(path="src/widget.py", content=source)],
+    )
+    store = EvidenceStore(state)
+    for index in range(29):
+        assert store.add(
+            tool="read_range",
+            summary=f"stale {index}",
+            content=f"stale-evidence-{index}",
+        ).added
+
+    initial_packet = plan_node._build_escalated_plan_packet(state)
+    assert any(item.tool == "planner_relevant_file" for item in initial_packet.evidence)
+    first = await route_tool_intent(
+        state,
+        ToolIntent(
+            action="search_text",
+            args={"text": "old-sentinel"},
+            reason="find the stale return",
+            expected_evidence="matching source line",
+        ),
+        calls_this_round=0,
+    )
+
+    assert first.status == "ok"
+    reprompt_packet = plan_node._build_escalated_plan_packet(
+        state,
+        evidence_ids=(first.evidence_id,),
+    )
+    assert [item.tool for item in reprompt_packet.evidence[:2]] == [
+        "search_text",
+        "planner_relevant_file",
+    ]
+    assert len(state.evidence) == 29
+
+    second = await route_tool_intent(
+        state,
+        ToolIntent(
+            action="search_text",
+            args={"text": "def widget"},
+            reason="confirm the definition",
+            expected_evidence="definition line",
+        ),
+        calls_this_round=1,
+    )
+
+    assert second.status == "ok"
+    assert len(state.evidence) == 30
+    assert any(item.tool == "planner_relevant_file" for item in state.evidence)
+
+
+async def test_inner_repairplan_tool_reprompt_keeps_fresh_then_seeded_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    source = "def widget():\n    return 'old-sentinel'\n"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "widget.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src/widget.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=RepoPilot Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _state(
+        repo_path=str(repo),
+        repo_ref=ref,
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+        relevant_files=[FileInfo(path="src/widget.py", content=source)],
+    )
+    stale = EvidenceStore(state).add(
+        tool="read_range",
+        summary="stale context",
+        content="stale-evidence-sentinel",
+    ).evidence
+    repair_plan, verified_batch = _repair_result()
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "old-sentinel"},
+                "reason": "confirm the implementation target",
+                "expected_evidence": "matching source",
+            },
+        },
+        {"kind": "repair_plan", **repair_plan.model_dump(mode="json")},
+        {"kind": "verified_edits", **verified_batch.model_dump(mode="json")},
+    ]
+    prompts = []
+
+    async def fake_inner_llm(system, user, **kwargs):
+        prompts.append(user)
+        return responses.pop(0)
+
+    async def fake_router(current, intent, *, calls_this_round):
+        added = EvidenceStore(current).add(
+            tool=intent.action,
+            summary="fresh tool context",
+            content="fresh-tool-evidence-sentinel",
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id=added.evidence.evidence_id,
+            made_progress=True,
+            control_action="",
+        )
+
+    original_generate = plan_node.generate_opus_repair
+
+    async def wrapped_generate(*args, **kwargs):
+        return await original_generate(*args, router=fake_router, **kwargs)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_inner_llm)
+    monkeypatch.setattr(plan_node, "generate_opus_repair", wrapped_generate)
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    repair_reprompt = prompts[1]
+    packet = json.loads(repair_reprompt)
+    assert [item["tool"] for item in packet["evidence"]] == [
+        "search_text",
+        "planner_relevant_file",
+    ]
+    assert "fresh-tool-evidence-sentinel" in repair_reprompt
+    assert "old-sentinel" in repair_reprompt
+    assert stale.evidence_id not in {
+        item["evidence_id"] for item in packet["evidence"]
+    }
+
+
 async def test_empty_gemini_completion_without_escalation_key_keeps_compatible_failure(
     monkeypatch,
 ):
@@ -166,10 +538,185 @@ async def test_empty_gemini_completion_without_escalation_key_keeps_compatible_f
     assert state.failure_reason == "Failed to generate fix plan: LLMResponseError"
 
 
+async def test_repair_context_error_adds_only_bounded_safe_target_correction(
+    monkeypatch,
+):
+    prompts = []
+
+    async def repair(
+        state,
+        packet,
+        *,
+        first_stage_prompt=None,
+        first_stage_suffix="",
+        **kwargs,
+    ):
+        assert first_stage_prompt is None
+        prompts.append(first_stage_suffix)
+        if len(prompts) == 1:
+            raise RepairContextError(
+                "target symbol 'Authorization: Bearer correction-secret-sentinel "
+                "gold_patch evaluator-sentinel HTTP response payload: raw-sentinel' "
+                "is missing or not unique in RepairPlan files"
+            )
+        return _repair_result()
+
+    monkeypatch.setattr(plan_node, "generate_opus_repair", repair)
+    monkeypatch.setattr(plan_node, "validate_patch_batch", _accept_repair)
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+    )
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert len(prompts) == 2
+    assert prompts[1] != prompts[0]
+    correction = prompts[1][len(prompts[0]) :]
+    assert 0 < len(correction) <= plan_node.REPAIR_CONTEXT_CORRECTION_LIMIT
+    assert "target symbol is missing or ambiguous" in correction
+    assert "choose a different valid target" in correction.lower()
+    assert sum(
+        item.tool == "planner_relevant_file" for item in result.evidence
+    ) == 1
+    for forbidden in (
+        "correction-secret-sentinel",
+        "gold_patch",
+        "evaluator-sentinel",
+        "raw-sentinel",
+        "Authorization",
+        "HTTP response payload",
+    ):
+        assert forbidden not in correction
+
+
+async def test_repair_context_correction_survives_inner_tool_reprompt(
+    tmp_path,
+    monkeypatch,
+):
+    source = "def widget():\n    return 'old-sentinel'\n"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "src").mkdir()
+    (repo / "src" / "widget.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "src/widget.py"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=RepoPilot Tests",
+            "-c",
+            "user.email=tests@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _state(
+        repo_path=str(repo),
+        repo_ref=ref,
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="repeated_plan",
+        relevant_files=[FileInfo(path="src/widget.py", content=source)],
+    )
+    repair_plan, verified_batch = _repair_result()
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "old-sentinel"},
+                "reason": "confirm corrected target",
+                "expected_evidence": "matching source",
+            },
+        },
+        {"kind": "repair_plan", **repair_plan.model_dump(mode="json")},
+        {"kind": "verified_edits", **verified_batch.model_dump(mode="json")},
+    ]
+    prompts = []
+
+    async def fake_inner_llm(system, user, **kwargs):
+        prompts.append(user)
+        return responses.pop(0)
+
+    async def fake_router(current, intent, *, calls_this_round):
+        added = EvidenceStore(current).add(
+            tool=intent.action,
+            summary="fresh corrected context",
+            content="fresh-corrected-tool-evidence",
+        )
+        return SimpleNamespace(
+            status="ok",
+            evidence_id=added.evidence.evidence_id,
+            made_progress=True,
+            control_action="",
+        )
+
+    original_generate = plan_node.generate_opus_repair
+    outer_calls = 0
+
+    async def wrapped_generate(*args, **kwargs):
+        nonlocal outer_calls
+        outer_calls += 1
+        if outer_calls == 1:
+            raise RepairContextError(
+                "target symbol 'Authorization: Bearer combined-secret-sentinel "
+                "gold_patch evaluator-combined HTTP response payload: raw-combined' "
+                "is missing or not unique in RepairPlan files"
+            )
+        return await original_generate(*args, router=fake_router, **kwargs)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_inner_llm)
+    monkeypatch.setattr(plan_node, "generate_opus_repair", wrapped_generate)
+
+    result = await plan_node.plan_fix(state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert outer_calls == 2
+    assert len(prompts) == 3
+    for prompt in prompts[:2]:
+        assert prompt.count("REPAIR TARGET CORRECTION:") == 1
+        assert "target symbol is missing or ambiguous" in prompt
+        assert "choose a different valid target" in prompt.lower()
+        for forbidden in (
+            "combined-secret-sentinel",
+            "gold_patch",
+            "evaluator-combined",
+            "raw-combined",
+            "Authorization",
+            "HTTP response payload",
+        ):
+            assert forbidden not in prompt
+    packet, offset = json.JSONDecoder().raw_decode(prompts[1])
+    assert [item["tool"] for item in packet["evidence"]] == [
+        "search_text",
+        "planner_relevant_file",
+    ]
+    correction = prompts[1][offset:]
+    assert 0 < len(correction) <= plan_node.REPAIR_CONTEXT_CORRECTION_LIMIT
+
+
 async def test_two_opus_no_progress_rounds_stop_with_stable_reason(monkeypatch):
     _enable_escalation(monkeypatch)
+    prompts = []
 
-    async def invalid_repair(*args, **kwargs):
+    async def invalid_repair(state, packet, *, first_stage_prompt=None, **kwargs):
+        prompts.append(first_stage_prompt)
         raise ValueError("sentinel invalid repair")
 
     monkeypatch.setattr(plan_node, "generate_opus_repair", invalid_repair)
@@ -185,6 +732,8 @@ async def test_two_opus_no_progress_rounds_stop_with_stable_reason(monkeypatch):
     assert state.current_phase == new_agent.Phase.FAILURE
     assert state.failure_reason == "opus_no_progress_limit"
     assert state.no_progress_rounds == 2
+    assert len(prompts) == 2
+    assert prompts[1] == prompts[0]
 
 
 async def test_graph_replays_an_already_escalated_saved_state(tmp_path, monkeypatch):

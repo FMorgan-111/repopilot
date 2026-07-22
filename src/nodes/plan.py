@@ -10,9 +10,11 @@ from collections.abc import Sequence
 from typing import Any
 
 from ..escalation import (
-    build_escalation_packet,
+    EscalationPacket,
     immediate_model_policy_reason,
+    prepare_repair_plan_packet,
     record_model_invocation,
+    relevance_window,
     render_escalation_packet,
 )
 from ..llm import llm_call
@@ -29,6 +31,7 @@ from ..outcome_summary import (
 from ..patch_gate import revalidate_approved_patch, validate_patch_batch
 from ..patch_match import closest_region, locate_search_block
 from ..repair_flow import (
+    RepairContextError,
     generate_opus_repair,
     resolve_search_target_symbol,
     request_verified_edit_correction,
@@ -67,6 +70,7 @@ PLAN_ISSUE_BODY_LIMIT = 2500
 PLAN_FILE_CONTENT_LIMIT = 6000
 PLAN_MAX_FILES = 3
 PLAN_FAILURE_LOG_LIMIT = 1000
+REPAIR_CONTEXT_CORRECTION_LIMIT = 500
 
 ESCALATED_PLAN_SYSTEM = (
     "You are RepoPilot's escalated planning node. The user message is the complete "
@@ -128,51 +132,6 @@ def _truncate_prompt_text(value: str, limit: int = 500) -> str:
     if len(value) <= limit:
         return value
     return f"{value[:limit].rstrip()}..."
-
-
-def _relevance_window(content: str, terms: Sequence[str], limit: int) -> str:
-    """Return up to ~`limit` chars of `content` centered on the line most
-    relevant to the issue terms, instead of blindly taking the head.
-
-    The fix site is often far below a file's imports; head-truncation hides it
-    and the planner then hallucinates a search block for code it never saw.
-    Centering on the best term match surfaces the actual lines to copy — at the
-    same token cost. Falls back to the head when nothing matches."""
-    if len(content) <= limit:
-        return content
-    lines = content.split("\n")
-    lowered = [line.lower() for line in lines]
-    lowered_terms = [t.lower() for t in terms if t.strip()]
-
-    best_idx, best_score = -1, 0
-    for i, line in enumerate(lowered):
-        score = sum(1 for t in lowered_terms if t in line)
-        if score > best_score:
-            best_score, best_idx = score, i
-    if best_idx < 0:
-        return f"{content[:limit].rstrip()}..."  # no match → old head behavior
-
-    lo = hi = best_idx
-    size = len(lines[best_idx])
-    while True:
-        moved = False
-        if lo > 0 and size + len(lines[lo - 1]) + 1 < limit:
-            lo -= 1
-            size += len(lines[lo]) + 1
-            moved = True
-        if hi < len(lines) - 1 and size + len(lines[hi + 1]) + 1 < limit:
-            hi += 1
-            size += len(lines[hi]) + 1
-            moved = True
-        if not moved:
-            break
-
-    window = "\n".join(lines[lo : hi + 1])
-    if lo > 0:
-        window = f"... [{lo} lines above truncated] ...\n{window}"
-    if hi < len(lines) - 1:
-        window = f"{window}\n... [{len(lines) - 1 - hi} lines below truncated] ..."
-    return window
 
 
 def _normalized_edit_key(file_path: str, search: str) -> str:
@@ -800,7 +759,7 @@ def build_plan_user_prompt(
     file_limit, max_files = _budget_scaled_file_limits(state)
     files_context = "\n\n".join(
         f"FILE: {file.path}\nRELEVANCE: {file.relevance_score} - {file.reason}\n"
-        f"CONTENT:\n{_relevance_window(file.content, files_terms, file_limit)}"
+        f"CONTENT:\n{relevance_window(file.content, files_terms, file_limit)}"
         for file in state.relevant_files[:max_files]
     )
     completed_attempts_context = ""
@@ -837,13 +796,51 @@ def _build_escalated_plan_user_prompt(
 ) -> str:
     """Render the Task 6 packet plus one first-stage-only rolling summary."""
     packet = render_escalation_packet(
-        build_escalation_packet(state, evidence_ids=evidence_ids)
+        _build_escalated_plan_packet(state, evidence_ids=evidence_ids)
     )
     packet = packet.replace(OUTCOME_SUMMARY_SECTION, "")
+    return f"{packet}{_build_escalated_plan_prompt_suffix(state)}"
+
+
+def _build_escalated_plan_prompt_suffix(state: AgentState) -> str:
+    """Return bounded first-stage context that follows exactly one packet."""
     summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
     if not summary:
-        return packet
-    return f"{packet}\n\n{OUTCOME_SUMMARY_SECTION}\n{summary}"
+        return ""
+    return f"\n\n{OUTCOME_SUMMARY_SECTION}\n{summary}"
+
+
+def _build_escalated_plan_packet(
+    state: AgentState,
+    *,
+    evidence_ids: tuple[str, ...] | None = None,
+) -> EscalationPacket:
+    return prepare_repair_plan_packet(state, evidence_ids=evidence_ids)
+
+
+def _repair_context_correction(error: RepairContextError) -> str:
+    """Classify one context rejection without copying its untrusted value."""
+    message = str(error).casefold()
+    if message.startswith("target symbol "):
+        reason = "target symbol is missing or ambiguous"
+    elif "evaluator" in message:
+        reason = "target context crosses the evaluator-data allowlist boundary"
+    elif "budget" in message or "too many target" in message:
+        reason = "target selection exceeds bounded context limits"
+    elif any(
+        marker in message
+        for marker in ("target file", "target path", "symlink", "checkout")
+    ):
+        reason = "target file is unavailable or outside the validated exact checkout"
+    else:
+        reason = "target context failed deterministic validation"
+    correction = (
+        "\n\nREPAIR TARGET CORRECTION:\n"
+        f"The previous RepairPlan was rejected because the {reason}. "
+        "Choose a different valid target file or symbol supported by the bounded "
+        "source evidence; do not repeat the rejected target."
+    )
+    return correction[:REPAIR_CONTEXT_CORRECTION_LIMIT]
 
 
 async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
@@ -927,6 +924,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
 
     calls_this_round = 0
     reasoning_tool_counter = [0]
+    repair_context_correction = ""
     while True:
         previous_provider = state.active_provider
         apply_escalation(state, should_escalate(state))
@@ -950,8 +948,11 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 )
                 repair_plan, verified_batch = await generate_opus_repair(
                     state,
-                    build_escalation_packet(state),
-                    first_stage_prompt=user,
+                    _build_escalated_plan_packet(state),
+                    first_stage_suffix=(
+                        _build_escalated_plan_prompt_suffix(state)
+                        + repair_context_correction
+                    ),
                     validate_edits=False,
                     tool_counter=reasoning_tool_counter,
                 )
@@ -1124,7 +1125,14 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     state.current_phase = Phase.FAILURE
                     return state
                 system = ESCALATED_PLAN_SYSTEM
-                user = _build_escalated_plan_user_prompt(state)
+                if isinstance(exc, RepairContextError):
+                    repair_context_correction = _repair_context_correction(exc)
+                else:
+                    repair_context_correction = ""
+                user = (
+                    f"{_build_escalated_plan_user_prompt(state)}"
+                    f"{repair_context_correction}"
+                )
                 prompt_tokens_estimate = _estimate_tokens(system, user)
                 continue
             state.failure_reason = f"Failed to generate fix plan: {type(exc).__name__}"

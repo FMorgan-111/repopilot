@@ -20,6 +20,7 @@ from pydantic import BaseModel, ValidationError
 from .escalation import (
     EscalationPacket,
     build_escalation_packet,
+    prepare_repair_plan_packet,
     record_model_invocation,
     render_escalation_packet,
 )
@@ -28,6 +29,7 @@ from .llm import llm_call
 from .local_search import is_sensitive_repo_path
 from .model_provider import redact_secrets
 from .model_policy import apply_escalation, should_escalate
+from .outcome_summary import MAX_OUTCOME_SUMMARY_CHARS, OUTCOME_SUMMARY_SECTION
 from .patch_match import locate_node_span
 from .repo_paths import canonical_repo_path
 from .reasoning_loop import (
@@ -43,6 +45,7 @@ from .state import (
     VerifiedEditBatch,
     _estimate_tokens,
 )
+from .summary_safety import sanitize_summary_text
 from .tool_router import ToolRouteResult, route_tool_intent
 
 TARGET_CONTEXT_CONTENT_LIMIT = 8_000
@@ -50,7 +53,10 @@ TARGET_CONTEXT_TOTAL_LIMIT = 24_000
 TARGET_CONTEXT_FILE_LIMIT = 8
 TARGET_CONTEXT_SYMBOL_LIMIT = 16
 REPAIR_PROMPT_LIMIT = 120_000
+REPAIR_CONTEXT_CORRECTION_LIMIT = 500
 SURROUNDING_LINES = 3
+
+_REPAIR_CONTEXT_CORRECTION_SECTION = "REPAIR TARGET CORRECTION:"
 
 _TEXT_SOURCE_SUFFIXES = frozenset(
     {
@@ -732,23 +738,110 @@ def verified_edits_to_patch_edits(
     return edits
 
 
+def _render_default_repair_plan_reprompt(
+    state: AgentState,
+    initial_packet: EscalationPacket,
+    evidence_ids: tuple[str, ...],
+    suffix: str = "",
+) -> str:
+    """Render fresh tool evidence followed by deterministic source evidence."""
+    rendered = render_escalation_packet(
+        prepare_repair_plan_packet(
+            state,
+            initial_packet,
+            evidence_ids=evidence_ids,
+        )
+    )
+    return f"{rendered}{suffix}"
+
+
+def _first_stage_prompt_suffix(prompt: str) -> str:
+    """Discard a caller-supplied packet and retain only its bounded suffix."""
+    try:
+        payload, offset = json.JSONDecoder().raw_decode(prompt)
+        EscalationPacket.model_validate(payload)
+    except (json.JSONDecodeError, ValidationError, TypeError) as exc:
+        raise RepairContextError(
+            "custom repair prompt must start with one valid escalation packet"
+        ) from exc
+    return _validated_first_stage_suffix(prompt[offset:])
+
+
+def _validated_first_stage_suffix(suffix: str) -> str:
+    """Allow only bounded rolling-summary and repair-correction sections."""
+    if not suffix:
+        return ""
+    summary_prefix = f"\n\n{OUTCOME_SUMMARY_SECTION}\n"
+    correction_prefix = f"\n\n{_REPAIR_CONTEXT_CORRECTION_SECTION}\n"
+    summary = ""
+    correction = ""
+    if suffix.startswith(summary_prefix):
+        remainder = suffix[len(summary_prefix) :]
+        if correction_prefix in remainder:
+            summary, correction_body = remainder.split(correction_prefix, 1)
+            correction = f"{correction_prefix}{correction_body}"
+        else:
+            summary = remainder
+    elif suffix.startswith(correction_prefix):
+        correction = suffix
+    else:
+        raise RepairContextError("custom repair prompt suffix is not allowlisted")
+
+    if summary:
+        if (
+            len(summary) > MAX_OUTCOME_SUMMARY_CHARS
+            or sanitize_summary_text(summary, len(summary)) != summary
+            or any(marker in summary for marker in ("{", "}"))
+            or OUTCOME_SUMMARY_SECTION in summary
+            or _REPAIR_CONTEXT_CORRECTION_SECTION in summary
+        ):
+            raise RepairContextError("custom repair summary suffix is invalid")
+    elif suffix.startswith(summary_prefix):
+        raise RepairContextError("custom repair summary suffix is empty")
+
+    if correction:
+        correction_body = correction[len(correction_prefix) :]
+        if (
+            not correction_body
+            or len(correction) > REPAIR_CONTEXT_CORRECTION_LIMIT
+            or sanitize_summary_text(correction_body, len(correction_body))
+            != correction_body
+            or any(marker in correction_body for marker in ("{", "}"))
+            or OUTCOME_SUMMARY_SECTION in correction_body
+            or _REPAIR_CONTEXT_CORRECTION_SECTION in correction_body
+        ):
+            raise RepairContextError("custom repair correction suffix is invalid")
+    return suffix
+
+
 async def generate_opus_repair(
     state: AgentState,
     packet: EscalationPacket,
     *,
     first_stage_prompt: str | None = None,
+    first_stage_suffix: str = "",
     validate_edits: bool = True,
     router: Callable[..., Awaitable[ToolRouteResult]] = route_tool_intent,
     policy_hook: Callable[[AgentState], None] | None = None,
     tool_counter: list[int] | None = None,
+    first_stage_reprompt: Callable[[tuple[str, ...]], str] | None = None,
 ) -> tuple[RepairPlan, VerifiedEditBatch]:
     """Generate patch-free intent, resolve exact context, then request edits."""
     if state.active_provider != "escalation" or not state.escalated:
         raise RepairContextError("two-stage repair requires one-way escalation")
     if packet.base_commit != state.repo_ref:
         raise RepairContextError("EscalationPacket base commit does not match checkout")
+    packet = prepare_repair_plan_packet(state, packet)
     rendered_packet = render_escalation_packet(packet)
-    plan_user = rendered_packet if first_stage_prompt is None else first_stage_prompt
+    if first_stage_prompt is not None and first_stage_suffix:
+        raise RepairContextError(
+            "repair plan prompt cannot combine a full override with a suffix"
+        )
+    if first_stage_prompt is not None:
+        first_stage_suffix = _first_stage_prompt_suffix(first_stage_prompt)
+    else:
+        first_stage_suffix = _validated_first_stage_suffix(first_stage_suffix)
+    plan_user = f"{rendered_packet}{first_stage_suffix}"
     if len(plan_user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("repair plan prompt exceeds strict context budget")
     reasoning_tool_counter = tool_counter if tool_counter is not None else [0]
@@ -772,8 +865,15 @@ async def generate_opus_repair(
         outcome_kind="repair_plan",
         router=router,
         policy_hook=policy_hook,
-        reprompt=lambda evidence_ids: render_escalation_packet(
-            build_escalation_packet(state, evidence_ids=evidence_ids)
+        reprompt=lambda evidence_ids: _render_default_repair_plan_reprompt(
+            state,
+            packet,
+            evidence_ids,
+            (
+                _first_stage_prompt_suffix(first_stage_reprompt(evidence_ids))
+                if first_stage_reprompt is not None
+                else first_stage_suffix
+            ),
         ),
         tool_counter=reasoning_tool_counter,
     )

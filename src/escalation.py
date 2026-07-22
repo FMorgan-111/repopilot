@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from typing import Any, Literal
 
 from pydantic import (
@@ -19,7 +19,7 @@ from pydantic import (
 from .evidence import EvidenceStore
 from .http_client import LLMResponseError
 from .model_provider import redact_secrets
-from .state import AgentState, FixAttempt, ModelInvocation
+from .state import AgentState, Evidence, FixAttempt, ModelInvocation, _issue_search_terms
 
 ISSUE_TITLE_LIMIT = 500
 ISSUE_BODY_LIMIT = 4_000
@@ -40,6 +40,10 @@ EVIDENCE_FINGERPRINT_LIMIT = 128
 ESCALATION_PACKET_RENDER_LIMIT = 70_000
 REMAINING_TOKEN_BUDGET_LIMIT = 1_000_000_000_000
 REMAINING_EXECUTION_ATTEMPTS_LIMIT = 1_000_000
+REPAIR_SOURCE_TOOL = "planner_relevant_file"
+REPAIR_SOURCE_FILE_LIMIT = 3
+REPAIR_STATE_EVIDENCE_LIMIT = 30
+REPAIR_TOOL_EVIDENCE_RESERVE = 1
 
 _EVALUATOR_FIELD_RE = re.compile(
     r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b"
@@ -78,6 +82,45 @@ def _safe_text(
         text = text[: min(boundary_offsets)]
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     return normalized[: max(0, limit)]
+
+
+def relevance_window(content: str, terms: Sequence[str], limit: int) -> str:
+    """Center a bounded source window on the densest issue-term match."""
+    if len(content) <= limit:
+        return content
+    lines = content.split("\n")
+    lowered = [line.lower() for line in lines]
+    lowered_terms = [term.lower() for term in terms if term.strip()]
+
+    best_idx, best_score = -1, 0
+    for index, line in enumerate(lowered):
+        score = sum(1 for term in lowered_terms if term in line)
+        if score > best_score:
+            best_score, best_idx = score, index
+    if best_idx < 0:
+        return f"{content[:limit].rstrip()}..."
+
+    lo = hi = best_idx
+    size = len(lines[best_idx])
+    while True:
+        moved = False
+        if lo > 0 and size + len(lines[lo - 1]) + 1 < limit:
+            lo -= 1
+            size += len(lines[lo]) + 1
+            moved = True
+        if hi < len(lines) - 1 and size + len(lines[hi + 1]) + 1 < limit:
+            hi += 1
+            size += len(lines[hi]) + 1
+            moved = True
+        if not moved:
+            break
+
+    window = "\n".join(lines[lo : hi + 1])
+    if lo > 0:
+        window = f"... [{lo} lines above truncated] ...\n{window}"
+    if hi < len(lines) - 1:
+        window = f"{window}\n... [{len(lines) - 1 - hi} lines below truncated] ..."
+    return window
 
 
 def _bounded_items(
@@ -440,6 +483,149 @@ def build_escalation_packet(
         remaining_token_budget=max(0, state.token_budget - state.token_usage),
         remaining_execution_attempts=max(0, state.max_retries - state.retry_count),
     )
+
+
+def _hydrated_repair_source_evidence(state: AgentState) -> tuple[Evidence, ...]:
+    """Build stable safe source items from only the hydrated top three files."""
+    generated_paths = _generated_test_paths(state)
+    terms = _issue_search_terms(state.issue_title, state.issue_body)
+    temporary = state.model_copy(deep=True)
+    temporary.evidence = []
+    store = EvidenceStore(
+        temporary,
+        max_items=REPAIR_SOURCE_FILE_LIMIT,
+        max_content_chars=EVIDENCE_CONTENT_LIMIT,
+        max_summary_chars=EVIDENCE_SUMMARY_LIMIT,
+    )
+    source_evidence: list[Evidence] = []
+    for file in state.relevant_files[:REPAIR_SOURCE_FILE_LIMIT]:
+        if file.path in generated_paths:
+            continue
+        added = store.add(
+            tool=REPAIR_SOURCE_TOOL,
+            summary=f"Hydrated exact-checkout source window for {file.path}",
+            content=_safe_text(
+                relevance_window(file.content, terms, EVIDENCE_CONTENT_LIMIT),
+                EVIDENCE_CONTENT_LIMIT,
+                denied_literals=generated_paths,
+            ),
+            file_path=file.path,
+        )
+        if added.evidence is not None:
+            source_evidence.append(added.evidence)
+    return tuple(source_evidence)
+
+
+def _initial_packet_repair_source(
+    state: AgentState,
+    packet: EscalationPacket,
+) -> tuple[EscalationEvidence, ...]:
+    """Retain bounded supplied source only when no hydrated files exist."""
+    if state.relevant_files:
+        return ()
+    generated_paths = _generated_test_paths(state)
+    source: list[EscalationEvidence] = []
+    for item in packet.evidence:
+        if item.tool != REPAIR_SOURCE_TOOL or item.file_path in generated_paths:
+            continue
+        safe_item = _as_escalation_evidence(
+            item,
+            denied_literals=generated_paths,
+        )
+        if safe_item is not None:
+            source.append(safe_item)
+        if len(source) >= REPAIR_SOURCE_FILE_LIMIT:
+            break
+    return tuple(source)
+
+
+def _reserve_repair_tool_evidence_capacity(
+    state: AgentState,
+    source_evidence: tuple[Evidence, ...],
+    *,
+    protected_evidence_ids: tuple[str, ...],
+) -> None:
+    """Compact persisted evidence while reserving one real router slot."""
+    source_ids = {item.evidence_id for item in source_evidence}
+    source_fingerprints = {item.fingerprint for item in source_evidence}
+    preserved = [
+        item
+        for item in state.evidence
+        if item.evidence_id not in source_ids
+        and item.fingerprint not in source_fingerprints
+        and (not state.relevant_files or item.tool != REPAIR_SOURCE_TOOL)
+    ]
+    protected_ids = set(protected_evidence_ids)
+    protected = [
+        item for item in preserved if item.evidence_id in protected_ids
+    ]
+    unprotected = [
+        item for item in preserved if item.evidence_id not in protected_ids
+    ]
+    available = max(
+        0,
+        REPAIR_STATE_EVIDENCE_LIMIT
+        - REPAIR_TOOL_EVIDENCE_RESERVE
+        - len(source_evidence),
+    )
+    state.evidence = [*protected, *unprotected][:available] + list(source_evidence)
+
+
+def prepare_repair_plan_packet(
+    state: AgentState,
+    packet: EscalationPacket | None = None,
+    *,
+    evidence_ids: tuple[str, ...] | None = None,
+) -> EscalationPacket:
+    """Hydrate and order bounded evidence for every RepairPlan prompt."""
+    initial_packet = packet or build_escalation_packet(state)
+    hydrated_source = _hydrated_repair_source_evidence(state)
+    supplied_source = _initial_packet_repair_source(state, initial_packet)
+    source_evidence: tuple[Evidence | EscalationEvidence, ...] = (
+        hydrated_source or supplied_source
+    )
+    _reserve_repair_tool_evidence_capacity(
+        state,
+        hydrated_source,
+        protected_evidence_ids=evidence_ids or (),
+    )
+
+    if evidence_ids is None:
+        leading = source_evidence
+        remaining = (
+            item
+            for item in initial_packet.evidence
+            if item.tool != REPAIR_SOURCE_TOOL
+        )
+    else:
+        explicit = build_escalation_packet(
+            state,
+            evidence_ids=evidence_ids,
+        ).evidence
+        leading = tuple(
+            item for item in explicit if item.tool != REPAIR_SOURCE_TOOL
+        )
+        remaining = iter(source_evidence)
+
+    merged: list[Evidence | EscalationEvidence] = []
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
+    for item in (*leading, *remaining):
+        if (
+            item.evidence_id in seen_ids
+            or item.fingerprint in seen_fingerprints
+        ):
+            continue
+        seen_ids.add(item.evidence_id)
+        seen_fingerprints.add(item.fingerprint)
+        merged.append(item)
+
+    payload = initial_packet.model_dump(mode="python")
+    payload["evidence"] = _bounded_evidence_values(
+        merged,
+        denied_literals=_generated_test_paths(state),
+    )
+    return EscalationPacket.model_validate(payload)
 
 
 def render_escalation_packet(packet: EscalationPacket) -> str:
