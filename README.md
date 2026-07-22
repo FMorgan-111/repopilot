@@ -391,7 +391,7 @@ python eval/report.py \
 Each instance is cloned and checked out at its exact 40-character
 `base_commit` before local code search, patching, and testing. The issue seed
 contains no gold patch, test patch, or evaluator-only fields.
-The primary benchmark score is the official `resolved` status from the
+The primary benchmark score is the Official `resolved` status from the
 SWE-bench harness. The auditable secondary engineering score is RepoPilot's
 `agent_success` (and compatibility `success` field), which is true only when
 `coverage_status` is `existing_verified` or `generated_verified` and a
