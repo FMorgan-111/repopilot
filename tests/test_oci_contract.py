@@ -127,6 +127,18 @@ def test_official_result_distinguishes_unresolved_from_infrastructure() -> None:
     assert infrastructure.status == "scorer_infra"
 
 
+def test_official_empty_patch_is_submitted_but_not_completed() -> None:
+    result = OfficialResult(
+        instance_id=INSTANCE_ID,
+        status="empty_patch",
+        submitted=True,
+        completed=False,
+        resolved=False,
+    )
+
+    assert result.status == "empty_patch"
+
+
 def test_sha256_file_hashes_exact_bytes(tmp_path: Path) -> None:
     path = tmp_path / "payload"
     path.write_bytes(b"exact\x00bytes")

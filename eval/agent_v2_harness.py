@@ -40,7 +40,9 @@ is_transient_git_transport_error = _execute._is_transient_git_transport_error
 classify_sample = importlib.import_module("eval.failure_taxonomy").classify_sample
 _swe_bench = importlib.import_module("eval.swe_bench")
 build_agent_seed = _swe_bench.build_agent_seed
+load_verified_instance = _swe_bench.load_verified_instance
 load_verified_samples = _swe_bench.load_verified_samples
+normalize_verified_row = _swe_bench.normalize_verified_row
 write_predictions = _swe_bench.write_predictions
 atomic_write_text = _swe_bench.atomic_write_text
 _safe_contracts = importlib.import_module("eval.safe_contracts")
@@ -674,18 +676,22 @@ async def evaluate_agent_v2_sample(
     return result
 
 
-def _safe_failed_sample_result(
+def safe_failed_sample_result(
     sample: dict[str, Any],
     error: Exception,
     *,
-    seed_gold_files: bool,
+    seed_gold_files: bool = False,
+    failure_class: str | None = None,
+    commit_sha: str | None = None,
 ) -> dict[str, Any]:
+    """Create a safe terminal result without serializing exception text."""
     issue = _as_mapping(sample.get("issue"))
     repo = _as_mapping(sample.get("repo"))
     is_swe_bench = sample.get("source") == "swe-bench-verified"
-    failure_class = (
-        "infra" if is_transient_git_transport_error(error) else "other"
-    )
+    if failure_class not in {"infra", "other"}:
+        failure_class = (
+            "infra" if is_transient_git_transport_error(error) else "other"
+        )
     safe_fields = _safe_result_fields({}, None, None)
     safe_fields.update(
         {
@@ -700,7 +706,7 @@ def _safe_failed_sample_result(
             "oracle_files" if seed_gold_files and not is_swe_bench else "end_to_end"
         ),
         "model": _safe_text(_configured_model(), 300),
-        "commit_sha": _current_commit_sha(),
+        "commit_sha": _safe_text(commit_sha or _current_commit_sha(), 40),
         "repo": _safe_text(f"{repo.get('owner', '')}/{repo.get('name', '')}", 500),
         "issue_url": _safe_text(issue.get("url")),
         "issue_title": _safe_text(issue.get("title")),
@@ -741,6 +747,36 @@ def _safe_failed_sample_result(
             }
         )
     return result
+
+
+async def run_exact_verified_instance(
+    instance_id: str,
+    *,
+    output_dir: Path,
+    max_retries: int = 3,
+    token_budget: int = 100_000,
+) -> dict[str, Any]:
+    """Run exactly one official Verified row and persist one safe checkpoint."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        row = load_verified_instance(instance_id)
+        sample = normalize_verified_row(row)
+        try:
+            result = await evaluate_agent_v2_sample(
+                sample,
+                0,
+                max_retries=max_retries,
+                token_budget=token_budget,
+                seed_gold_files=False,
+            )
+        except Exception as exc:
+            result = safe_failed_sample_result(sample, exc)
+        _write_results_with_fallback([result], output_dir / "result.json")
+        write_predictions([result], output_dir / "prediction.jsonl")
+        return result
+    finally:
+        await _close_shared_resources()
 
 
 async def run_agent_v2_eval(
@@ -819,7 +855,7 @@ async def run_agent_v2_eval(
                     seed_gold_files=seed_gold_files,
                 )
             except Exception as exc:
-                result = _safe_failed_sample_result(
+                result = safe_failed_sample_result(
                     sample,
                     exc,
                     seed_gold_files=seed_gold_files,

@@ -129,10 +129,14 @@ class OfficialResult(BaseModel):
             self.submitted and self.completed and self.resolved
         ):
             raise ValueError("resolved status requires all result flags")
-        if self.status in {"unresolved", "empty_patch"} and (
+        if self.status == "unresolved" and (
             not self.submitted or not self.completed or self.resolved
         ):
             raise ValueError(f"{self.status} status has inconsistent result flags")
+        if self.status == "empty_patch" and (
+            not self.submitted or self.completed or self.resolved
+        ):
+            raise ValueError("empty_patch status has inconsistent result flags")
         if self.status == "scorer_infra" and self.resolved:
             raise ValueError("scorer infrastructure failure cannot be resolved")
         if self.status != "scorer_infra" and self.error_class:

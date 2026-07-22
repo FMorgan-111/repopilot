@@ -236,7 +236,7 @@ git commit -m "feat(eval): prepare immutable SWE-bench OCI runtime"
 - Produces: `generate_instance(runtime_path: Path, output_dir: Path) -> None`
 - Produces: `score_instance(runtime_path: Path, output_dir: Path, *, scorer=run_evaluation_main) -> OfficialResult`
 
-- [ ] **Step 1: Write failing generation/scorer isolation tests**
+- [x] **Step 1: Write failing generation/scorer isolation tests**
 
 ```python
 @pytest.mark.asyncio
@@ -261,13 +261,13 @@ def test_runtime_infra_skips_official_scorer(monkeypatch, infra_runtime, tmp_pat
     scorer.assert_not_called()
 ```
 
-- [ ] **Step 2: Run tests and confirm the public entry points are missing**
+- [x] **Step 2: Run tests and confirm the public entry points are missing**
 
 Run: `pytest tests/test_agent_v2_eval.py tests/test_oci_runner.py -q`
 
 Expected: FAIL on missing functions and credential boundary behavior.
 
-- [ ] **Step 3: Implement exact generation and scorer projection**
+- [x] **Step 3: Implement exact generation and scorer projection**
 
 ```python
 SCORER_FORBIDDEN_ENV = frozenset({
@@ -292,13 +292,13 @@ def _project_official_report(report: Mapping[str, Any], instance_id: str) -> Off
 
 Promote the safe failure helper without weakening its allowlist. For ready runtimes, generation calls the exact-instance harness with retries `3` and token budget `100000`; for infrastructure runtimes it writes a safe failure result and empty-patch prediction without a model call. The scorer runs from a temporary working directory and calls official `swebench.harness.run_evaluation.main()` for exactly one ID, dataset, prediction file, worker, namespace, and 1800-second timeout. It projects only the safe booleans/status/error class into `official_result.json`; raw logs and evaluator material remain outside the upload bundle.
 
-- [ ] **Step 4: Run focused tests and make them pass**
+- [x] **Step 4: Run focused tests and make them pass**
 
 Run: `pytest tests/test_agent_v2_eval.py tests/test_oci_runner.py -q`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit generation and scoring**
+- [x] **Step 5: Commit generation and scoring**
 
 ```bash
 git add eval/agent_v2_harness.py eval/oci_runner.py tests/test_agent_v2_eval.py tests/test_oci_runner.py

@@ -1038,6 +1038,96 @@ async def test_run_swe_bench_eval_without_requested_ids_keeps_seed_selection(
     ]
 
 
+def test_public_safe_failed_result_uses_explicit_commit_and_infra_class(
+    monkeypatch,
+):
+    secret = "must-not-be-serialized"
+    monkeypatch.setattr(agent_v2_harness, "_configured_model", lambda: "test-model")
+
+    result = agent_v2_harness.safe_failed_sample_result(
+        swe_bench_sample(),
+        RuntimeError(secret),
+        failure_class="infra",
+        commit_sha="b" * 40,
+    )
+
+    assert result["failure_class"] == "infra"
+    assert result["commit_sha"] == "b" * 40
+    assert result["model_patch"] == ""
+    assert secret not in json.dumps(result)
+
+
+async def test_run_exact_verified_instance_loads_only_one_row_and_fixed_limits(
+    monkeypatch, tmp_path
+):
+    instance_id = "acme__widget-8"
+    sample = swe_bench_sample()
+    calls = []
+
+    def fake_load(requested_id):
+        calls.append(("load", requested_id))
+        return {"instance_id": requested_id}
+
+    async def fake_evaluate(
+        selected,
+        idx,
+        max_retries=3,
+        token_budget=100000,
+        seed_gold_files=False,
+    ):
+        calls.append(
+            (
+                "evaluate",
+                selected["instance_id"],
+                idx,
+                max_retries,
+                token_budget,
+                seed_gold_files,
+            )
+        )
+        return {
+            "id": selected["id"],
+            "mode": "agent_v2",
+            "instance_id": selected["instance_id"],
+            "base_commit": selected["base_commit"],
+            "model": "gemini-3.5-flash:stable",
+            "model_patch": "diff --git a/a.py b/a.py\n",
+            "success": False,
+            "agent_success": False,
+            "official_resolved": None,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "load_verified_instance", fake_load)
+    monkeypatch.setattr(
+        agent_v2_harness, "normalize_verified_row", lambda row: sample
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "evaluate_agent_v2_sample", fake_evaluate
+    )
+    monkeypatch.setattr(
+        agent_v2_harness, "_close_shared_resources", lambda: asyncio.sleep(0)
+    )
+
+    result = await agent_v2_harness.run_exact_verified_instance(
+        instance_id,
+        output_dir=tmp_path,
+        max_retries=3,
+        token_budget=100_000,
+    )
+
+    assert result["instance_id"] == instance_id
+    assert calls == [
+        ("load", instance_id),
+        ("evaluate", instance_id, 0, 3, 100_000, False),
+    ]
+    assert json.loads((tmp_path / "result.json").read_text())[0][
+        "instance_id"
+    ] == instance_id
+    assert json.loads((tmp_path / "prediction.jsonl").read_text())[
+        "instance_id"
+    ] == instance_id
+
+
 def test_agent_v2_eval_cli_forwards_sample_ids_and_results_path(
     monkeypatch, tmp_path
 ):
