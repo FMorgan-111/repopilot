@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -24,6 +27,11 @@ from ..patch_match import (
 )
 from ..patch_repair import repair_unified_diff
 from ..repair_flow import resolve_search_target_symbol
+from ..safe_subprocess import (
+    BoundedProcessResult,
+    minimal_subprocess_env,
+    run_oci_process,
+)
 from ..state import (
     AgentState,
     FixAttempt,
@@ -34,7 +42,9 @@ from ..state import (
     _primary_patch_file,
     _record_node_diagnostic,
     _record_tool,
+    tool_manifest_fingerprint,
 )
+from ..tool_policy import fixed_test_argv, repository_execution_mode
 
 _TOKENIZED_GITHUB_URL_RE = re.compile(
     r"https://x-access-token:[^@\s'\"\]]+@github[.]com/"
@@ -103,11 +113,61 @@ def _repo_cache_path(owner: str, repo: str, repo_ref: str = "") -> Path:
     return _repopilot_home() / "repos" / _repo_key(owner, repo, repo_ref)
 
 
-def _repo_work_path(owner: str, repo: str, repo_ref: str = "") -> Path:
-    """Stable per-repo work tree, reused across samples of the same repo so the
-    sibling venv and editable install survive instead of being rebuilt each time.
-    """
-    return _repopilot_home() / "repos" / f"{_repo_key(owner, repo, repo_ref)}-work"
+def _trace_scope(trace_id: str) -> str:
+    if not trace_id:
+        raise ValueError("trace_id is required for a mutable repository checkout")
+    return hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
+
+
+def _repo_work_path(
+    owner: str,
+    repo: str,
+    repo_ref: str = "",
+    trace_id: str = "",
+) -> Path:
+    """Return a mutable checkout path containing only a SHA-256 trace scope."""
+    scope = _trace_scope(trace_id)
+    return (
+        _repopilot_home()
+        / "repos"
+        / f"{_repo_key(owner, repo, repo_ref)}-work-{scope}"
+    )
+
+
+@asynccontextmanager
+async def _cache_lock(cache_path: Path):
+    """Serialize all shared-cache inspection and mutation for one cache key."""
+    lock_root = cache_path.parent / ".locks"
+    lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_root_info = lock_root.stat()
+    if (
+        lock_root.is_symlink()
+        or not lock_root.is_dir()
+        or lock_root_info.st_uid != os.geteuid()
+        or bool(lock_root_info.st_mode & 0o022)
+    ):
+        raise RuntimeError("repository cache lock directory is unsafe")
+    lock_name = hashlib.sha256(cache_path.name.encode("utf-8")).hexdigest() + ".lock"
+    lock_path = lock_root / lock_name
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        lock_info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.geteuid()
+            or lock_info.st_nlink != 1
+            or bool(lock_info.st_mode & 0o022)
+        ):
+            raise RuntimeError("repository cache lock is not a regular file")
+        await asyncio.to_thread(fcntl.flock, fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def _validated_repo_ref(state: AgentState) -> str:
@@ -149,6 +209,7 @@ def _clone_local_repo(cache_path: Path, target: str) -> None:  # pragma: no cove
         text=True,
         timeout=180,
         check=True,
+        env=minimal_subprocess_env(),
     )
 
 
@@ -174,6 +235,7 @@ async def _run_git_async(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        env=minimal_subprocess_env(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -226,15 +288,37 @@ async def _worktree_head(work: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-async def _reset_work_tree_async(work: str) -> None:
-    """Restore a reused work tree to pristine HEAD, dropping a prior sample's
-    applied patch. ``clean -fd`` (no ``-x``) keeps git-ignored build artifacts
-    like ``.egg-info`` so the editable install stays valid across reuse."""
+async def _verify_clean_worktree(work: str, expected_head: str) -> None:
+    head = await _checked_git(
+        ["git", "-C", work, "rev-parse", "HEAD"],
+        30,
+    )
+    if head.stdout.strip().lower() != expected_head.lower():
+        raise RuntimeError("repository checkout HEAD does not match the approved ref")
+    status = await _checked_git(
+        [
+            "git",
+            "-C",
+            work,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        60,
+    )
+    if status.stdout:
+        raise RuntimeError("repository checkout is not clean")
+
+
+async def _reset_work_tree_async(work: str, expected_head: str) -> None:
+    """Reset, clean, and verify a reused trace-scoped checkout."""
     for args in (
-        ["git", "-C", work, "reset", "--hard", "HEAD"],
-        ["git", "-C", work, "clean", "-fd"],
+        ["git", "-C", work, "reset", "--hard", expected_head],
+        ["git", "-C", work, "clean", "-fdx"],
     ):
-        await _run_git_async(args, timeout=120)
+        await _checked_git(args, 120)
+    await _verify_clean_worktree(work, expected_head)
 
 
 async def _checked_git(args: list[str], timeout: float) -> _ProcResult:
@@ -325,7 +409,7 @@ async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
             60,
         )
     finally:
-        await _run_git_async(
+        await _checked_git(
             [
                 "git",
                 "-C",
@@ -335,7 +419,7 @@ async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
                 "origin",
                 safe_url,
             ],
-            timeout=60,
+            60,
         )
 
 
@@ -347,19 +431,21 @@ async def _populate_ref_cache(
     retry_delays: tuple[float, ...] = _EXACT_REF_FETCH_RETRY_DELAYS,
 ) -> None:
     await _checked_git(["git", "init", str(cache_path)], 60)
-    await _checked_git(
-        [
-            "git",
-            "-C",
-            str(cache_path),
-            "remote",
-            "add",
-            "origin",
-            _repo_url(state, include_token=True),
-        ],
-        60,
-    )
+    remote_added = False
     try:
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "remote",
+                "add",
+                "origin",
+                _repo_url(state, include_token=True),
+            ],
+            60,
+        )
+        remote_added = True
         await _fetch_exact_ref(cache_path, repo_ref, retry_delays)
         await _checked_git(
             [
@@ -373,18 +459,19 @@ async def _populate_ref_cache(
             60,
         )
     finally:
-        await _run_git_async(
-            [
-                "git",
-                "-C",
-                str(cache_path),
-                "remote",
-                "set-url",
-                "origin",
-                _repo_url(state, include_token=False),
-            ],
-            timeout=60,
-        )
+        if remote_added:
+            await _checked_git(
+                [
+                    "git",
+                    "-C",
+                    str(cache_path),
+                    "remote",
+                    "set-url",
+                    "origin",
+                    _repo_url(state, include_token=False),
+                ],
+                60,
+            )
 
 
 async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
@@ -404,18 +491,22 @@ async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
             shutil.rmtree(cache_path, ignore_errors=True)
             continue
         if result.returncode == 0:
-            await _run_git_async(
-                [
-                    "git",
-                    "-C",
-                    str(cache_path),
-                    "remote",
-                    "set-url",
-                    "origin",
-                    safe_repo_url,
-                ],
-                timeout=60,
-            )
+            try:
+                await _checked_git(
+                    [
+                        "git",
+                        "-C",
+                        str(cache_path),
+                        "remote",
+                        "set-url",
+                        "origin",
+                        safe_repo_url,
+                    ],
+                    60,
+                )
+            except Exception:
+                shutil.rmtree(cache_path, ignore_errors=True)
+                raise
             return
         last_error = _redact_sensitive_error_text(
             (result.stderr or result.stdout).strip()
@@ -428,8 +519,21 @@ async def git_clone(state: AgentState) -> str:
     """Prepare a fresh live checkout or an immutable benchmark checkout."""
     repo_ref = _validated_repo_ref(state)
     cache_path = _repo_cache_path(state.owner, state.repo, repo_ref)
-    work = str(_repo_work_path(state.owner, state.repo, repo_ref))
+    work = str(
+        _repo_work_path(state.owner, state.repo, repo_ref, state.trace_id)
+    )
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+    async with _cache_lock(cache_path):
+        return await _git_clone_locked(state, repo_ref, cache_path, work)
+
+
+async def _git_clone_locked(
+    state: AgentState,
+    repo_ref: str,
+    cache_path: Path,
+    work: str,
+) -> str:
+    """Inspect and mutate one shared cache only while its advisory lock is held."""
 
     if repo_ref and (Path(work) / ".git").exists():
         if (
@@ -437,7 +541,7 @@ async def git_clone(state: AgentState) -> str:
             and await _worktree_head(work) == repo_ref
         ):
             _repo_cache_event("worktree_hit", state)
-            await _reset_work_tree_async(work)
+            await _reset_work_tree_async(work, repo_ref)
             return work
         _repo_cache_event("ref_mismatch", state, target="worktree")
         shutil.rmtree(work, ignore_errors=True)
@@ -471,10 +575,12 @@ async def git_clone(state: AgentState) -> str:
     shutil.rmtree(work, ignore_errors=True)
     try:
         await _clone_local_repo_async(cache_path, work)
-        if repo_ref and await _worktree_head(work) != repo_ref:
-            raise RuntimeError("local benchmark clone did not resolve requested repo_ref")
+        expected_head = repo_ref or await _worktree_head(str(cache_path))
+        if not expected_head:
+            raise RuntimeError("repository cache HEAD could not be established")
+        await _verify_clean_worktree(work, expected_head)
         return work
-    except (subprocess.CalledProcessError, asyncio.TimeoutError):
+    except (subprocess.CalledProcessError, asyncio.TimeoutError, RuntimeError):
         _repo_cache_event("rebuild", state)
         shutil.rmtree(cache_path, ignore_errors=True)
         shutil.rmtree(work, ignore_errors=True)
@@ -483,6 +589,10 @@ async def git_clone(state: AgentState) -> str:
         else:
             await _populate_live_cache(state, cache_path)
         await _clone_local_repo_async(cache_path, work)
+        expected_head = repo_ref or await _worktree_head(str(cache_path))
+        if not expected_head:
+            raise RuntimeError("repository cache HEAD could not be established")
+        await _verify_clean_worktree(work, expected_head)
         return work
 
 
@@ -494,6 +604,7 @@ def _git_apply_check(repo_path: str, patch_content: str) -> subprocess.Completed
         capture_output=True,
         text=True,
         timeout=60,
+        env=minimal_subprocess_env(),
     )
 
 
@@ -505,6 +616,7 @@ def _git_apply(repo_path: str, patch_content: str) -> subprocess.CompletedProces
         capture_output=True,
         text=True,
         timeout=60,
+        env=minimal_subprocess_env(),
     )
 
 
@@ -526,6 +638,7 @@ def git_diff(repo_path: str) -> str:
             capture_output=True,
             text=True,
             timeout=30,
+            env=minimal_subprocess_env(),
         )
         if result.returncode != 0:
             return ""
@@ -541,6 +654,7 @@ def git_diff(repo_path: str) -> str:
             ],
             capture_output=True,
             timeout=30,
+            env=minimal_subprocess_env(),
         )
         if untracked.returncode != 0:
             return ""
@@ -580,6 +694,7 @@ def git_diff(repo_path: str) -> str:
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=minimal_subprocess_env(),
             )
             if untracked_diff.returncode not in {0, 1}:
                 return ""
@@ -893,6 +1008,7 @@ def _create_venv(repo_path: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=VENV_CREATE_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
         )
     except Exception as exc:  # pragma: no cover - defensive
         stdlib_reason = str(exc)[:200]
@@ -909,6 +1025,7 @@ def _create_venv(repo_path: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=VENV_CREATE_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
         )
     except Exception as exc:  # pragma: no cover - defensive
         uv_reason = str(exc)[:200]
@@ -962,6 +1079,7 @@ def _pip_install_editable(
                 capture_output=True,
                 text=True,
                 timeout=INSTALL_TIMEOUT_SECONDS,
+                env=minimal_subprocess_env(),
             )
         except subprocess.TimeoutExpired:
             return {"attempted": True, "success": False, "reason": "timeout",
@@ -988,6 +1106,7 @@ def _ensure_pytest_available(python_exe: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=30,
+            env=minimal_subprocess_env(),
         )
     except Exception as exc:  # pragma: no cover - defensive
         check = subprocess.CompletedProcess(
@@ -1006,6 +1125,7 @@ def _ensure_pytest_available(python_exe: str) -> dict[str, Any]:
             capture_output=True,
             text=True,
             timeout=INSTALL_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
         return {"attempted": True, "success": False, "reason": "timeout",
@@ -1033,15 +1153,16 @@ async def run_pytest(repo_path: str, command: str | None = None) -> dict[str, An
     has_venv = _venv_is_ready(repo_path)
     py = str(venv_python) if has_venv else "python3"
 
-    env = os.environ.copy()
-    if has_venv:
-        env["PATH"] = f"{venv_python.parent}{os.pathsep}{env.get('PATH', '')}"
-        env["VIRTUAL_ENV"] = str(_venv_dir_for(repo_path))
+    env = minimal_subprocess_env(
+        {"VIRTUAL_ENV": str(_venv_dir_for(repo_path))} if has_venv else None
+    )
 
     if command:
         cmd = shlex.split(command)
         if has_venv and cmd and cmd[0] == "pytest":
             cmd = [py, "-m", "pytest", *cmd[1:]]
+        elif has_venv and cmd and cmd[0] in {"python", "python3"}:
+            cmd = [py, *cmd[1:]]
     else:
         cmd = [py, "-m", "pytest", "-q"]
     result = subprocess.run(
@@ -1054,6 +1175,69 @@ async def run_pytest(repo_path: str, command: str | None = None) -> dict[str, An
     )
     return {
         "command": " ".join(cmd),
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.returncode == 0,
+    }
+
+
+def _validate_oci_execution_state(state: AgentState) -> None:
+    if not _COMMIT_RE.fullmatch(state.repo_ref):
+        raise RuntimeError("OCI execution requires an exact 40-character repo_ref")
+    approval = state.tool_patch_approval
+    if approval is None or approval.base_ref.lower() != state.repo_ref.lower():
+        raise RuntimeError("OCI execution requires an exact PatchGate approval")
+    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+    if patch_sha != approval.patch_sha256:
+        raise RuntimeError("OCI execution PatchGate approval does not match the patch")
+    if (
+        tool_manifest_fingerprint(approval.changed_manifest)
+        != approval.manifest_fingerprint
+    ):
+        raise RuntimeError("OCI execution PatchGate manifest approval is invalid")
+
+
+def _oci_test_argv(state: AgentState) -> list[str]:
+    config = state.tool_sandbox_config
+    if config is None:  # pragma: no cover - guarded by execution mode
+        raise RuntimeError("OCI tool sandbox is not configured")
+    fallback = [config.python_executable, "-P", "-m", "pytest", "-q"]
+    if not state.test_command:
+        return fallback
+    try:
+        planner_argv = shlex.split(state.test_command, posix=True)
+        approved_argv, _normalized = fixed_test_argv(
+            Path(state.repo_path).resolve(),
+            state,
+            planner_argv,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return fallback
+    return approved_argv
+
+
+def _run_oci_pytest(state: AgentState) -> dict[str, Any]:
+    # Runtime-local import avoids execute -> tool_router -> tool_policy cycles.
+    from ..tool_router import disposable_test_snapshot
+
+    config = state.tool_sandbox_config
+    if config is None:  # pragma: no cover - guarded by execution mode
+        raise RuntimeError("OCI tool sandbox is not configured")
+    argv = _oci_test_argv(state)
+    with disposable_test_snapshot(
+        state,
+        apply_approved_changes=True,
+    ) as sandbox:
+        result: BoundedProcessResult = run_oci_process(
+            argv,
+            sandbox=sandbox,
+            config=config,
+            timeout=300,
+            max_output_bytes=8_000,
+        )
+    return {
+        "command": shlex.join(argv),
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -1094,6 +1278,18 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         ),
     )
     try:
+        execution_mode = repository_execution_mode(state)
+        if execution_mode == "oci":
+            _validate_oci_execution_state(state)
+    except Exception as exc:
+        attempt.test_result = "execution_error"
+        attempt.failure_kind = "infra_error"
+        attempt.error_log = _redact_sensitive_error_text(str(exc))
+        attempt.success = False
+        state.fix_attempts.append(attempt)
+        state.current_phase = Phase.VERIFY
+        return state
+    try:
         cloned_during_execute = False
         if not state.repo_path:
             try:
@@ -1107,7 +1303,9 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 state.current_phase = Phase.VERIFY
                 return state
             cloned_during_execute = True
-        if cloned_during_execute or state.repo_ref:
+        if execution_mode == "unsafe_host" and (
+            cloned_during_execute or state.repo_ref
+        ):
             # Build an isolated venv once, right after the fresh clone, then do
             # a best-effort editable install into it so the package and its test
             # deps import when pytest runs. The venv sidesteps PEP 668 on
@@ -1224,7 +1422,12 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 edit_count=len(state.patch_edits),
             )
 
-        test_result = await run_pytest(state.repo_path, state.test_command)
+        if execution_mode == "oci":
+            test_result = _run_oci_pytest(state)
+            test_tool_name = "run_oci_pytest"
+        else:
+            test_result = await run_pytest(state.repo_path, state.test_command)
+            test_tool_name = "run_pytest"
         attempt.test_result = json.dumps(
             {
                 "command": test_result.get("command"),
@@ -1239,11 +1442,18 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         attempt.success = bool(test_result.get("success"))
         attempt.failure_kind = "" if attempt.success else "test_failed"
         state.fix_attempts.append(attempt)
-        _record_tool(state, "run_pytest", {"repo_path": state.repo_path}, test_result)
+        _record_tool(
+            state,
+            test_tool_name,
+            {"repo_path": state.repo_path},
+            test_result,
+        )
 
     except Exception as exc:
         attempt.test_result = "execution_error"
-        attempt.failure_kind = "execution_error"
+        attempt.failure_kind = (
+            "infra_error" if execution_mode == "oci" else "execution_error"
+        )
         attempt.error_log = _redact_sensitive_error_text(str(exc))
         attempt.success = False
         state.fix_attempts.append(attempt)

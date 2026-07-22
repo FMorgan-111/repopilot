@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 from collections.abc import Sequence
@@ -85,6 +86,18 @@ class PolicyDecision(BaseModel):
     normalized_args: dict[str, object] = Field(default_factory=dict)
     argv: list[str] = Field(default_factory=list)
     reason: str = ""
+
+
+def repository_execution_mode(state: AgentState) -> Literal["oci", "unsafe_host"]:
+    """Select the repository-code boundary before any clone or patch mutation."""
+    if state.tool_sandbox_config is not None:
+        return "oci"
+    if os.getenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION") == "1":
+        return "unsafe_host"
+    raise RuntimeError(
+        "repository host execution is disabled; configure an OCI tool sandbox "
+        "or explicitly set REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION=1"
+    )
 
 
 def _reject(fingerprint: str, reason: str, *, duplicate: bool = False) -> PolicyDecision:

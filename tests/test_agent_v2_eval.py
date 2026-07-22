@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -299,6 +300,35 @@ async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
     assert result["base_commit"] == "a" * 40
     assert result["model_patch"] == "diff --git"
     assert result["evaluation_mode"] == "end_to_end"
+
+
+async def test_swe_bench_preclone_and_agent_share_one_trace_identity(monkeypatch):
+    captured = {}
+
+    async def fake_clone(state):
+        captured["clone_trace"] = state.trace_id
+        return "/tmp/exact-work"
+
+    async def fake_agent(_issue_url, **kwargs):
+        captured["agent_trace"] = kwargs["seed"]["trace_id"]
+        return {
+            "success": False,
+            "final_phase": "FAILED",
+            "trace_id": captured["agent_trace"],
+            "run_id": captured["agent_trace"],
+            "model_patch": "",
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "git_clone", fake_clone, raising=False)
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+
+    await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(), idx=0, seed_gold_files=False
+    )
+
+    assert re.fullmatch(r"[0-9a-f]{12}", captured["clone_trace"])
+    assert captured["agent_trace"] == captured["clone_trace"]
 
 
 async def test_evaluate_agent_v2_sample_saves_run_and_attaches_replay(monkeypatch):

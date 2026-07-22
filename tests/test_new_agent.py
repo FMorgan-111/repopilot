@@ -12,6 +12,11 @@ from src import graph, http_client, new_agent
 from src.state import ModelInvocation, NoProgressEvent
 
 
+@pytest.fixture(autouse=True)
+def _enable_explicit_legacy_host_execution(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+
+
 def test_agent_v2_default_budget_is_100000():
     assert new_agent.agent_v2.__defaults__[1] == 100_000
 
@@ -257,6 +262,27 @@ async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):
     assert captured["state"].current_phase == new_agent.Phase.LOCATE
     assert captured["state"].repo_ref == "a" * 40
     assert captured["state"].repo_path == "/tmp/widget"
+
+
+async def test_seeded_trace_identity_is_used_by_final_agent(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(_compiled_graph, state):
+        captured["trace_id"] = state.trace_id
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *_args, **_kwargs: None)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={"trace_id": "abc123def456"},
+    )
+
+    assert captured["trace_id"] == "abc123def456"
+    assert payload["trace_id"] == "abc123def456"
 
 
 async def test_oracle_seed_with_files_starts_agent_at_plan(monkeypatch):
@@ -1079,10 +1105,11 @@ async def test_worktree_is_healthy_false_when_head_ok_but_no_files(monkeypatch, 
 async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tmp_path):
     repopilot_home = tmp_path / ".repopilot"
     cache_path = repopilot_home / "repos" / "acme-widget"
-    work_path = repopilot_home / "repos" / "acme-widget-work"
+    trace_id = "live-cache-trace"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    work_path = execute_node._repo_work_path("acme", "widget", "", trace_id)
     (cache_path / ".git").mkdir(parents=True)
     (work_path / ".git").mkdir(parents=True)
-    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
     commands = []
 
     async def fake_run_git(args, timeout, cwd=None):
@@ -1094,10 +1121,17 @@ async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tm
     async def _healthy(_w):
         return True
     monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
+    monkeypatch.setattr(
+        execute_node, "_worktree_head", lambda _path: asyncio.sleep(0, result="b" * 40)
+    )
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
         repo="widget",
+        trace_id=trace_id,
     )
 
     repo_path = await execute_node.git_clone(state)
@@ -1127,8 +1161,11 @@ async def test_git_clone_fetches_exact_ref_into_commit_keyed_cache(
     repopilot_home = tmp_path / ".repopilot"
     repo_ref = "a" * 40
     cache_path = repopilot_home / "repos" / f"acme-widget-{repo_ref}"
-    work_path = repopilot_home / "repos" / f"acme-widget-{repo_ref}-work"
+    trace_id = "exact-cache-trace"
     monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    work_path = execute_node._repo_work_path(
+        "acme", "widget", repo_ref, trace_id
+    )
     commands = []
 
     async def fake_run_git(args, timeout, cwd=None):
@@ -1148,11 +1185,15 @@ async def test_git_clone_fetches_exact_ref_into_commit_keyed_cache(
     monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
     monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
     monkeypatch.setattr(execute_node, "_worktree_head", matching_head, raising=False)
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
         repo="widget",
         repo_ref=repo_ref,
+        trace_id=trace_id,
     )
 
     repo_path = await execute_node.git_clone(state)
@@ -1195,10 +1236,17 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
     async def _healthy(_w):
         return True
     monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
+    monkeypatch.setattr(
+        execute_node, "_worktree_head", lambda _path: asyncio.sleep(0, result="b" * 40)
+    )
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
         repo="widget",
+        trace_id="populate-cache-trace",
     )
 
     repo_path = await execute_node.git_clone(state)
@@ -1251,6 +1299,7 @@ async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_
         issue_url="https://github.com/acme/widget/issues/7",
         owner="acme",
         repo="widget",
+        trace_id="failed-cache-trace",
     )
 
     try:

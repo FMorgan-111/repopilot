@@ -30,6 +30,7 @@ sanitize_evaluator_text = _evaluator_safety.sanitize_evaluator_text
 repopilot_home = importlib.import_module("src.home").repopilot_home
 close_store = importlib.import_module("src.memory").close_store
 AgentState = importlib.import_module("src.state").AgentState
+Tracer = importlib.import_module("src.tracer").Tracer
 CoverageProof = importlib.import_module("src.state").CoverageProof
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
@@ -561,16 +562,20 @@ async def _build_eval_seed(
         return _build_gold_seed(sample) if seed_gold_files else None
     issue = sample["issue"]
     repo = sample["repo"]
+    trace_id = Tracer().trace_id
     prep = AgentState(
         issue_url=issue["url"],
         owner=repo["owner"],
         repo=repo["name"],
         issue_number=issue["number"],
         repo_ref=sample["base_commit"],
+        trace_id=trace_id,
         skip_commit=True,
     )
     repo_path = await git_clone(prep)
-    return build_agent_seed(sample, repo_path)
+    seed = build_agent_seed(sample, repo_path)
+    seed["trace_id"] = trace_id
+    return seed
 
 
 async def evaluate_agent_v2_sample(

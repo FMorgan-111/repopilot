@@ -9,6 +9,7 @@ This module is a thin re-export wrapper. The implementation lives in:
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any
 
 from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
@@ -404,6 +405,9 @@ async def agent_v2(
     print(f"[agent_v2] Starting for {issue_url}", file=sys.stderr, flush=True)
 
     tracer = Tracer()
+    seeded_trace_id = str((seed or {}).get("trace_id", ""))
+    if re.fullmatch(r"[0-9a-f]{12}", seeded_trace_id):
+        tracer.trace_id = seeded_trace_id
     state = AgentState(
         issue_url=issue_url,
         max_retries=max_retries,

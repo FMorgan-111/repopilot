@@ -1,11 +1,18 @@
 import hashlib
 import subprocess
 
+import pytest
+
 import src.nodes.execute as execute_node
 from src import new_agent
 from src.patch_gate import validate_patch_batch
 from src.patch_repair import repair_unified_diff
 from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
+
+
+@pytest.fixture(autouse=True)
+def _enable_explicit_legacy_host_execution(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
 
 
 async def test_execute_fix_prepares_environment_for_precloned_benchmark_repo(

@@ -27,7 +27,9 @@ _TRUSTED_EXECUTABLE_DIRS = (
 _SAFE_HOST_ENV_KEYS = frozenset(
     {"COMSPEC", "LANG", "LC_ALL", "PATHEXT", "SYSTEMROOT", "TZ", "WINDIR"}
 )
-_SAFE_OVERRIDE_KEYS = frozenset({"HOME", "PYTHONPATH", "TEMP", "TMP", "TMPDIR"})
+_SAFE_OVERRIDE_KEYS = frozenset(
+    {"HOME", "PYTHONPATH", "TEMP", "TMP", "TMPDIR", "VIRTUAL_ENV"}
+)
 
 
 @dataclass(frozen=True)

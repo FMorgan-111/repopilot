@@ -280,7 +280,7 @@ def test_run_pytest_prefers_venv_interpreter(tmp_path, monkeypatch):
     asyncio.run(execute_node.run_pytest(str(tmp_path)))
 
     assert captured["cmd"][0] == str(marker)
-    assert str(marker.parent) in captured["env"]["PATH"]
+    assert captured["env"]["PATH"] == execute_node.minimal_subprocess_env()["PATH"]
     assert captured["env"]["VIRTUAL_ENV"] == str(
         execute_node._venv_dir_for(str(tmp_path))
     )

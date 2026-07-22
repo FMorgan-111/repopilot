@@ -15,6 +15,11 @@ from src.nodes import reflect as reflect_node
 from src.state import PatchEdit
 
 
+@pytest.fixture(autouse=True)
+def _enable_explicit_legacy_host_execution(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+
+
 def _failed_attempt(file_path="app/router.py", search="def handle():",
                     replace="def handle(x):"):
     return new_agent.FixAttempt(
