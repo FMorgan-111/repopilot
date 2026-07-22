@@ -428,7 +428,7 @@ assert "| Official terminal coverage | 2/2 |" in summary
 assert "| Internal/official agreement | 2/2 |" in summary
 assert "| Model tokens | 30 |" in summary
 assert "| Model elapsed seconds | 2.000 |" in summary
-assert "| Engineering score | 100.00/100 |" in summary
+assert "| Engineering score | 60.00/100 |" in summary
 ```
 
 Add a scorer-infrastructure case proving it remains in the requested
