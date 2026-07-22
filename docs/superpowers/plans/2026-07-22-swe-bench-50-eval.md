@@ -685,7 +685,9 @@ directories, Docker state, credentials, or model outputs.
 
 Preserve the already-written 100,000-token and OCI safety material. Change:
 
-- default branch instructions and dispatch references from `main` to `master`;
+- workflow-availability prerequisite from `main` to the actual default branch,
+  `master`, while dispatch examples use
+  `--ref fix/release-readiness-20260717` so results bind the feature commit;
 - all public `baseline_10` examples and artifact paths to `baseline_50`;
 - “ten-instance baseline” wording to “fixed 50-instance baseline”;
 - checkpoint sequencing text to say the five IDs are a subset and the final
