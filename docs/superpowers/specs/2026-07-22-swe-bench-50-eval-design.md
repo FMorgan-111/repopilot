@@ -1,7 +1,7 @@
 # SWE-bench 50-Instance Evaluation Design
 
-**Date:** 2026-07-22  
-**Status:** Approved design; written-spec review  
+**Date:** 2026-07-22
+**Status:** Approved design; written-spec review
 **Branch:** `fix/release-readiness-20260717`
 
 ## Goal

@@ -1,7 +1,7 @@
 # Success-First Model Escalation and Constrained Tools Design
 
-**Date:** 2026-07-20  
-**Status:** Proposed for implementation  
+**Date:** 2026-07-20
+**Status:** Proposed for implementation
 **Branch:** `fix/release-readiness-20260717`
 
 ## Goal

@@ -147,4 +147,3 @@ def test_normalize_plan_decision_drops_malformed_edit():
     decision = _normalize_plan_decision(resp)
     assert len(decision.patch_edits) == 1
     assert decision.patch_edits[0].file_path == "a.py"
-

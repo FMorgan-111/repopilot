@@ -1,7 +1,7 @@
 # SWE-bench OCI Matrix Evaluation Design
 
-**Date:** 2026-07-22  
-**Status:** Approved for planning  
+**Date:** 2026-07-22
+**Status:** Approved for planning
 **Branch:** `fix/release-readiness-20260717`
 
 ## Goal
