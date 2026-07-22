@@ -10,11 +10,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from eval.swe_bench import atomic_write_text
+from eval.swe_bench import (
+    DATASET_NAME,
+    DATASET_REVISION,
+    atomic_write_text,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DATASET_NAME = "SWE-bench/SWE-bench_Verified"
-DATASET_REVISION = "main"
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
 ESCALATION_MODEL = "claude-opus-4-8:stable"
 TESTBED_PYTHON = "/opt/miniconda3/envs/testbed/bin/python"
@@ -79,7 +81,10 @@ class RuntimeRecord(BaseModel):
     mode: EvalMode
     instance_id: str
     dataset_name: Literal["SWE-bench/SWE-bench_Verified"] = DATASET_NAME
-    dataset_revision: Literal["main"] = DATASET_REVISION
+    dataset_revision: Literal[
+        "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+    ] = DATASET_REVISION
+    row_sha256: str = ""
     commit_sha: str
     status: RuntimeStatus
     remote_image: str = ""
@@ -96,6 +101,13 @@ class RuntimeRecord(BaseModel):
             raise ValueError("commit_sha must be a 40-character lowercase hex SHA")
         return value
 
+    @field_validator("row_sha256")
+    @classmethod
+    def validate_row_sha256(cls, value: str) -> str:
+        if value and not _SHA256_RE.fullmatch(value):
+            raise ValueError("row_sha256 must be a lowercase SHA-256 digest")
+        return value
+
     @model_validator(mode="after")
     def validate_runtime_identity(self) -> RuntimeRecord:
         if self.status == "ready":
@@ -105,6 +117,8 @@ class RuntimeRecord(BaseModel):
                 raise ValueError("ready runtime requires immutable image_sha")
             if self.error_class:
                 raise ValueError("ready runtime cannot have error_class")
+            if not self.row_sha256:
+                raise ValueError("ready runtime requires row_sha256")
         elif self.image_sha:
             raise ValueError("infrastructure runtime cannot claim image_sha")
         return self
@@ -154,7 +168,10 @@ class InstanceManifest(BaseModel):
     instance_id: str
     commit_sha: str
     dataset_name: Literal["SWE-bench/SWE-bench_Verified"] = DATASET_NAME
-    dataset_revision: Literal["main"] = DATASET_REVISION
+    dataset_revision: Literal[
+        "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+    ] = DATASET_REVISION
+    row_sha256: str = ""
     runtime_status: RuntimeStatus
     image_sha: str
     primary_model: Literal["gemini-3.5-flash:stable"] = PRIMARY_MODEL
@@ -166,6 +183,13 @@ class InstanceManifest(BaseModel):
     def validate_commit_sha(cls, value: str) -> str:
         if not _COMMIT_SHA_RE.fullmatch(value):
             raise ValueError("commit_sha must be a 40-character lowercase hex SHA")
+        return value
+
+    @field_validator("row_sha256")
+    @classmethod
+    def validate_row_sha256(cls, value: str) -> str:
+        if value and not _SHA256_RE.fullmatch(value):
+            raise ValueError("row_sha256 must be a lowercase SHA-256 digest")
         return value
 
     @field_validator("files")
@@ -183,6 +207,8 @@ class InstanceManifest(BaseModel):
             self.image_sha
         ):
             raise ValueError("ready runtime requires immutable image_sha")
+        if self.runtime_status == "ready" and not self.row_sha256:
+            raise ValueError("ready runtime requires row_sha256")
         if self.runtime_status != "ready" and self.image_sha:
             raise ValueError("infrastructure runtime cannot claim image_sha")
         return self

@@ -12,12 +12,34 @@ from eval import oci_aggregate
 from eval.oci_aggregate import ArtifactContractError, aggregate_artifacts
 from eval.oci_contract import OfficialResult, RuntimeRecord, sha256_file, write_model
 from eval.oci_runner import package_instance
-from eval.swe_bench import write_predictions
+from eval.swe_bench import verified_row_sha256, write_predictions
 
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
 _DEFAULT_MODEL_INVOCATIONS = object()
+_MISSING_AGENT_VERDICT = object()
+
+
+def _artifact_row(instance_id: str) -> dict[str, str]:
+    return {
+        "repo": "owner/repo",
+        "instance_id": instance_id,
+        "base_commit": "d" * 40,
+        "patch": "",
+        "test_patch": "",
+        "problem_statement": "A pinned row",
+        "hints_text": "",
+        "created_at": "2026-01-01",
+        "version": "1.0",
+        "FAIL_TO_PASS": "[]",
+        "PASS_TO_PASS": "[]",
+        "environment_setup_commit": "e" * 40,
+        "difficulty": "medium",
+    }
+
+
+ROW_SHA = verified_row_sha256(_artifact_row("owner__repo-1"))
 
 
 def _repo_root(tmp_path: Path, instance_ids: list[str]) -> Path:
@@ -83,7 +105,7 @@ def _completed_output(
     *,
     resolved: bool = False,
     official_status: str | None = None,
-    agent_success: bool | None = None,
+    agent_success: object = None,
     input_tokens: object = 10,
     output_tokens: object = 5,
     elapsed_seconds: object = 1.0,
@@ -97,6 +119,7 @@ def _completed_output(
         instance_id=instance_id,
         commit_sha=COMMIT_SHA,
         status="ready",
+        row_sha256=verified_row_sha256(_artifact_row(instance_id)),
         remote_image="swebench/sweb.eval.x86_64.owner_repo-1:latest",
         image_sha=IMAGE_SHA,
     )
@@ -109,7 +132,6 @@ def _completed_output(
         "model": PRIMARY_MODEL,
         "model_patch": "diff --git a/a.py b/a.py\n",
         "success": resolved,
-        "agent_success": resolved if agent_success is None else agent_success,
         "failure_class": "success" if resolved else "tests",
         "model_invocations": (
             [
@@ -128,6 +150,10 @@ def _completed_output(
             else model_invocations
         ),
     }
+    if agent_success is not _MISSING_AGENT_VERDICT:
+        result["agent_success"] = (
+            resolved if agent_success is None else agent_success
+        )
     (output_dir / "result.json").write_text(
         json.dumps([result]) + "\n", encoding="utf-8"
     )
@@ -151,7 +177,7 @@ def _package(
     *,
     resolved: bool = False,
     official_status: str | None = None,
-    agent_success: bool | None = None,
+    agent_success: object = None,
     input_tokens: object = 10,
     output_tokens: object = 5,
     elapsed_seconds: object = 1.0,
@@ -169,7 +195,12 @@ def _package(
         elapsed_seconds=elapsed_seconds,
         model_invocations=model_invocations,
     )
-    package_instance(runtime_path, runtime_path.parent, artifact_dir)
+    package_instance(
+        runtime_path,
+        runtime_path.parent,
+        artifact_dir,
+        row_loader=_artifact_row,
+    )
     destination = artifacts_root / f"bundle-{instance_id}"
     artifact_dir.rename(destination)
     return destination
@@ -181,7 +212,12 @@ def test_package_copies_only_safe_hash_bound_files(tmp_path: Path) -> None:
         "raw evaluator output", encoding="utf-8"
     )
 
-    manifest = package_instance(runtime_path, runtime_path.parent, artifact_dir)
+    manifest = package_instance(
+        runtime_path,
+        runtime_path.parent,
+        artifact_dir,
+        row_loader=_artifact_row,
+    )
 
     assert sorted(path.name for path in artifact_dir.iterdir()) == [
         "manifest.json",
@@ -190,12 +226,115 @@ def test_package_copies_only_safe_hash_bound_files(tmp_path: Path) -> None:
         "result.json",
     ]
     assert manifest.dataset_name == "SWE-bench/SWE-bench_Verified"
-    assert manifest.dataset_revision == "main"
+    assert manifest.dataset_revision == (
+        "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+    )
+    assert manifest.row_sha256 == ROW_SHA
     for filename, digest in manifest.files.items():
         assert digest == sha256_file(artifact_dir / filename)
     assert "raw evaluator output" not in "".join(
         path.read_text(encoding="utf-8") for path in artifact_dir.iterdir()
     )
+
+
+def test_package_rejects_oversized_regular_payload_before_copying(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    (runtime_path.parent / "result.json").write_bytes(
+        b"x" * (oci_aggregate.ARTIFACT_FILE_BYTE_LIMIT + 1)
+    )
+
+    with pytest.raises(ArtifactContractError, match="byte limit"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+    assert not artifact_dir.exists() or not any(artifact_dir.iterdir())
+
+
+def test_package_rejects_runtime_dataset_row_digest_mismatch(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    different_row = {
+        "repo": "owner/repo",
+        "instance_id": "owner__repo-1",
+        "base_commit": "d" * 40,
+        "patch": "",
+        "test_patch": "",
+        "problem_statement": "Different pinned row",
+        "hints_text": "",
+        "created_at": "2026-01-01",
+        "version": "1.0",
+        "FAIL_TO_PASS": "[]",
+        "PASS_TO_PASS": "[]",
+        "environment_setup_commit": "e" * 40,
+        "difficulty": "medium",
+    }
+
+    with pytest.raises(ValueError, match="dataset row digest mismatch"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=lambda _instance_id: different_row,
+        )
+
+    assert not artifact_dir.exists() or not any(artifact_dir.iterdir())
+
+
+def test_aggregate_rejects_oversized_regular_payload_before_parsing(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    (bundle / "result.json").write_bytes(
+        b"x" * (oci_aggregate.ARTIFACT_FILE_BYTE_LIMIT + 1)
+    )
+
+    with pytest.raises(ArtifactContractError, match="byte limit"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_enforces_cumulative_bundle_byte_limit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    total_bytes = sum(path.stat().st_size for path in bundle.iterdir())
+    monkeypatch.setattr(
+        oci_aggregate, "ARTIFACT_TOTAL_BYTE_LIMIT", total_bytes - 1, raising=False
+    )
+
+    with pytest.raises(ArtifactContractError, match="total byte limit"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
 
 
 def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
@@ -235,6 +374,14 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
     assert "| Model tokens | 30 |" in summary
     assert "| Model elapsed seconds | 2.000 |" in summary
     assert "| Engineering score | 60.00/100 |" in summary
+    assert "| Official resolution | 1/2 | 40.00/80 |" in summary
+    assert "| Non-infrastructure | 2/2 | 10.00/10 |" in summary
+    assert "| Explicit internal/official agreement | 2/2 | 5.00/5 |" in summary
+    assert "| Completed within time/token budget | 2/2 | 5.00/5 |" in summary
+    assert (
+        "| owner__repo-2 | ready | failed | unresolved | 15 | 1.000 |"
+        in summary
+    )
     assert summary.index("| Official score |") < summary.index("| Engineering score |")
 
 
@@ -266,7 +413,7 @@ def test_aggregate_keeps_scorer_infrastructure_in_requested_denominator(
     assert "| Official terminal coverage | 1/2 |" in summary
     assert "| Internal/official agreement | 1/1 |" in summary
     assert "| Infrastructure failure | 1 |" in summary
-    assert "| Engineering score | 55.00/100 |" in summary
+    assert "| Engineering score | 52.50/100 |" in summary
 
 
 def test_model_usage_ignores_invalid_numeric_projections() -> None:
@@ -327,6 +474,62 @@ def test_aggregate_ignores_non_list_model_invocations(tmp_path: Path) -> None:
     assert "| Model tokens | 0 |" in summary
     assert "| Model elapsed seconds | 0.000 |" in summary
     assert "| Primary model invocations | 0 |" in summary
+    assert "| Completed within time/token budget | 0/1 | 0.00/5 |" in summary
+    assert "| Engineering score | 15.00/100 |" in summary
+    assert "| owner__repo-1 | ready | failed | unresolved | unavailable | unavailable |" in summary
+
+
+def test_missing_internal_verdict_receives_no_agreement_credit(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        agent_success=_MISSING_AGENT_VERDICT,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Internal/official agreement | 0/1 |" in summary
+    assert "| Explicit internal/official agreement | 0/1 | 0.00/5 |" in summary
+    assert "| owner__repo-1 | ready | unavailable | unresolved | 15 | 1.000 |" in summary
+
+
+def test_incomplete_official_result_receives_no_budget_credit(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        official_status="empty_patch",
+        agent_success=False,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Completed within time/token budget | 0/1 | 0.00/5 |" in summary
 
 
 @pytest.mark.parametrize(

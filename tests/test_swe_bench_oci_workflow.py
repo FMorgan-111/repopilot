@@ -6,6 +6,12 @@ from pathlib import Path
 import pytest
 
 WORKFLOW = Path(".github/workflows/swe-bench-oci-eval.yml")
+README = Path("README.md")
+DATASET_CACHE_KEY = (
+    "swe-bench-verified-"
+    "c104f840cc67f8b6eec6f759ebc8b2693d585d4a-"
+    "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c-v2"
+)
 
 
 def _workflow_text() -> str:
@@ -75,7 +81,7 @@ def _assert_public_dataset_cache_contract(text: str) -> None:
     assert re.findall(r"(?m)^        ([a-zA-Z_-]+):", cache) == ["uses", "with"]
     assert re.findall(r"(?m)^        uses: (.+)$", cache) == ["actions/cache@v4"]
     assert re.findall(r"(?m)^          key: (.+)$", cache) == [
-        "swe-bench-verified-main-v1"
+        DATASET_CACHE_KEY
     ]
 
     with_block = _mapping_block(cache, "with", 8)
@@ -141,8 +147,8 @@ def test_public_dataset_cache_contract_rejects_near_matches() -> None:
     mutations = (
         text.replace("actions/cache@v4", "actions/cache@v4-extra", 1),
         text.replace(
-            "key: swe-bench-verified-main-v1",
-            "key: swe-bench-verified-main-v1-extra",
+            f"key: {DATASET_CACHE_KEY}",
+            f"key: {DATASET_CACHE_KEY}-extra",
             1,
         ),
         text.replace(
@@ -203,3 +209,17 @@ def test_workflow_pins_permissions_and_aggregates_current_commit() -> None:
     assert '--expected-commit "${{ github.sha }}"' in text
     assert "python -m eval.oci_aggregate" in text
     assert "retention-days: 30" in text
+
+
+def test_readme_documents_pinned_dataset_and_fail_closed_scoring() -> None:
+    text = README.read_text(encoding="utf-8")
+
+    assert "c104f840cc67f8b6eec6f759ebc8b2693d585d4a" in text
+    assert "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c" in text
+    assert "8 MiB per file" in text
+    assert "16 MiB per instance bundle" in text
+    assert "80 * official_resolved / requested" in text
+    assert "10 * non_infrastructure_instances / requested" in text
+    assert "5 * explicit_agreements / official_terminal_instances" in text
+    assert "5 * completed_within_budget_instances / requested" in text
+    assert "Missing or invalid verdict/telemetry receives no credit" in text

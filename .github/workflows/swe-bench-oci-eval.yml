@@ -91,7 +91,7 @@ jobs:
           path: |
             ${{ runner.temp }}/public-hf-cache
             ${{ runner.temp }}/repopilot-home/eval/datasets
-          key: swe-bench-verified-main-v1
+          key: swe-bench-verified-c104f840cc67f8b6eec6f759ebc8b2693d585d4a-f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c-v2
 
       - name: Install evaluation dependencies
         run: python -m pip install -e ".[memory,eval]"

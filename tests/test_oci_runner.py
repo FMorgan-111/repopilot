@@ -17,7 +17,8 @@ from eval.oci_runner import (
     prepare_instance,
     score_instance,
 )
-from src.safe_subprocess import BoundedProcessResult
+from eval.swe_bench import verified_row_sha256
+from src.safe_subprocess import BoundedProcessResult, ProcessTimeoutError
 
 INSTANCE_ID = "pytest-dev__pytest-10081"
 COMMIT_SHA = "a" * 40
@@ -25,6 +26,23 @@ IMAGE_SHA = "sha256:" + "b" * 64
 OFFICIAL_IMAGE = (
     "swebench/sweb.eval.x86_64.pytest-dev__pytest-10081:latest"
 )
+OFFICIAL_ROW = {
+    "repo": "pytest-dev/pytest",
+    "instance_id": INSTANCE_ID,
+    "base_commit": "c" * 40,
+    "patch": "",
+    "test_patch": "",
+    "problem_statement": "A regression",
+    "hints_text": "",
+    "created_at": "2026-01-01",
+    "version": "1.0",
+    "FAIL_TO_PASS": "[]",
+    "PASS_TO_PASS": "[]",
+    "environment_setup_commit": "d" * 40,
+    "difficulty": "medium",
+}
+ROW_SHA = verified_row_sha256(OFFICIAL_ROW)
+OTHER_IMAGE_SHA = "sha256:" + "e" * 64
 MODEL_CREDENTIAL_NAMES = (
     "LLM_API_KEY",
     "LLM_ESCALATION_API_KEY",
@@ -49,6 +67,7 @@ def _write_runtime(tmp_path: Path, *, status: str = "ready") -> Path:
         instance_id=INSTANCE_ID,
         commit_sha=COMMIT_SHA,
         status=status,
+        row_sha256=ROW_SHA if status == "ready" else "",
         remote_image=OFFICIAL_IMAGE if status == "ready" else "",
         image_sha=IMAGE_SHA if status == "ready" else "",
         error_class="" if status == "ready" else "DockerUnavailable",
@@ -58,13 +77,34 @@ def _write_runtime(tmp_path: Path, *, status: str = "ready") -> Path:
 
 def _row_loader(instance_id: str) -> dict[str, str]:
     assert instance_id == INSTANCE_ID
-    return {"instance_id": instance_id}
+    return dict(OFFICIAL_ROW)
 
 
 def _test_spec_factory(row, *, namespace):
-    assert row == {"instance_id": INSTANCE_ID}
+    assert row == OFFICIAL_ROW
     assert namespace == "swebench"
     return SimpleNamespace(instance_image_key=OFFICIAL_IMAGE)
+
+
+def _docker_alias_runner(
+    tags: dict[str, str], commands: list[list[str]]
+):
+    def command_runner(argv, **kwargs):
+        command = list(argv)
+        commands.append(command)
+        if command[1:3] == ["image", "tag"]:
+            tags[command[4]] = tags.get(command[3], command[3])
+            return BoundedProcessResult(command, 0, "", "")
+        if command[1:3] == ["image", "inspect"]:
+            image = command[-1]
+            digest = tags.get(image, "")
+            return BoundedProcessResult(command, 0 if digest else 1, digest, "")
+        if command[1:3] == ["image", "rm"]:
+            tags.pop(command[-1], None)
+            return BoundedProcessResult(command, 0, "", "")
+        raise AssertionError(f"unexpected Docker command: {command}")
+
+    return command_runner
 
 
 def test_pull_retries_transient_failures_with_bounded_schedule(
@@ -103,6 +143,26 @@ def test_pull_retries_network_unreachable_without_is(monkeypatch) -> None:
                 return BoundedProcessResult(
                     list(argv), 1, "", "network unreachable"
                 )
+            return BoundedProcessResult(list(argv), 0, "pulled", "")
+        return BoundedProcessResult(list(argv), 0, IMAGE_SHA, "")
+
+    monkeypatch.setattr(oci_runner.time, "sleep", sleeps.append)
+
+    assert _pull_and_pin_image(OFFICIAL_IMAGE, command_runner) == IMAGE_SHA
+    assert pulls == 3
+    assert sleeps == [5.0, 20.0]
+
+
+def test_pull_retries_process_timeouts_with_bounded_schedule(monkeypatch) -> None:
+    pulls = 0
+    sleeps: list[float] = []
+
+    def command_runner(argv, **kwargs):
+        nonlocal pulls
+        if argv[1] == "pull":
+            pulls += 1
+            if pulls < 3:
+                raise ProcessTimeoutError("partial pull", "registry stalled")
             return BoundedProcessResult(list(argv), 0, "pulled", "")
         return BoundedProcessResult(list(argv), 0, IMAGE_SHA, "")
 
@@ -189,6 +249,7 @@ def test_prepare_pulls_official_image_and_preflights_digest(tmp_path: Path) -> N
     assert record.status == "ready"
     assert record.remote_image == OFFICIAL_IMAGE
     assert record.image_sha == IMAGE_SHA
+    assert record.row_sha256 == ROW_SHA
     assert commands == [
         ["docker", "pull", "--platform=linux/amd64", OFFICIAL_IMAGE],
         ["docker", "image", "inspect", "--format={{.Id}}", OFFICIAL_IMAGE],
@@ -434,6 +495,8 @@ def test_score_invokes_official_harness_and_projects_resolved_result(
         encoding="utf-8",
     )
     seen: dict[str, object] = {}
+    tags = {OFFICIAL_IMAGE: IMAGE_SHA, IMAGE_SHA: IMAGE_SHA}
+    commands: list[list[str]] = []
 
     def fake_scorer(**kwargs):
         seen.update(kwargs)
@@ -453,7 +516,12 @@ def test_score_invokes_official_harness_and_projects_resolved_result(
         )
         return report_path
 
-    result = score_instance(runtime_path, tmp_path, scorer=fake_scorer)
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=fake_scorer,
+        command_runner=_docker_alias_runner(tags, commands),
+    )
 
     assert result.status == "resolved"
     assert result.submitted is True
@@ -464,15 +532,98 @@ def test_score_invokes_official_harness_and_projects_resolved_result(
     assert seen["max_workers"] == 1
     assert seen["force_rebuild"] is False
     assert seen["cache_level"] == "none"
-    assert seen["clean"] is True
+    assert seen["clean"] is False
     assert seen["open_file_limit"] == 4096
     assert seen["timeout"] == 1800
     assert seen["namespace"] == "swebench"
     assert seen["modal"] is False
+    assert seen["instance_image_tag"] != "latest"
+    assert seen["env_image_tag"] != "latest"
     stored = json.loads(
         (tmp_path / "official_result.json").read_text(encoding="utf-8")
     )
     assert stored == result.model_dump(mode="json")
+
+
+def test_score_uses_verified_run_local_alias_when_latest_is_retargeted(
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    (tmp_path / "prediction.jsonl").write_text("{}\n", encoding="utf-8")
+    tags = {OFFICIAL_IMAGE: IMAGE_SHA, IMAGE_SHA: IMAGE_SHA}
+    commands: list[list[str]] = []
+    alias_seen = ""
+
+    def fake_scorer(**kwargs):
+        nonlocal alias_seen
+        assert kwargs["instance_image_tag"] != "latest"
+        assert kwargs["env_image_tag"] != "latest"
+        alias_seen = OFFICIAL_IMAGE.removesuffix("latest") + str(
+            kwargs["instance_image_tag"]
+        )
+        assert tags[alias_seen] == IMAGE_SHA
+        tags[OFFICIAL_IMAGE] = OTHER_IMAGE_SHA
+        if kwargs["clean"]:
+            tags.pop(alias_seen)
+        report_path = Path.cwd() / "official-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "submitted_ids": [INSTANCE_ID],
+                    "completed_ids": [INSTANCE_ID],
+                    "resolved_ids": [INSTANCE_ID],
+                    "unresolved_ids": [],
+                    "empty_patch_ids": [],
+                    "error_ids": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return report_path
+
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=fake_scorer,
+        command_runner=_docker_alias_runner(tags, commands),
+    )
+
+    assert result.status == "resolved"
+    assert result.completed is True
+    assert tags[OFFICIAL_IMAGE] == OTHER_IMAGE_SHA
+    assert alias_seen not in tags
+    assert sum(command[1:3] == ["image", "inspect"] for command in commands) == 2
+
+
+def test_score_fails_closed_when_run_local_alias_changes_during_scoring(
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    (tmp_path / "prediction.jsonl").write_text("{}\n", encoding="utf-8")
+    tags = {OFFICIAL_IMAGE: IMAGE_SHA, IMAGE_SHA: IMAGE_SHA}
+    commands: list[list[str]] = []
+
+    def fake_scorer(**kwargs):
+        alias = OFFICIAL_IMAGE.removesuffix("latest") + str(
+            kwargs["instance_image_tag"]
+        )
+        tags[alias] = OTHER_IMAGE_SHA
+        report_path = Path.cwd() / "official-report.json"
+        report_path.write_text("{}", encoding="utf-8")
+        return report_path
+
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=fake_scorer,
+        command_runner=_docker_alias_runner(tags, commands),
+    )
+
+    assert result.status == "scorer_infra"
+    assert result.error_class == "OciImageInfrastructureError"
+    assert all(
+        image == OFFICIAL_IMAGE or image == IMAGE_SHA for image in tags
+    )
 
 
 def test_infrastructure_runtime_skips_official_scorer(tmp_path: Path) -> None:

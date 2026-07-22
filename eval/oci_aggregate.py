@@ -32,6 +32,8 @@ SAFE_PAYLOAD_FILES = (
     "official_result.json",
 )
 SAFE_ARTIFACT_FILES = frozenset((*SAFE_PAYLOAD_FILES, "manifest.json"))
+ARTIFACT_FILE_BYTE_LIMIT = 8 * 1024 * 1024
+ARTIFACT_TOTAL_BYTE_LIMIT = 16 * 1024 * 1024
 _EVALUATOR_KEYS = frozenset(
     {"gold_patch", "test_patch", "fail_to_pass", "pass_to_pass"}
 )
@@ -68,6 +70,24 @@ class _BundleSnapshot:
             raise ArtifactContractError("unknown artifact snapshot file") from exc
 
 
+@dataclass
+class _ArtifactByteBudget:
+    total_read: int = 0
+
+    def check_before_read(self, size: int) -> None:
+        if size > ARTIFACT_FILE_BYTE_LIMIT:
+            raise ArtifactContractError("artifact file byte limit exceeded")
+        if self.total_read + size > ARTIFACT_TOTAL_BYTE_LIMIT:
+            raise ArtifactContractError("artifact total byte limit exceeded")
+
+    def consume(self, chunk_size: int, file_read: int) -> None:
+        if file_read > ARTIFACT_FILE_BYTE_LIMIT:
+            raise ArtifactContractError("artifact file byte limit exceeded")
+        self.total_read += chunk_size
+        if self.total_read > ARTIFACT_TOTAL_BYTE_LIMIT:
+            raise ArtifactContractError("artifact total byte limit exceeded")
+
+
 def _discover_manifest_paths(artifacts_dir: Path) -> list[Path]:
     root = Path(artifacts_dir)
     return [
@@ -101,7 +121,11 @@ def _assert_bound_directory(
         raise ArtifactContractError("artifact bundle changed during snapshot")
 
 
-def _read_snapshot_file(bundle_fd: int, filename: str) -> bytes:
+def _read_snapshot_file(
+    bundle_fd: int,
+    filename: str,
+    budget: _ArtifactByteBudget,
+) -> bytes:
     nofollow = getattr(os, "O_NOFOLLOW", None)
     nonblock = getattr(os, "O_NONBLOCK", None)
     if nofollow is None or nonblock is None:
@@ -115,11 +139,18 @@ def _read_snapshot_file(bundle_fd: int, filename: str) -> bytes:
     except OSError as exc:
         raise ArtifactContractError("artifact file unavailable") from exc
     try:
-        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        opened = os.fstat(file_fd)
+        if not stat.S_ISREG(opened.st_mode):
             raise ArtifactContractError("artifact file set mismatch")
+        budget.check_before_read(opened.st_size)
         chunks: list[bytes] = []
+        file_read = 0
         while chunk := os.read(file_fd, 1024 * 1024):
+            file_read += len(chunk)
+            budget.consume(len(chunk), file_read)
             chunks.append(chunk)
+        if file_read != opened.st_size:
+            raise ArtifactContractError("artifact file changed during snapshot")
         return b"".join(chunks)
     except OSError as exc:
         raise ArtifactContractError("artifact file unavailable") from exc
@@ -147,8 +178,9 @@ def _snapshot_bundle(root_fd: int, bundle_name: str) -> _BundleSnapshot:
             raise ArtifactContractError("artifact bundle unavailable") from exc
         if names != SAFE_ARTIFACT_FILES:
             raise ArtifactContractError("artifact file set mismatch")
+        budget = _ArtifactByteBudget()
         files = {
-            filename: _read_snapshot_file(bundle_fd, filename)
+            filename: _read_snapshot_file(bundle_fd, filename, budget)
             for filename in SAFE_ARTIFACT_FILES
         }
         try:
@@ -238,6 +270,52 @@ def _model_usage(
     return tokens, elapsed
 
 
+def _internal_verdict(result: dict[str, Any]) -> bool | None:
+    verdict = result.get("agent_success")
+    if type(verdict) is not bool:
+        return None
+    reported_success = result.get("success", verdict)
+    if type(reported_success) is not bool or reported_success is not verdict:
+        return None
+    return verdict
+
+
+def _complete_model_usage(
+    invocations: tuple[dict[str, Any], ...],
+) -> tuple[int, float] | None:
+    if not invocations:
+        return None
+    tokens = 0
+    durations: list[float] = []
+    for invocation in invocations:
+        if invocation.get("model") not in {PRIMARY_MODEL, ESCALATION_MODEL}:
+            return None
+        if not isinstance(invocation.get("status"), str) or not invocation["status"]:
+            return None
+        for key in ("input_tokens", "output_tokens"):
+            value = invocation.get(key)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                return None
+            tokens += value
+        duration = invocation.get("elapsed_seconds")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
+            return None
+        try:
+            projected_duration = float(duration)
+        except (OverflowError, ValueError):
+            return None
+        if not math.isfinite(projected_duration) or projected_duration < 0:
+            return None
+        durations.append(projected_duration)
+    try:
+        elapsed = math.fsum(durations)
+    except OverflowError:
+        return None
+    if not math.isfinite(elapsed):
+        return None
+    return tokens, elapsed
+
+
 def _assert_safe_tree(value: Any) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
@@ -315,20 +393,44 @@ def parse_safe_payloads(
     expected_commit: str,
 ) -> VerifiedPayload:
     """Parse the three uploadable payloads and enforce cross-file identity."""
-    directory = Path(directory)
-    try:
-        result_bytes = (directory / "result.json").read_bytes()
-        prediction_bytes = (directory / "prediction.jsonl").read_bytes()
-        official_bytes = (directory / "official_result.json").read_bytes()
-    except OSError as exc:
-        raise ArtifactContractError("invalid safe artifact payload") from exc
-    return _parse_safe_payload_bytes(
-        result_bytes,
-        prediction_bytes,
-        official_bytes,
+    payload, _files = snapshot_safe_payloads(
+        directory,
         expected_instance_id=expected_instance_id,
         expected_commit=expected_commit,
     )
+    return payload
+
+
+def snapshot_safe_payloads(
+    directory: Path,
+    *,
+    expected_instance_id: str,
+    expected_commit: str,
+) -> tuple[VerifiedPayload, dict[str, bytes]]:
+    """Read a bounded regular-file snapshot and validate its safe payloads."""
+    directory = Path(directory)
+    try:
+        directory_fd = os.open(directory, _directory_open_flags())
+    except (ArtifactContractError, OSError) as exc:
+        if isinstance(exc, ArtifactContractError):
+            raise
+        raise ArtifactContractError("invalid safe artifact payload") from exc
+    try:
+        budget = _ArtifactByteBudget()
+        files = {
+            filename: _read_snapshot_file(directory_fd, filename, budget)
+            for filename in SAFE_PAYLOAD_FILES
+        }
+    finally:
+        os.close(directory_fd)
+    payload = _parse_safe_payload_bytes(
+        files["result.json"],
+        files["prediction.jsonl"],
+        files["official_result.json"],
+        expected_instance_id=expected_instance_id,
+        expected_commit=expected_commit,
+    )
+    return payload, files
 
 
 def _verify_bundle(
@@ -371,9 +473,10 @@ def _summary(
 ) -> str:
     requested = len(ordered)
     completed = sum(item.official.completed for _manifest, item in ordered)
-    internal_success = sum(
-        item.result.get("agent_success") is True for _manifest, item in ordered
-    )
+    internal_verdicts = [
+        _internal_verdict(item.result) for _manifest, item in ordered
+    ]
+    internal_success = sum(verdict is True for verdict in internal_verdicts)
     official_resolved = sum(item.official.resolved for _manifest, item in ordered)
     official_terminal = sum(
         item.official.status != "scorer_infra" for _manifest, item in ordered
@@ -387,14 +490,21 @@ def _summary(
     infrastructure = requested - non_infrastructure
     agreements = sum(
         item.official.status != "scorer_infra"
-        and (item.result.get("agent_success") is True) == item.official.resolved
-        for _manifest, item in ordered
+        and verdict is not None
+        and verdict == item.official.resolved
+        for (_manifest, item), verdict in zip(ordered, internal_verdicts)
     )
     invocation_groups = [_model_invocations(item.result) for _manifest, item in ordered]
-    usage = [_model_usage(invocations) for invocations in invocation_groups]
-    model_tokens = sum(tokens for tokens, _elapsed in usage)
-    model_elapsed = sum(elapsed for _tokens, elapsed in usage)
-    within_budget = sum(tokens <= 100_000 for tokens, _elapsed in usage)
+    usage = [_complete_model_usage(invocations) for invocations in invocation_groups]
+    model_tokens = sum(item[0] for item in usage if item is not None)
+    model_elapsed = math.fsum(item[1] for item in usage if item is not None)
+    within_budget = sum(
+        payload.official.completed
+        and item is not None
+        and item[0] <= 100_000
+        and item[1] <= 360 * 60
+        for (_manifest, payload), item in zip(ordered, usage)
+    )
     official_score = 100.0 * official_resolved / requested
     resolution_component = 80.0 * official_resolved / requested
     infrastructure_component = 10.0 * non_infrastructure / requested
@@ -439,6 +549,15 @@ def _summary(
         f"| Escalation model invocations | {model_counts[ESCALATION_MODEL]} |",
         f"| Engineering score | {engineering_score:.2f}/100 |",
         "",
+        "## Engineering score components",
+        "",
+        "| Component | Fraction | Points |",
+        "| --- | ---: | ---: |",
+        f"| Official resolution | {official_resolved}/{requested} | {resolution_component:.2f}/80 |",
+        f"| Non-infrastructure | {non_infrastructure}/{requested} | {infrastructure_component:.2f}/10 |",
+        f"| Explicit internal/official agreement | {agreements}/{official_terminal} | {agreement_component:.2f}/5 |",
+        f"| Completed within time/token budget | {within_budget}/{requested} | {budget_component:.2f}/5 |",
+        "",
         "## Failure taxonomy",
         "",
     ]
@@ -450,20 +569,28 @@ def _summary(
             "",
             "## Instances",
             "",
-            "| Instance | Runtime | Internal | Official |",
-            "| --- | --- | --- | --- |",
+            "| Instance | Runtime | Internal | Official | Model tokens | Model elapsed seconds |",
+            "| --- | --- | --- | --- | ---: | ---: |",
         ]
     )
     lines.extend(
-        "| {instance} | {runtime} | {internal} | {official} |".format(
+        "| {instance} | {runtime} | {internal} | {official} | {tokens} | {elapsed} |".format(
             instance=manifest.instance_id,
             runtime=manifest.runtime_status,
             internal=(
-                "success" if payload.result.get("agent_success") is True else "failed"
+                "unavailable"
+                if verdict is None
+                else "success"
+                if verdict
+                else "failed"
             ),
             official=payload.official.status,
+            tokens="unavailable" if item is None else str(item[0]),
+            elapsed="unavailable" if item is None else f"{item[1]:.3f}",
         )
-        for manifest, payload in ordered
+        for (manifest, payload), verdict, item in zip(
+            ordered, internal_verdicts, usage
+        )
     )
     return "\n".join(lines) + "\n"
 

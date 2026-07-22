@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import random
+import re
 import tempfile
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
@@ -12,7 +15,103 @@ from pathlib import Path
 from typing import Any
 
 DATASET_NAME = "SWE-bench/SWE-bench_Verified"
-DATASET_REVISION = "main"
+DATASET_REVISION = "c104f840cc67f8b6eec6f759ebc8b2693d585d4a"
+DATASET_ROW_COUNT = 500
+DATASET_CONTENT_SHA256 = (
+    "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c"
+)
+DATASET_ROW_FIELDS = (
+    "repo",
+    "instance_id",
+    "base_commit",
+    "patch",
+    "test_patch",
+    "problem_statement",
+    "hints_text",
+    "created_at",
+    "version",
+    "FAIL_TO_PASS",
+    "PASS_TO_PASS",
+    "environment_setup_commit",
+    "difficulty",
+)
+_CACHE_SCHEMA_VERSION = 1
+
+
+def _validated_verified_row(row: Mapping[str, Any]) -> dict[str, str]:
+    if set(row) != set(DATASET_ROW_FIELDS):
+        raise ValueError("invalid SWE-bench Verified row schema")
+    projected = {field: row[field] for field in DATASET_ROW_FIELDS}
+    if any(not isinstance(value, str) for value in projected.values()):
+        raise ValueError("invalid SWE-bench Verified row schema")
+    if (
+        not projected["instance_id"]
+        or projected["repo"].count("/") != 1
+        or not re.fullmatch(r"[0-9a-f]{40}", projected["base_commit"])
+        or not re.fullmatch(
+            r"[0-9a-f]{40}", projected["environment_setup_commit"]
+        )
+    ):
+        raise ValueError("invalid SWE-bench Verified row schema")
+    for field in ("FAIL_TO_PASS", "PASS_TO_PASS"):
+        try:
+            tests = json.loads(projected[field])
+        except json.JSONDecodeError as exc:
+            raise ValueError("invalid SWE-bench Verified row schema") from exc
+        if not isinstance(tests, list) or any(
+            not isinstance(item, str) for item in tests
+        ):
+            raise ValueError("invalid SWE-bench Verified row schema")
+    return projected
+
+
+def serialize_verified_rows(rows: Sequence[Mapping[str, Any]]) -> bytes:
+    """Serialize official rows using the code-pinned upstream column order."""
+    return b"".join(
+        json.dumps(
+            _validated_verified_row(row),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        + b"\n"
+        for row in rows
+    )
+
+
+def verified_row_sha256(row: Mapping[str, Any]) -> str:
+    """Return a stable digest for one validated official dataset row."""
+    serialized = serialize_verified_rows([row])
+    return hashlib.sha256(serialized.removesuffix(b"\n")).hexdigest()
+
+
+def _expected_cache_metadata() -> dict[str, Any]:
+    return {
+        "schema_version": _CACHE_SCHEMA_VERSION,
+        "dataset": DATASET_NAME,
+        "revision": DATASET_REVISION,
+        "split": "test",
+        "row_count": DATASET_ROW_COUNT,
+        "content_sha256": DATASET_CONTENT_SHA256,
+    }
+
+
+def _validate_dataset_contents(contents: bytes) -> list[dict[str, str]]:
+    if not hmac.compare_digest(
+        hashlib.sha256(contents).hexdigest(), DATASET_CONTENT_SHA256
+    ):
+        raise ValueError("SWE-bench Verified content SHA-256 mismatch")
+    try:
+        decoded = contents.decode("utf-8")
+        rows = [json.loads(line) for line in decoded.splitlines() if line]
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid SWE-bench Verified cache content") from exc
+    if len(rows) != DATASET_ROW_COUNT:
+        raise ValueError("invalid SWE-bench Verified row count")
+    validated = [_validated_verified_row(row) for row in rows]
+    if len({row["instance_id"] for row in validated}) != len(validated):
+        raise ValueError("duplicate SWE-bench Verified instance ID")
+    if serialize_verified_rows(validated) != contents:
+        raise ValueError("non-canonical SWE-bench Verified cache content")
+    return validated
 
 
 def atomic_write_text(path: Path, contents: str) -> Path:
@@ -121,31 +220,33 @@ def load_verified_rows(
     """Load and cache the exact official SWE-bench Verified rows."""
     path = cache_path or _default_cache_path()
     if path.exists():
-        return [
-            json.loads(line)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if line
-        ]
+        metadata_path = path.with_suffix(".metadata.json")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("invalid SWE-bench Verified cache metadata") from exc
+        if metadata != _expected_cache_metadata():
+            raise ValueError("invalid SWE-bench Verified cache metadata")
+        return _validate_dataset_contents(path.read_bytes())
     if dataset_loader is None:
         from datasets import load_dataset
 
         dataset_loader = load_dataset
     rows = [
-        dict(item)
+        _validated_verified_row(dict(item))
         for item in dataset_loader(
             DATASET_NAME,
             split="test",
             revision=DATASET_REVISION,
         )
     ]
-    atomic_write_text(
-        path,
-        "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in rows),
-    )
+    contents = serialize_verified_rows(rows)
+    rows = _validate_dataset_contents(contents)
+    atomic_write_text(path, contents.decode("utf-8"))
     atomic_write_text(
         path.with_suffix(".metadata.json"),
         json.dumps(
-            {"dataset": DATASET_NAME, "revision": DATASET_REVISION},
+            _expected_cache_metadata(),
             sort_keys=True,
         ),
     )

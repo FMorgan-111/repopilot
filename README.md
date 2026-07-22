@@ -337,6 +337,17 @@ five checkpoint IDs are a subset of the fixed 50-instance baseline. The
 checkpoint must pass its infrastructure and artifact checks before starting
 that baseline, whose final score denominator is exactly 50.
 
+The dataset boundary is `SWE-bench/SWE-bench_Verified`, split `test`, at the
+immutable Hugging Face revision
+`c104f840cc67f8b6eec6f759ebc8b2693d585d4a`. RepoPilot serializes the exact
+500-row, 13-field dataset in its fixed upstream column order and requires
+content SHA-256
+`f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c`.
+Cached content is accepted only when its metadata, row schema, row count, and
+content digest all match those code-pinned values. The public workflow cache
+key is
+`swe-bench-verified-c104f840cc67f8b6eec6f759ebc8b2693d585d4a-f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c-v2`.
+
 Before the first run:
 
 1. Revoke any API key that has appeared in a terminal transcript, chat, log,
@@ -378,7 +389,28 @@ Each instance upload contains only `result.json`, `prediction.jsonl`,
 `results.json`, `predictions.jsonl`, `official_results.json`, and `summary.md`.
 Raw official logs, evaluator patches, model credentials, RepoPilot home data,
 and target repositories are not uploaded. Generated evaluation outputs are
-workflow artifacts and are not committed to Git.
+workflow artifacts and are not committed to Git. Snapshot reads are bounded to
+8 MiB per file and 16 MiB per instance bundle. Official scoring tags the
+prepared image digest with a run-local alias, verifies that alias immediately
+before and after the harness call, and never scores through `latest`.
+
+The aggregate displays the official score first. Its secondary engineering
+score is auditable from four explicit fractions:
+
+```text
+engineering_score =
+    80 * official_resolved / requested
+  + 10 * non_infrastructure_instances / requested
+  +  5 * explicit_agreements / official_terminal_instances
+  +  5 * completed_within_budget_instances / requested
+```
+
+An agreement requires an explicit valid internal boolean verdict. Budget
+credit requires a completed official job plus complete model token and elapsed
+telemetry, at most 100,000 tokens, and at most 360 minutes.
+Missing or invalid verdict/telemetry receives no credit. `summary.md` reports every component's
+numerator and denominator and each instance's token and elapsed usage; these
+secondary metrics never replace the raw official resolved fraction.
 
 Generate a replay-safe summary from any result path:
 
@@ -392,11 +424,11 @@ Each instance is cloned and checked out at its exact 40-character
 `base_commit` before local code search, patching, and testing. The issue seed
 contains no gold patch, test patch, or evaluator-only fields.
 The primary benchmark score is the Official `resolved` status from the
-SWE-bench harness. The auditable secondary engineering score is RepoPilot's
-`agent_success` (and compatibility `success` field), which is true only when
+SWE-bench harness. RepoPilot's internal `agent_success` is true only when
 `coverage_status` is `existing_verified` or `generated_verified` and a
-nonempty differential `coverage_proof` is present. It is not benchmark
-resolution:
+nonempty differential `coverage_proof` is present. It contributes only to the
+explicit agreement fraction above; it is neither official benchmark
+resolution nor the engineering score by itself:
 
 ```bash
 python -m swebench.harness.run_evaluation \

@@ -5,10 +5,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
-import shutil
 import time
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
@@ -27,9 +27,10 @@ from eval.oci_contract import (
     sha256_file,
     write_model,
 )
-from eval.swe_bench import load_verified_instance
+from eval.swe_bench import load_verified_instance, verified_row_sha256
 from src.safe_subprocess import (
     BoundedProcessResult,
+    ProcessTimeoutError,
     SandboxPaths,
     run_bounded_process,
     run_oci_process,
@@ -126,6 +127,7 @@ def _runtime_record(
     status: RuntimeStatus,
     remote_image: str = "",
     image_sha: str = "",
+    row_sha256: str = "",
     error: BaseException | None = None,
 ) -> RuntimeRecord:
     return RuntimeRecord(
@@ -135,6 +137,7 @@ def _runtime_record(
         status=status,
         remote_image=remote_image,
         image_sha=image_sha,
+        row_sha256=row_sha256,
         error_class=type(error).__name__ if error is not None else "",
     )
 
@@ -166,13 +169,21 @@ def _pull_and_pin_image(
     command_runner: CommandRunner,
 ) -> str:
     for attempt in range(len(_PULL_RETRY_DELAYS) + 1):
-        pulled = command_runner(
-            ["docker", "pull", "--platform=linux/amd64", image],
-            cwd=REPO_ROOT,
-            timeout=1_800,
-            max_output_bytes=32_000,
-            decode_errors="strict",
-        )
+        try:
+            pulled = command_runner(
+                ["docker", "pull", "--platform=linux/amd64", image],
+                cwd=REPO_ROOT,
+                timeout=1_800,
+                max_output_bytes=32_000,
+                decode_errors="strict",
+            )
+        except ProcessTimeoutError:
+            if attempt == len(_PULL_RETRY_DELAYS):
+                raise OciImageInfrastructureError(
+                    "official image pull failed"
+                ) from None
+            time.sleep(_PULL_RETRY_DELAYS[attempt])
+            continue
         if not pulled.returncode:
             break
         if (
@@ -238,6 +249,7 @@ def prepare_instance(
     commit_sha = commit_loader()
     try:
         row = row_loader(instance_id)
+        row_sha256 = verified_row_sha256(row)
     except Exception as exc:
         return _persist_runtime(
             output_dir,
@@ -266,6 +278,7 @@ def prepare_instance(
                 commit_sha=commit_sha,
                 status="oci_image_infra",
                 remote_image=remote_image,
+                row_sha256=row_sha256,
                 error=exc,
             ),
         )
@@ -281,6 +294,7 @@ def prepare_instance(
                 commit_sha=commit_sha,
                 status="oci_boundary_infra",
                 remote_image=remote_image,
+                row_sha256=row_sha256,
                 error=exc,
             ),
         )
@@ -294,6 +308,7 @@ def prepare_instance(
             status="ready",
             remote_image=remote_image,
             image_sha=image_sha,
+            row_sha256=row_sha256,
         ),
     )
 
@@ -488,11 +503,40 @@ def _scorer_infrastructure_result(
     )
 
 
+def _run_image_alias_command(
+    argv: list[str], command_runner: CommandRunner
+) -> BoundedProcessResult:
+    result = command_runner(
+        argv,
+        cwd=REPO_ROOT,
+        timeout=60,
+        max_output_bytes=4_000,
+        decode_errors="strict",
+    )
+    if result.returncode:
+        raise OciImageInfrastructureError("scorer image alias command failed")
+    return result
+
+
+def _verify_image_alias(
+    alias: str,
+    expected_sha: str,
+    command_runner: CommandRunner,
+) -> None:
+    inspected = _run_image_alias_command(
+        ["docker", "image", "inspect", "--format={{.Id}}", alias],
+        command_runner,
+    )
+    if not hmac.compare_digest(inspected.stdout.strip(), expected_sha):
+        raise OciImageInfrastructureError("scorer image alias digest changed")
+
+
 def score_instance(
     runtime_path: Path,
     output_dir: Path,
     *,
     scorer: Callable[..., Path] = _official_scorer,
+    command_runner: CommandRunner = run_bounded_process,
 ) -> OfficialResult:
     """Run the official scorer only in a model-credential-free environment."""
     _require_credential_free_scorer_env()
@@ -511,28 +555,43 @@ def score_instance(
         f"repopilot-{runtime.commit_sha[:12]}-"
         f"{hashlib.sha256(runtime.instance_id.encode()).hexdigest()[:12]}"
     )
+    if not _OFFICIAL_IMAGE_RE.fullmatch(runtime.remote_image):
+        result = _scorer_infrastructure_result(runtime, "ValueError")
+        write_model(output_dir / "official_result.json", result)
+        return result
+    scorer_alias = runtime.remote_image.removesuffix("latest") + run_id
+    alias_created = False
     original_cwd = Path.cwd()
     try:
-        os.chdir(scorer_dir)
-        report_path = scorer(
-            dataset_name="SWE-bench/SWE-bench_Verified",
-            split="test",
-            instance_ids=[runtime.instance_id],
-            predictions_path=str(prediction_path),
-            max_workers=1,
-            force_rebuild=False,
-            cache_level="none",
-            clean=True,
-            open_file_limit=4096,
-            run_id=run_id,
-            timeout=1800,
-            namespace="swebench",
-            rewrite_reports=False,
-            modal=False,
-            instance_image_tag="latest",
-            env_image_tag="latest",
-            report_dir=str(scorer_dir),
+        _run_image_alias_command(
+            ["docker", "image", "tag", runtime.image_sha, scorer_alias],
+            command_runner,
         )
+        alias_created = True
+        _verify_image_alias(scorer_alias, runtime.image_sha, command_runner)
+        os.chdir(scorer_dir)
+        try:
+            report_path = scorer(
+                dataset_name="SWE-bench/SWE-bench_Verified",
+                split="test",
+                instance_ids=[runtime.instance_id],
+                predictions_path=str(prediction_path),
+                max_workers=1,
+                force_rebuild=False,
+                cache_level="none",
+                clean=False,
+                open_file_limit=4096,
+                run_id=run_id,
+                timeout=1800,
+                namespace="swebench",
+                rewrite_reports=False,
+                modal=False,
+                instance_image_tag=run_id,
+                env_image_tag=run_id,
+                report_dir=str(scorer_dir),
+            )
+        finally:
+            _verify_image_alias(scorer_alias, runtime.image_sha, command_runner)
         report_path = Path(report_path)
         if not report_path.is_absolute():
             report_path = scorer_dir / report_path
@@ -544,6 +603,16 @@ def score_instance(
         result = _scorer_infrastructure_result(runtime, type(exc).__name__)
     finally:
         os.chdir(original_cwd)
+        if alias_created:
+            try:
+                _run_image_alias_command(
+                    ["docker", "image", "rm", scorer_alias],
+                    command_runner,
+                )
+            except Exception as exc:
+                result = _scorer_infrastructure_result(
+                    runtime, type(exc).__name__
+                )
     write_model(output_dir / "official_result.json", result)
     return result
 
@@ -552,30 +621,36 @@ def package_instance(
     runtime_path: Path,
     output_dir: Path,
     artifact_dir: Path,
+    *,
+    row_loader: Callable[[str], Mapping[str, Any]] = load_verified_instance,
 ) -> InstanceManifest:
     """Copy only validated safe payloads and bind their exact bytes."""
-    from eval.oci_aggregate import SAFE_PAYLOAD_FILES, parse_safe_payloads
+    from eval.oci_aggregate import SAFE_PAYLOAD_FILES, snapshot_safe_payloads
 
     runtime = _load_runtime(runtime_path)
     output_dir = Path(output_dir)
     artifact_dir = Path(artifact_dir)
+    if runtime.row_sha256:
+        current_row_sha256 = verified_row_sha256(
+            row_loader(runtime.instance_id)
+        )
+        if not hmac.compare_digest(current_row_sha256, runtime.row_sha256):
+            raise ValueError("runtime dataset row digest mismatch")
     if artifact_dir.exists() and any(artifact_dir.iterdir()):
         raise ValueError("artifact directory must be empty")
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    for filename in SAFE_PAYLOAD_FILES:
-        source = output_dir / filename
-        if source.is_symlink() or not source.is_file():
-            raise ValueError(f"safe artifact source unavailable: {filename}")
-        shutil.copyfile(source, artifact_dir / filename)
-    parse_safe_payloads(
-        artifact_dir,
+    _payload, payload_files = snapshot_safe_payloads(
+        output_dir,
         expected_instance_id=runtime.instance_id,
         expected_commit=runtime.commit_sha,
     )
+    for filename in SAFE_PAYLOAD_FILES:
+        (artifact_dir / filename).write_bytes(payload_files[filename])
     manifest = InstanceManifest(
         mode=runtime.mode,
         instance_id=runtime.instance_id,
         commit_sha=runtime.commit_sha,
+        row_sha256=runtime.row_sha256,
         runtime_status=runtime.status,
         image_sha=runtime.image_sha,
         files={

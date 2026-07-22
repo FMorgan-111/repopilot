@@ -20,6 +20,7 @@ from eval.oci_contract import (
 
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
+ROW_SHA = "c" * 64
 INSTANCE_ID = "pytest-dev__pytest-10081"
 
 
@@ -28,6 +29,7 @@ def _manifest_payload(**overrides: object) -> dict[str, object]:
         "mode": "checkpoint_5",
         "instance_id": INSTANCE_ID,
         "commit_sha": COMMIT_SHA,
+        "row_sha256": ROW_SHA,
         "runtime_status": "ready",
         "image_sha": IMAGE_SHA,
         "primary_model": "gemini-3.5-flash:stable",
@@ -100,6 +102,36 @@ def test_runtime_record_forbids_unknown_fields() -> None:
             error_class="DatasetUnavailable",
             gold_patch="must not persist",
         )
+
+
+def test_ready_runtime_and_manifest_bind_valid_dataset_row_digest() -> None:
+    runtime = RuntimeRecord(
+        mode="checkpoint_5",
+        instance_id=INSTANCE_ID,
+        commit_sha=COMMIT_SHA,
+        status="ready",
+        remote_image="swebench/sweb.eval.x86_64.owner_repo-1:latest",
+        image_sha=IMAGE_SHA,
+        row_sha256=ROW_SHA,
+    )
+    manifest = InstanceManifest.model_validate(
+        _manifest_payload(row_sha256=ROW_SHA)
+    )
+
+    assert runtime.row_sha256 == ROW_SHA
+    assert manifest.row_sha256 == ROW_SHA
+
+    with pytest.raises(ValidationError, match="row_sha256"):
+        RuntimeRecord(
+            mode="checkpoint_5",
+            instance_id=INSTANCE_ID,
+            commit_sha=COMMIT_SHA,
+            status="ready",
+            remote_image="swebench/sweb.eval.x86_64.owner_repo-1:latest",
+            image_sha=IMAGE_SHA,
+        )
+    with pytest.raises(ValidationError, match="row_sha256"):
+        InstanceManifest.model_validate(_manifest_payload(row_sha256="d" * 63))
 
 
 def test_manifest_requires_image_sha_only_for_ready_runtime() -> None:
