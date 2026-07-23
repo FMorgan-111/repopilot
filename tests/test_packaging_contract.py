@@ -113,3 +113,23 @@ assert 'numpy' not in sys.modules
         capture_output=True,
         text=True,
     )
+
+
+def test_importing_eval_harness_does_not_load_dotenv():
+    code = """
+import dotenv
+
+def reject_import_time_dotenv(*args, **kwargs):
+    raise AssertionError('eval harness loaded dotenv during import')
+
+dotenv.load_dotenv = reject_import_time_dotenv
+import eval.harness
+"""
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )

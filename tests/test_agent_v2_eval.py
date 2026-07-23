@@ -189,6 +189,7 @@ async def test_legacy_harness_llm_request_uses_bounded_shared_client(monkeypatch
 def sample_record():
     return {
         "id": "acme/widget#7:8",
+        "base_commit": "a" * 40,
         "repo": {"owner": "acme", "name": "widget"},
         "issue": {
             "url": "https://github.com/acme/widget/issues/7",
@@ -200,6 +201,102 @@ def sample_record():
         },
         "signals": {"has_tests_changed": True},
     }
+
+
+def test_gold_seed_reads_files_only_from_exact_sample_commit(monkeypatch):
+    from eval import harness
+
+    refs = []
+    monkeypatch.setattr(
+        harness,
+        "_gh_get",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("gold seed resolved mutable repository metadata")
+        ),
+    )
+    monkeypatch.setattr(
+        harness,
+        "fetch_file_content",
+        lambda _owner, _repo, _path, ref: refs.append(ref) or "source",
+    )
+
+    seed = agent_v2_harness._build_gold_seed(sample_record())
+
+    assert seed is not None
+    assert refs == ["a" * 40]
+
+
+@pytest.mark.parametrize("base_commit", [None, "main", "A" * 40, "a" * 39])
+def test_gold_seed_rejects_missing_or_mutable_commit_before_content_reads(
+    monkeypatch, base_commit
+):
+    from eval import harness
+
+    sample = sample_record()
+    if base_commit is None:
+        sample.pop("base_commit")
+    else:
+        sample["base_commit"] = base_commit
+    monkeypatch.setattr(
+        harness,
+        "fetch_file_content",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("content read before commit validation")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="base_commit"):
+        agent_v2_harness._build_gold_seed(sample)
+
+
+def test_current_commit_sha_uses_minimal_environment_with_hostile_path(
+    monkeypatch, tmp_path
+):
+    from src.safe_subprocess import minimal_subprocess_env
+
+    captured = {}
+    monkeypatch.setenv("PATH", str(tmp_path / "hostile-bin"))
+    monkeypatch.setenv("LLM_API_KEY", "model-secret")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "actions-secret")
+
+    def fake_run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        return SimpleNamespace(stdout="a" * 40 + "\n")
+
+    monkeypatch.setattr(agent_v2_harness.subprocess, "run", fake_run)
+
+    assert agent_v2_harness._current_commit_sha() == "a" * 40
+    assert captured["kwargs"]["env"] == minimal_subprocess_env()
+    assert captured["kwargs"]["env"]["PATH"] != str(tmp_path / "hostile-bin")
+    assert "LLM_API_KEY" not in captured["kwargs"]["env"]
+    assert "GITHUB_TOKEN" not in captured["kwargs"]["env"]
+    assert "ACTIONS_ID_TOKEN_REQUEST_TOKEN" not in captured["kwargs"]["env"]
+
+
+async def test_custom_gold_seed_preflights_all_commits_before_agent_or_writes(
+    monkeypatch, tmp_path
+):
+    samples_path = tmp_path / "samples.jsonl"
+    sample = sample_record()
+    sample.pop("base_commit")
+    samples_path.write_text(json.dumps(sample) + "\n", encoding="utf-8")
+
+    async def forbidden_agent(*_args, **_kwargs):
+        raise AssertionError("agent ran before immutable seed preflight")
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", forbidden_agent)
+    results_path = tmp_path / "must-not-exist.json"
+
+    with pytest.raises(ValueError, match="--seed-gold-files.*base_commit"):
+        await agent_v2_harness.run_agent_v2_eval(
+            n_samples=1,
+            samples_path=samples_path,
+            results_path=results_path,
+            seed_gold_files=True,
+        )
+
+    assert not results_path.exists()
 
 
 def swe_bench_sample():

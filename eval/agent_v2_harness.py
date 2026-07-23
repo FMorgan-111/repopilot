@@ -52,6 +52,9 @@ safe_int = _safe_contracts.safe_int
 safe_float = _safe_contracts.safe_float
 sanitize_output_text = _safe_contracts.sanitize_output_text
 validate_safe_coverage_proof = _safe_contracts.validate_safe_coverage_proof
+minimal_subprocess_env = importlib.import_module(
+    "src.safe_subprocess"
+).minimal_subprocess_env
 
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
@@ -408,6 +411,7 @@ def _current_commit_sha() -> str:
             text=True,
             timeout=5,
             check=True,
+            env=minimal_subprocess_env(),
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         return ""
@@ -518,20 +522,19 @@ def _build_gold_seed(sample: dict[str, Any]) -> dict[str, Any] | None:
     search). Removes locate from the critical path so eval measures the patch
     stage, not GitHub search rate-limiting. Returns None if no code file could
     be seeded (fall back to the normal locate path)."""
-    from eval.harness import _gh_get, fetch_file_content
+    from eval.harness import _validate_base_commit, fetch_file_content
 
     repo = sample["repo"]
     issue = sample["issue"]
     owner, name = repo["owner"], repo["name"]
-    meta = _gh_get(f"https://api.github.com/repos/{owner}/{name}")
-    ref = (meta or {}).get("default_branch") or "main"
+    base_commit = _validate_base_commit(sample.get("base_commit"))
 
     files: list[dict[str, Any]] = []
     for entry in sample.get("patch", {}).get("files", []):
         path = entry.get("path", "")
         if not path or _is_doc_path(path):
             continue
-        content = fetch_file_content(owner, name, path, ref)
+        content = fetch_file_content(owner, name, path, base_commit)
         if not content:  # added file with no pre-image, or fetch failed → skip
             continue
         files.append(
@@ -843,6 +846,17 @@ async def run_agent_v2_eval(
                 sample_id=sample_id,
                 samples_path=samples_path,
             )
+            if seed_gold_files:
+                from eval.harness import _validate_base_commit
+
+                for sample in samples:
+                    try:
+                        _validate_base_commit(sample.get("base_commit"))
+                    except ValueError as exc:
+                        raise ValueError(
+                            "--seed-gold-files requires every custom sample to "
+                            "provide an exact 40-lowercase-hex base_commit"
+                        ) from exc
         else:
             raise ValueError(f"Unsupported dataset: {dataset}")
         results: list[dict[str, Any]] = []
@@ -898,8 +912,14 @@ def main(argv: list[str] | None = None) -> None:
         type=int,
         default=DEFAULT_AGENT_V2_TOKEN_BUDGET,
     )
-    parser.add_argument("--seed-gold-files", action="store_true",
-                        help="Seed relevant_files from dataset gold changed files")
+    parser.add_argument(
+        "--seed-gold-files",
+        action="store_true",
+        help=(
+            "Seed relevant_files from custom dataset gold changed files; every "
+            "sample must provide an exact 40-lowercase-hex base_commit"
+        ),
+    )
     parser.add_argument("--samples-file", type=str, default=None,
                         help="Path to custom samples JSONL file")
     parser.add_argument(

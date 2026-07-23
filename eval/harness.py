@@ -22,29 +22,42 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse as urllib_parse
 import urllib.request as urllib_req
 from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
 
 # ── repo root ─────────────────────────────────────────────────────────────
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-load_dotenv(REPO_ROOT / ".env", override=False)
-
 DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
-_bounded_llm_request = importlib.import_module("src.http_client").llm_request
-_model_provider = importlib.import_module("src.model_provider")
-get_model_config = _model_provider.get_model_config
-get_model_name = _model_provider.get_model_name
+minimal_subprocess_env = importlib.import_module(
+    "src.safe_subprocess"
+).minimal_subprocess_env
+
+
+def get_model_config(provider: str):
+    """Lazily resolve model configuration after an evaluator was selected."""
+    return importlib.import_module("src.model_provider").get_model_config(provider)
+
+
+def get_model_name(provider: str) -> str:
+    """Lazily resolve the model name without loading evaluator configuration."""
+    return importlib.import_module("src.model_provider").get_model_name(provider)
+
+
+async def _bounded_llm_request(*args, **kwargs):
+    """Import the shared HTTP transport only when legacy evaluation is authorized."""
+    request = importlib.import_module("src.http_client").llm_request
+    return await request(*args, **kwargs)
 
 
 def _get_llm_base_url() -> str:
@@ -65,7 +78,6 @@ async def llm_request(
 
 # ── paths ────────────────────────────────────────────────────────────────
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"
-EVAL_TMP = Path("/tmp/repopilot-eval")
 RESULTS_PATH = REPO_ROOT / "eval" / "eval_results.json"
 SUMMARY_PATH = REPO_ROOT / "eval" / "eval_summary.md"
 
@@ -73,13 +85,43 @@ SUMMARY_PATH = REPO_ROOT / "eval" / "eval_summary.md"
 MAX_SAMPLES = 5
 TIMEOUT_PER_SAMPLE = 600  # 10 minutes
 CLONE_TIMEOUT = 180  # 3 minutes for minimal clone (ansible ~2GB needs it)
+MAX_SOURCE_FILE_BYTES = 512 * 1024
+MAX_SEARCH_FILES = 10_000
+MAX_SEARCH_BYTES = 8 * 1024 * 1024
+MAX_SEARCH_RESULTS = 300
 DEEPSEEK_PRICING = {
     "input": 0.27 / 1_000_000,   # $0.27 per 1M input tokens
     "output": 0.36 / 1_000_000,  # $0.36 per 1M output tokens (cached miss)
 }
 
-_gh_file_cache: dict[str, list[str]] = {}  # "owner/repo" -> [file paths]
-_gh_content_cache: dict[str, str] = {}     # "owner/repo/path" -> file content
+_gh_file_cache: dict[str, list[str]] = {}
+_gh_content_cache: dict[str, str] = {}
+
+_BASE_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+_UNSAFE_LEGACY_ENV = "REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION"
+
+
+def _validate_base_commit(value: object) -> str:
+    if not isinstance(value, str) or _BASE_COMMIT_RE.fullmatch(value) is None:
+        raise ValueError("legacy eval sample base_commit must be 40 lowercase hex")
+    return value
+
+
+def _sample_base_commit(sample: object) -> str:
+    if not isinstance(sample, dict):
+        raise ValueError("legacy eval sample must contain a valid base_commit")
+    return _validate_base_commit(sample.get("base_commit"))
+
+
+def _require_legacy_host_execution(unsafe_allow_host_execution: bool) -> None:
+    if (
+        unsafe_allow_host_execution is not True
+        or os.getenv(_UNSAFE_LEGACY_ENV) != "1"
+    ):
+        raise PermissionError(
+            "legacy host evaluation requires an explicit API/CLI selection and "
+            f"{_UNSAFE_LEGACY_ENV}=1"
+        )
 
 
 def _gh_get(url: str, timeout: int = 30) -> dict | None:
@@ -100,36 +142,36 @@ def _gh_get(url: str, timeout: int = 30) -> dict | None:
         return None
 
 
-def fetch_file_list(owner: str, repo: str) -> list[str]:
-    """Get all file paths via GitHub Tree API (recursive). Cached per-run."""
-    cache_key = f"{owner}/{repo}"
+def fetch_file_list(owner: str, repo: str, base_commit: str) -> list[str]:
+    """Get file paths for one immutable commit via the GitHub Tree API."""
+    base_commit = _validate_base_commit(base_commit)
+    cache_key = f"{owner}/{repo}@{base_commit}"
     if cache_key in _gh_file_cache:
         return _gh_file_cache[cache_key]
 
     data = _gh_get(
-        f"https://api.github.com/repos/{owner}/{repo}/git/trees/main?recursive=1",
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/"
+        f"{base_commit}?recursive=1",
         timeout=60,
     )
-    if not data:
-        # Try 'master' branch if 'main' returns no tree
-        data = _gh_get(
-            f"https://api.github.com/repos/{owner}/{repo}/git/trees/master?recursive=1",
-            timeout=60,
-        )
     files = [t["path"] for t in (data or {}).get("tree", []) if t.get("type") == "blob"]
     _gh_file_cache[cache_key] = files
     return files
 
 
-def fetch_file_content(owner: str, repo: str, path: str, ref: str = "main") -> str:
-    """Read file content via GitHub Contents API. Cached per-run."""
-    cache_key = f"{owner}/{repo}/{path}"
+def fetch_file_content(
+    owner: str, repo: str, path: str, base_commit: str
+) -> str:
+    """Read file content at one immutable commit via the GitHub Contents API."""
+    base_commit = _validate_base_commit(base_commit)
+    cache_key = f"{owner}/{repo}@{base_commit}/{path}"
     if cache_key in _gh_content_cache:
         return _gh_content_cache[cache_key]
 
-    safe_path = urllib_req.quote(path, safe="")
+    safe_path = urllib_parse.quote(path, safe="")
     data = _gh_get(
-        f"https://api.github.com/repos/{owner}/{repo}/contents/{safe_path}?ref={ref}",
+        f"https://api.github.com/repos/{owner}/{repo}/contents/{safe_path}"
+        f"?ref={base_commit}",
         timeout=15,
     )
     if not data:
@@ -157,26 +199,9 @@ def search_files_by_name(file_list: list[str], term: str, max_results: int = 15)
 
 
 def search_code_via_github(owner: str, repo: str, query: str, max_results: int = 10) -> list[str]:
-    """Search GitHub code (file contents) for files matching the query.
-
-    Uses GitHub's /search/code API to find files whose CONTENTS contain the query.
-    This catches files like replace.py (contains "allowlist_externals"),
-    checker.py (contains "warn_unreachable"), etc. that filename-only search misses.
-
-    Fixes v0 file_recall=0 root cause:
-    - Old harness only did filename matching via search_files_by_name.
-    - Actual file names (replace.py, checker.py, manager.py) rarely appear in issue text.
-    - But the issue text DOES contain terms like "allowlist_externals" which appear
-      in the file CONTENTS. Code search bridges this gap.
-    """
-    import urllib.parse as urlparse
-    q = f"repo:{owner}/{repo} {query}"
-    safe_q = urlparse.quote(q, safe="")
-    url = f"https://api.github.com/search/code?q={safe_q}&per_page={max_results}"
-    data = _gh_get(url, timeout=15)
-    if not data:
-        return []
-    return [item["path"] for item in data.get("items", []) if item.get("path")]
+    """Disabled: GitHub code search is bound to a mutable default branch."""
+    del owner, repo, query, max_results
+    return []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -307,122 +332,173 @@ async def _llm_search_context(
         return [], []
 
 
-def clone_repo(owner: str, repo: str, target: Path, timeout: int = 600) -> bool:
-    """Shallow-clone a GitHub repo. Returns True on success.
-
-    Fixes v0 clone_failed root cause:
-    - Clean target dir between retries (partial clone from failed strategy
-      left non-empty dir, causing second strategy to fail).
-    - Increased timeout from 300s to 600s for large repos (ansible ~2GB).
-    - Dropped --filter=blob:none (requires server support, unreliable).
-    - Added --no-tags to skip tag objects.
-    """
+def clone_repo(
+    owner: str,
+    repo: str,
+    base_commit: str,
+    target: Path,
+    timeout: int = 600,
+) -> bool:
+    """Fetch and verify one exact commit in a detached checkout."""
+    base_commit = _validate_base_commit(base_commit)
     url = f"https://github.com/{owner}/{repo}.git"
-    strategies = [
-        # Strategy 1: shallow clone, single branch, no tags (fastest)
-        ["git", "clone", "--depth", "1", "--single-branch", "--no-tags", url, str(target)],
-        # Strategy 2: shallow clone, single branch (fallback if --no-tags unsupported)
-        ["git", "clone", "--depth", "1", "--single-branch", url, str(target)],
-        # Strategy 3: ultra-shallow (depth 1 only, any branch)
-        ["git", "clone", "--depth", "1", url, str(target)],
+    git_prefix = [
+        "git",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "credential.interactive=never",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "init.templateDir=",
     ]
-    for i, cmd in enumerate(strategies):
-        # Clean up any partial clone from previous strategy
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-        target.mkdir(parents=True, exist_ok=True)
+    commands = [
+        [*git_prefix, "init", str(target)],
+        [*git_prefix, "-C", str(target), "remote", "add", "origin", url],
+        [
+            *git_prefix,
+            "-C",
+            str(target),
+            "fetch",
+            "--depth",
+            "1",
+            "--no-tags",
+            "origin",
+            base_commit,
+        ],
+        [*git_prefix, "-C", str(target), "checkout", "--detach", base_commit],
+    ]
+    def remove_path(path: Path) -> None:
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            if result.returncode == 0:
-                return True
-            # Log failure for debugging
-            stderr = (result.stderr or "")[:200]
-            print(f"    clone strategy {i+1} failed: {stderr}", flush=True)
-        except subprocess.TimeoutExpired:
-            print(f"    clone strategy {i+1} timed out after {timeout}s", flush=True)
-            shutil.rmtree(target, ignore_errors=True)
-            continue
-        except Exception as exc:
-            print(f"    clone strategy {i+1} error: {exc}", flush=True)
-            shutil.rmtree(target, ignore_errors=True)
-            continue
+            if path.is_symlink() or path.is_file():
+                path.unlink()
+            else:
+                shutil.rmtree(path)
+        except FileNotFoundError:
+            pass
+
+    remove_path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    git_home = target.parent / f".{target.name}-git-home"
+    remove_path(git_home)
+    git_home.mkdir(mode=0o700)
+    git_home.chmod(0o700)
+    env = minimal_subprocess_env({"HOME": str(git_home)})
+    success = False
+    try:
+        for command in commands:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+            )
+            if result.returncode != 0:
+                stderr = (result.stderr or "")[:200]
+                print(f"    exact checkout failed: {stderr}", flush=True)
+                return False
+
+        head = subprocess.run(
+            [*git_prefix, "-C", str(target), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        detached = subprocess.run(
+            [*git_prefix, "-C", str(target), "symbolic-ref", "-q", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        if (
+            head.returncode == 0
+            and head.stdout.strip() == base_commit
+            and detached.returncode == 1
+        ):
+            success = True
+            return True
+        print("    exact detached HEAD verification failed", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"    exact checkout timed out after {timeout}s", flush=True)
+    except Exception as exc:
+        print(f"    exact checkout error: {exc}", flush=True)
+    finally:
+        remove_path(git_home)
+        if not success:
+            remove_path(target)
     return False
 
 
-def grep_repo(repo_path: Path, term: str, max_files: int = 15) -> list[str]:
-    """Search repo for files matching a term.
-
-    Fixes v0 file_recall=0 root cause:
-    - Old version excluded .rst, .test, .toml, .yaml, .json — but many fixes
-      touch docs, test data files, and config. Now only excludes binary assets.
-    - Added filename search: also searches file paths for the term (e.g.,
-      "replace" should match src/tox/.../replace.py even if content doesn't
-      contain the word "replace" as a keyword).
-    - Combined content + filename results with filename matches ranked first
-      (filenames are stronger signals).
-    """
+def grep_repo(
+    repo_path: Path,
+    tracked_files: list[str],
+    terms: list[str],
+    *,
+    max_files: int = MAX_SEARCH_RESULTS,
+    max_scanned_files: int = MAX_SEARCH_FILES,
+    max_total_bytes: int = MAX_SEARCH_BYTES,
+) -> list[str]:
+    """Search the exact tracked-file allowlist once under aggregate bounds."""
     results: list[str] = []
-    seen: set[str] = set()
-
-    # Strategy 1: ripgrep content search (broad file types, exclude only binaries)
-    try:
-        result = subprocess.run(
-            ["rg", "-l", "--max-filesize", "500K",
-             "--iglob", "!*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot,mp4,mp3,avi,mov,zip,tar,gz,bz2,xz}",
-             term, str(repo_path)],
-            capture_output=True, text=True, timeout=30,
+    normalized_terms = [term.lower() for term in terms if term]
+    total_bytes = 0
+    scanned_files = 0
+    for rel_path in tracked_files:
+        if (
+            scanned_files >= max_scanned_files
+            or total_bytes >= max_total_bytes
+            or len(results) >= max_files
+        ):
+            break
+        relative = Path(rel_path)
+        if ".git" in relative.parts:
+            continue
+        remaining = max_total_bytes - total_bytes
+        content = read_file_content(
+            repo_path,
+            rel_path,
+            max_bytes=min(MAX_SOURCE_FILE_BYTES, remaining),
         )
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                if line.strip():
-                    rel = str(Path(line.strip()).relative_to(repo_path))
-                    if rel not in seen:
-                        seen.add(rel)
-                        results.append(rel)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+        scanned_files += 1
+        if not content:
+            continue
+        total_bytes += len(content.encode("utf-8", errors="replace"))
+        path_text = relative.as_posix().lower()
+        content_lower = content.lower()
+        if any(term in path_text or term in content_lower for term in normalized_terms):
+            results.append(relative.as_posix())
+    return results
 
-    # Strategy 2: filename search — find files whose path contains the term
-    # This catches cases where the file name (e.g., replace.py) doesn't contain
-    # the search term as a word but the path itself is a strong signal.
+
+def read_file_content(
+    repo_path: Path,
+    rel_path: str,
+    *,
+    max_bytes: int = MAX_SOURCE_FILE_BYTES,
+) -> str:
+    """Boundedly read a non-symlink regular file contained in the checkout."""
+    relative = Path(rel_path)
+    if relative.is_absolute() or ".." in relative.parts:
+        return ""
+    full = repo_path / relative
     try:
-        result = subprocess.run(
-            ["rg", "--files", "--iglob", "!*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot,mp4,mp3,avi,mov,zip,tar,gz}",
-             str(repo_path)],
-            capture_output=True, text=True, timeout=15,
-        )
-        if result.returncode == 0:
-            all_files = [
-                line.strip()
-                for line in result.stdout.strip().split("\n")
-                if line.strip()
-            ]
-            # Match term against file path
-            term_lower = term.lower()
-            for fpath in all_files:
-                fname = Path(fpath).name.lower()
-                fdir = str(Path(fpath).parent).lower()
-                # Match if term appears in filename or directory name
-                if term_lower in fname or term_lower in fdir:
-                    try:
-                        rel = str(Path(fpath).relative_to(repo_path))
-                    except ValueError:
-                        rel = fpath
-                    if rel not in seen:
-                        seen.add(rel)
-                        results.append(rel)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    return results[:max_files]
-
-
-def read_file_content(repo_path: Path, rel_path: str) -> str:
-    """Read a file from the cloned repo."""
-    full = repo_path / rel_path
-    try:
-        return full.read_text(encoding="utf-8", errors="replace")
-    except Exception:
+        root = repo_path.resolve(strict=True)
+        if full.is_symlink():
+            return ""
+        resolved = full.resolve(strict=True)
+        if not resolved.is_relative_to(root) or not resolved.is_file():
+            return ""
+        if max_bytes < 0 or resolved.stat().st_size > max_bytes:
+            return ""
+        data = resolved.read_bytes()
+        if len(data) > max_bytes:
+            return ""
+        return data.decode("utf-8", errors="replace")
+    except (OSError, ValueError):
         return ""
 
 
@@ -478,80 +554,46 @@ def _fix_patch(patch_content: str) -> str:
 
 
 def apply_patch(repo_path: Path, patch_content: str) -> tuple[bool, str]:
-    """Apply a unified diff patch with fallbacks. Returns (success, output).
-
-    Tries multiple methods:
-    1. git apply --check + git apply (strict)
-    2. patch -p1 (lenient, handles line-number offsets)
-    3. git apply --reject (apply what we can)
-    """
+    """Apply a unified diff only when strict Git preflight succeeds."""
     sanitized = _fix_patch(patch_content)
 
-    # Method 1: git apply (strict)
     result = subprocess.run(
         ["git", "apply", "--check"],
         input=sanitized,
         cwd=str(repo_path),
         capture_output=True, text=True, timeout=30,
+        env=minimal_subprocess_env(),
     )
-    check_ok = result.returncode == 0
     check_output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        return False, f"git apply preflight failed: {check_output[:2000]}"
 
-    if check_ok:
-        result2 = subprocess.run(
-            ["git", "apply"],
-            input=sanitized,
-            cwd=str(repo_path),
-            capture_output=True, text=True, timeout=30,
-        )
-        if result2.returncode == 0:
-            return True, (result2.stdout + result2.stderr).strip()
-        check_output = (result2.stdout + result2.stderr).strip()
-
-    # Method 2: patch -p1 (lenient, handles fuzz)
-    result3 = subprocess.run(
-        ["patch", "-p1", "-f", "--dry-run"],
+    applied = subprocess.run(
+        ["git", "apply"],
         input=sanitized,
         cwd=str(repo_path),
         capture_output=True, text=True, timeout=30,
+        env=minimal_subprocess_env(),
     )
-    if result3.returncode == 0:
-        result4 = subprocess.run(
-            ["patch", "-p1", "-f"],
-            input=sanitized,
-            cwd=str(repo_path),
-            capture_output=True, text=True, timeout=30,
-        )
-        if result4.returncode == 0:
-            return True, (result4.stdout + result4.stderr).strip()
-        return False, (result4.stdout + result4.stderr).strip()[:2000]
-
-    # Method 3: git apply --reject (apply partial, creates .rej files)
-    result5 = subprocess.run(
-        ["git", "apply", "--reject"],
-        input=sanitized,
-        cwd=str(repo_path),
-        capture_output=True, text=True, timeout=30,
-    )
-    reject_output = (result5.stdout + result5.stderr).strip()
-    if result5.returncode == 0:
-        return True, f"applied with rejects: {reject_output[:500]}"
-
-    return False, f"all methods failed. git-check: {check_output[:500]} | patch: {reject_output[:500]}"
+    output = (applied.stdout + applied.stderr).strip()
+    return applied.returncode == 0, output[:2000]
 
 
 def run_tests(repo_path: Path) -> tuple[bool, str]:
     """Run pytest in the repo. Returns (success, output)."""
     # Try common test commands
     candidates = [
-        ["python3", "-m", "pytest", "-x", "-q", "--tb=short"],
-        ["python", "-m", "pytest", "-x", "-q", "--tb=short"],
-        ["pytest", "-x", "-q", "--tb=short"],
+        [sys.executable, "-P", "-m", "pytest", "-x", "-q", "--tb=short"],
     ]
     for cmd in candidates:
         try:
             result = subprocess.run(
-                cmd, cwd=str(repo_path), capture_output=True, text=True, timeout=300,
+                cmd,
+                cwd=str(repo_path),
+                capture_output=True,
+                text=True,
+                timeout=300,
+                env=minimal_subprocess_env(),
             )
             output = (result.stdout + "\n" + result.stderr)[:5000]
             return result.returncode == 0, output
@@ -809,8 +851,18 @@ def _extract_relevant_sections(
 # single-sample evaluation
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) -> dict:
-    """Evaluate one sample. Returns a result dict."""
+async def evaluate_sample(
+    sample: dict,
+    idx: int,
+    model: str = DEFAULT_MODEL,
+    *,
+    unsafe_allow_host_execution: bool = False,
+    _eval_root: Path | None = None,
+) -> dict:
+    """Evaluate one sample after explicit authorization for host execution."""
+    del idx
+    _require_legacy_host_execution(unsafe_allow_host_execution)
+    base_commit = _sample_base_commit(sample)
     sample_id = sample["id"]
     issue = sample["issue"]
     patch_data = sample["patch"]
@@ -836,62 +888,57 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
         "error": None,
     }
 
+    workspace = None
+    if _eval_root is None:
+        workspace = tempfile.TemporaryDirectory(prefix="repopilot-legacy-eval-")
+        eval_root = Path(workspace.name)
+    else:
+        eval_root = _eval_root
+        eval_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        eval_root.chmod(0o700)
     t_start = time.monotonic()
-    repo_path = EVAL_TMP / sample_id.replace("/", "_").replace("#", "_").replace(":", "_")
+    repo_path = eval_root / sample_id.replace("/", "_").replace("#", "_").replace(":", "_")
     owner, repo_name = repo_info["owner"], repo_info["name"]
 
     try:
-        # ── 1. file discovery via GitHub API (no clone needed) ──
-        print(f"  [{sample_id}] Fetching file list via GitHub API...", flush=True)
-        all_files = fetch_file_list(owner, repo_name)
-        if not all_files:
-            # API failed — fall back to clone+grep
-            print(f"  [{sample_id}] API failed, falling back to git clone...", flush=True)
-            if not clone_repo(owner, repo_name, repo_path):
-                result["error"] = "clone_failed"
-                return result
-            clone_time = time.monotonic() - t_start
-            print(f"  [{sample_id}] Clone done in {clone_time:.1f}s", flush=True)
-            # Use git ls-files as file list
-            ls_result = subprocess.run(
-                ["git", "ls-files"], cwd=str(repo_path),
-                capture_output=True, text=True, timeout=15,
-            )
-            all_files = [
-                line.strip()
-                for line in ls_result.stdout.split("\n")
-                if line.strip()
-            ]
-        else:
-            print(f"  [{sample_id}] {len(all_files)} files via API", flush=True)
+        # Clone first so discovery, reads, patching, and tests all use the same
+        # verified immutable checkout. No default-branch GitHub code search is used.
+        print(f"  [{sample_id}] Fetching exact commit {base_commit}...", flush=True)
+        if not clone_repo(
+            owner,
+            repo_name,
+            base_commit,
+            repo_path,
+            timeout=CLONE_TIMEOUT,
+        ):
+            result["error"] = "clone_failed"
+            return result
+        clone_time = time.monotonic() - t_start
+        print(f"  [{sample_id}] Exact checkout done in {clone_time:.1f}s", flush=True)
 
-        # ── 2. find candidate files (filename search + GitHub code search) ──
+        ls_result = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(repo_path),
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=minimal_subprocess_env(),
+        )
+        if ls_result.returncode != 0:
+            result["error"] = "ls_files_failed"
+            return result
+        all_files = [path for path in ls_result.stdout.split("\0") if path]
+
+        # Search the exact local checkout by both path and content.
         search_terms = _extract_search_terms(issue["title"], issue["body"])
         print(f"  [{sample_id}] Search terms: {search_terms}", flush=True)
-
         candidate_set: set[str] = set()
-
-        # Strategy A: GitHub code search (content-based, most effective)
-        # Code search finds files by CONTENT, catching cases like
-        # "allowlist_externals" -> replace.py, "INJECT_FACTS_AS_VARS" -> manager.py
-        code_search_terms = search_terms[:8]  # top 8 terms for code search
-        for term in code_search_terms:
-            try:
-                for f in search_code_via_github(owner, repo_name, term, max_results=10):
-                    candidate_set.add(f)
-            except Exception:
-                pass  # code search is best-effort
-
-        # Strategy B: filename search (fast, works if filenames appear in issue)
         for term in search_terms[:10]:
             for f in search_files_by_name(all_files, term, max_results=30):
                 candidate_set.add(f)
+        for path in grep_repo(repo_path, all_files, search_terms[:10]):
+            candidate_set.add(path)
 
-        # Strategy C: derive search terms from code search file paths, then re-search
-        # Code search often finds files whose NAMES don't match the issue text.
-        # Extract path components (e.g., "src/tox/config/loader/ini/replace.py"
-        # → "replace", "loader", "ini") and use them as supplementary search terms
-        # to boost recall, especially for repos where code search returns few hits.
         path_derived_terms: set[str] = set()
         for path in list(candidate_set):
             for part in path.replace("/", ".").replace("-", "_").split("."):
@@ -899,25 +946,11 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
                 if len(part) >= 3 and part not in {"py", "src", "test", "tests"}:
                     path_derived_terms.add(part)
 
-        # Always run supplementary search with path-derived terms
-        # (regardless of candidate count — large sets may still miss the target)
-        if path_derived_terms:
-            # Supplementary code search with path-derived terms (skip already-searched)
-            for term in list(path_derived_terms)[:10]:
-                if term in code_search_terms:
-                    continue
-                try:
-                    for f in search_code_via_github(owner, repo_name, term, max_results=10):
-                        candidate_set.add(f)
-                except Exception:
-                    pass
-
-            # Supplementary filename search with path-derived terms
-            for term in list(path_derived_terms)[:15]:
-                if term in search_terms:
-                    continue
-                for f in search_files_by_name(all_files, term, max_results=30):
-                    candidate_set.add(f)
+        for term in list(path_derived_terms)[:15]:
+            if term in search_terms:
+                continue
+            for f in search_files_by_name(all_files, term, max_results=30):
+                candidate_set.add(f)
 
         candidate_files = sorted(candidate_set)
         print(f"  [{sample_id}] Found {len(candidate_files)} candidate files", flush=True)
@@ -937,7 +970,7 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
         print(f"  [{sample_id}] file_recall: k1={result['file_recall']['k1']:.2f} "
               f"k3={result['file_recall']['k3']:.2f} k5={result['file_recall']['k5']:.2f}", flush=True)
 
-        # ── 5. read top files via GitHub API (instant, no clone) ──
+        # ── 5. read top files from the verified exact checkout ──
         files_to_read: list[str] = []
         for path in ranked_paths[:5]:
             if path not in files_to_read:
@@ -948,10 +981,10 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
 
         top_files: list[dict] = []
         for path in files_to_read[:5]:
-            content = fetch_file_content(owner, repo_name, path)
+            content = read_file_content(repo_path, path)
             if content:
                 top_files.append({"path": path, "content": content})
-        print(f"  [{sample_id}] Read {len(top_files)} files via API", flush=True)
+        print(f"  [{sample_id}] Read {len(top_files)} local files", flush=True)
 
         # ── 6. LLM: generate patch ──
         print(f"  [{sample_id}] Phase 2: generating patch...", flush=True)
@@ -968,26 +1001,27 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
         result["token_usage"]["output"] = total_out
         result["token_usage"]["cost"] = estimate_cost(total_in, total_out)
 
-        # ── 7. apply patch (needs clone — attempt now) ──
+        # ── 7. apply and test in the same verified checkout ──
         if agent_patch.strip():
-            print(f"  [{sample_id}] Cloning for patch apply ({CLONE_TIMEOUT}s timeout)...", flush=True)
-            if clone_repo(owner, repo_name, repo_path, timeout=CLONE_TIMEOUT):
-                print(f"  [{sample_id}] Clone OK, applying patch...", flush=True)
-                ok, apply_output = apply_patch(repo_path, agent_patch)
-                result["patch_apply"] = ok
-                if not ok:
-                    result["patch_apply_error"] = apply_output[:2000]
-                print(f"  [{sample_id}] Patch apply: {'OK' if ok else 'FAILED'}", flush=True)
+            print(f"  [{sample_id}] Applying patch...", flush=True)
+            ok, apply_output = apply_patch(repo_path, agent_patch)
+            result["patch_apply"] = ok
+            if not ok:
+                result["patch_apply_error"] = apply_output[:2000]
+            print(
+                f"  [{sample_id}] Patch apply: {'OK' if ok else 'FAILED'}",
+                flush=True,
+            )
 
-                if has_tests and ok:
-                    print(f"  [{sample_id}] Running tests...", flush=True)
-                    test_ok, test_output = run_tests(repo_path)
-                    result["test_pass"] = test_ok
-                    result["test_output"] = test_output[:3000]
-                    print(f"  [{sample_id}] Tests: {'PASS' if test_ok else 'FAIL'}", flush=True)
-            else:
-                print(f"  [{sample_id}] Clone timed out — skipping apply/test", flush=True)
-                result["patch_apply_error"] = "clone_timeout_for_apply"
+            if has_tests and ok:
+                print(f"  [{sample_id}] Running tests...", flush=True)
+                test_ok, test_output = run_tests(repo_path)
+                result["test_pass"] = test_ok
+                result["test_output"] = test_output[:3000]
+                print(
+                    f"  [{sample_id}] Tests: {'PASS' if test_ok else 'FAIL'}",
+                    flush=True,
+                )
         else:
             result["patch_apply_error"] = "LLM did not produce a patch"
             print(f"  [{sample_id}] No patch produced by LLM", flush=True)
@@ -1004,6 +1038,8 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
         print(f"  [{sample_id}] Done in {elapsed:.1f}s", flush=True)
         if repo_path.exists():
             shutil.rmtree(repo_path, ignore_errors=True)
+        if workspace is not None:
+            workspace.cleanup()
 
     return result
 
@@ -1015,12 +1051,15 @@ async def evaluate_sample(sample: dict, idx: int, model: str = DEFAULT_MODEL) ->
 async def run_eval(
     n_samples: int = MAX_SAMPLES,
     model: str = DEFAULT_MODEL,
+    *,
+    unsafe_allow_host_execution: bool = False,
 ) -> list[dict]:
-    """Run the full evaluation on n_samples."""
+    """Run the legacy evaluator only after both unsafe opt-ins are present."""
+    _require_legacy_host_execution(unsafe_allow_host_execution)
     samples = load_samples(n_samples)
+    for sample in samples:
+        _sample_base_commit(sample)
     print(f"Loaded {len(samples)} samples from {SAMPLES_PATH}", flush=True)
-
-    EVAL_TMP.mkdir(parents=True, exist_ok=True)
 
     results = []
     for i, sample in enumerate(samples):
@@ -1030,7 +1069,12 @@ async def run_eval(
 
         try:
             result = await asyncio.wait_for(
-                evaluate_sample(sample, i, model=model),
+                evaluate_sample(
+                    sample,
+                    i,
+                    model=model,
+                    unsafe_allow_host_execution=True,
+                ),
                 timeout=TIMEOUT_PER_SAMPLE,
             )
         except asyncio.TimeoutError:
@@ -1071,10 +1115,16 @@ def main(argv: list[str] | None = None) -> None:
         prog="python eval/harness.py",
         description="Run RepoPilot evals.",
     )
-    parser.add_argument(
+    evaluator = parser.add_mutually_exclusive_group(required=True)
+    evaluator.add_argument(
         "--agent-v2",
         action="store_true",
         help="Run the state-graph agent eval mode with saved-run replay.",
+    )
+    evaluator.add_argument(
+        "--unsafe-legacy",
+        action="store_true",
+        help="Run the legacy host evaluator (also requires explicit unsafe env opt-in).",
     )
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
     parser.add_argument("--model", default=DEFAULT_MODEL)
@@ -1111,7 +1161,14 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
-    asyncio.run(run_eval(n_samples=args.samples, model=args.model))
+    _require_legacy_host_execution(args.unsafe_legacy)
+    asyncio.run(
+        run_eval(
+            n_samples=args.samples,
+            model=args.model,
+            unsafe_allow_host_execution=True,
+        )
+    )
 
 
 if __name__ == "__main__":
