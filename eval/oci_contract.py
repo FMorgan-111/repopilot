@@ -17,7 +17,10 @@ from pydantic import (
     model_validator,
 )
 
-from eval.safe_contracts import has_verified_coverage_proof
+from eval.safe_contracts import (
+    has_verified_coverage_proof,
+    normalize_exception_class,
+)
 from eval.swe_bench import (
     DATASET_NAME,
     DATASET_REVISION,
@@ -79,9 +82,6 @@ _MODE_FILES: dict[str, str] = {
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
-_EXCEPTION_CLASS_RE = re.compile(
-    r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)"
-)
 _SAFE_FILES = frozenset(
     {"result.json", "prediction.jsonl", "official_result.json"}
 )
@@ -116,6 +116,15 @@ def require_mode_instance(
     """Reject arbitrary workflow-provided IDs outside the tracked mode."""
     if instance_id not in load_mode_instance_ids(mode, repo_root):
         raise ValueError(f"instance ID is not tracked for {mode}: {instance_id}")
+
+
+def synthetic_repo_identity(instance_id: str) -> tuple[str, str]:
+    """Derive the repository identity used by synthetic SWE-bench failures."""
+    owner, separator, repo_and_number = instance_id.partition("__")
+    repo, number_separator, _number = repo_and_number.rpartition("-")
+    if not separator or not number_separator:
+        return "unknown", "unknown"
+    return owner, repo
 
 
 class RuntimeRecord(BaseModel):
@@ -183,6 +192,13 @@ class OfficialResult(BaseModel):
     resolved: StrictBool
     error_class: str = ""
 
+    @field_validator("error_class")
+    @classmethod
+    def validate_error_class(cls, value: str) -> str:
+        if normalize_exception_class(value) != value:
+            raise ValueError("error_class must be a sanitized exception class")
+        return value
+
     @model_validator(mode="after")
     def validate_status_flags(self) -> OfficialResult:
         if self.status == "resolved" and not (
@@ -225,7 +241,7 @@ class ModelInvocationRecord(BaseModel):
     @field_validator("error_class")
     @classmethod
     def validate_error_class(cls, value: str) -> str:
-        if value and not _EXCEPTION_CLASS_RE.fullmatch(value):
+        if normalize_exception_class(value) != value:
             raise ValueError("error_class must be a sanitized exception class")
         return value
 

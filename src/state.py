@@ -20,6 +20,8 @@ from pydantic import (
     model_validator,
 )
 
+from eval.safe_contracts import normalize_exception_class
+
 from .evaluator_safety import contains_evaluator_only, sanitize_evaluator_text
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
@@ -345,15 +347,7 @@ class ModelInvocation(BaseModel):
     @field_validator("error_class", mode="before")
     @classmethod
     def _keep_exception_class_only(cls, value: Any) -> str:
-        if isinstance(value, BaseException):
-            return type(value).__name__
-        candidate = str(value or "").strip().partition(":")[0].strip()
-        if re.fullmatch(
-            r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)",
-            candidate,
-        ):
-            return candidate
-        return ""
+        return normalize_exception_class(value)
 
     @field_validator("node", mode="before")
     @classmethod

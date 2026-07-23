@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Iterator, Protocol
 
 from eval.oci_contract import (
+    PRIMARY_MODEL,
     REPO_ROOT,
     TESTBED_PYTHON,
     EvalMode,
@@ -25,6 +26,7 @@ from eval.oci_contract import (
     RuntimeStatus,
     require_mode_instance,
     sha256_file,
+    synthetic_repo_identity,
     write_model,
 )
 from eval.swe_bench import (
@@ -340,10 +342,7 @@ def _operator_tool_environment(runtime: RuntimeRecord) -> Iterator[None]:
 
 
 def _synthetic_verified_sample(runtime: RuntimeRecord) -> dict[str, Any]:
-    owner, separator, repo_and_number = runtime.instance_id.partition("__")
-    repo, number_separator, _number = repo_and_number.rpartition("-")
-    if not separator or not number_separator:
-        owner, repo = "unknown", "unknown"
+    owner, repo = synthetic_repo_identity(runtime.instance_id)
     return {
         "id": runtime.instance_id,
         "instance_id": runtime.instance_id,
@@ -372,6 +371,8 @@ def _write_generation_failure(
         failure_class="infra",
         commit_sha=runtime.commit_sha,
     )
+    result["model"] = PRIMARY_MODEL
+    result["models_used"] = [PRIMARY_MODEL]
     agent_v2_harness._write_results_with_fallback(
         [result], Path(output_dir) / "result.json"
     )
@@ -643,7 +644,11 @@ def package_instance(
     row_loader: Callable[[str], Mapping[str, Any]] = load_verified_instance,
 ) -> InstanceManifest:
     """Copy only validated safe payloads and bind their exact bytes."""
-    from eval.oci_aggregate import SAFE_PAYLOAD_FILES, snapshot_safe_payloads
+    from eval.oci_aggregate import (
+        SAFE_PAYLOAD_FILES,
+        snapshot_safe_payloads,
+        validate_payload_consistency,
+    )
 
     runtime = _load_runtime(runtime_path)
     output_dir = Path(output_dir)
@@ -657,11 +662,12 @@ def package_instance(
     if artifact_dir.exists() and any(artifact_dir.iterdir()):
         raise ValueError("artifact directory must be empty")
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    _payload, payload_files = snapshot_safe_payloads(
+    payload, payload_files = snapshot_safe_payloads(
         output_dir,
         expected_instance_id=runtime.instance_id,
         expected_commit=runtime.commit_sha,
     )
+    validate_payload_consistency(runtime.status, payload)
     for filename in SAFE_PAYLOAD_FILES:
         (artifact_dir / filename).write_bytes(payload_files[filename])
     manifest = InstanceManifest(

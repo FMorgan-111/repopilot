@@ -70,7 +70,7 @@ def _write_runtime(tmp_path: Path, *, status: str = "ready") -> Path:
         row_sha256=ROW_SHA if status == "ready" else "",
         remote_image=OFFICIAL_IMAGE if status == "ready" else "",
         image_sha=IMAGE_SHA if status == "ready" else "",
-        error_class="" if status == "ready" else "DockerUnavailable",
+        error_class="" if status == "ready" else "RuntimeError",
     )
     return write_model(tmp_path / "runtime.json", runtime)
 
@@ -709,7 +709,7 @@ def test_infrastructure_runtime_skips_official_scorer(tmp_path: Path) -> None:
 
     assert result.status == "scorer_infra"
     assert result.resolved is False
-    assert result.error_class == "DockerUnavailable"
+    assert result.error_class == "RuntimeError"
 
 
 def test_generate_cli_forwards_runtime_and_output(monkeypatch, tmp_path: Path) -> None:

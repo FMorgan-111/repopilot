@@ -24,7 +24,9 @@ from eval.oci_contract import (
     ModelInvocationRecord,
     OfficialResult,
     ResultRecord,
+    RuntimeStatus,
     load_mode_instance_ids,
+    synthetic_repo_identity,
 )
 from eval.safe_contracts import sanitize_output_text
 from eval.swe_bench import atomic_write_text
@@ -286,8 +288,19 @@ def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-finite JSON number: {value}")
 
 
+def _parse_finite_json_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def _strict_json_loads(value: str | bytes) -> Any:
-    return json.loads(value, parse_constant=_reject_json_constant)
+    return json.loads(
+        value,
+        parse_constant=_reject_json_constant,
+        parse_float=_parse_finite_json_float,
+    )
 
 
 def _parse_safe_payload_bytes(
@@ -393,33 +406,65 @@ def snapshot_safe_payloads(
     return payload, files
 
 
-def _validate_bundle_consistency(
-    manifest: InstanceManifest,
+def _is_synthetic_generation_failure(result: ResultRecord) -> bool:
+    owner, repo = synthetic_repo_identity(result.instance_id)
+    return bool(
+        result.mode == "agent_v2"
+        and result.evaluation_mode == "end_to_end"
+        and result.model == PRIMARY_MODEL
+        and result.id == result.instance_id
+        and result.repo == f"{owner}/{repo}"
+        and result.issue_url == ""
+        and result.issue_title == result.instance_id
+        and not result.success
+        and not result.agent_success
+        and result.official_resolved is None
+        and not result.waiting_for_user
+        and result.final_phase == "FAILED"
+        and result.run_id == ""
+        and result.trace_id == ""
+        and result.turns_taken == 0
+        and result.token_used == 0
+        and result.error == "Sample evaluation failed."
+        and result.replay is None
+        and result.replay_error is None
+        and result.models_used == [PRIMARY_MODEL]
+        and not result.escalated
+        and result.escalation_reason == ""
+        and not result.model_invocations
+        and not result.tool_invocations
+        and result.unique_evidence_count == 0
+        and result.max_consecutive_no_progress == 0
+        and result.attempt_outcome_summary == ""
+        and result.coverage_status == "failed"
+        and not result.coverage_test_files
+        and result.coverage_test_command == ""
+        and result.coverage_proof is None
+        and result.coverage_failure_reason == "infra"
+        and result.test_generation_attempts == 0
+        and result.failure_class == "infra"
+        and result.base_commit == ""
+        and result.model_patch == ""
+    )
+
+
+def validate_payload_consistency(
+    runtime_status: RuntimeStatus,
     payload: VerifiedPayload,
 ) -> None:
     result = payload.result
     official = payload.official
-    if manifest.runtime_status != "ready" and (
-        official.status != "scorer_infra"
+    synthetic_failure = _is_synthetic_generation_failure(result)
+    if runtime_status != "ready" and (
+        not synthetic_failure
+        or official.status != "scorer_infra"
         or official.submitted
         or official.completed
         or official.resolved
         or not official.error_class
-        or result.failure_class != "infra"
-        or result.success
-        or result.agent_success
-        or result.final_phase != "FAILED"
-        or bool(result.base_commit)
-        or bool(result.model_patch)
-        or bool(result.model_invocations)
-        or result.models_used != [PRIMARY_MODEL]
-        or result.escalated
-        or bool(result.escalation_reason)
-        or result.coverage_status != "failed"
-        or result.coverage_proof is not None
     ):
         raise ArtifactContractError("inconsistent artifact bundle")
-    if manifest.runtime_status == "ready" and not result.base_commit:
+    if runtime_status == "ready" and not result.base_commit and not synthetic_failure:
         raise ArtifactContractError("inconsistent artifact bundle")
     if official.status == "empty_patch" and result.model_patch:
         raise ArtifactContractError("inconsistent artifact bundle")
@@ -465,7 +510,7 @@ def _verify_bundle(
         expected_instance_id=expected_instance_id,
         expected_commit=expected_commit,
     )
-    _validate_bundle_consistency(manifest, payload)
+    validate_payload_consistency(manifest.runtime_status, payload)
     return manifest, payload
 
 

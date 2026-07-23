@@ -8,11 +8,18 @@ from pathlib import Path
 
 import pytest
 
-from eval import oci_aggregate
+from eval import oci_aggregate, oci_runner
 from eval.oci_aggregate import ArtifactContractError, aggregate_artifacts
 from eval.oci_contract import OfficialResult, RuntimeRecord, sha256_file, write_model
-from eval.oci_runner import package_instance
+from eval.oci_runner import (
+    _write_generation_failure,
+    generate_instance,
+    package_instance,
+    score_instance,
+)
 from eval.swe_bench import verified_row_sha256, write_predictions
+from src.safe_subprocess import BoundedProcessResult
+from src.state import ModelInvocation
 
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
@@ -124,7 +131,7 @@ def _completed_output(
         "instance_id": instance_id,
         "commit_sha": COMMIT_SHA,
         "status": runtime_status,
-        "error_class": "" if runtime_status == "ready" else "RuntimeUnavailable",
+        "error_class": "" if runtime_status == "ready" else "RuntimeError",
     }
     if runtime_status == "ready":
         runtime_payload.update(
@@ -135,6 +142,24 @@ def _completed_output(
     runtime = RuntimeRecord.model_validate(runtime_payload)
     runtime_path = write_model(output_dir / "runtime.json", runtime)
     status = official_status or ("resolved" if resolved else "unresolved")
+    if runtime_status != "ready":
+        _write_generation_failure(
+            runtime,
+            output_dir,
+            RuntimeError(runtime.error_class),
+        )
+        write_model(
+            output_dir / "official_result.json",
+            OfficialResult(
+                instance_id=instance_id,
+                status="scorer_infra",
+                submitted=False,
+                completed=False,
+                resolved=False,
+                error_class="RuntimeError",
+            ),
+        )
+        return runtime_path, artifact_dir
     internal_success = (
         status in {"resolved", "unresolved"}
         if agent_success in {None, _MISSING_AGENT_VERDICT}
@@ -217,7 +242,7 @@ def _completed_output(
         submitted=status != "scorer_infra",
         completed=status in {"resolved", "unresolved"},
         resolved=status == "resolved",
-        error_class="DockerUnavailable" if status == "scorer_infra" else "",
+        error_class="RuntimeError" if status == "scorer_infra" else "",
     )
     write_model(output_dir / "official_result.json", official)
     return runtime_path, artifact_dir
@@ -267,6 +292,15 @@ def _package(
 def _rewrite_bundle_json(bundle: Path, filename: str, payload: object) -> None:
     path = bundle / filename
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["files"][filename] = sha256_file(path)
+    manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+
+
+def _rewrite_bundle_bytes(bundle: Path, filename: str, payload: bytes) -> None:
+    path = bundle / filename
+    path.write_bytes(payload)
     manifest_path = bundle / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["files"][filename] = sha256_file(path)
@@ -437,6 +471,27 @@ def test_package_rejects_nonfinite_number_in_nested_result_telemetry(
         )
 
 
+def test_package_rejects_exponent_overflow_in_nested_result_telemetry(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    result_path = runtime_path.parent / "result.json"
+    results = json.loads(result_path.read_text(encoding="utf-8"))
+    results[0]["tool_invocations"] = [{"unsafe_number": 0}]
+    raw = json.dumps(results).replace('"unsafe_number": 0', '"unsafe_number": 1e309')
+    result_path.write_text(raw + "\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
 def test_package_rejects_completed_patch_without_model_history(
     tmp_path: Path,
 ) -> None:
@@ -447,6 +502,26 @@ def test_package_rejects_completed_patch_without_model_history(
     )
 
     with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
+def test_package_rejects_ready_non_synthetic_result_without_base_commit(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    result_path = runtime_path.parent / "result.json"
+    results = json.loads(result_path.read_text(encoding="utf-8"))
+    results[0]["base_commit"] = ""
+    result_path.write_text(json.dumps(results) + "\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactContractError, match="inconsistent artifact bundle"):
         package_instance(
             runtime_path,
             runtime_path.parent,
@@ -675,6 +750,50 @@ def test_aggregate_rejects_inconsistent_invocation_error_class(
         )
 
 
+@pytest.mark.parametrize(
+    "error_class",
+    ["ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout"],
+)
+def test_package_and_aggregate_accept_gateway_timeout_invocation(
+    tmp_path: Path,
+    error_class: str,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    producer_invocation = ModelInvocation(
+        model=PRIMARY_MODEL,
+        provider="primary",
+        node="plan",
+        elapsed_seconds=1.0,
+        input_tokens=10,
+        output_tokens=0,
+        status="error",
+        error_class=type(error_class, (TimeoutError,), {})(),
+    )
+
+    _package(
+        artifacts,
+        instance_id,
+        official_status="empty_patch",
+        agent_success=False,
+        model_patch="",
+        model_invocations=[producer_invocation.model_dump(mode="json")],
+        failure_class="model_gateway_infra",
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    assert summary_path.is_file()
+
+
 def test_aggregate_rejects_completed_bundle_with_only_error_invocation(
     tmp_path: Path,
 ) -> None:
@@ -738,6 +857,29 @@ def test_aggregate_rejects_nonfinite_nested_result_number(
     results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
     results[0]["replay"] = {"unsafe_number": value}
     _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_rejects_exponent_overflow_in_nested_result_number(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["replay"] = {"unsafe_number": 0}
+    raw = json.dumps(results).replace('"unsafe_number": 0', '"unsafe_number": 1e309')
+    _rewrite_bundle_bytes(bundle, "result.json", (raw + "\n").encode())
 
     with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
         aggregate_artifacts(
@@ -1047,27 +1189,64 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
 @pytest.mark.parametrize(
     ("scope", "field", "value"),
     [
+        ("official", "schema_version", 2),
+        ("official", "instance_id", "other__repo-2"),
+        ("official", "status", "empty_patch"),
         ("official", "submitted", True),
         ("official", "completed", True),
-        ("official", "error_class", ""),
+        ("official", "resolved", True),
+        ("result", "id", "other__repo-2"),
+        ("result", "mode", "legacy"),
+        ("result", "evaluation_mode", "oracle_files"),
+        ("result", "model", ESCALATION_MODEL),
+        ("result", "commit_sha", "b" * 40),
+        ("result", "repo", "other/repo"),
+        ("result", "issue_url", "https://example.test/issues/1"),
+        ("result", "issue_title", "Different title"),
+        ("result", "success", True),
+        ("result", "agent_success", True),
+        ("result", "official_resolved", False),
+        ("result", "waiting_for_user", True),
         ("result", "final_phase", "DONE"),
+        ("result", "run_id", "run-1"),
+        ("result", "trace_id", "trace-1"),
+        ("result", "turns_taken", 1),
+        ("result", "token_used", 1),
+        ("result", "error", None),
+        ("result", "replay", {}),
+        ("result", "replay_error", "ValueError"),
+        ("result", "models_used", [ESCALATION_MODEL]),
+        ("result", "escalated", True),
+        ("result", "escalation_reason", "repeated_no_progress"),
+        ("result", "model_invocations", [_invocation()]),
+        ("result", "tool_invocations", [{"tool_name": "search"}]),
+        ("result", "unique_evidence_count", 1),
+        ("result", "max_consecutive_no_progress", 1),
+        ("result", "attempt_outcome_summary", "attempted"),
         ("result", "base_commit", "d" * 40),
-        ("result", "coverage_status", "existing_verified"),
-        ("result", "coverage_proof", {"status": "existing_verified"}),
+        ("result", "model_patch", "diff --git a/a.py b/a.py\n"),
+        ("result", "coverage_status", "pending"),
+        ("result", "coverage_test_files", ["tests/test_auth.py"]),
+        ("result", "coverage_test_command", "pytest tests/test_auth.py"),
+        ("result", "coverage_proof", _coverage_proof()),
+        ("result", "coverage_failure_reason", "other"),
+        ("result", "test_generation_attempts", 1),
+        ("result", "failure_class", "other"),
+        ("result", "instance_id", "other__repo-2"),
     ],
 )
-def test_nonready_runtime_rejects_nonproducer_telemetry(
+@pytest.mark.parametrize("boundary", ["package", "aggregate"])
+def test_nonready_runtime_rejects_every_fixed_nonproducer_field_at_each_boundary(
     tmp_path: Path,
     scope: str,
     field: str,
     value: object,
+    boundary: str,
 ) -> None:
     instance_id = "owner__repo-1"
-    repo_root = _repo_root(tmp_path, [instance_id])
-    artifacts = tmp_path / "artifacts"
-    artifacts.mkdir()
-    bundle = _package(
-        artifacts,
+    work = tmp_path / "work"
+    runtime_path, artifact_dir = _completed_output(
+        work,
         instance_id,
         official_status="scorer_infra",
         model_patch="",
@@ -1078,14 +1257,46 @@ def test_nonready_runtime_rejects_nonproducer_telemetry(
     filename = (
         "official_result.json" if scope == "official" else "result.json"
     )
-    payload = json.loads((bundle / filename).read_text(encoding="utf-8"))
+    source_path = runtime_path.parent / filename
+    payload = json.loads(source_path.read_text(encoding="utf-8"))
     target = payload if scope == "official" else payload[0]
     target[field] = value
+    if boundary == "package":
+        source_path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with pytest.raises(
+            ArtifactContractError,
+            match=(
+                "invalid safe artifact payload|inconsistent artifact bundle|"
+                "cross-file artifact identity mismatch"
+            ),
+        ):
+            package_instance(
+                runtime_path,
+                runtime_path.parent,
+                artifact_dir,
+                row_loader=_artifact_row,
+            )
+        return
+
+    package_instance(
+        runtime_path,
+        runtime_path.parent,
+        artifact_dir,
+        row_loader=_artifact_row,
+    )
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = artifacts / f"bundle-{instance_id}"
+    artifact_dir.rename(bundle)
     _rewrite_bundle_json(bundle, filename, payload)
+    repo_root = _repo_root(tmp_path, [instance_id])
 
     with pytest.raises(
         ArtifactContractError,
-        match="invalid safe artifact payload|inconsistent artifact bundle",
+        match=(
+            "invalid safe artifact payload|inconsistent artifact bundle|"
+            "cross-file artifact identity mismatch"
+        ),
     ):
         aggregate_artifacts(
             "checkpoint_5",
@@ -1187,6 +1398,105 @@ def test_valid_nonready_infrastructure_bundle_scores_zero(
     assert "| Non-infrastructure | 0/1 | 0.00/10 |" in summary
     assert "| Completed within time/token budget | 0/1 | 0.00/5 |" in summary
     assert "| Engineering score | 0.00/100 |" in summary
+
+
+async def test_ready_generation_failure_packages_and_aggregates_real_projection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    runtime = RuntimeRecord(
+        mode="checkpoint_5",
+        instance_id=instance_id,
+        commit_sha=COMMIT_SHA,
+        row_sha256=ROW_SHA,
+        status="ready",
+        remote_image="swebench/sweb.eval.x86_64.owner_repo-1:latest",
+        image_sha=IMAGE_SHA,
+    )
+    runtime_path = write_model(output_dir / "runtime.json", runtime)
+    for name in oci_runner._SCORER_FORBIDDEN_ENV:
+        monkeypatch.delenv(name, raising=False)
+
+    async def fail_generation(*args, **kwargs):
+        raise RuntimeError("generation failed")
+
+    await generate_instance(
+        runtime_path,
+        output_dir,
+        agent_runner=fail_generation,
+    )
+
+    tags = {runtime.image_sha: runtime.image_sha}
+
+    def command_runner(argv, **kwargs):
+        command = list(argv)
+        if command[1:3] == ["image", "tag"]:
+            tags[command[4]] = tags[command[3]]
+            return BoundedProcessResult(command, 0, "", "")
+        if command[1:3] == ["image", "inspect"]:
+            digest = tags.get(command[-1], "")
+            return BoundedProcessResult(
+                command,
+                0 if digest else 1,
+                digest,
+                "",
+            )
+        if command[1:3] == ["image", "rm"]:
+            tags.pop(command[-1], None)
+            return BoundedProcessResult(command, 0, "", "")
+        raise AssertionError(f"unexpected command: {command}")
+
+    def empty_patch_scorer(**kwargs):
+        report_path = Path.cwd() / "official-report.json"
+        report_path.write_text(
+            json.dumps(
+                {
+                    "submitted_ids": [instance_id],
+                    "completed_ids": [],
+                    "resolved_ids": [],
+                    "unresolved_ids": [],
+                    "empty_patch_ids": [instance_id],
+                    "error_ids": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return report_path
+
+    official = score_instance(
+        runtime_path,
+        output_dir,
+        scorer=empty_patch_scorer,
+        command_runner=command_runner,
+        row_loader=_artifact_row,
+    )
+    assert official.status == "empty_patch"
+
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    package_instance(
+        runtime_path,
+        output_dir,
+        artifacts / f"bundle-{instance_id}",
+        row_loader=_artifact_row,
+    )
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    [combined] = json.loads(
+        (summary_path.parent / "results.json").read_text(encoding="utf-8")
+    )
+    assert combined["base_commit"] == ""
+    assert combined["failure_class"] == "infra"
 
 
 def test_incomplete_official_result_receives_no_budget_credit(

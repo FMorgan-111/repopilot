@@ -261,7 +261,7 @@ def test_official_result_distinguishes_unresolved_from_infrastructure() -> None:
         submitted=False,
         completed=False,
         resolved=False,
-        error_class="DockerUnavailable",
+        error_class="RuntimeError",
     )
 
     assert unresolved.status == "unresolved"
@@ -288,6 +288,24 @@ def test_official_scorer_infrastructure_requires_error_class() -> None:
             submitted=False,
             completed=False,
             resolved=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    ["CredentialSentinel", "ReadTimeout secret-token", "api_key=secret-value"],
+)
+def test_official_scorer_infrastructure_rejects_unsafe_error_class(
+    error_class: str,
+) -> None:
+    with pytest.raises(ValidationError, match="error_class"):
+        OfficialResult(
+            instance_id=INSTANCE_ID,
+            status="scorer_infra",
+            submitted=False,
+            completed=False,
+            resolved=False,
+            error_class=error_class,
         )
 
 
@@ -448,18 +466,43 @@ def test_invalid_response_allows_sanitized_or_empty_error_class(
     assert record.model_invocations[0].error_class == error_class
 
 
-def test_invocation_rejects_unsanitized_error_class() -> None:
+@pytest.mark.parametrize(
+    "error_class",
+    ["gateway exploded", "ReadTimeout: secret-token", "api_key=secret-value"],
+)
+def test_invocation_rejects_unsanitized_error_class(error_class: str) -> None:
     with pytest.raises(ValidationError, match="error_class"):
         _result_record_model().model_validate(
             _result_payload(
                 model_invocations=[
                     _invocation_payload(
                         status="error",
-                        error_class="gateway exploded",
+                        error_class=error_class,
                     )
                 ]
             )
         )
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    ["ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout"],
+)
+def test_invocation_accepts_shared_gateway_timeout_class(
+    error_class: str,
+) -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_invocations=[
+                _invocation_payload(
+                    status="error",
+                    error_class=error_class,
+                )
+            ]
+        )
+    )
+
+    assert record.model_invocations[0].error_class == error_class
 
 
 def test_result_models_used_match_ordered_unique_invocation_history() -> None:

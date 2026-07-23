@@ -143,6 +143,9 @@ _MODEL_GATEWAY_ERROR_CLASSES = frozenset(
         "WriteTimeout",
     }
 )
+_SAFE_EXCEPTION_CLASS_RE = re.compile(
+    r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)"
+)
 _GENERATE_PLAN_GATEWAY_RE = re.compile(
     r"(?i)failed to generate fix plan:\s*(?:"
     + "|".join(sorted(_MODEL_GATEWAY_ERROR_CLASSES))
@@ -211,6 +214,19 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def normalize_official_resolved(value: Any) -> bool | None:
     """Only an actual JSON boolean is an official scorer result."""
     return value if type(value) is bool else None
+
+
+def normalize_exception_class(value: Any) -> str:
+    """Return only a safe exception type name, including gateway timeouts."""
+    if isinstance(value, BaseException):
+        candidate = type(value).__name__
+    else:
+        candidate = str(value or "").strip().partition(":")[0].strip()
+    if candidate in _MODEL_GATEWAY_ERROR_CLASSES:
+        return candidate
+    if _SAFE_EXCEPTION_CLASS_RE.fullmatch(candidate):
+        return candidate
+    return ""
 
 
 def _canonical_test_path(value: Any) -> str | None:

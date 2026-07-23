@@ -2,6 +2,7 @@ from copy import deepcopy
 
 import pytest
 
+from eval import safe_contracts
 from eval.safe_contracts import (
     has_verified_coverage_proof,
     normalize_official_resolved,
@@ -135,6 +136,29 @@ def test_safe_coverage_contract_rejects_control_characters_in_test_id():
 )
 def test_official_resolved_accepts_only_actual_booleans(value, expected):
     assert normalize_official_resolved(value) is expected
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    ["ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout"],
+)
+def test_exception_class_normalizer_preserves_gateway_timeout_classes(
+    error_class: str,
+) -> None:
+    exception = type(error_class, (TimeoutError,), {})()
+
+    assert safe_contracts.normalize_exception_class(exception) == error_class
+    assert safe_contracts.normalize_exception_class(error_class) == error_class
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["CredentialSentinel", "ReadTimeout secret-token", "api_key=secret-value"],
+)
+def test_exception_class_normalizer_rejects_arbitrary_or_secret_bearing_values(
+    value: str,
+) -> None:
+    assert safe_contracts.normalize_exception_class(value) == ""
 
 
 @pytest.mark.parametrize(

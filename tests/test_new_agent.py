@@ -235,6 +235,35 @@ def test_model_invocation_rejects_non_exception_error_class(hostile_value):
     assert hostile_value not in invocation.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    "error_class",
+    ["ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout"],
+)
+def test_model_invocation_preserves_gateway_timeout_class_round_trip(
+    error_class,
+):
+    exception = type(error_class, (TimeoutError,), {})()
+    from_exception = ModelInvocation(
+        model="gemini-3.5-flash:stable",
+        provider="primary",
+        node="plan",
+        elapsed_seconds=1.0,
+        input_tokens=1,
+        output_tokens=0,
+        status="error",
+        error_class=exception,
+    )
+
+    loaded = ModelInvocation.model_validate_json(from_exception.model_dump_json())
+    from_string = ModelInvocation.model_validate(
+        {**from_exception.model_dump(), "error_class": error_class}
+    )
+
+    assert from_exception.error_class == error_class
+    assert loaded.error_class == error_class
+    assert from_string.error_class == error_class
+
+
 async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):
     captured = {}
 
