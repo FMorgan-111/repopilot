@@ -739,6 +739,142 @@ def test_reader_construction_failure_after_spawn_still_closes_and_reaps(
     assert process.stdin.closed
 
 
+def test_reader_started_before_start_raises_is_joined_before_return(
+    tmp_path, monkeypatch
+):
+    class FakeProcess:
+        pid = 4246
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        stdin = io.BytesIO()
+
+    process = FakeProcess()
+    reaped = threading.Event()
+    cleanup_signal = threading.Event()
+    reader_entered = threading.Event()
+    reader_finished = threading.Event()
+    original_start = threading.Thread.start
+    interrupted_thread: threading.Thread | None = None
+
+    def delayed_reader(pipe, *_args):
+        reader_entered.set()
+        cleanup_signal.wait(timeout=2)
+        time.sleep(0.2)
+        pipe.close()
+        reader_finished.set()
+
+    def interrupted_start(self):
+        nonlocal interrupted_thread
+        target = self._target
+        original_start(self)
+        if target is delayed_reader and interrupted_thread is None:
+            interrupted_thread = self
+            assert reader_entered.wait(timeout=2)
+            raise _InjectedBaseException("reader start return interrupted")
+
+    def terminate(received):
+        assert received is process
+        received.returncode = -15
+        reaped.set()
+        cleanup_signal.set()
+
+    monkeypatch.setattr(safe_subprocess.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(safe_subprocess, "_reader", delayed_reader)
+    monkeypatch.setattr(safe_subprocess.threading.Thread, "start", interrupted_start)
+    monkeypatch.setattr(safe_subprocess, "_terminate_process_group", terminate)
+
+    try:
+        with pytest.raises(
+            _InjectedBaseException, match="reader start return interrupted"
+        ):
+            run_bounded_process(["/usr/bin/fake"], cwd=tmp_path)
+        assert interrupted_thread is not None
+        cleanup_completed_before_return = (
+            reaped.is_set()
+            and process.stdout.closed
+            and process.stderr.closed
+            and process.stdin.closed
+            and reader_finished.is_set()
+            and not interrupted_thread.is_alive()
+        )
+    finally:
+        cleanup_signal.set()
+        if interrupted_thread is not None:
+            interrupted_thread.join(timeout=2)
+
+    assert cleanup_completed_before_return
+
+
+def test_writer_started_before_start_raises_is_joined_before_return(
+    tmp_path, monkeypatch
+):
+    class FakeProcess:
+        pid = 4247
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        stdin = io.BytesIO()
+
+    process = FakeProcess()
+    reaped = threading.Event()
+    cleanup_signal = threading.Event()
+    writer_entered = threading.Event()
+    writer_finished = threading.Event()
+    original_start = threading.Thread.start
+    interrupted_thread: threading.Thread | None = None
+
+    def delayed_writer(pipe, _value):
+        writer_entered.set()
+        cleanup_signal.wait(timeout=2)
+        time.sleep(0.2)
+        pipe.close()
+        writer_finished.set()
+
+    def interrupted_start(self):
+        nonlocal interrupted_thread
+        target = self._target
+        original_start(self)
+        if target is delayed_writer:
+            interrupted_thread = self
+            assert writer_entered.wait(timeout=2)
+            raise _InjectedBaseException("writer start return interrupted")
+
+    def terminate(received):
+        assert received is process
+        received.returncode = -15
+        reaped.set()
+        cleanup_signal.set()
+
+    monkeypatch.setattr(safe_subprocess.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(safe_subprocess, "_write_input", delayed_writer)
+    monkeypatch.setattr(safe_subprocess.threading.Thread, "start", interrupted_start)
+    monkeypatch.setattr(safe_subprocess, "_terminate_process_group", terminate)
+
+    try:
+        with pytest.raises(
+            _InjectedBaseException, match="writer start return interrupted"
+        ):
+            run_bounded_process(
+                ["/usr/bin/fake"], cwd=tmp_path, input_text="payload"
+            )
+        assert interrupted_thread is not None
+        cleanup_completed_before_return = (
+            reaped.is_set()
+            and process.stdout.closed
+            and process.stderr.closed
+            and process.stdin.closed
+            and writer_finished.is_set()
+            and not interrupted_thread.is_alive()
+        )
+    finally:
+        cleanup_signal.set()
+        if interrupted_thread is not None:
+            interrupted_thread.join(timeout=2)
+
+    assert cleanup_completed_before_return
+
+
 def test_process_lookup_during_group_signal_still_waits_for_leader(monkeypatch):
     class FakeProcess:
         pid = 4244

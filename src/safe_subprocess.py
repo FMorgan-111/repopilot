@@ -668,9 +668,7 @@ def run_bounded_process(
     lock = threading.Lock()
     overflow = threading.Event()
     readers: list[threading.Thread] = []
-    started_readers: list[threading.Thread] = []
     writer: threading.Thread | None = None
-    writer_started = False
     timed_out = False
     watched_overflow = False
     watched = Path(watched_output_path) if watched_output_path is not None else None
@@ -696,7 +694,6 @@ def run_bounded_process(
         )
         for reader in readers:
             reader.start()
-            started_readers.append(reader)
         if input_bytes is not None:
             assert process.stdin is not None
             writer = threading.Thread(
@@ -705,7 +702,6 @@ def run_bounded_process(
                 daemon=True,
             )
             writer.start()
-            writer_started = True
 
         deadline = time.monotonic() + timeout
         while True:
@@ -735,9 +731,10 @@ def run_bounded_process(
         try:
             _terminate_process_group(process)
         finally:
-            for reader in started_readers:
-                reader.join()
-            if writer is not None and writer_started:
+            for reader in readers:
+                if getattr(reader, "ident", None) is not None:
+                    reader.join()
+            if writer is not None and getattr(writer, "ident", None) is not None:
                 writer.join()
             for pipe in (process.stdout, process.stderr):
                 if pipe is not None:
