@@ -984,6 +984,28 @@ async def test_resume_agent_v2_rejects_non_paused_run(monkeypatch):
     assert payload["error"] == "Run abc123def456 is not waiting for user input."
 
 
+async def test_resume_agent_v2_uses_preloaded_authorized_state(monkeypatch):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="abc123def456",
+        current_phase=new_agent.Phase.DONE,
+    )
+
+    def forbidden_load(run_id):
+        raise AssertionError("an API-authorized snapshot must not be loaded again")
+
+    monkeypatch.setattr(new_agent, "load_run", forbidden_load)
+
+    payload = await new_agent.resume_agent_v2(
+        "abc123def456",
+        "Proceed.",
+        state=state,
+    )
+
+    assert payload["success"] is False
+    assert payload["error"] == "Run abc123def456 is not waiting for user input."
+
+
 async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch):
     captured_states = []
     frame = new_agent.DecisionFrame(

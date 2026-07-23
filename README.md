@@ -458,16 +458,45 @@ non-retryable errors never use stale data.
 
 ### Running the FastAPI server
 
+Configure a separate API bearer token and an exact repository allowlist before
+starting the service. Inject the token through the deployment secret store;
+the example below uses placeholders only:
+
 ```bash
+export REPOPILOT_API_TOKEN=<deployment-secret>
+export REPOPILOT_ALLOWED_REPOS=owner/repo,second-owner/second-repo
 uvicorn src.main:app --reload
 ```
+
+`REPOPILOT_ALLOWED_REPOS` is a nonempty comma-separated list of exact
+`owner/repo` names. Matching is case-insensitive. Wildcards, URLs, paths,
+whitespace, blank entries, duplicates, and malformed names make the service
+fail closed. Only `GET /health` is public; all other routes require
+`Authorization: Bearer <deployment-secret>`. Missing API configuration returns
+503, missing or invalid credentials return the same 401 response, and a
+repository outside the allowlist returns 403 before GitHub, model, clone, or
+write helpers run.
 
 Endpoints:
 
 - `GET  /health` — liveness check
 - `POST /analyze` — issue classification + file ranking (v1)
 - `POST /agent` — legacy agent loop
+- `POST /intelligent-agent` — legacy stateful agent
 - `POST /agent/v2` — current state-machine agent (recommended)
+- `POST /agent/v2/resume` — resume an authorized saved run
+- `GET  /agent/v2/runs/{run_id}` — inspect an authorized saved-run summary
+- `GET  /agent/v2/runs/{run_id}/replay?format=json|markdown` — replay an
+  authorized run
+
+Protected request bodies are capped at exactly 65,536 bytes, including chunked
+requests. At most two authorized repository operations execute concurrently;
+a third is rejected immediately with 429 and `Retry-After` instead of joining
+an unbounded waiter queue. Agent v2 accepts `max_retries` 0–3 and
+`token_budget` 1–100,000; legacy turn counts are 1–10. Run IDs use at most 64
+safe alphanumeric/underscore/hyphen characters, and resume answers are limited
+to 1–16,384 characters. Public OpenAPI, Swagger UI, and ReDoc routes are
+disabled.
 
 ---
 

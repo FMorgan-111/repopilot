@@ -5,15 +5,39 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from src import main
-from src.state import AgentState
+from src.state import AgentState, Phase
+
+API_TOKEN = "test-api-token"
+
+
+@pytest.fixture(autouse=True)
+def api_security_env(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_API_TOKEN", API_TOKEN)
+    monkeypatch.setenv("REPOPILOT_ALLOWED_REPOS", "acme/widget")
 
 
 @pytest.fixture
 def api_client():
     transport = ASGITransport(app=main.app)
-    client = AsyncClient(transport=transport, base_url="http://testserver")
+    client = AsyncClient(
+        transport=transport,
+        base_url="http://testserver",
+        headers={"Authorization": f"Bearer {API_TOKEN}"},
+    )
     yield client
     asyncio.run(client.aclose())
+
+
+def _authorized_saved_state() -> AgentState:
+    return AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        trace_id="abc123def456",
+        current_phase=Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Confirm API risk."},
+    )
 
 
 async def test_post_analyze_normal_request(monkeypatch, api_client):
@@ -48,11 +72,7 @@ async def test_post_analyze_invalid_url(monkeypatch, api_client):
     response = await api_client.post("/analyze", json={"issue_url": "nope"})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "status": "error",
-        "error": "Invalid GitHub issue URL: nope",
-        "trace_id": "abc123def456",
-    }
+    assert response.json() == {"detail": "Invalid request."}
 
 
 async def test_get_health_returns_ok(api_client):
@@ -94,11 +114,7 @@ async def test_post_agent_invalid_url_returns_error(monkeypatch, api_client):
     response = await api_client.post("/agent", json={"issue_url": "nope"})
 
     assert response.status_code == 400
-    assert response.json() == {
-        "status": "error",
-        "error": "Invalid GitHub issue URL: nope",
-        "trace_id": "abc123def456",
-    }
+    assert response.json() == {"detail": "Invalid request."}
 
 
 async def test_post_agent_v2_routes_to_new_agent(monkeypatch, api_client):
@@ -167,7 +183,7 @@ async def test_post_agent_v2_uses_100000_default_budget(monkeypatch, api_client)
 async def test_post_agent_v2_resume_routes_to_resume_agent(monkeypatch, api_client):
     calls = []
 
-    async def fake_resume_agent_v2(run_id, human_answer):
+    async def fake_resume_agent_v2(run_id, human_answer, *, state):
         calls.append({"run_id": run_id, "human_answer": human_answer})
         return {
             "done": True,
@@ -181,6 +197,7 @@ async def test_post_agent_v2_resume_routes_to_resume_agent(monkeypatch, api_clie
         }
 
     monkeypatch.setattr(main, "resume_agent_v2", fake_resume_agent_v2)
+    monkeypatch.setattr(main, "load_run", lambda run_id: _authorized_saved_state())
     response = await api_client.post(
         "/agent/v2/resume",
         json={
@@ -203,7 +220,7 @@ async def test_post_agent_v2_resume_routes_to_resume_agent(monkeypatch, api_clie
 
 
 async def test_post_agent_v2_resume_rejects_non_paused_run(monkeypatch, api_client):
-    async def fake_resume_agent_v2(run_id, human_answer):
+    async def fake_resume_agent_v2(run_id, human_answer, *, state):
         return {
             "done": True,
             "success": False,
@@ -216,6 +233,7 @@ async def test_post_agent_v2_resume_rejects_non_paused_run(monkeypatch, api_clie
         }
 
     monkeypatch.setattr(main, "resume_agent_v2", fake_resume_agent_v2)
+    monkeypatch.setattr(main, "load_run", lambda run_id: _authorized_saved_state())
 
     response = await api_client.post(
         "/agent/v2/resume",
@@ -226,26 +244,16 @@ async def test_post_agent_v2_resume_rejects_non_paused_run(monkeypatch, api_clie
     )
 
     assert response.status_code == 400
-    assert response.json() == {
-        "status": "error",
-        "done": True,
-        "success": False,
-        "waiting_for_user": False,
-        "final_phase": "DONE",
-        "run_id": "abc123def456",
-        "trace_id": "abc123def456",
-        "human_input_request": {},
-        "error": "Run abc123def456 is not waiting for user input.",
-    }
+    assert response.json() == {"detail": "Agent request failed."}
 
 
 async def test_post_agent_v2_resume_returns_404_for_missing_saved_run(
     monkeypatch, api_client
 ):
-    async def fake_resume_agent_v2(run_id, human_answer):
+    def fake_load_run(run_id):
         raise FileNotFoundError(f"No saved run file for {run_id}")
 
-    monkeypatch.setattr(main, "resume_agent_v2", fake_resume_agent_v2)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
 
     response = await api_client.post(
         "/agent/v2/resume",
@@ -256,21 +264,16 @@ async def test_post_agent_v2_resume_returns_404_for_missing_saved_run(
     )
 
     assert response.status_code == 404
-    assert response.json() == {
-        "status": "error",
-        "success": False,
-        "run_id": "missing-run",
-        "error": "Saved run missing-run was not found.",
-    }
+    assert response.json() == {"detail": "Saved run was not found."}
 
 
 async def test_post_agent_v2_resume_returns_500_for_corrupt_saved_run_json(
     monkeypatch, api_client
 ):
-    async def fake_resume_agent_v2(run_id, human_answer):
+    def fake_load_run(run_id):
         raise json.JSONDecodeError("Expecting value", "not-json", 0)
 
-    monkeypatch.setattr(main, "resume_agent_v2", fake_resume_agent_v2)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
 
     response = await api_client.post(
         "/agent/v2/resume",
@@ -281,23 +284,18 @@ async def test_post_agent_v2_resume_returns_500_for_corrupt_saved_run_json(
     )
 
     assert response.status_code == 500
-    assert response.json() == {
-        "status": "error",
-        "success": False,
-        "run_id": "corrupt-run",
-        "error": "Saved run corrupt-run could not be loaded.",
-    }
+    assert response.json() == {"detail": "Saved run could not be loaded."}
 
 
 async def test_post_agent_v2_resume_returns_500_for_invalid_saved_run_state(
     monkeypatch, api_client
 ):
-    async def fake_resume_agent_v2(run_id, human_answer):
+    def fake_load_run(run_id):
         AgentState.model_validate(
             {"issue_url": "https://github.com/acme/widget/issues/42", "current_phase": "BAD"}
         )
 
-    monkeypatch.setattr(main, "resume_agent_v2", fake_resume_agent_v2)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
 
     response = await api_client.post(
         "/agent/v2/resume",
@@ -308,21 +306,19 @@ async def test_post_agent_v2_resume_returns_500_for_invalid_saved_run_state(
     )
 
     assert response.status_code == 500
-    assert response.json() == {
-        "status": "error",
-        "success": False,
-        "run_id": "invalid-run",
-        "error": "Saved run invalid-run could not be loaded.",
-    }
+    assert response.json() == {"detail": "Saved run could not be loaded."}
 
 
 async def test_get_agent_v2_replay_returns_json(monkeypatch, api_client):
     calls = []
 
-    def fake_replay_run(run_id):
+    def fake_load_run(run_id):
         calls.append(run_id)
+        return _authorized_saved_state()
+
+    def fake_summarize_replay(state):
         return {
-            "run_id": run_id,
+            "run_id": state.trace_id,
             "issue_url": "https://github.com/acme/widget/issues/7",
             "current_phase": "WAITING_FOR_USER",
             "pause": {"pending_human_input": True, "question": "Confirm API risk."},
@@ -337,7 +333,8 @@ async def test_get_agent_v2_replay_returns_json(monkeypatch, api_client):
             ],
         }
 
-    monkeypatch.setattr(main, "replay_run", fake_replay_run)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
+    monkeypatch.setattr(main, "summarize_replay", fake_summarize_replay)
 
     response = await api_client.get("/agent/v2/runs/abc123def456/replay")
 
@@ -366,7 +363,8 @@ async def test_get_agent_v2_replay_returns_markdown(monkeypatch, api_client):
         "timeline": [],
     }
 
-    monkeypatch.setattr(main, "replay_run", lambda run_id: replay)
+    monkeypatch.setattr(main, "load_run", lambda run_id: _authorized_saved_state())
+    monkeypatch.setattr(main, "summarize_replay", lambda state: replay)
     monkeypatch.setattr(
         main,
         "format_replay_markdown",
@@ -386,36 +384,26 @@ async def test_get_agent_v2_replay_returns_markdown(monkeypatch, api_client):
 async def test_get_agent_v2_replay_returns_404_for_missing_saved_run(
     monkeypatch, api_client
 ):
-    def fake_replay_run(run_id):
+    def fake_load_run(run_id):
         raise FileNotFoundError(f"No saved run file for {run_id}")
 
-    monkeypatch.setattr(main, "replay_run", fake_replay_run)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
 
     response = await api_client.get("/agent/v2/runs/missing-run/replay")
 
     assert response.status_code == 404
-    assert response.json() == {
-        "status": "error",
-        "success": False,
-        "run_id": "missing-run",
-        "error": "Saved run missing-run was not found.",
-    }
+    assert response.json() == {"detail": "Saved run was not found."}
 
 
 async def test_get_agent_v2_replay_returns_500_for_corrupt_saved_run(
     monkeypatch, api_client
 ):
-    def fake_replay_run(run_id):
+    def fake_load_run(run_id):
         raise json.JSONDecodeError("Expecting value", "not-json", 0)
 
-    monkeypatch.setattr(main, "replay_run", fake_replay_run)
+    monkeypatch.setattr(main, "load_run", fake_load_run)
 
     response = await api_client.get("/agent/v2/runs/corrupt-run/replay")
 
     assert response.status_code == 500
-    assert response.json() == {
-        "status": "error",
-        "success": False,
-        "run_id": "corrupt-run",
-        "error": "Saved run corrupt-run could not be loaded.",
-    }
+    assert response.json() == {"detail": "Saved run could not be loaded."}

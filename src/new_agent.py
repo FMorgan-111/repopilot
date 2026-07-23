@@ -505,9 +505,15 @@ async def agent_v2(
     return payload
 
 
-async def resume_agent_v2(run_id: str, human_answer: str) -> dict:
+async def resume_agent_v2(
+    run_id: str,
+    human_answer: str,
+    *,
+    state: AgentState | None = None,
+) -> dict:
     """Resume a paused RepoPilot v2 run with a human answer."""
-    state = load_run(run_id)
+    if state is None:
+        state = load_run(run_id)
     if (
         state.current_phase != Phase.WAITING_FOR_USER
         or not state.pending_human_input
