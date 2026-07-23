@@ -513,8 +513,8 @@ async def resume_agent_v2(
 ) -> dict:
     """Resume a paused RepoPilot v2 run with a human answer."""
     if state is None:
-        state = load_run(run_id)
-    state = claim_run_for_resume(run_id, state)
+        state = await _run_store_call(load_run, run_id)
+    state = await _run_store_call(claim_run_for_resume, run_id, state)
     claimed_state = state.model_copy(deep=True)
 
     _remember(
@@ -531,13 +531,39 @@ async def resume_agent_v2(
     graph = build_agent_graph(start_phase=Phase.PLAN)
     final_state = await run_graph(graph, state)
     final_state.resume_in_progress = False
-    save_run(final_state, rollback_state=claimed_state)
+    # This write is the commit point, including when the graph pauses again.
+    # Cancellation drains it to one durable outcome before propagating.
+    await _run_store_call(
+        save_run,
+        final_state,
+        rollback_state=claimed_state,
+    )
     payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
 
     tracer = Tracer()
     tracer.trace_id = state.trace_id
     _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", final_state)
     return payload
+
+
+async def _run_store_call(operation, /, *args, **kwargs):
+    """Run blocking store I/O off-loop and drain it before cancellation wins."""
+    worker = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as original_cancel:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException as worker_error:
+            raise original_cancel from worker_error
+        raise original_cancel
 
 
 def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> None:

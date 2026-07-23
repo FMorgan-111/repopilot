@@ -3,6 +3,7 @@ import functools
 import json
 import stat
 import subprocess
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -1232,6 +1233,30 @@ async def test_resume_agent_v2_saves_run_when_it_pauses_again(monkeypatch, tmp_p
     assert durable.resume_in_progress is False
 
 
+def _save_paused_resume_state(root_dir, run_id, question="Proceed?"):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id=run_id,
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": question},
+    )
+    run_store.save_run(state, root_dir=root_dir)
+    return run_store.load_run(run_id, root_dir=root_dir)
+
+
+def _use_real_resume_claim(monkeypatch, root_dir):
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+
+
 async def test_simultaneous_resumes_execute_graph_exactly_once(
     monkeypatch, tmp_path
 ):
@@ -1358,6 +1383,96 @@ async def test_different_run_ids_resume_concurrently(monkeypatch, tmp_path):
     assert {result["run_id"] for result in results} == {"run-a", "run-b"}
 
 
+async def test_blocked_run_lock_does_not_stall_loop_or_another_run(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    for run_id in ("run-a", "run-b"):
+        run_store.save_run(
+            new_agent.AgentState(
+                issue_url=f"https://github.com/acme/widget/issues/{run_id[-1]}",
+                trace_id=run_id,
+                current_phase=new_agent.Phase.WAITING_FOR_USER,
+                pending_human_input=True,
+                human_input_request={"question": "Proceed?"},
+            ),
+            root_dir=root_dir,
+        )
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    heartbeat_ran = threading.Event()
+    run_b_started = threading.Event()
+    progress_before_release = threading.Event()
+
+    def hold_run_a_lock():
+        with run_store._run_lock("run-a", root_dir):
+            lock_held.set()
+            assert release_lock.wait(timeout=3)
+
+    async def heartbeat():
+        await asyncio.sleep(0)
+        heartbeat_ran.set()
+
+    async def fake_run_graph(graph, state):
+        if state.trace_id == "run-b":
+            run_b_started.set()
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def release_after_progress_or_timeout():
+        if heartbeat_ran.wait(timeout=0.5) and run_b_started.wait(timeout=0.5):
+            progress_before_release.set()
+        release_lock.set()
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    holder = asyncio.create_task(asyncio.to_thread(hold_run_a_lock))
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    watchdog = threading.Thread(target=release_after_progress_or_timeout)
+    watchdog.start()
+
+    run_a = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "run-a",
+            "Proceed.",
+            state=run_store.load_run("run-a", root_dir=root_dir),
+        )
+    )
+    pulse = asyncio.create_task(heartbeat())
+    run_b = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "run-b",
+            "Proceed.",
+            state=run_store.load_run("run-b", root_dir=root_dir),
+        )
+    )
+
+    await asyncio.gather(run_a, pulse, run_b, holder)
+    watchdog.join(timeout=1)
+
+    assert progress_before_release.is_set()
+
+
 async def test_cancelled_resume_leaves_durable_lease_consumed(
     monkeypatch, tmp_path
 ):
@@ -1426,6 +1541,221 @@ async def test_cancelled_resume_leaves_durable_lease_consumed(
             "Proceed again.",
             state=durable,
         )
+
+
+async def test_cancelled_blocked_claim_is_drained_without_running_graph(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-claim")
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    claim_started = threading.Event()
+    claim_finished = threading.Event()
+    graph_calls = 0
+
+    def hold_claim_lock():
+        with run_store._run_lock("cancelled-claim", root_dir):
+            lock_held.set()
+            assert release_lock.wait(timeout=3)
+
+    def blocking_claim(run_id, expected_state):
+        claim_started.set()
+        try:
+            return run_store.claim_run_for_resume(
+                run_id,
+                expected_state,
+                root_dir=root_dir,
+            )
+        finally:
+            claim_finished.set()
+
+    async def forbidden_graph(graph, state):
+        nonlocal graph_calls
+        graph_calls += 1
+        return state
+
+    monkeypatch.setattr(new_agent, "claim_run_for_resume", blocking_claim)
+    monkeypatch.setattr(new_agent, "run_graph", forbidden_graph)
+
+    holder = asyncio.create_task(asyncio.to_thread(hold_claim_lock))
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-claim",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(claim_started.wait, 1)
+
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_lock.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    await holder
+
+    assert caught.value.args == ("first cancellation",)
+    assert claim_finished.is_set()
+    assert graph_calls == 0
+    durable = run_store.load_run("cancelled-claim", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+
+
+async def test_cancelled_terminal_save_drains_committed_write(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-terminal-save")
+    save_started = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def blocking_save(state, **kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        try:
+            return run_store.save_run(state, root_dir=root_dir, **kwargs)
+        finally:
+            save_finished.set()
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", blocking_save)
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-terminal-save",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert caught.value.args == ("first cancellation",)
+    assert save_finished.is_set()
+    durable = run_store.load_run("cancelled-terminal-save", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.DONE
+    assert durable.resume_in_progress is False
+
+
+async def test_cancelled_repaused_save_commits_the_new_pause(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(
+        root_dir,
+        "cancelled-repaused-save",
+        question="First question?",
+    )
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    async def repaused_graph(graph, state):
+        state.current_phase = new_agent.Phase.WAITING_FOR_USER
+        state.pending_human_input = True
+        state.human_input_request = {"question": "New question?"}
+        return state
+
+    def blocking_save(state, **kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        return run_store.save_run(state, root_dir=root_dir, **kwargs)
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", blocking_save)
+    monkeypatch.setattr(new_agent, "run_graph", repaused_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-repaused-save",
+            "First answer.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+    task.cancel("cancel after new pause")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(asyncio.CancelledError, match="cancel after new pause"):
+        await task
+
+    durable = run_store.load_run("cancelled-repaused-save", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.WAITING_FOR_USER
+    assert durable.pending_human_input is True
+    assert durable.human_input_request == {"question": "New question?"}
+    assert durable.resume_in_progress is False
+
+
+async def test_cancelled_final_save_observes_worker_failure(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-failing-save")
+    save_started = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def failing_save(state, **_kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        save_finished.set()
+        raise OSError("injected worker save failure")
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", failing_save)
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-failing-save",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+    task.cancel("cancel failing save")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+
+    assert caught.value.args == ("cancel failing save",)
+    assert save_finished.is_set()
+    assert isinstance(caught.value.__cause__, OSError)
+    assert str(caught.value.__cause__) == "injected worker save failure"
+    durable = run_store.load_run("cancelled-failing-save", root_dir=root_dir)
+    assert durable.resume_in_progress is True
 
 
 async def test_crashed_resume_leaves_durable_lease_consumed(
