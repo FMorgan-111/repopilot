@@ -9,9 +9,15 @@ from __future__ import annotations
 
 import math
 import re
+import sys
 import unicodedata
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+if not __package__:  # Support documented direct eval script entry points.
+    repo_root = str(Path(__file__).resolve().parents[1])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
 
 from src.exception_safety import (
     MODEL_GATEWAY_ERROR_CLASSES,

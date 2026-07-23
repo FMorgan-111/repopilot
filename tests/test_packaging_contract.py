@@ -127,6 +127,9 @@ def test_shipped_src_imports_state_and_cli_without_eval_package(
     code = """
 from pathlib import Path
 import os
+import sys
+
+sys.path.insert(0, os.environ["REPOPILOT_TEST_SHIPPED_ROOT"])
 import src
 import src.state
 import src.cli
@@ -145,9 +148,21 @@ assert Path(src.__file__).resolve().is_relative_to(
     env["REPOPILOT_TEST_SHIPPED_ROOT"] = str(tmp_path)
 
     subprocess.run(
-        [sys.executable, "-P", "-c", code],
+        [sys.executable, "-I", "-c", code],
         cwd=tmp_path,
         env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_documented_eval_report_script_runs_without_installed_project(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        [sys.executable, "-S", str(ROOT / "eval" / "report.py"), "--help"],
+        cwd=tmp_path,
         check=True,
         capture_output=True,
         text=True,
