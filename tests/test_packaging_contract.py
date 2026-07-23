@@ -13,6 +13,11 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10
 
 
 ROOT = Path(__file__).resolve().parents[1]
+_FIXED_EVAL_ID_FILES = (
+    "eval/baseline_10_ids.txt",
+    "eval/baseline_50_ids.txt",
+    "eval/checkpoint_5_ids.txt",
+)
 
 
 def _dependency_names(dependencies: list[str]) -> set[str]:
@@ -51,6 +56,33 @@ def test_generated_editable_install_metadata_is_ignored():
     assert "*.egg-info/" in gitignore
     assert "build/" in gitignore
     assert "dist/" in gitignore
+
+
+def test_fixed_eval_id_contract_files_are_tracked():
+    for relative_path in _FIXED_EVAL_ID_FILES:
+        assert (ROOT / relative_path).is_file()
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", *_FIXED_EVAL_ID_FILES],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert tracked.returncode == 0, tracked.stderr
+
+
+def test_fixed_eval_id_contract_files_are_not_ignored():
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", *_FIXED_EVAL_ID_FILES],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert ignored.returncode == 1, ignored.stdout
 
 
 def test_base_install_can_use_disabled_episode_memory_without_numpy():

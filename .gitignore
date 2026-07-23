@@ -20,5 +20,10 @@ eval/checkpoint_*_summary.md
 eval/checkpoint_*_predictions.jsonl
 eval/success_first_*.json
 eval/success_first_*_summary.md
+
+# Immutable evaluation inputs used by clean checkouts and GitHub Actions.
+!eval/baseline_10_ids.txt
+!eval/baseline_50_ids.txt
+!eval/checkpoint_5_ids.txt
 examples/traces/case_1.json
 examples/traces/trace_*.json
