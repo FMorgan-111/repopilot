@@ -224,8 +224,8 @@ async def test_oci_execute_uses_exact_snapshot_and_skips_all_host_execution(
     assert captured["argv"] == [
         "/sandbox/bin/python",
         "-P",
-        "-m",
-        "pytest",
+        "-c",
+        tool_policy.PYTEST_BOOTSTRAP,
         "tests/test_widget.py::test_answer",
         "-q",
     ]
@@ -252,8 +252,8 @@ async def test_oci_execute_ignores_hostile_test_text_and_uses_fixed_full_suite(
     assert captured["argv"] == [
         "/sandbox/bin/python",
         "-P",
-        "-m",
-        "pytest",
+        "-c",
+        tool_policy.PYTEST_BOOTSTRAP,
         "-q",
     ]
     assert all("planner-command-ran" not in token for token in captured["argv"])

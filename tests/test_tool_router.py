@@ -18,7 +18,7 @@ from src.state import (
     ToolPatchApproval,
     ToolSandboxConfig,
 )
-from src.tool_policy import ToolIntent
+from src.tool_policy import PYTEST_BOOTSTRAP, ToolIntent
 from src.tool_router import (
     _disposable_test_snapshot,
     _preflight_exact_tree,
@@ -235,7 +235,12 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
 
     assert result.status == "ok"
     assert isinstance(captured["argv"], list)
-    assert captured["argv"][:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
+    assert captured["argv"][:4] == [
+        "/usr/bin/python3",
+        "-P",
+        "-c",
+        PYTEST_BOOTSTRAP,
+    ]
     assert captured["root"] != root_repo
     assert captured["sandbox"].workspace == captured["root"]
     assert "one passed" in state.evidence[-1].content

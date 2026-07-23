@@ -3,11 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+from src.safe_subprocess import minimal_subprocess_env
 from src.state import (
     AgentState,
     GeneratedTestApproval,
@@ -16,7 +18,7 @@ from src.state import (
     ToolPatchApproval,
     ToolSandboxConfig,
 )
-from src.tool_policy import ToolIntent, ToolPolicy
+from src.tool_policy import PYTEST_BOOTSTRAP, ToolIntent, ToolPolicy
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:
@@ -247,7 +249,7 @@ def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
 
     assert python.approved is True
     assert project.approved is True
-    assert python.argv[:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
+    assert python.argv[:4] == ["/usr/bin/python3", "-P", "-c", PYTEST_BOOTSTRAP]
     assert project.argv[0] == "/usr/bin/npm"
 
 
@@ -682,9 +684,65 @@ def test_public_fixed_test_argv_uses_sandbox_python_and_preserves_selector(tmp_p
     assert argv == [
         "/usr/bin/python3",
         "-P",
-        "-m",
-        "pytest",
+        "-c",
+        PYTEST_BOOTSTRAP,
         "tests/test_widget.py",
         "-q",
     ]
     assert normalized == "python -m pytest tests/test_widget.py -q"
+
+
+def test_fixed_pytest_argv_imports_trusted_pytest_before_workspace(tmp_path):
+    import src.tool_policy as policy
+
+    root, _commit = _repo(tmp_path)
+    (root / "pytest.py").write_text(
+        'raise RuntimeError("hostile repository pytest.py imported")\n',
+        encoding="utf-8",
+    )
+    (root / "tests" / "test_widget.py").write_text(
+        "import pytest\n"
+        "from src.widget import widget\n\n"
+        "def test_widget():\n"
+        "    assert widget() == 1\n"
+        "    assert pytest.__file__ != 'pytest.py'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--amend", "--no-edit"],
+        check=True,
+        capture_output=True,
+    )
+    commit = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    state = _state(
+        root,
+        commit,
+        tool_sandbox_config=ToolSandboxConfig(
+            backend="docker",
+            image="registry.example/repopilot-tests@sha256:" + "1" * 64,
+            python_executable=sys.executable,
+        ),
+    )
+
+    argv, _normalized = policy.fixed_test_argv(
+        root,
+        state,
+        ["pytest", "tests/test_widget.py", "-q"],
+    )
+    result = subprocess.run(
+        argv,
+        cwd=root,
+        env=minimal_subprocess_env(),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout

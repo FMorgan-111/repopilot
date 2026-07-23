@@ -44,7 +44,7 @@ from ..state import (
     _record_tool,
     tool_manifest_fingerprint,
 )
-from ..tool_policy import fixed_test_argv, repository_execution_mode
+from ..tool_policy import fixed_pytest_argv, fixed_test_argv, repository_execution_mode
 
 _TOKENIZED_GITHUB_URL_RE = re.compile(
     r"https://x-access-token:[^@\s'\"\]]+@github[.]com/"
@@ -1298,7 +1298,7 @@ def _oci_test_argv(state: AgentState) -> list[str]:
     config = state.tool_sandbox_config
     if config is None:  # pragma: no cover - guarded by execution mode
         raise RuntimeError("OCI tool sandbox is not configured")
-    fallback = [config.python_executable, "-P", "-m", "pytest", "-q"]
+    fallback = fixed_pytest_argv(config.python_executable, ["-q"])
     if not state.test_command:
         return fallback
     try:

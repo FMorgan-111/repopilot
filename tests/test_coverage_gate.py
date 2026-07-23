@@ -24,6 +24,7 @@ from src.state import (
     ToolSandboxConfig,
     tool_manifest_fingerprint,
 )
+from src.tool_policy import PYTEST_BOOTSTRAP
 
 _IMAGE = "registry.example/repopilot-tests@sha256:" + "2" * 64
 
@@ -137,7 +138,7 @@ async def test_differential_coverage_never_runs_repository_code_on_host(
     async def fake_oci(argv, *, sandbox, config, **_kwargs):
         assert config == state.tool_sandbox_config
         assert sandbox.workspace != root
-        assert argv[:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
+        assert argv[:4] == ["/usr/bin/python3", "-P", "-c", PYTEST_BOOTSTRAP]
         workspaces.append(sandbox.workspace)
         fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
         if fixed:

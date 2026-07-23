@@ -30,6 +30,13 @@ _SAFE_TEST_OPTION_RE = re.compile(
 )
 _PACKAGE_TEST_SCRIPT_RE = re.compile(r"test(?::[A-Za-z0-9_.-]+)?")
 _PACKAGE_EXECUTABLES = frozenset({"npm", "pnpm", "yarn", "bun"})
+PYTEST_BOOTSTRAP = (
+    "import os\n"
+    "import sys\n"
+    "import pytest\n"
+    "sys.path.insert(0, os.getcwd())\n"
+    "raise SystemExit(pytest.main(sys.argv[1:]))\n"
+)
 
 _ARG_KEYS: dict[ToolAction, frozenset[str]] = {
     "search_symbol": frozenset({"symbol", "path"}),
@@ -279,6 +286,11 @@ def _checkout_head(root: Path) -> str:
     ).strip()
 
 
+def fixed_pytest_argv(python_executable: str, args: Sequence[str]) -> list[str]:
+    """Import trusted pytest before exposing the repository import path."""
+    return [python_executable, "-P", "-c", PYTEST_BOOTSTRAP, *args]
+
+
 def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str], str]:
     config = state.tool_sandbox_config
     if config is None:
@@ -286,10 +298,10 @@ def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str
     tokens = _safe_tokens(command)
     if tokens[0] == "pytest":
         suffix = tokens[1:]
-        argv = [config.python_executable, "-P", "-m", "pytest", *suffix]
+        argv = fixed_pytest_argv(config.python_executable, suffix)
     elif tokens[:3] == ["python", "-m", "pytest"]:
         suffix = tokens[3:]
-        argv = [config.python_executable, "-P", "-m", "pytest", *suffix]
+        argv = fixed_pytest_argv(config.python_executable, suffix)
     else:
         configured = _safe_tokens(state.test_command) if state.test_command else []
         launcher = _project_test_prefix(root, state, configured) if configured else ""
