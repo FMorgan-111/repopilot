@@ -137,7 +137,7 @@ async def test_coverage_fails_closed_when_live_patch_drifts_between_runs(
     )
     calls = 0
 
-    def mutate_live_after_first_run(argv, *, sandbox, **_kwargs):
+    async def mutate_live_after_first_run(argv, *, sandbox, **_kwargs):
         nonlocal calls
         calls += 1
         fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
@@ -155,7 +155,7 @@ async def test_coverage_fails_closed_when_live_patch_drifts_between_runs(
         )
 
     monkeypatch.setattr(
-        "src.coverage_gate.run_oci_process", mutate_live_after_first_run
+        "src.coverage_gate.run_oci_process_async", mutate_live_after_first_run
     )
     decision = await validate_differential_coverage(state, candidate)
 

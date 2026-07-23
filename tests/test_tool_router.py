@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -211,7 +212,7 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     root, commit = _repo(tmp_path)
     captured: dict[str, object] = {}
 
-    def fake_oci(argv, *, sandbox, config, **kwargs):
+    async def fake_oci(argv, *, sandbox, config, **kwargs):
         captured["argv"] = argv
         captured["root"] = sandbox.workspace
         captured["sandbox"] = sandbox
@@ -222,7 +223,7 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
         assert (sandbox.workspace / "tests" / "test_widget.py").is_file()
         return BoundedProcessResult(argv=argv, returncode=0, stdout="one passed", stderr="")
 
-    monkeypatch.setattr("src.tool_router.run_oci_process", fake_oci)
+    monkeypatch.setattr("src.tool_router.run_oci_process_async", fake_oci, raising=False)
     root_repo = root
     state = _state(root, commit)
 
@@ -287,7 +288,7 @@ async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
         tool_patch_approval=_approval(commit, patch, manifest),
     )
 
-    def fake_oci(argv, *, sandbox, config, **kwargs):
+    async def fake_oci(argv, *, sandbox, config, **kwargs):
         snapshot = sandbox.workspace
         assert "'approved'" in (snapshot / "src" / "widget.py").read_text()
         assert not (snapshot / "host-only-sentinel").exists()
@@ -295,7 +296,7 @@ async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
         assert config.image == _IMAGE
         return BoundedProcessResult(argv=argv, returncode=0, stdout="passed", stderr="")
 
-    monkeypatch.setattr("src.tool_router.run_oci_process", fake_oci)
+    monkeypatch.setattr("src.tool_router.run_oci_process_async", fake_oci, raising=False)
 
     result = await route_tool_intent(
         state,
@@ -304,6 +305,50 @@ async def test_targeted_test_snapshot_contains_only_base_plus_approved_patch(
     )
 
     assert result.status == "ok"
+
+
+async def test_targeted_test_keeps_snapshot_alive_until_cancelled_worker_drains(
+    tmp_path, monkeypatch
+):
+    root, commit = _repo(tmp_path)
+    state = _state(root, commit)
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    captured: dict[str, Path] = {}
+
+    async def draining_oci(argv, *, sandbox, **_kwargs):
+        captured["workspace"] = sandbox.workspace
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert sandbox.workspace.is_dir()
+            cleanup_started.set()
+            await cleanup_release.wait()
+            assert sandbox.workspace.is_dir()
+            raise
+
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process_async", draining_oci, raising=False
+    )
+    task = asyncio.create_task(
+        route_tool_intent(
+            state,
+            _intent("run_targeted_test", command="pytest tests/test_widget.py"),
+            calls_this_round=0,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=3)
+    task.cancel("cancel targeted OCI")
+    await asyncio.wait_for(cleanup_started.wait(), timeout=3)
+
+    workspace = captured["workspace"]
+    assert workspace.is_dir()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError, match="cancel targeted OCI"):
+        await task
+    assert not workspace.exists()
 
 
 async def test_diff_and_patch_validation_use_state_baseline(tmp_path):
@@ -366,10 +411,12 @@ async def test_errors_store_only_sanitized_exception_class(tmp_path, monkeypatch
     root, commit = _repo(tmp_path)
     secret = "sk-sensitive-tool-error"
 
-    def explode(*args, **kwargs):
+    async def explode(*args, **kwargs):
         raise RuntimeError(f"failed with {secret}")
 
-    monkeypatch.setattr("src.tool_router.run_oci_process", explode)
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process_async", explode, raising=False
+    )
     state = _state(root, commit)
 
     result = await route_tool_intent(
@@ -488,7 +535,7 @@ async def test_patch_manifest_fingerprint_tamper_fails_before_oci_run(
     )
     state = _state(root, commit, tool_patch_approval=approval)
     monkeypatch.setattr(
-        "src.tool_router.run_oci_process",
+        "src.tool_router.run_oci_process_async",
         lambda *args, **kwargs: pytest.fail("tampered manifest reached OCI"),
     )
 
@@ -536,7 +583,7 @@ async def test_postapply_scan_rejects_traditional_sensitive_or_manifest_patch(
         tool_patch_approval=_approval(commit, patch, manifest),
     )
     monkeypatch.setattr(
-        "src.tool_router.run_oci_process",
+        "src.tool_router.run_oci_process_async",
         lambda *args, **kwargs: pytest.fail("protected patch reached OCI"),
     )
 
@@ -569,7 +616,7 @@ async def test_postapply_manifest_must_match_exact_snapshot_changes(
         tool_patch_approval=_approval(commit, patch, []),
     )
     monkeypatch.setattr(
-        "src.tool_router.run_oci_process",
+        "src.tool_router.run_oci_process_async",
         lambda *args, **kwargs: pytest.fail("unexpected change reached OCI"),
     )
 

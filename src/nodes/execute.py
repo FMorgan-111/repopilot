@@ -30,7 +30,7 @@ from ..repair_flow import resolve_search_target_symbol
 from ..safe_subprocess import (
     BoundedProcessResult,
     minimal_subprocess_env,
-    run_oci_process,
+    run_oci_process_async,
 )
 from ..state import (
     AgentState,
@@ -1313,7 +1313,7 @@ def _oci_test_argv(state: AgentState) -> list[str]:
     return approved_argv
 
 
-def _run_oci_pytest(state: AgentState) -> dict[str, Any]:
+async def _run_oci_pytest(state: AgentState) -> dict[str, Any]:
     # Runtime-local import avoids execute -> tool_router -> tool_policy cycles.
     from ..tool_router import disposable_test_snapshot
 
@@ -1325,7 +1325,7 @@ def _run_oci_pytest(state: AgentState) -> dict[str, Any]:
         state,
         apply_approved_changes=True,
     ) as sandbox:
-        result: BoundedProcessResult = run_oci_process(
+        result: BoundedProcessResult = await run_oci_process_async(
             argv,
             sandbox=sandbox,
             config=config,
@@ -1523,7 +1523,7 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
             )
 
         if execution_mode == "oci":
-            test_result = _run_oci_pytest(state)
+            test_result = await _run_oci_pytest(state)
             test_tool_name = "run_oci_pytest"
         else:
             test_result = await run_pytest(state.repo_path, state.test_command)

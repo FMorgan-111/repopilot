@@ -7,7 +7,6 @@ Discovery is intentionally advisory.  Only four stable executions performed by
 from __future__ import annotations
 
 import ast
-import asyncio
 import hashlib
 import json
 import os
@@ -27,7 +26,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from .evaluator_safety import sanitize_evaluator_text
 from .model_provider import redact_secrets
 from .repo_paths import canonical_repo_path
-from .safe_subprocess import run_oci_process
+from .safe_subprocess import run_oci_process_async
 from .state import (
     AgentState,
     CoverageProof,
@@ -848,8 +847,7 @@ async def _run_isolated_candidate(
             else None
         ),
     ) as sandbox:
-        result = await asyncio.to_thread(
-            run_oci_process,
+        result = await run_oci_process_async(
             argv,
             sandbox=sandbox,
             config=config,

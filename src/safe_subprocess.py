@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import signal
@@ -91,6 +92,10 @@ class ProcessTimeoutError(RuntimeError):
         super().__init__("subprocess exceeded the configured timeout")
         self.stdout = stdout
         self.stderr = stderr
+
+
+class ProcessCancellationRequested(RuntimeError):
+    """Raised in a worker thread after cooperative subprocess cleanup."""
 
 
 def _is_trusted_executable(path: Path) -> bool:
@@ -346,7 +351,11 @@ def _force_remove_container(backend: str, name: str, cidfile: Path) -> bool:
 
 
 def _verify_created_container(
-    backend: str, name: str, sandbox: SandboxPaths, config: ToolSandboxConfig
+    backend: str,
+    name: str,
+    sandbox: SandboxPaths,
+    config: ToolSandboxConfig,
+    cancellation_event: threading.Event | None,
 ) -> None:
     inspected = run_bounded_process(
         [backend, "inspect", name],
@@ -354,6 +363,7 @@ def _verify_created_container(
         timeout=15,
         max_output_bytes=128_000,
         decode_errors="strict",
+        cancellation_event=cancellation_event,
     )
     if inspected.returncode != 0:
         raise NetworkIsolationUnavailableError("OCI created-container inspect failed")
@@ -407,6 +417,7 @@ def _run_oci_container(
     prefix: str,
     timeout: float,
     max_output_bytes: int,
+    cancellation_event: threading.Event | None,
 ) -> BoundedProcessResult:
     name, cidfile = _container_identity(prefix, sandbox)
     argv = build_oci_command(
@@ -419,32 +430,37 @@ def _run_oci_container(
     )
     recovery = _write_recovery_record(backend, name, cidfile)
     result: BoundedProcessResult | None = None
-    operation_error: Exception | None = None
+    operation_error: BaseException | None = None
     try:
         created = run_bounded_process(
             argv,
             cwd=sandbox.root,
             timeout=min(timeout, 60),
             max_output_bytes=max_output_bytes,
+            cancellation_event=cancellation_event,
         )
         if created.returncode != 0:
             result = created
         else:
-            _verify_created_container(backend, name, sandbox, config)
+            _verify_created_container(
+                backend, name, sandbox, config, cancellation_event
+            )
             result = run_bounded_process(
                 [backend, "start", "-a", name],
                 cwd=sandbox.root,
                 timeout=timeout,
                 max_output_bytes=max_output_bytes,
+                cancellation_event=cancellation_event,
             )
-    except Exception as exc:
+    except BaseException as exc:
         operation_error = exc
-    try:
-        cleaned = _force_remove_container(backend, name, cidfile)
-    except Exception:
-        cleaned = False
-    if not cleaned:
-        raise IsolationCleanupError(name, recovery) from operation_error
+    finally:
+        try:
+            cleaned = _force_remove_container(backend, name, cidfile)
+        except BaseException:
+            cleaned = False
+        if not cleaned:
+            raise IsolationCleanupError(name, recovery) from operation_error
     if operation_error is not None:
         raise operation_error.with_traceback(operation_error.__traceback__)
     assert result is not None
@@ -458,6 +474,7 @@ def run_oci_process(
     config: ToolSandboxConfig,
     timeout: float = 300,
     max_output_bytes: int = 8_000,
+    cancellation_event: threading.Event | None = None,
 ) -> BoundedProcessResult:
     """Probe and execute repository code only in a digest-pinned OCI image."""
     backend = trusted_executable(config.backend, required=True)
@@ -477,6 +494,7 @@ def run_oci_process(
         prefix="probe",
         timeout=min(timeout, 30),
         max_output_bytes=8_000,
+        cancellation_event=cancellation_event,
     )
     if probe.returncode != 0 or "pytest" not in f"{probe.stdout}\n{probe.stderr}".casefold():
         raise NetworkIsolationUnavailableError("OCI Python/pytest capability probe failed")
@@ -489,6 +507,7 @@ def run_oci_process(
             prefix="project-probe",
             timeout=min(timeout, 30),
             max_output_bytes=8_000,
+            cancellation_event=cancellation_event,
         )
         if project_probe.returncode != 0:
             raise NetworkIsolationUnavailableError(
@@ -502,7 +521,51 @@ def run_oci_process(
         prefix="command",
         timeout=timeout,
         max_output_bytes=max_output_bytes,
+        cancellation_event=cancellation_event,
     )
+
+
+async def run_oci_process_async(
+    command: Sequence[str],
+    *,
+    sandbox: SandboxPaths,
+    config: ToolSandboxConfig,
+    timeout: float = 300,
+    max_output_bytes: int = 8_000,
+) -> BoundedProcessResult:
+    """Run OCI work off-loop and drain its cleanup before propagating cancellation."""
+    cancellation_event = threading.Event()
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            run_oci_process,
+            command,
+            sandbox=sandbox,
+            config=config,
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            cancellation_event=cancellation_event,
+        )
+    )
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as original_cancel:
+        cancellation_event.set()
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                continue
+        try:
+            worker.result()
+        except ProcessCancellationRequested:
+            pass
+        except IsolationCleanupError as cleanup_error:
+            raise original_cancel from cleanup_error
+        except BaseException:
+            pass
+        raise original_cancel
 
 
 def _reader(
@@ -544,14 +607,15 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
-            return
+            pass
         except PermissionError:
             process.kill()
-        time.sleep(0.2)
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except (PermissionError, ProcessLookupError):
-            pass
+        else:
+            time.sleep(0.2)
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except (PermissionError, ProcessLookupError):
+                pass
     else:  # pragma: no cover
         try:
             process.send_signal(signal.CTRL_BREAK_EVENT)
@@ -575,6 +639,7 @@ def run_bounded_process(
     watched_output_path: str | Path | None = None,
     max_watched_output_bytes: int | None = None,
     decode_errors: Literal["strict", "replace"] = "replace",
+    cancellation_event: threading.Event | None = None,
 ) -> BoundedProcessResult:
     """Run fixed argv with bounded capture and reap the group on every exit."""
     if not argv or any(not isinstance(token, str) for token in argv):
@@ -597,73 +662,94 @@ def run_bounded_process(
         kwargs["start_new_session"] = True
     else:  # pragma: no cover
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    process = subprocess.Popen(original_argv, **kwargs)  # type: ignore[arg-type]
-    assert process.stdout is not None and process.stderr is not None
     stdout = bytearray()
     stderr = bytearray()
     budget = [max_output_bytes]
     lock = threading.Lock()
     overflow = threading.Event()
-    readers = [
-        threading.Thread(
-            target=_reader,
-            args=(process.stdout, stdout, budget, lock, overflow),
-            daemon=True,
-        ),
-        threading.Thread(
-            target=_reader,
-            args=(process.stderr, stderr, budget, lock, overflow),
-            daemon=True,
-        ),
-    ]
-    for reader in readers:
-        reader.start()
+    readers: list[threading.Thread] = []
+    started_readers: list[threading.Thread] = []
     writer: threading.Thread | None = None
-    if input_text is not None:
-        assert process.stdin is not None
-        writer = threading.Thread(
-            target=_write_input,
-            args=(process.stdin, input_text.encode("utf-8")),
-            daemon=True,
-        )
-        writer.start()
-
-    deadline = time.monotonic() + timeout
+    writer_started = False
     timed_out = False
     watched_overflow = False
-    group_terminated = False
     watched = Path(watched_output_path) if watched_output_path is not None else None
-    while process.poll() is None:
+    input_bytes = input_text.encode("utf-8") if input_text is not None else None
+    if cancellation_event is not None and cancellation_event.is_set():
+        raise ProcessCancellationRequested
+    process = subprocess.Popen(original_argv, **kwargs)  # type: ignore[arg-type]
+    try:
+        assert process.stdout is not None and process.stderr is not None
+        readers.extend(
+            [
+                threading.Thread(
+                    target=_reader,
+                    args=(process.stdout, stdout, budget, lock, overflow),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=_reader,
+                    args=(process.stderr, stderr, budget, lock, overflow),
+                    daemon=True,
+                ),
+            ]
+        )
+        for reader in readers:
+            reader.start()
+            started_readers.append(reader)
+        if input_bytes is not None:
+            assert process.stdin is not None
+            writer = threading.Thread(
+                target=_write_input,
+                args=(process.stdin, input_bytes),
+                daemon=True,
+            )
+            writer.start()
+            writer_started = True
+
+        deadline = time.monotonic() + timeout
+        while True:
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise ProcessCancellationRequested
+            if process.poll() is not None:
+                break
+            if watched is not None:
+                try:
+                    watched_overflow = watched.stat().st_size > int(
+                        max_watched_output_bytes or 0
+                    )
+                except FileNotFoundError:
+                    pass
+            if overflow.is_set() or watched_overflow or time.monotonic() >= deadline:
+                timed_out = not overflow.is_set() and not watched_overflow
+                break
+            time.sleep(0.01)
         if watched is not None:
             try:
-                watched_overflow = watched.stat().st_size > int(max_watched_output_bytes or 0)
+                watched_overflow = watched_overflow or watched.stat().st_size > int(
+                    max_watched_output_bytes or 0
+                )
             except FileNotFoundError:
                 pass
-        if overflow.is_set() or watched_overflow or time.monotonic() >= deadline:
-            timed_out = not overflow.is_set() and not watched_overflow
-            _terminate_process_group(process)
-            group_terminated = True
-            break
-        time.sleep(0.01)
-    if watched is not None:
+    finally:
         try:
-            watched_overflow = watched_overflow or watched.stat().st_size > int(
-                max_watched_output_bytes or 0
-            )
-        except FileNotFoundError:
-            pass
-    if not group_terminated:
-        _terminate_process_group(process)
+            _terminate_process_group(process)
+        finally:
+            for reader in started_readers:
+                reader.join()
+            if writer is not None and writer_started:
+                writer.join()
+            for pipe in (process.stdout, process.stderr):
+                if pipe is not None:
+                    pipe.close()
+            if process.stdin is not None:
+                process.stdin.close()
     if watched_overflow and watched is not None and max_watched_output_bytes is not None:
         try:
             with watched.open("r+b") as output:
                 output.truncate(max_watched_output_bytes)
         except OSError:
             pass
-    for reader in readers:
-        reader.join(timeout=1)
-    if writer is not None:
-        writer.join(timeout=1)
     stdout_text = stdout.decode("utf-8", errors=decode_errors)
     stderr_text = stderr.decode("utf-8", errors=decode_errors)
     if overflow.is_set() or watched_overflow:

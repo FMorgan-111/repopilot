@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import subprocess
 from pathlib import Path
@@ -29,7 +30,7 @@ _IMAGE = "registry.example/repopilot-tests@sha256:" + "2" * 64
 
 @pytest.fixture(autouse=True)
 def _mock_coverage_oci(monkeypatch):
-    def fake_oci(argv, *, sandbox, **_kwargs):
+    async def fake_oci(argv, *, sandbox, **_kwargs):
         fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
         if fixed:
             return BoundedProcessResult(list(argv), 0, "1 passed", "")
@@ -40,7 +41,9 @@ def _mock_coverage_oci(monkeypatch):
             "",
         )
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", fake_oci)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", fake_oci, raising=False
+    )
 
 
 def _git(root: Path, *args: str) -> str:
@@ -131,7 +134,7 @@ async def test_differential_coverage_never_runs_repository_code_on_host(
     async def forbidden_host(*_args, **_kwargs):
         pytest.fail("host test runner was called")
 
-    def fake_oci(argv, *, sandbox, config, **_kwargs):
+    async def fake_oci(argv, *, sandbox, config, **_kwargs):
         assert config == state.tool_sandbox_config
         assert sandbox.workspace != root
         assert argv[:4] == ["/usr/bin/python3", "-P", "-m", "pytest"]
@@ -150,7 +153,9 @@ async def test_differential_coverage_never_runs_repository_code_on_host(
         )
 
     monkeypatch.setattr("src.coverage_gate._run_candidate", forbidden_host)
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", fake_oci, raising=False)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", fake_oci, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
 
     assert decision.verified is True
@@ -161,17 +166,58 @@ async def test_differential_coverage_never_runs_repository_code_on_host(
 
 
 @pytest.mark.asyncio
+async def test_generated_coverage_keeps_snapshot_alive_until_cancelled_worker_drains(
+    differential_repo,
+    monkeypatch,
+):
+    _root, _base_ref, state, candidate = differential_repo
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    captured: dict[str, Path] = {}
+
+    async def draining_oci(argv, *, sandbox, **_kwargs):
+        captured["workspace"] = sandbox.workspace
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert sandbox.workspace.is_dir()
+            cleanup_started.set()
+            await cleanup_release.wait()
+            assert sandbox.workspace.is_dir()
+            raise
+
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", draining_oci, raising=False
+    )
+    task = asyncio.create_task(validate_differential_coverage(state, candidate))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    task.cancel("cancel coverage OCI")
+    await asyncio.wait_for(cleanup_started.wait(), timeout=3)
+
+    workspace = captured["workspace"]
+    assert workspace.is_dir()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError, match="cancel coverage OCI"):
+        await task
+    assert not workspace.exists()
+
+
+@pytest.mark.asyncio
 async def test_differential_coverage_rejects_snapshot_manifest_drift(
     differential_repo,
     monkeypatch,
 ):
     _root, _base_ref, state, candidate = differential_repo
 
-    def mutating_oci(argv, *, sandbox, **_kwargs):
+    async def mutating_oci(argv, *, sandbox, **_kwargs):
         (sandbox.workspace / "tests" / "test_maths.py").write_text("mutated")
         return BoundedProcessResult(list(argv), 0, "1 passed", "")
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", mutating_oci, raising=False)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", mutating_oci, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "coverage_infra"
@@ -244,7 +290,7 @@ async def test_generated_candidate_is_overlaid_on_base_snapshot_only(
         source="generated",
     )
 
-    def generated_oci(argv, *, sandbox, **_kwargs):
+    async def generated_oci(argv, *, sandbox, **_kwargs):
         assert (sandbox.workspace / "tests" / "test_generated.py").is_file()
         fixed = "return 2" in (sandbox.workspace / "src" / "maths.py").read_text()
         if fixed:
@@ -256,7 +302,9 @@ async def test_generated_candidate_is_overlaid_on_base_snapshot_only(
             "",
         )
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", generated_oci)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", generated_oci, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is True
     assert decision.status == "generated_verified"
@@ -314,7 +362,7 @@ async def test_modified_generated_test_is_bound_and_overlaid_on_exact_base(
         source="generated",
     )
 
-    def generated_oci(argv, *, sandbox, **_kwargs):
+    async def generated_oci(argv, *, sandbox, **_kwargs):
         assert "generated regression" in (
             sandbox.workspace / "tests" / "test_maths.py"
         ).read_text()
@@ -328,7 +376,9 @@ async def test_modified_generated_test_is_bound_and_overlaid_on_exact_base(
             "",
         )
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", generated_oci)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", generated_oci, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is True
     assert decision.status == "generated_verified"
@@ -359,19 +409,22 @@ async def test_differential_coverage_rejects_base_that_also_passes(
 ):
     _root, _base_ref, state, candidate = differential_repo
 
-    def passing(argv, **_kwargs):
+    async def passing(argv, **_kwargs):
         return BoundedProcessResult(list(argv), 0, "1 passed", "")
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", passing)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", passing, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "base_also_passes"
 
 
 @pytest.mark.asyncio
-async def test_differential_coverage_rejects_fixed_failure(differential_repo):
+async def test_differential_coverage_rejects_fixed_failure(
+    differential_repo, monkeypatch
+):
     _root, _base_ref, state, candidate = differential_repo
-    from unittest.mock import patch
 
     failing = BoundedProcessResult(
         list(candidate.argv),
@@ -379,8 +432,13 @@ async def test_differential_coverage_rejects_fixed_failure(differential_repo):
         "FAILED tests/test_maths.py::test_answer - AssertionError: wrong fixed result",
         "",
     )
-    with patch("src.coverage_gate.run_oci_process", return_value=failing):
-        decision = await validate_differential_coverage(state, candidate)
+    async def fail_oci(*_args, **_kwargs):
+        return failing
+
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", fail_oci, raising=False
+    )
+    decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "fixed_does_not_pass"
 
@@ -392,10 +450,12 @@ async def test_differential_coverage_rejects_infrastructure_error(
 ):
     _root, _base_ref, state, candidate = differential_repo
 
-    def infra(argv, **_kwargs):
+    async def infra(argv, **_kwargs):
         return BoundedProcessResult(list(argv), 1, "ERROR collecting tests", "")
 
-    monkeypatch.setattr("src.coverage_gate.run_oci_process", infra)
+    monkeypatch.setattr(
+        "src.coverage_gate.run_oci_process_async", infra, raising=False
+    )
     decision = await validate_differential_coverage(state, candidate)
     assert decision.verified is False
     assert decision.reason == "fixed_does_not_pass"

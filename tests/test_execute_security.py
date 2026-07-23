@@ -197,7 +197,7 @@ async def test_oci_execute_uses_exact_snapshot_and_skips_all_host_execution(
     def forbidden(*_args, **_kwargs):
         raise AssertionError("OCI mode must not invoke host build or test helpers")
 
-    def fake_oci(argv, *, sandbox, config, **kwargs):
+    async def fake_oci(argv, *, sandbox, config, **kwargs):
         captured["argv"] = list(argv)
         captured["config"] = config
         captured["workspace"] = sandbox.workspace
@@ -214,7 +214,9 @@ async def test_oci_execute_uses_exact_snapshot_and_skips_all_host_execution(
         "run_pytest",
     ):
         monkeypatch.setattr(execute_node, name, forbidden)
-    monkeypatch.setattr(execute_node, "run_oci_process", fake_oci, raising=False)
+    monkeypatch.setattr(
+        execute_node, "run_oci_process_async", fake_oci, raising=False
+    )
 
     result = await execute_node.execute_fix(state)
 
@@ -236,12 +238,14 @@ async def test_oci_execute_ignores_hostile_test_text_and_uses_fixed_full_suite(
     state = _approved_state(tmp_path, command=sentinel)
     captured: dict[str, object] = {}
 
-    def fake_oci(argv, *, sandbox, **_kwargs):
+    async def fake_oci(argv, *, sandbox, **_kwargs):
         captured["argv"] = list(argv)
         captured["workspace"] = sandbox.workspace
         return BoundedProcessResult(list(argv), 1, "failed", "")
 
-    monkeypatch.setattr(execute_node, "run_oci_process", fake_oci, raising=False)
+    monkeypatch.setattr(
+        execute_node, "run_oci_process_async", fake_oci, raising=False
+    )
 
     result = await execute_node.execute_fix(state)
 
@@ -254,6 +258,43 @@ async def test_oci_execute_ignores_hostile_test_text_and_uses_fixed_full_suite(
     ]
     assert all("planner-command-ran" not in token for token in captured["argv"])
     assert result.fix_attempts[-1].success is False
+
+
+async def test_oci_execute_keeps_snapshot_alive_until_cancelled_worker_drains(
+    tmp_path, monkeypatch
+):
+    state = _approved_state(tmp_path, command="pytest tests/test_widget.py -q")
+    started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    captured: dict[str, Path] = {}
+
+    async def draining_oci(argv, *, sandbox, **_kwargs):
+        captured["workspace"] = sandbox.workspace
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            assert sandbox.workspace.is_dir()
+            cleanup_started.set()
+            await cleanup_release.wait()
+            assert sandbox.workspace.is_dir()
+            raise
+
+    monkeypatch.setattr(
+        execute_node, "run_oci_process_async", draining_oci, raising=False
+    )
+    task = asyncio.create_task(execute_node.execute_fix(state))
+    await asyncio.wait_for(started.wait(), timeout=3)
+    task.cancel("cancel execute OCI")
+    await asyncio.wait_for(cleanup_started.wait(), timeout=3)
+
+    workspace = captured["workspace"]
+    assert workspace.is_dir()
+    cleanup_release.set()
+    with pytest.raises(asyncio.CancelledError, match="cancel execute OCI"):
+        await task
+    assert not workspace.exists()
 
 
 @pytest.mark.parametrize(

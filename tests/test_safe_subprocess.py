@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+import io
 import json
 import sys
+import threading
 import time
 from pathlib import Path
 
 import pytest
 
+import src.safe_subprocess as safe_subprocess
 from src.safe_subprocess import (
     BoundedProcessResult,
     IsolationCleanupError,
@@ -24,6 +28,10 @@ from src.safe_subprocess import (
 from src.state import ToolSandboxConfig
 
 _IMAGE = "registry.example/repopilot-tests@sha256:" + "1" * 64
+
+
+class _InjectedBaseException(BaseException):
+    pass
 
 
 def _config() -> ToolSandboxConfig:
@@ -409,6 +417,61 @@ def test_configured_project_runner_gets_a_real_executable_probe(tmp_path, monkey
     assert any("--entrypoint=/usr/bin/npm" in argv and argv[-1] == "--version" for argv in creates)
 
 
+def test_project_probe_cancellation_prevents_command_container(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    cancellation = threading.Event()
+    calls: list[list[str]] = []
+    active: set[str] = set()
+    cleanup_started = False
+    starts = 0
+
+    def fake_bounded(argv, **kwargs):
+        nonlocal cleanup_started, starts
+        calls.append(list(argv))
+        if argv[1] == "create":
+            cleanup_started = False
+        if argv[1] != "rm" and not cleanup_started:
+            assert kwargs["cancellation_event"] is cancellation
+        if argv[1] == "create":
+            name = next(token for token in argv if token.startswith("--name="))[7:]
+            active.add(name)
+            return BoundedProcessResult(list(argv), 0, "created", "")
+        if argv[1] == "start":
+            starts += 1
+            if starts == 1:
+                return BoundedProcessResult(list(argv), 0, "pytest 9.0.0", "")
+            cancellation.set()
+            raise safe_subprocess.ProcessCancellationRequested
+        if argv[1] == "rm":
+            cleanup_started = True
+            assert "cancellation_event" not in kwargs
+            active.discard(argv[-1])
+            return BoundedProcessResult(list(argv), 0, "", "")
+        if cleanup_started:
+            assert "cancellation_event" not in kwargs
+            return BoundedProcessResult(list(argv), 1, "", "No such container")
+        return _inspect_result(argv, sandbox, exists=argv[-1] in active)
+
+    monkeypatch.setattr(
+        safe_subprocess,
+        "trusted_executable",
+        lambda *_args, **_kwargs: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(safe_subprocess, "run_bounded_process", fake_bounded)
+
+    with pytest.raises(safe_subprocess.ProcessCancellationRequested):
+        run_oci_process(
+            ["/usr/bin/npm", "test", "--", "tests/test_widget.py"],
+            sandbox=sandbox,
+            config=_config(),
+            cancellation_event=cancellation,
+        )
+
+    create_calls = [argv for argv in calls if argv[1] == "create"]
+    assert len(create_calls) == 2
+    assert create_calls[-1][-1] == "--version"
+
+
 def _wait_for_file(path: Path, timeout: float = 3.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -416,6 +479,502 @@ def _wait_for_file(path: Path, timeout: float = 3.0) -> bool:
             return True
         time.sleep(0.02)
     return path.exists()
+
+
+async def _wait_for_thread_event(
+    event: threading.Event, timeout: float = 3.0
+) -> None:
+    deadline = time.monotonic() + timeout
+    while not event.is_set():
+        if time.monotonic() >= deadline:
+            raise AssertionError("thread event was not set before timeout")
+        await asyncio.sleep(0.01)
+
+
+def test_pre_cancelled_process_never_spawns(tmp_path, monkeypatch):
+    cancellation = threading.Event()
+    cancellation.set()
+    monkeypatch.setattr(
+        safe_subprocess.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("pre-cancelled process was spawned"),
+    )
+
+    with pytest.raises(safe_subprocess.ProcessCancellationRequested):
+        run_bounded_process(
+            [sys.executable, "-c", "pass"],
+            cwd=tmp_path,
+            cancellation_event=cancellation,
+        )
+
+
+def test_cancellation_reaps_process_group_and_completes_io_threads(
+    tmp_path, monkeypatch
+):
+    cancellation = threading.Event()
+    parent_marker = tmp_path / "cancel-parent"
+    child_marker = tmp_path / "cancel-child"
+    ready = tmp_path / "cancel-ready"
+    reader_completions: list[int] = []
+    writer_completed = threading.Event()
+    original_reader = safe_subprocess._reader
+    original_writer = safe_subprocess._write_input
+
+    def tracked_reader(*args):
+        try:
+            original_reader(*args)
+        finally:
+            reader_completions.append(threading.get_ident())
+
+    def tracked_writer(*args):
+        try:
+            original_writer(*args)
+        finally:
+            writer_completed.set()
+
+    monkeypatch.setattr(safe_subprocess, "_reader", tracked_reader)
+    monkeypatch.setattr(safe_subprocess, "_write_input", tracked_writer)
+    child = (
+        "import pathlib,signal,sys,time; marker=pathlib.Path(sys.argv[1]); "
+        "ready=pathlib.Path(sys.argv[2]); "
+        "signal.signal(signal.SIGTERM, lambda *_: (marker.write_text('yes'), sys.exit(0))); "
+        "ready.write_text('yes'); time.sleep(60)"
+    )
+    parent = (
+        "import pathlib,signal,subprocess,sys,time; marker=pathlib.Path(sys.argv[1]); "
+        "child=sys.argv[2]; child_marker=sys.argv[3]; ready=pathlib.Path(sys.argv[4]); "
+        "signal.signal(signal.SIGTERM, lambda *_: (marker.write_text('yes'), sys.exit(0))); "
+        "subprocess.Popen([sys.executable, '-c', child, child_marker, str(ready)]); "
+        "\nwhile not ready.exists():\n time.sleep(0.01)"
+        "\ntime.sleep(60)"
+    )
+    outcome: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            run_bounded_process(
+                [
+                    sys.executable,
+                    "-c",
+                    parent,
+                    str(parent_marker),
+                    child,
+                    str(child_marker),
+                    str(ready),
+                ],
+                cwd=tmp_path,
+                input_text="x" * 8_000_000,
+                timeout=10,
+                cancellation_event=cancellation,
+            )
+        except BaseException as exc:
+            outcome.append(exc)
+
+    worker = threading.Thread(target=invoke)
+    worker.start()
+    assert _wait_for_file(ready)
+    cancellation.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert len(outcome) == 1
+    assert isinstance(outcome[0], safe_subprocess.ProcessCancellationRequested)
+    assert _wait_for_file(parent_marker)
+    assert _wait_for_file(child_marker)
+    assert len(reader_completions) == 2
+    assert writer_completed.is_set()
+
+
+def test_arbitrary_base_exception_still_terminates_and_joins_io(
+    tmp_path, monkeypatch
+):
+    release_io = threading.Event()
+    terminated = threading.Event()
+    reader_completions: list[int] = []
+    writer_completed = threading.Event()
+
+    class FakeProcess:
+        pid = 4242
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        stdin = io.BytesIO()
+
+        def poll(self):
+            raise _InjectedBaseException("poll interrupted")
+
+    process = FakeProcess()
+
+    def blocking_reader(*_args):
+        release_io.wait(timeout=2)
+        reader_completions.append(threading.get_ident())
+
+    def blocking_writer(*_args):
+        release_io.wait(timeout=2)
+        writer_completed.set()
+
+    def terminate(received):
+        assert received is process
+        process.returncode = -15
+        terminated.set()
+        release_io.set()
+
+    monkeypatch.setattr(safe_subprocess.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(safe_subprocess, "_reader", blocking_reader)
+    monkeypatch.setattr(safe_subprocess, "_write_input", blocking_writer)
+    monkeypatch.setattr(safe_subprocess, "_terminate_process_group", terminate)
+
+    try:
+        with pytest.raises(_InjectedBaseException, match="poll interrupted"):
+            run_bounded_process(
+                ["/usr/bin/fake"],
+                cwd=tmp_path,
+                input_text="payload",
+            )
+        cleanup_observed = (
+            terminated.is_set()
+            and len(reader_completions) == 2
+            and writer_completed.is_set()
+        )
+    finally:
+        release_io.set()
+
+    assert cleanup_observed
+
+
+def test_partial_reader_start_failure_closes_unowned_pipes_and_reaps(
+    tmp_path, monkeypatch
+):
+    class FakeProcess:
+        pid = 4243
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        stdin = io.BytesIO()
+
+    process = FakeProcess()
+    reaped = threading.Event()
+    thread_index = 0
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            nonlocal thread_index
+            self.index = thread_index
+            thread_index += 1
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+            self.joined = False
+
+        def start(self):
+            if self.index == 1:
+                raise _InjectedBaseException("second reader start interrupted")
+            self.target(*self.args)
+
+        def join(self):
+            self.joined = True
+
+    def terminate(received):
+        assert received is process
+        received.returncode = -15
+        reaped.set()
+
+    monkeypatch.setattr(safe_subprocess.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(safe_subprocess.threading, "Thread", FakeThread)
+    monkeypatch.setattr(safe_subprocess, "_terminate_process_group", terminate)
+
+    with pytest.raises(_InjectedBaseException, match="second reader start interrupted"):
+        run_bounded_process(
+            ["/usr/bin/fake"],
+            cwd=tmp_path,
+            input_text="payload",
+        )
+
+    assert reaped.is_set()
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert process.stdin.closed
+
+
+def test_reader_construction_failure_after_spawn_still_closes_and_reaps(
+    tmp_path, monkeypatch
+):
+    class FakeProcess:
+        pid = 4245
+        returncode = None
+        stdout = io.BytesIO()
+        stderr = io.BytesIO()
+        stdin = io.BytesIO()
+
+    process = FakeProcess()
+    reaped = threading.Event()
+    constructions = 0
+
+    class FailingThread:
+        def __init__(self, **_kwargs):
+            nonlocal constructions
+            constructions += 1
+            if constructions == 2:
+                raise _InjectedBaseException("reader construction interrupted")
+
+    def terminate(received):
+        assert received is process
+        received.returncode = -15
+        reaped.set()
+
+    monkeypatch.setattr(safe_subprocess.subprocess, "Popen", lambda *_a, **_k: process)
+    monkeypatch.setattr(safe_subprocess.threading, "Thread", FailingThread)
+    monkeypatch.setattr(safe_subprocess, "_terminate_process_group", terminate)
+
+    with pytest.raises(_InjectedBaseException, match="reader construction interrupted"):
+        run_bounded_process(
+            ["/usr/bin/fake"],
+            cwd=tmp_path,
+            input_text="payload",
+        )
+
+    assert reaped.is_set()
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert process.stdin.closed
+
+
+def test_process_lookup_during_group_signal_still_waits_for_leader(monkeypatch):
+    class FakeProcess:
+        pid = 4244
+
+        def __init__(self):
+            self.wait_calls = 0
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            return 0
+
+    process = FakeProcess()
+    monkeypatch.setattr(
+        safe_subprocess.os,
+        "killpg",
+        lambda *_args: (_ for _ in ()).throw(ProcessLookupError()),
+    )
+
+    safe_subprocess._terminate_process_group(process)
+
+    assert process.wait_calls == 1
+
+
+def test_oci_removal_runs_for_arbitrary_base_exception(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    calls: list[list[str]] = []
+    active: set[str] = set()
+    starts = 0
+
+    def fake_bounded(argv, **_kwargs):
+        nonlocal starts
+        calls.append(list(argv))
+        if argv[1] == "create":
+            name = next(token for token in argv if token.startswith("--name="))[7:]
+            active.add(name)
+            return BoundedProcessResult(list(argv), 0, "created", "")
+        if argv[1] == "start":
+            starts += 1
+            if starts == 1:
+                return BoundedProcessResult(list(argv), 0, "pytest 9.0.0", "")
+            raise _InjectedBaseException("start interrupted")
+        if argv[1] == "rm":
+            active.discard(argv[-1])
+            return BoundedProcessResult(list(argv), 0, "", "")
+        return _inspect_result(argv, sandbox, exists=argv[-1] in active)
+
+    monkeypatch.setattr(
+        safe_subprocess,
+        "trusted_executable",
+        lambda *_args, **_kwargs: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(safe_subprocess, "run_bounded_process", fake_bounded)
+
+    with pytest.raises(_InjectedBaseException, match="start interrupted"):
+        run_oci_process(
+            ["/usr/bin/python3", "-P", "-m", "pytest", "tests/test_widget.py"],
+            sandbox=sandbox,
+            config=_config(),
+        )
+
+    assert len([argv for argv in calls if argv[1:3] == ["rm", "-f"]]) == 2
+
+
+def test_oci_force_removal_never_receives_cancellation_token(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    cancellation = threading.Event()
+    cleanup_started = False
+    starts = 0
+
+    def fake_bounded(argv, **kwargs):
+        nonlocal cleanup_started, starts
+        if argv[1] == "create":
+            cleanup_started = False
+        if argv[1] != "rm" and not cleanup_started:
+            assert kwargs["cancellation_event"] is cancellation
+        if argv[1] == "create":
+            name = next(token for token in argv if token.startswith("--name="))[7:]
+            return BoundedProcessResult(list(argv), 0, name, "")
+        if argv[1] == "start":
+            starts += 1
+            if starts == 1:
+                return BoundedProcessResult(list(argv), 0, "pytest 9.0.0", "")
+            cancellation.set()
+            raise safe_subprocess.ProcessCancellationRequested
+        if argv[1] == "rm":
+            cleanup_started = True
+            assert "cancellation_event" not in kwargs
+            return BoundedProcessResult(list(argv), 0, "", "")
+        if cleanup_started:
+            assert "cancellation_event" not in kwargs
+            return BoundedProcessResult(list(argv), 1, "", "No such container")
+        return _inspect_result(argv, sandbox, exists=True)
+
+    monkeypatch.setattr(
+        safe_subprocess,
+        "trusted_executable",
+        lambda *_args, **_kwargs: "/usr/bin/docker",
+    )
+    monkeypatch.setattr(safe_subprocess, "run_bounded_process", fake_bounded)
+
+    with pytest.raises(safe_subprocess.ProcessCancellationRequested):
+        run_oci_process(
+            ["/usr/bin/python3", "-P", "-m", "pytest", "tests/test_widget.py"],
+            sandbox=sandbox,
+            config=_config(),
+            cancellation_event=cancellation,
+        )
+
+
+async def test_async_oci_adapter_keeps_event_loop_responsive(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_oci(argv, *, cancellation_event, **_kwargs):
+        started.set()
+        assert release.wait(timeout=3)
+        return BoundedProcessResult(list(argv), 0, "passed", "")
+
+    monkeypatch.setattr(safe_subprocess, "run_oci_process", blocking_oci)
+    task = asyncio.create_task(
+        safe_subprocess.run_oci_process_async(
+            ["/usr/bin/python3", "-m", "pytest"],
+            sandbox=sandbox,
+            config=_config(),
+        )
+    )
+    await _wait_for_thread_event(started)
+    heartbeat = 0
+    for _ in range(5):
+        await asyncio.sleep(0)
+        heartbeat += 1
+    release.set()
+
+    result = await task
+    assert heartbeat == 5
+    assert result.returncode == 0
+
+
+async def test_async_oci_cancellation_waits_for_worker_cleanup(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    started = threading.Event()
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+    worker_finished = threading.Event()
+
+    def cancellable_oci(argv, *, cancellation_event, **_kwargs):
+        started.set()
+        assert cancellation_event.wait(timeout=3)
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=3)
+        worker_finished.set()
+        raise safe_subprocess.ProcessCancellationRequested
+
+    monkeypatch.setattr(safe_subprocess, "run_oci_process", cancellable_oci)
+    task = asyncio.create_task(
+        safe_subprocess.run_oci_process_async(
+            ["/usr/bin/python3", "-m", "pytest"],
+            sandbox=sandbox,
+            config=_config(),
+        )
+    )
+    await _wait_for_thread_event(started)
+    task.cancel("original cancellation")
+    await _wait_for_thread_event(cleanup_started)
+    await asyncio.sleep(0)
+    assert not task.done()
+    cleanup_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value.args == ("original cancellation",)
+    assert worker_finished.is_set()
+
+
+async def test_async_oci_drain_survives_repeated_cancellation(tmp_path, monkeypatch):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    started = threading.Event()
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+
+    def cancellable_oci(argv, *, cancellation_event, **_kwargs):
+        started.set()
+        assert cancellation_event.wait(timeout=3)
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=3)
+        raise safe_subprocess.ProcessCancellationRequested
+
+    monkeypatch.setattr(safe_subprocess, "run_oci_process", cancellable_oci)
+    task = asyncio.create_task(
+        safe_subprocess.run_oci_process_async(
+            ["/usr/bin/python3", "-m", "pytest"],
+            sandbox=sandbox,
+            config=_config(),
+        )
+    )
+    await _wait_for_thread_event(started)
+    task.cancel("first cancellation")
+    await _wait_for_thread_event(cleanup_started)
+    task.cancel("second cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    cleanup_release.set()
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value.args == ("first cancellation",)
+
+
+async def test_async_oci_cleanup_error_is_chained_to_original_cancellation(
+    tmp_path, monkeypatch
+):
+    sandbox = SandboxPaths.create(tmp_path / "bundle")
+    started = threading.Event()
+    recovery = tmp_path / "recovery.json"
+
+    def failing_cleanup(argv, *, cancellation_event, **_kwargs):
+        started.set()
+        assert cancellation_event.wait(timeout=3)
+        raise IsolationCleanupError("repopilot-test-cleanup", recovery)
+
+    monkeypatch.setattr(safe_subprocess, "run_oci_process", failing_cleanup)
+    task = asyncio.create_task(
+        safe_subprocess.run_oci_process_async(
+            ["/usr/bin/python3", "-m", "pytest"],
+            sandbox=sandbox,
+            config=_config(),
+        )
+    )
+    await _wait_for_thread_event(started)
+    task.cancel("original cancellation")
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await task
+    assert caught.value.args == ("original cancellation",)
+    assert isinstance(caught.value.__cause__, IsolationCleanupError)
 
 
 def test_streaming_output_cap_terminates_entire_process_group(tmp_path):

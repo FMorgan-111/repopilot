@@ -29,7 +29,7 @@ from .safe_subprocess import (
     BoundedProcessResult,
     SandboxPaths,
     run_bounded_process,
-    run_oci_process,
+    run_oci_process_async,
     trusted_executable,
 )
 from .state import (
@@ -652,7 +652,7 @@ def _has_untracked_files(root: Path) -> bool:
     return bool(result.stdout)
 
 
-def _execute_data_tool(
+async def _execute_data_tool(
     state: AgentState,
     intent: ToolIntent,
     normalized_args: dict[str, object],
@@ -688,7 +688,7 @@ def _execute_data_tool(
             if state.tool_sandbox_config is None:
                 raise ValueError("tool sandbox is not configured")
             content = _completed_content(
-                run_oci_process(
+                await run_oci_process_async(
                     argv,
                     sandbox=sandbox,
                     config=state.tool_sandbox_config,
@@ -791,7 +791,7 @@ async def route_tool_intent(
         )
 
     try:
-        content, file_path, symbol = _execute_data_tool(
+        content, file_path, symbol = await _execute_data_tool(
             state, intent, decision.normalized_args, decision.argv
         )
         added = EvidenceStore(state).add(
