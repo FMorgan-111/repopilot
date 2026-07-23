@@ -308,14 +308,25 @@ def _parse_chat_completion_json(payload: object) -> dict:
         raise LLMResponseError("chat completion choice limit exceeded")
     aggregate_content_bytes = 0
     aggregate_tool_calls = 0
-    usable = False
-    for choice in choices:
+    aggregate_tool_argument_bytes = 0
+    canonical_choices: list[dict] = []
+    seen_indexes: set[int] = set()
+    for position, choice in enumerate(choices):
         if not isinstance(choice, dict):
-            continue
+            raise LLMResponseError("incomplete chat completion choice structure")
+        index = _provider_index(choice.get("index", position), "choice")
+        if index in seen_indexes:
+            raise LLMResponseError("duplicate choice index")
+        seen_indexes.add(index)
         message = choice.get("message")
         if not isinstance(message, dict):
-            continue
+            raise LLMResponseError("incomplete chat completion choice structure")
+        role = message.get("role")
+        if not isinstance(role, str) or not role:
+            raise LLMResponseError("incomplete chat completion message structure")
         content = message.get("content")
+        if content is not None and not isinstance(content, str):
+            raise LLMResponseError("invalid chat completion content structure")
         tool_calls = message.get("tool_calls")
         validated_tool_calls = (
             _validate_tool_calls(tool_calls) if tool_calls is not None else []
@@ -323,6 +334,14 @@ def _parse_chat_completion_json(payload: object) -> dict:
         aggregate_tool_calls += len(validated_tool_calls)
         if aggregate_tool_calls > LLM_MAX_TOOL_CALLS:
             raise LLMResponseError("chat completion tool call limit exceeded")
+        aggregate_tool_argument_bytes += sum(
+            len(call["function"]["arguments"].encode("utf-8"))
+            for call in validated_tool_calls
+        )
+        if aggregate_tool_argument_bytes > LLM_MAX_TOOL_ARGUMENT_BYTES:
+            raise LLMResponseError(
+                "chat completion aggregate tool argument byte limit exceeded"
+            )
         if isinstance(content, str):
             content_bytes = len(content.encode("utf-8"))
             if content_bytes > LLM_MAX_CONTENT_BYTES:
@@ -332,18 +351,51 @@ def _parse_chat_completion_json(payload: object) -> dict:
                 raise LLMResponseError(
                     "chat completion aggregate content byte limit exceeded"
                 )
-        if (isinstance(content, str) and content) or validated_tool_calls:
-            usable = True
-    if usable:
-        return payload
-    raise LLMResponseError("empty chat completion response")
+        if not ((isinstance(content, str) and content) or validated_tool_calls):
+            raise LLMResponseError("empty chat completion choice")
+        finish_reason = choice.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise LLMResponseError("invalid chat completion finish reason")
+        canonical_message: dict[str, object] = {
+            "role": role,
+            "content": content,
+        }
+        if validated_tool_calls:
+            canonical_message["tool_calls"] = validated_tool_calls
+        canonical_choices.append(
+            {
+                "index": index,
+                "message": canonical_message,
+                "finish_reason": finish_reason,
+            }
+        )
+    result: dict[str, object] = {"choices": canonical_choices}
+    if "usage" in payload and payload["usage"] is not None:
+        result["usage"] = _validate_usage(payload["usage"])
+    return result
 
 
 def _provider_index(value: object, label: str) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError) as exc:
-        raise LLMResponseError(f"invalid {label} index") from exc
+    if type(value) is not int or value < 0:
+        raise LLMResponseError(f"invalid {label} index")
+    return value
+
+
+_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+
+
+def _validate_usage(value: object) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise LLMResponseError("invalid chat completion usage")
+    canonical: dict[str, int] = {}
+    for field in _USAGE_FIELDS:
+        if field not in value:
+            continue
+        count = value[field]
+        if type(count) is not int or not 0 <= count <= (2**63 - 1):
+            raise LLMResponseError("invalid chat completion usage")
+        canonical[field] = count
+    return canonical
 
 
 def _validate_tool_calls(tool_calls: object) -> list[dict]:
@@ -351,6 +403,7 @@ def _validate_tool_calls(tool_calls: object) -> list[dict]:
         raise LLMResponseError("incomplete tool call structure")
     if len(tool_calls) > LLM_MAX_TOOL_CALLS:
         raise LLMResponseError("chat completion tool call limit exceeded")
+    canonical: list[dict] = []
     for call in tool_calls:
         if not isinstance(call, dict):
             raise LLMResponseError("incomplete tool call structure")
@@ -370,7 +423,17 @@ def _validate_tool_calls(tool_calls: object) -> list[dict]:
             > LLM_MAX_TOOL_ARGUMENT_BYTES
         ):
             raise LLMResponseError("chat completion tool argument byte limit exceeded")
-    return tool_calls
+        canonical.append(
+            {
+                "id": call["id"],
+                "type": "function",
+                "function": {
+                    "name": function["name"],
+                    "arguments": function["arguments"],
+                },
+            }
+        )
+    return canonical
 
 
 async def _bounded_sse_lines(resp: object):
@@ -401,6 +464,7 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
     usage: dict | None = None
     event_count = 0
     aggregate_content_bytes = 0
+    aggregate_tool_argument_bytes = 0
     tool_call_count = 0
     done_seen = False
 
@@ -417,7 +481,7 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
             done_seen = True
             continue
         if done_seen:
-            continue
+            raise LLMResponseError("chat completion data after DONE")
         try:
             event = json.loads(data)
         except json.JSONDecodeError as exc:
@@ -426,17 +490,21 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
             raise LLMResponseError("unsupported SSE event shape")
         if event.get("error"):
             raise LLMResponseError(_provider_error_message(event["error"]))
-        if isinstance(event.get("usage"), dict):
-            usage = event["usage"]
-        event_choices = event.get("choices") or []
+        if "usage" in event and event["usage"] is not None:
+            usage = _validate_usage(event["usage"])
+        event_choices = event.get("choices", [])
         if not isinstance(event_choices, list):
             raise LLMResponseError("unsupported SSE choices shape")
         if len(event_choices) > LLM_MAX_CHOICES:
             raise LLMResponseError("chat completion choice limit exceeded")
+        event_indexes: set[int] = set()
         for position, choice in enumerate(event_choices):
             if not isinstance(choice, dict):
-                continue
+                raise LLMResponseError("unsupported SSE choice shape")
             index = _provider_index(choice.get("index", position), "choice")
+            if index in event_indexes:
+                raise LLMResponseError("duplicate choice index in SSE event")
+            event_indexes.add(index)
             if index not in choice_states and len(choice_states) >= LLM_MAX_CHOICES:
                 raise LLMResponseError("chat completion choice limit exceeded")
             state = choice_states.setdefault(
@@ -444,17 +512,24 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
                 {
                     "content": [],
                     "content_bytes": 0,
-                    "role": "assistant",
+                    "role": None,
                     "tool_calls": {},
                     "finish_reason": None,
                 },
             )
-            delta = choice.get("delta") or {}
+            delta = choice.get("delta")
             if not isinstance(delta, dict):
                 raise LLMResponseError("unsupported SSE delta shape")
-            if isinstance(delta.get("role"), str):
-                state["role"] = delta["role"]
-            if isinstance(delta.get("content"), str):
+            if "role" in delta:
+                role = delta["role"]
+                if not isinstance(role, str) or not role:
+                    raise LLMResponseError("invalid SSE role structure")
+                if state["role"] is not None and state["role"] != role:
+                    raise LLMResponseError("conflicting role in SSE stream")
+                state["role"] = role
+            if "content" in delta and delta["content"] is not None:
+                if not isinstance(delta["content"], str):
+                    raise LLMResponseError("invalid SSE content structure")
                 chunk_bytes = len(delta["content"].encode("utf-8"))
                 if state["content_bytes"] + chunk_bytes > LLM_MAX_CONTENT_BYTES:
                     raise LLMResponseError(
@@ -467,26 +542,43 @@ async def _consume_sse_chat_completion(resp: object) -> dict:
                     )
                 state["content"].append(delta["content"])
                 state["content_bytes"] += chunk_bytes
-            tool_call_count += _accumulate_tool_call_deltas(
+            created, argument_bytes = _accumulate_tool_call_deltas(
                 state["tool_calls"],
                 delta.get("tool_calls"),
                 remaining=LLM_MAX_TOOL_CALLS - tool_call_count,
             )
+            tool_call_count += created
+            aggregate_tool_argument_bytes += argument_bytes
+            if aggregate_tool_argument_bytes > LLM_MAX_TOOL_ARGUMENT_BYTES:
+                raise LLMResponseError(
+                    "chat completion aggregate tool argument byte limit exceeded"
+                )
             if choice.get("finish_reason") is not None:
-                state["finish_reason"] = choice["finish_reason"]
+                finish_reason = choice["finish_reason"]
+                if not isinstance(finish_reason, str):
+                    raise LLMResponseError("invalid SSE finish reason")
+                if (
+                    state["finish_reason"] is not None
+                    and state["finish_reason"] != finish_reason
+                ):
+                    raise LLMResponseError("conflicting finish reason in SSE stream")
+                state["finish_reason"] = finish_reason
+
+    if not done_seen:
+        raise LLMResponseError("incomplete chat completion SSE stream")
 
     choices: list[dict] = []
     for index, state in sorted(choice_states.items()):
         content = "".join(state["content"])
         message: dict[str, object] = {
-            "role": state["role"],
+            "role": state["role"] or "assistant",
             "content": content or None,
         }
         tool_calls = _finalize_tool_calls(state["tool_calls"])
         if tool_calls:
             message["tool_calls"] = tool_calls
         if not content and not tool_calls:
-            continue
+            raise LLMResponseError("empty chat completion choice")
         choices.append(
             {
                 "index": index,
@@ -507,16 +599,21 @@ def _accumulate_tool_call_deltas(
     deltas: object,
     *,
     remaining: int = LLM_MAX_TOOL_CALLS,
-) -> int:
+) -> tuple[int, int]:
     if deltas is None:
-        return 0
+        return 0, 0
     if not isinstance(deltas, list):
         raise LLMResponseError("unsupported tool call delta shape")
     created = 0
+    added_argument_bytes = 0
+    event_indexes: set[int] = set()
     for position, delta in enumerate(deltas):
         if not isinstance(delta, dict):
-            continue
+            raise LLMResponseError("unsupported tool call delta shape")
         index = _provider_index(delta.get("index", position), "tool call")
+        if index in event_indexes:
+            raise LLMResponseError("duplicate tool call index in SSE delta")
+        event_indexes.add(index)
         if index not in states:
             if created >= remaining:
                 raise LLMResponseError("chat completion tool call limit exceeded")
@@ -531,16 +628,36 @@ def _accumulate_tool_call_deltas(
                 "argument_bytes": 0,
             },
         )
-        if isinstance(delta.get("id"), str):
-            state["id"] += delta["id"]
-        if isinstance(delta.get("type"), str):
-            state["type"] = delta["type"]
-        function = delta.get("function") or {}
-        if isinstance(function, dict):
-            if isinstance(function.get("name"), str):
-                state["name"] += function["name"]
-            if isinstance(function.get("arguments"), str):
-                argument_bytes = len(function["arguments"].encode("utf-8"))
+        if "id" in delta:
+            call_id = delta["id"]
+            if not isinstance(call_id, str) or not call_id:
+                raise LLMResponseError("invalid tool call id structure")
+            if state["id"] and state["id"] != call_id:
+                raise LLMResponseError("conflicting tool call id in SSE stream")
+            state["id"] = call_id
+        if "type" in delta:
+            call_type = delta["type"]
+            if call_type != "function":
+                raise LLMResponseError("invalid tool call type structure")
+            if state["type"] and state["type"] != call_type:
+                raise LLMResponseError("conflicting tool call type in SSE stream")
+            state["type"] = call_type
+        if "function" in delta:
+            function = delta["function"]
+            if not isinstance(function, dict):
+                raise LLMResponseError("unsupported tool call function shape")
+            if "name" in function:
+                name = function["name"]
+                if not isinstance(name, str) or not name:
+                    raise LLMResponseError("invalid tool call name structure")
+                if state["name"] and state["name"] != name:
+                    raise LLMResponseError("conflicting tool call name in SSE stream")
+                state["name"] = name
+            if "arguments" in function:
+                arguments = function["arguments"]
+                if not isinstance(arguments, str):
+                    raise LLMResponseError("invalid tool call arguments structure")
+                argument_bytes = len(arguments.encode("utf-8"))
                 if (
                     state["argument_bytes"] + argument_bytes
                     > LLM_MAX_TOOL_ARGUMENT_BYTES
@@ -548,9 +665,10 @@ def _accumulate_tool_call_deltas(
                     raise LLMResponseError(
                         "chat completion tool argument byte limit exceeded"
                     )
-                state["arguments"] += function["arguments"]
+                state["arguments"] += arguments
                 state["argument_bytes"] += argument_bytes
-    return created
+                added_argument_bytes += argument_bytes
+    return created, added_argument_bytes
 
 
 def _finalize_tool_calls(states: dict[int, dict]) -> list[dict]:

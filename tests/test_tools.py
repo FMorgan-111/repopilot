@@ -136,7 +136,7 @@ async def test_read_issue_uses_stale_cache_for_github_503(monkeypatch, tmp_path)
         "labels": ["bug"],
         "number": 42,
     }
-    key = cache_globals["_cache_key"]("read_issue", "acme", "widget", 42)
+    key = cache_globals["_cache_key"](read_issue, "acme", "widget", 42)
     cache_globals["_save"](key, cached_issue)
     now["value"] = 20.0
 
@@ -159,7 +159,7 @@ async def test_read_issue_does_not_use_stale_cache_for_github_404(
     monkeypatch.setitem(cache_globals, "CACHE_STALE_TTL", 100)
     now = {"value": 0.0}
     monkeypatch.setattr(cache_globals["time"], "time", lambda: now["value"])
-    key = cache_globals["_cache_key"]("read_issue", "acme", "widget", 404)
+    key = cache_globals["_cache_key"](read_issue, "acme", "widget", 404)
     cache_globals["_save"](key, {"title": "Wrong repository"})
     now["value"] = 20.0
 

@@ -3,7 +3,7 @@
 import json
 
 from dotenv import load_dotenv
-load_dotenv(override=True)
+load_dotenv(override=False)
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse, PlainTextResponse

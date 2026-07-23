@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from .state import AgentState, NodeFn, Phase, _as_state, _record_node_diagnostic
+from .timeout_diagnostics import extract_timeout_cleanup_evidence
 
 try:  # pragma: no cover - exercised only when langgraph is installed.
     from langgraph.graph import END, StateGraph
@@ -76,11 +77,15 @@ class FallbackCompiledGraph:
                 working = _as_state(
                     await asyncio.wait_for(node(working), timeout=timeout)
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 elapsed = time.monotonic() - t0
-                working.failure_reason = (
+                failure_reason = (
                     f"Phase {current} timed out after {timeout}s (elapsed {elapsed:.1f}s)"
                 )
+                cleanup_evidence = extract_timeout_cleanup_evidence(exc)
+                if cleanup_evidence is not None:
+                    failure_reason += f"; {cleanup_evidence.summary()}"
+                working.failure_reason = failure_reason
                 working.current_phase = Phase.FAILURE
                 _record_node_diagnostic(
                     working,
@@ -90,6 +95,11 @@ class FallbackCompiledGraph:
                     elapsed_seconds=elapsed,
                     error=asyncio.TimeoutError(),
                     phase_timeout_seconds=timeout,
+                    **(
+                        cleanup_evidence.diagnostic_details()
+                        if cleanup_evidence is not None
+                        else {}
+                    ),
                 )
                 self._progress_fn(
                     current, "TIMEOUT",

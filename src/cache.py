@@ -24,6 +24,7 @@ REPOPILOT_CACHE_STALE_TTL=<secs>  Override the maximum stale age.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -60,12 +61,66 @@ def _ensure_dir() -> None:
     cache_dir().mkdir(parents=True, exist_ok=True)
 
 
-def _cache_key(func_name: str, *args, **kwargs) -> str:
-    """Derive a deterministic, filesystem-safe key from call arguments."""
+def _typed_cache_value(value: object) -> object:
+    value_type = type(value)
+    if value is None:
+        return ["none"]
+    if value_type is bool:
+        return ["bool", value]
+    if value_type is int:
+        return ["int", str(value)]
+    if value_type is float:
+        return ["float", value.hex()]
+    if value_type is str:
+        return ["str", value]
+    if value_type is bytes:
+        return ["bytes", value.hex()]
+    if value_type is list:
+        return ["list", [_typed_cache_value(item) for item in value]]
+    if value_type is tuple:
+        return ["tuple", [_typed_cache_value(item) for item in value]]
+    if value_type in {set, frozenset}:
+        items = [_typed_cache_value(item) for item in value]
+        items.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+        return [value_type.__name__, items]
+    if value_type is dict:
+        items = [
+            [_typed_cache_value(key), _typed_cache_value(item)]
+            for key, item in value.items()
+        ]
+        items.sort(key=lambda item: json.dumps(item[0], sort_keys=True, separators=(",", ":")))
+        return ["dict", items]
+    if isinstance(value, Path):
+        return [
+            "path",
+            f"{value_type.__module__}.{value_type.__qualname__}",
+            str(value),
+        ]
+    raise TypeError(
+        "unsupported cache key value: "
+        f"{value_type.__module__}.{value_type.__qualname__}"
+    )
+
+
+def _cache_key(func: Callable, *args, **kwargs) -> str:
+    """Derive a canonical key from function identity and bound typed arguments."""
+    if not callable(func):
+        raise TypeError("cache key function must be callable")
+    target = inspect.unwrap(func)
+    signature = inspect.signature(target)
+    bound = signature.bind(*args, **kwargs)
+    bound.apply_defaults()
     payload = json.dumps(
-        {"func": func_name, "args": args, "kwargs": kwargs},
+        {
+            "module": target.__module__,
+            "qualname": target.__qualname__,
+            "arguments": [
+                [name, _typed_cache_value(value)]
+                for name, value in bound.arguments.items()
+            ],
+        },
         sort_keys=True,
-        default=str,
+        separators=(",", ":"),
     )
     call_digest = hashlib.sha256(payload.encode()).hexdigest()
     return f"{_github_credential_partition()}-{call_digest}"
@@ -142,7 +197,7 @@ def cached(
 
         @wraps(inner)
         async def wrapper(*args, **kwargs):
-            key = _cache_key(inner.__name__, *args, **kwargs)
+            key = _cache_key(inner, *args, **kwargs)
             entry = _load(key)
             if entry is not None and entry.state == "fresh":
                 _log_cache_event(

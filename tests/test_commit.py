@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import re
 import subprocess
 from pathlib import Path
 
+import httpx
 import pytest
 
 from src.coverage_gate import validate_terminal_coverage_binding
@@ -33,6 +35,110 @@ def _git(root: Path, *args: str) -> str:
         text=True,
     ).stdout.strip()
 
+
+def _tree_sha(entries: list[tuple[str, str, str]]) -> str:
+    body = b"".join(
+        mode.lstrip("0").encode("ascii")
+        + b" "
+        + name.encode("utf-8")
+        + b"\0"
+        + bytes.fromhex(sha)
+        for mode, name, sha in sorted(
+            entries,
+            key=lambda item: (item[1] + ("/" if item[0] == "040000" else "")).encode(),
+        )
+    )
+    return hashlib.sha1(
+        f"tree {len(body)}\0".encode("ascii") + body
+    ).hexdigest()
+
+
+def test_contents_api_url_encodes_repository_and_path_segments():
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme org",
+        repo="widget#fork",
+    )
+
+    assert commit_node._contents_url(state, "src/a b+#?.py") == (
+        "https://api.github.com/repos/acme%20org/widget%23fork/contents/"
+        "src/a%20b%2B%23%3F.py"
+    )
+
+
+def test_remote_tree_map_proves_every_nested_tree_object():
+    leaf = _git_blob_sha(b"ok\n")
+    forged_tree = "f" * 40
+    root = _tree_sha([("040000", "src", forged_tree)])
+    payload = {
+        "sha": root,
+        "truncated": False,
+        "tree": [
+            {"path": "src", "mode": "040000", "type": "tree", "sha": forged_tree},
+            {
+                "path": "src/app.py",
+                "mode": "100644",
+                "type": "blob",
+                "sha": leaf,
+                "size": 3,
+            },
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="tree identity"):
+        commit_node._remote_tree_map(payload, root)
+
+
+def test_remote_tree_map_rejects_omitted_descendants_and_extra_empty_trees():
+    empty_tree = _tree_sha([])
+    root = _tree_sha([("040000", "empty", empty_tree)])
+    payload = {
+        "sha": root,
+        "truncated": False,
+        "tree": [
+            {"path": "empty", "mode": "040000", "type": "tree", "sha": empty_tree}
+        ],
+    }
+
+    with pytest.raises(RuntimeError, match="empty tree"):
+        commit_node._remote_tree_map(payload, root)
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"path": "../escape", "mode": "100644", "type": "blob", "size": 1},
+        {"path": "src//app.py", "mode": "100644", "type": "blob", "size": 1},
+        {"path": "app.py", "mode": "040000", "type": "blob", "size": 1},
+        {"path": "app.py", "mode": "100644", "type": "tree", "size": 1},
+        {"path": "app.py", "mode": "100644", "type": "blob", "size": True},
+        {"path": "app.py", "mode": "100644", "type": "blob", "size": -1},
+    ],
+)
+def test_remote_tree_map_rejects_invalid_paths_modes_and_sizes(entry):
+    leaf = _git_blob_sha(b"x")
+    candidate = {**entry, "sha": leaf}
+    root = _tree_sha([("100644", "app.py", leaf)])
+
+    with pytest.raises(RuntimeError, match="malformed"):
+        commit_node._remote_tree_map(
+            {"sha": root, "truncated": False, "tree": [candidate]}, root
+        )
+
+
+@pytest.mark.parametrize(
+    "parents",
+    [
+        [{"sha": "b" * 40}],
+        [{"sha": "a" * 40}, {"sha": "b" * 40}],
+        [],
+    ],
+)
+def test_contents_commit_must_be_exact_single_parent_successor(parents):
+    with pytest.raises(RuntimeError, match="exact linear successor"):
+        commit_node._contents_commit_identity(
+            {"commit": {"sha": "c" * 40, "parents": parents}}, "a" * 40
+        )
 
 def _state(
     tmp_path: Path,
@@ -132,7 +238,10 @@ def _state(
 
 def _mock_branch(monkeypatch: pytest.MonkeyPatch, state: AgentState) -> None:
     async def repo(_state):
-        return {"default_branch": "main"}
+        return {
+            "default_branch": "main",
+            "full_name": f"{state.owner}/{state.repo}",
+        }
 
     async def ref(_state, branch):
         return {
@@ -143,7 +252,7 @@ def _mock_branch(monkeypatch: pytest.MonkeyPatch, state: AgentState) -> None:
     async def create_ref(_state, branch, sha):
         return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
 
-    async def verify(_state, _binding, _base_sha, _branch):
+    async def verify(_state, _binding, _base_sha, _branch, **_kwargs):
         return "d" * 40
 
     monkeypatch.setattr("src.nodes.commit._github_get_repo", repo)
@@ -203,7 +312,13 @@ async def test_push_files_uses_manifest_targets_and_base_blob_sha(
         writes.append(
             {"path": path, "content": content, "branch": branch, "sha": sha}
         )
-        return {"content": {"path": path}}
+        return {
+            "content": {"path": path},
+            "commit": {
+                "sha": "d" * 40,
+                "parents": [{"sha": state.repo_ref}],
+            },
+        }
 
     monkeypatch.setattr("src.nodes.commit._github_create_or_update_file", write)
     result = await push_files(state)
@@ -213,6 +328,7 @@ async def test_push_files_uses_manifest_targets_and_base_blob_sha(
     assert writes[0]["content"] == "VALUE = 2\n"
     assert writes[0]["sha"] == expected_blob
     assert result["files"][0]["path"] == "src/widget.py"
+    assert result["repository_identity"]["full_name"] == "acme/widget"
 
 
 @pytest.mark.asyncio
@@ -224,10 +340,19 @@ async def test_push_files_includes_approved_untracked_generated_test_without_sha
     _attach_proof(state)
     _mock_branch(monkeypatch, state)
     writes: list[tuple[str, str]] = []
+    commit_shas = iter(["d" * 40, "e" * 40])
+    previous = state.repo_ref
 
     async def write(_state, path, content, branch, message, sha=""):
+        nonlocal previous
         writes.append((path, sha))
-        return {"content": {"path": path}}
+        commit_sha = next(commit_shas)
+        result = {
+            "content": {"path": path},
+            "commit": {"sha": commit_sha, "parents": [{"sha": previous}]},
+        }
+        previous = commit_sha
+        return result
 
     monkeypatch.setattr("src.nodes.commit._github_create_or_update_file", write)
     await push_files(state)
@@ -290,7 +415,10 @@ async def test_push_files_rejects_malicious_existing_branch_before_write(
     writes = []
 
     async def repo(_state):
-        return {"default_branch": "main"}
+        return {
+            "default_branch": "main",
+            "full_name": f"{state.owner}/{state.repo}",
+        }
 
     async def get_ref(_state, branch):
         sha = state.repo_ref if branch == "main" else "f" * 40
@@ -322,7 +450,10 @@ async def test_push_files_reuses_colliding_branch_only_on_exact_base(
     writes = []
 
     async def repo(_state):
-        return {"default_branch": "main"}
+        return {
+            "default_branch": "main",
+            "full_name": f"{state.owner}/{state.repo}",
+        }
 
     async def get_ref(_state, branch):
         return {
@@ -335,10 +466,17 @@ async def test_push_files_reuses_colliding_branch_only_on_exact_base(
 
     async def write(_state, path, content, branch, message, sha=""):
         writes.append(path)
-        return {"content": {"path": path}}
+        return {
+            "content": {"path": path},
+            "commit": {
+                "sha": "d" * 40,
+                "parents": [{"sha": state.repo_ref}],
+            },
+        }
 
-    async def verify(_state, _binding, base_sha, branch):
+    async def verify(_state, _binding, base_sha, branch, **kwargs):
         assert base_sha == state.repo_ref
+        assert kwargs["expected_head_sha"] == "d" * 40
         return "d" * 40
 
     monkeypatch.setattr(commit_node, "_github_get_repo", repo)
@@ -363,51 +501,102 @@ def _base_tree(root: Path, ref: str) -> list[dict[str, str]]:
     for line in _git(root, "ls-tree", "-r", ref).splitlines():
         metadata, path = line.split("\t", 1)
         mode, kind, sha = metadata.split()
-        entries.append({"path": path, "mode": mode, "type": kind, "sha": sha})
+        entries.append(
+            {
+                "path": path,
+                "mode": mode,
+                "type": kind,
+                "sha": sha,
+                "size": int(_git(root, "cat-file", "-s", sha)),
+            }
+        )
     return entries
+
+
+def _complete_tree_entries(leaves):
+    entries = {entry["path"]: dict(entry) for entry in leaves}
+    directories = set()
+    for path in entries:
+        parts = path.split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            directories.add("/".join(parts[:index]))
+    for directory in sorted(
+        directories, key=lambda value: value.count("/"), reverse=True
+    ):
+        children = []
+        for path, entry in entries.items():
+            parent, _, name = path.rpartition("/")
+            if parent == directory:
+                children.append((entry["mode"], name, entry["sha"]))
+        entries[directory] = {
+            "path": directory,
+            "mode": "040000",
+            "type": "tree",
+            "sha": _tree_sha(children),
+        }
+    root_children = []
+    for path, entry in entries.items():
+        parent, _, name = path.rpartition("/")
+        if not parent:
+            root_children.append((entry["mode"], name, entry["sha"]))
+    return list(entries.values()), _tree_sha(root_children)
 
 
 def _remote_tree_fixture(state: AgentState, *, unexpected=False):
     root = Path(state.repo_path)
-    base_entries = _base_tree(root, state.repo_ref)
+    base_leaves = _base_tree(root, state.repo_ref)
     changed = b"VALUE = 2\n"
-    head_entries = [dict(entry) for entry in base_entries]
-    source = next(entry for entry in head_entries if entry["path"] == "src/widget.py")
+    head_leaves = [dict(entry) for entry in base_leaves]
+    source = next(entry for entry in head_leaves if entry["path"] == "src/widget.py")
     source["sha"] = _git_blob_sha(changed)
+    source["size"] = len(changed)
     if unexpected:
-        head_entries.append(
+        head_leaves.append(
             {
                 "path": "evil.txt",
                 "mode": "100644",
                 "type": "blob",
                 "sha": _git_blob_sha(b"evil\n"),
+                "size": 5,
             }
         )
-    return base_entries, head_entries, changed
+    base_entries, base_root = _complete_tree_entries(base_leaves)
+    head_entries, head_root = _complete_tree_entries(head_leaves)
+    return base_entries, base_root, head_entries, head_root, changed
 
 
 def _mock_remote_verification_api(
-    monkeypatch, state, *, unexpected=False, blob_content=None
+    monkeypatch,
+    state,
+    *,
+    unexpected=False,
+    blob_content=None,
+    head_parent=None,
 ):
-    base_entries, head_entries, changed = _remote_tree_fixture(
+    base_entries, base_root, head_entries, head_root, changed = _remote_tree_fixture(
         state, unexpected=unexpected
     )
     branch = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
     head_sha = "d" * 40
 
     async def get_ref(_state, requested_branch):
-        assert requested_branch == branch
+        sha = state.repo_ref if requested_branch == "main" else head_sha
         return {
-            "ref": f"refs/heads/{branch}",
-            "object": {"sha": head_sha},
+            "ref": f"refs/heads/{requested_branch}",
+            "object": {"sha": sha},
         }
 
     async def get_commit(_state, sha):
-        tree_sha = "a" * 40 if sha == state.repo_ref else "b" * 40
-        return {"sha": sha, "tree": {"sha": tree_sha}}
+        tree_sha = base_root if sha == state.repo_ref else head_root
+        parents = (
+            []
+            if sha == state.repo_ref
+            else [{"sha": head_parent or state.repo_ref}]
+        )
+        return {"sha": sha, "tree": {"sha": tree_sha}, "parents": parents}
 
     async def get_tree(_state, tree_sha):
-        tree = base_entries if tree_sha == "a" * 40 else head_entries
+        tree = base_entries if tree_sha == base_root else head_entries
         return {"sha": tree_sha, "truncated": False, "tree": tree}
 
     async def get_blob(_state, sha):
@@ -425,6 +614,72 @@ def _mock_remote_verification_api(
     monkeypatch.setattr(commit_node, "_github_get_tree", get_tree, raising=False)
     monkeypatch.setattr(commit_node, "_github_get_blob", get_blob, raising=False)
     return branch, head_sha
+
+
+def _pr_payload(state, head_sha, *, number=12):
+    return {
+        "number": number,
+        "html_url": f"https://github.com/{state.owner}/{state.repo}/pull/{number}",
+        "url": f"https://api.github.com/repos/{state.owner}/{state.repo}/pulls/{number}",
+        "head": {
+            "sha": head_sha,
+            "ref": state.branch_name,
+            "repo": {"full_name": f"{state.owner}/{state.repo}"},
+        },
+        "base": {
+            "sha": state.repo_ref,
+            "ref": state.base_branch,
+            "repo": {"full_name": f"{state.owner}/{state.repo}"},
+        },
+    }
+
+
+def _mock_pr_repo(monkeypatch, state, *, full_name=None):
+    async def get_repo(_state):
+        return {"full_name": full_name or f"{state.owner}/{state.repo}"}
+
+    async def list_prs(*_args, **_kwargs):
+        return []
+
+    monkeypatch.setattr(commit_node, "_github_get_repo", get_repo)
+    monkeypatch.setattr(
+        commit_node, "_github_list_open_prs", list_prs, raising=False
+    )
+
+
+def _repo_identity(state, *, full_name=None):
+    return commit_node._canonical_repo_identity(
+        {"full_name": full_name or f"{state.owner}/{state.repo}"}, state
+    )
+
+
+def test_pr_identity_rejects_valid_https_urls_for_the_wrong_resource(tmp_path):
+    state = _state(tmp_path)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    payload = _pr_payload(state, "d" * 40)
+    payload["html_url"] = "https://example.invalid/not-this-pr"
+
+    with pytest.raises(RuntimeError, match="pull request identity"):
+        commit_node._validate_pr_identity(
+            payload, state, 12, "d" * 40, _repo_identity(state)
+        )
+
+
+def test_remote_blob_rejects_boolean_size():
+    content = b"x"
+    sha = _git_blob_sha(content)
+
+    with pytest.raises(RuntimeError, match="blob response is malformed"):
+        commit_node._decode_remote_blob(
+            {
+                "sha": sha,
+                "encoding": "base64",
+                "size": True,
+                "content": base64.b64encode(content).decode("ascii"),
+            },
+            sha,
+        )
 
 
 @pytest.mark.asyncio
@@ -478,6 +733,23 @@ async def test_remote_branch_verification_rejects_mismatched_blob_content(
 
 
 @pytest.mark.asyncio
+async def test_remote_branch_verification_rejects_non_successor_commit(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    binding = validate_terminal_coverage_binding(state)
+    branch, _ = _mock_remote_verification_api(
+        monkeypatch, state, head_parent="b" * 40
+    )
+
+    with pytest.raises(RuntimeError, match="exact linear successor"):
+        await commit_node._verify_remote_branch(
+            state, binding, state.repo_ref, branch
+        )
+
+
+@pytest.mark.asyncio
 async def test_create_pr_reverifies_remote_branch_before_api_call(
     tmp_path, monkeypatch
 ):
@@ -486,6 +758,7 @@ async def test_create_pr_reverifies_remote_branch_before_api_call(
     state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
     state.base_branch = "main"
     calls = []
+    _mock_pr_repo(monkeypatch, state)
 
     async def get_ref(_state, branch):
         assert branch == "main"
@@ -504,6 +777,843 @@ async def test_create_pr_reverifies_remote_branch_before_api_call(
     monkeypatch.setattr(commit_node, "_github_create_pr", forbidden_pr)
 
     with pytest.raises(RuntimeError, match="remote branch tree mismatch"):
-        await create_pr(state)
+        await create_pr(
+            state,
+            verified_head_sha="d" * 40,
+            commit_chain=("d" * 40,),
+            repository_identity=_repo_identity(state),
+        )
 
     assert calls == ["verify"]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_binds_post_get_and_refs_to_verified_head(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    calls = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **kwargs):
+        assert kwargs["expected_head_sha"] == head_sha
+        assert kwargs["expected_commit_chain"] == (head_sha,)
+        calls.append("verify")
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        calls.append("post")
+        return payload
+
+    async def get_pr(_state, number):
+        assert number == 12
+        calls.append("get")
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        calls.append(f"ref:{branch}")
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr, raising=False)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+
+    result = await create_pr(
+        state,
+        verified_head_sha=head_sha,
+        commit_chain=(head_sha,),
+        repository_identity=_repo_identity(state),
+    )
+
+    assert result == payload
+    assert calls == ["verify", "post", "get", "ref:main", f"ref:{state.branch_name}"]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_never_closes_unvalidated_post_response_number(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    mismatched = _pr_payload(state, "e" * 40, number=42)
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return mismatched
+
+    async def close(_state, number):
+        closed.append(number)
+
+    async def sleep(_delay):
+        return None
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close, raising=False)
+    monkeypatch.setattr(commit_node.asyncio, "sleep", sleep)
+
+    with pytest.raises(commit_node.PRCleanupError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert closed == []
+    assert exc_info.value.pr_number == 42
+    assert isinstance(exc_info.value.validation_error, RuntimeError)
+    assert isinstance(exc_info.value.cleanup_error, RuntimeError)
+    assert "could not be reconciled" in str(exc_info.value.cleanup_error)
+
+
+@pytest.mark.asyncio
+async def test_create_pr_closes_pr_when_head_moves_after_verification(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else "e" * 40
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr, raising=False)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close, raising=False)
+
+    with pytest.raises(RuntimeError, match="branch moved"):
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_surfaces_validation_and_cleanup_failures(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    mismatched = _pr_payload(state, "e" * 40)
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return mismatched
+
+    async def close(*_args, **_kwargs):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    with pytest.raises(commit_node.PRCleanupError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert isinstance(exc_info.value.validation_error, RuntimeError)
+    assert isinstance(exc_info.value.cleanup_error, OSError)
+    assert exc_info.value.pr_number == 12
+
+
+@pytest.mark.asyncio
+async def test_create_pr_accepts_github_canonical_repository_casing(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.owner = "Acme"
+    state.repo = "Widget"
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    payload["html_url"] = "https://github.com/acme/widget/pull/12"
+    payload["url"] = "https://api.github.com/repos/acme/widget/pulls/12"
+    payload["head"]["repo"]["full_name"] = "acme/widget"
+    payload["base"]["repo"]["full_name"] = "acme/widget"
+    _mock_pr_repo(monkeypatch, state, full_name="acme/widget")
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+
+    assert (
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(
+                state, full_name="acme/widget"
+            ),
+        )
+        == payload
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_pr_rejects_repository_identity_drift_before_post(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    posted = []
+
+    _mock_pr_repo(monkeypatch, state, full_name="other/widget")
+
+    async def forbidden(*_args, **_kwargs):
+        posted.append(True)
+        pytest.fail("PR POST must not run after repository identity drift")
+
+    monkeypatch.setattr(commit_node, "_github_create_pr", forbidden)
+
+    with pytest.raises(RuntimeError, match="repository identity"):
+        await create_pr(
+            state,
+            verified_head_sha="d" * 40,
+            commit_chain=("d" * 40,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert posted == []
+
+
+@pytest.mark.asyncio
+async def test_create_pr_cancellation_during_post_drains_and_closes_remote_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    post_created = asyncio.Event()
+    release_post = asyncio.Event()
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        post_created.set()
+        await release_post.wait()
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await post_created.wait()
+    task.cancel()
+    release_post.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_cancellation_during_confirmation_closes_remote_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    confirmation_started = asyncio.Event()
+    release_confirmation = asyncio.Event()
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def get_pr(*_args, **_kwargs):
+        confirmation_started.set()
+        await release_confirmation.wait()
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    async def create(*_args, **_kwargs):
+        return payload
+
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await confirmation_started.wait()
+    task.cancel()
+    release_confirmation.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_cancellation_during_final_ref_check_closes_remote_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    ref_check_started = asyncio.Event()
+    release_ref_check = asyncio.Event()
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def check_refs(*_args, **_kwargs):
+        ref_check_started.set()
+        await release_ref_check.wait()
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_assert_pr_refs_unchanged", check_refs)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await ref_check_started.wait()
+    task.cancel()
+    release_ref_check.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_cancellation_cleanup_failure_preserves_cancel_semantics(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    post_created = asyncio.Event()
+    release_post = asyncio.Event()
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        post_created.set()
+        await release_post.wait()
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    async def close(*_args, **_kwargs):
+        raise OSError("close failed")
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await post_created.wait()
+    task.cancel()
+    release_post.set()
+
+    with pytest.raises(commit_node.PRCancellationCleanupError) as exc_info:
+        await task
+
+    assert isinstance(exc_info.value, asyncio.CancelledError)
+    assert exc_info.value.pr_number == 12
+    assert isinstance(exc_info.value.cleanup_error, OSError)
+
+
+@pytest.mark.asyncio
+async def test_create_pr_second_cancellation_does_not_misreport_successful_cleanup(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    post_created = asyncio.Event()
+    release_post = asyncio.Event()
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        post_created.set()
+        await release_post.wait()
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def get_ref(_state, branch):
+        sha = state.repo_ref if branch == "main" else head_sha
+        return {"ref": f"refs/heads/{branch}", "object": {"sha": sha}}
+
+    async def close(_state, number):
+        close_started.set()
+        await release_close.wait()
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_github_get_ref", get_ref)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await post_created.wait()
+    task.cancel()
+    release_post.set()
+    await close_started.wait()
+    task.cancel()
+    release_close.set()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await task
+
+    assert not isinstance(
+        exc_info.value, commit_node.PRCancellationCleanupError
+    )
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_missing_number_reconciles_and_closes_exact_new_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    exact = _pr_payload(state, head_sha)
+    malformed = dict(exact)
+    malformed.pop("number")
+    list_calls = 0
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def list_prs(*_args, **_kwargs):
+        nonlocal list_calls
+        list_calls += 1
+        return [] if list_calls == 1 else [exact]
+
+    async def create(*_args, **_kwargs):
+        return malformed
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_list_open_prs", list_prs)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    with pytest.raises(RuntimeError, match="pull request identity"):
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_unknown_post_outcome_reconciles_only_new_exact_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    preexisting = _pr_payload(state, head_sha, number=10)
+    created = _pr_payload(state, head_sha, number=12)
+    unrelated = _pr_payload(state, "e" * 40, number=14)
+    list_calls = 0
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def list_prs(*_args, **_kwargs):
+        nonlocal list_calls
+        list_calls += 1
+        return [preexisting] if list_calls == 1 else [preexisting, created, unrelated]
+
+    async def create(*_args, **_kwargs):
+        raise OSError("POST outcome unknown")
+
+    async def close(_state, number):
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_list_open_prs", list_prs)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    with pytest.raises(OSError, match="outcome unknown"):
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_unknown_post_outcome_without_match_is_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        raise OSError("POST outcome unknown")
+
+    async def close(_state, number):
+        closed.append(number)
+
+    async def sleep(_delay):
+        return None
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+    monkeypatch.setattr(commit_node.asyncio, "sleep", sleep)
+
+    with pytest.raises(commit_node.PRCleanupError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert closed == []
+    assert exc_info.value.pr_number is None
+    assert isinstance(exc_info.value.validation_error, OSError)
+    assert isinstance(exc_info.value.cleanup_error, RuntimeError)
+    assert "could not be reconciled" in str(exc_info.value.cleanup_error)
+
+
+@pytest.mark.asyncio
+async def test_create_pr_definitive_4xx_rejection_is_not_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    list_calls = 0
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def list_prs(*_args, **_kwargs):
+        nonlocal list_calls
+        list_calls += 1
+        return []
+
+    request = httpx.Request(
+        "POST", "https://api.github.com/repos/acme/widget/pulls"
+    )
+    response = httpx.Response(422, request=request)
+    rejection = httpx.HTTPStatusError(
+        "unprocessable entity", request=request, response=response
+    )
+
+    async def create(*_args, **_kwargs):
+        raise rejection
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_list_open_prs", list_prs)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+
+    with pytest.raises(httpx.HTTPStatusError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert exc_info.value is rejection
+    assert list_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_create_pr_reconciliation_failure_is_not_swallowed(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    list_calls = 0
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def list_prs(*_args, **_kwargs):
+        nonlocal list_calls
+        list_calls += 1
+        if list_calls == 1:
+            return []
+        raise OSError("reconciliation failed")
+
+    async def create(*_args, **_kwargs):
+        return {"html_url": "https://github.com/acme/widget/pull/unknown"}
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_list_open_prs", list_prs)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+
+    with pytest.raises(commit_node.PRCleanupError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert exc_info.value.pr_number is None
+    assert isinstance(exc_info.value.cleanup_error, OSError)
+
+
+@pytest.mark.asyncio
+async def test_create_pr_reconciliation_never_closes_preexisting_or_unrelated_pr(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    preexisting = _pr_payload(state, head_sha, number=10)
+    unrelated = _pr_payload(state, "e" * 40, number=14)
+    list_calls = 0
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def list_prs(*_args, **_kwargs):
+        nonlocal list_calls
+        list_calls += 1
+        return [preexisting] if list_calls == 1 else [preexisting, unrelated]
+
+    async def create(*_args, **_kwargs):
+        return {"html_url": "https://github.com/acme/widget/pull/unknown"}
+
+    async def close(_state, number):
+        closed.append(number)
+
+    async def sleep(_delay):
+        return None
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_list_open_prs", list_prs)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+    monkeypatch.setattr(commit_node.asyncio, "sleep", sleep)
+
+    with pytest.raises(commit_node.PRCleanupError) as exc_info:
+        await create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+
+    assert list_calls == 4
+    assert closed == []
+    assert exc_info.value.pr_number is None
+    assert isinstance(exc_info.value.cleanup_error, RuntimeError)
+    assert "could not be reconciled" in str(exc_info.value.cleanup_error)

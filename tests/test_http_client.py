@@ -430,7 +430,159 @@ async def test_llm_request_accepts_non_stream_json_completion(monkeypatch):
 
     result = await llm_request([{"role": "user", "content": "hi"}])
 
-    assert result == payload
+    assert result == {
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"total_tokens": 7},
+    }
+
+
+def test_json_completion_rejects_mixed_valid_and_malformed_choices():
+    from src.http_client import _parse_chat_completion_json
+
+    payload = {
+        "choices": [
+            {"message": {"role": "assistant", "content": "ok"}},
+            {"message": "not-an-object"},
+        ]
+    }
+
+    with pytest.raises(LLMResponseError, match="choice structure"):
+        _parse_chat_completion_json(payload)
+
+
+@pytest.mark.parametrize("value", [True, "0", -1])
+def test_json_completion_rejects_noncanonical_choice_indexes(value):
+    from src.http_client import _parse_chat_completion_json
+
+    payload = {
+        "choices": [
+            {
+                "index": value,
+                "message": {"role": "assistant", "content": "ok"},
+            }
+        ]
+    }
+
+    with pytest.raises(LLMResponseError, match="invalid choice index"):
+        _parse_chat_completion_json(payload)
+
+
+def test_json_completion_rejects_duplicate_choice_indexes():
+    from src.http_client import _parse_chat_completion_json
+
+    payload = {
+        "choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "a"}},
+            {"index": 0, "message": {"role": "assistant", "content": "b"}},
+        ]
+    }
+
+    with pytest.raises(LLMResponseError, match="duplicate choice index"):
+        _parse_chat_completion_json(payload)
+
+
+def test_json_completion_returns_only_validated_canonical_fields():
+    from src.http_client import _parse_chat_completion_json
+
+    result = _parse_chat_completion_json(
+        {
+            "id": "untrusted-id",
+            "choices": [
+                {
+                    "index": 2,
+                    "unknown": "drop-me",
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "unknown": "drop-me",
+                        "tool_calls": [
+                            {
+                                "index": 9,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "lookup",
+                                    "arguments": "{}",
+                                    "unknown": "drop-me",
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"total_tokens": 3, "unknown": 99},
+        }
+    )
+
+    assert result == {
+        "choices": [
+            {
+                "index": 2,
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"},
+                        }
+                    ],
+                },
+                "finish_reason": "tool_calls",
+            }
+        ],
+        "usage": {"total_tokens": 3},
+    }
+
+
+def test_json_completion_enforces_aggregate_tool_argument_limit():
+    from src.http_client import _parse_chat_completion_json
+
+    arguments = "x" * ((LLM_MAX_TOOL_ARGUMENT_BYTES // 2) + 1)
+    payload = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_tool_call(0, arguments), _tool_call(1, arguments)],
+                }
+            }
+        ]
+    }
+
+    with pytest.raises(LLMResponseError, match="aggregate tool argument"):
+        _parse_chat_completion_json(payload)
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [
+        {"total_tokens": True},
+        {"total_tokens": -1},
+        {"total_tokens": "3"},
+    ],
+)
+def test_json_completion_rejects_malformed_usage(usage):
+    from src.http_client import _parse_chat_completion_json
+
+    with pytest.raises(LLMResponseError, match="usage"):
+        _parse_chat_completion_json(
+            {
+                "choices": [
+                    {"message": {"role": "assistant", "content": "ok"}}
+                ],
+                "usage": usage,
+            }
+        )
 
 
 def test_llm_response_limits_are_explicit():
@@ -891,6 +1043,112 @@ async def test_llm_request_rejects_incomplete_json_tool_call(monkeypatch):
     )
 
     with pytest.raises(LLMResponseError, match="incomplete tool call structure"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        (
+            'data: {"choices":[{"index":true,"delta":{"content":"hi"}}]}\n\n'
+            "data: [DONE]\n",
+            "invalid choice index",
+        ),
+        (
+            'data: {"choices":[{"delta":{"content":7}}]}\n\n'
+            "data: [DONE]\n",
+            "content structure",
+        ),
+        (
+            'data: {"choices":[{"delta":{"tool_calls":[null]}}]}\n\n'
+            "data: [DONE]\n",
+            "tool call delta shape",
+        ),
+        (
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":[]}]}}]}\n\ndata: [DONE]\n',
+            "tool call function shape",
+        ),
+    ],
+)
+async def test_sse_completion_rejects_malformed_nested_shapes(
+    monkeypatch, body, message
+):
+    _stream_from_raw(monkeypatch, body.encode())
+
+    with pytest.raises(LLMResponseError, match=message):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "message"),
+    [
+        ({"role": "assistant"}, {"role": "tool"}, "conflicting role"),
+        (
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": ""},
+                    }
+                ]
+            },
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {"arguments": "{}"},
+                    }
+                ]
+            },
+            "conflicting tool call id",
+        ),
+    ],
+)
+async def test_sse_completion_rejects_conflicting_repeated_metadata(
+    monkeypatch, first, second, message
+):
+    body = (
+        "data: "
+        + json.dumps({"choices": [{"index": 0, "delta": first}]})
+        + "\n\ndata: "
+        + json.dumps({"choices": [{"index": 0, "delta": second}]})
+        + "\n\ndata: [DONE]\n"
+    )
+    _stream_from_raw(monkeypatch, body.encode())
+
+    with pytest.raises(LLMResponseError, match=message):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+async def test_sse_completion_enforces_aggregate_tool_argument_limit(monkeypatch):
+    arguments = "x" * ((LLM_MAX_TOOL_ARGUMENT_BYTES // 2) + 1)
+    calls = [_tool_call(0, arguments), _tool_call(1, arguments)]
+    body = (
+        "data: "
+        + json.dumps({"choices": [{"delta": {"tool_calls": calls}}]})
+        + "\n\ndata: [DONE]\n"
+    )
+    _stream_from_raw(monkeypatch, body.encode())
+
+    with pytest.raises(LLMResponseError, match="aggregate tool argument"):
+        await llm_request([{"role": "user", "content": "hi"}])
+
+
+async def test_sse_completion_rejects_mixed_usable_and_empty_choices(monkeypatch):
+    body = (
+        'data: {"choices":['
+        '{"index":0,"delta":{"content":"ok"}},'
+        '{"index":1,"delta":{}}]}\n\n'
+        "data: [DONE]\n"
+    )
+    _stream_from_raw(monkeypatch, body.encode())
+
+    with pytest.raises(LLMResponseError, match="empty chat completion choice"):
         await llm_request([{"role": "user", "content": "hi"}])
 
 

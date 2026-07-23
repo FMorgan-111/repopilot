@@ -7,6 +7,8 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,14 +33,7 @@ def runs_dir(root_dir: Path | str | None = None) -> Path:
 
 def run_path(run_id: str, root_dir: Path | str | None = None) -> Path:
     _validate_run_id(run_id)
-    directory = runs_dir(root_dir=root_dir)
-    path = directory / f"{run_id}.json"
-    canonical_parent = directory.resolve(strict=False)
-    try:
-        path.resolve(strict=False).parent.relative_to(canonical_parent)
-    except ValueError as exc:
-        raise ValueError("run path must remain within the runs directory") from exc
-    return path
+    return runs_dir(root_dir=root_dir) / f"{run_id}.json"
 
 
 def _validate_run_id(run_id: str) -> str:
@@ -47,80 +42,175 @@ def _validate_run_id(run_id: str) -> str:
     return run_id
 
 
+def _identity(info: os.stat_result) -> tuple[int, int]:
+    return info.st_dev, info.st_ino
+
+
+def _open_anchored_directory(path: Path, *, create: bool) -> int:
+    """Open a directory by walking no-follow descriptors from its anchor."""
+    absolute = path.expanduser().absolute()
+    if not absolute.anchor or len(absolute.parts) < 2:
+        raise ValueError("run-store root directory is too broad")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    descriptor = os.open(absolute.anchor, flags)
+    try:
+        for part in absolute.parts[1:]:
+            try:
+                before = os.stat(part, dir_fd=descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, 0o700, dir_fd=descriptor)
+                os.fsync(descriptor)
+                before = os.stat(
+                    part, dir_fd=descriptor, follow_symlinks=False
+                )
+            if stat.S_ISLNK(before.st_mode) or not stat.S_ISDIR(before.st_mode):
+                raise ValueError(
+                    "run-store root directory components must be real directories"
+                )
+            try:
+                child = os.open(part, flags, dir_fd=descriptor)
+            except OSError as exc:
+                raise ValueError(
+                    "run-store root directory could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(child)
+                after = os.stat(
+                    part, dir_fd=descriptor, follow_symlinks=False
+                )
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or _identity(before) != _identity(opened)
+                    or _identity(after) != _identity(opened)
+                ):
+                    raise ValueError(
+                        "run-store root directory changed while it was opened"
+                    )
+            except Exception:
+                os.close(child)
+                raise
+            os.close(descriptor)
+            descriptor = child
+
+        opened = os.fstat(descriptor)
+        path_info = os.stat(absolute, follow_symlinks=False)
+        resolved_info = os.stat(
+            absolute.resolve(strict=True), follow_symlinks=False
+        )
+        if (
+            _identity(path_info) != _identity(opened)
+            or _identity(resolved_info) != _identity(opened)
+        ):
+            raise ValueError("run-store root directory changed while it was opened")
+        result = descriptor
+        descriptor = -1
+        return result
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+@contextmanager
 def _open_runs_directory(
     root_dir: Path | str | None,
     *,
     create: bool,
-) -> tuple[Path, int]:
-    directory = runs_dir(root_dir=root_dir)
-    if create:
+) -> Iterator[tuple[Path, int, int]]:
+    root = Path(root_dir) if root_dir is not None else default_runs_dir()
+    directory = root / "runs"
+    root_descriptor = -1
+    runs_descriptor = -1
+    try:
+        root_descriptor = _open_anchored_directory(root, create=create)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
         try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except FileExistsError:
-            pass
+            runs_before = os.stat(
+                "runs", dir_fd=root_descriptor, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            if not create:
+                raise
+            os.mkdir("runs", 0o700, dir_fd=root_descriptor)
+            os.fsync(root_descriptor)
+            runs_before = os.stat(
+                "runs", dir_fd=root_descriptor, follow_symlinks=False
+            )
+        if stat.S_ISLNK(runs_before.st_mode) or not stat.S_ISDIR(runs_before.st_mode):
+            raise ValueError("runs directory must be a real directory, not a symlink")
+        try:
+            runs_descriptor = os.open(
+                "runs", flags, dir_fd=root_descriptor
+            )
+        except OSError as exc:
+            raise ValueError("runs directory could not be opened safely") from exc
+        runs_opened = os.fstat(runs_descriptor)
+        runs_after = os.stat(
+            "runs", dir_fd=root_descriptor, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISDIR(runs_opened.st_mode)
+            or _identity(runs_before) != _identity(runs_opened)
+            or _identity(runs_after) != _identity(runs_opened)
+        ):
+            raise ValueError("runs directory changed while it was opened")
+        yield directory, root_descriptor, runs_descriptor
+    finally:
+        if runs_descriptor >= 0:
+            os.close(runs_descriptor)
+        if root_descriptor >= 0:
+            os.close(root_descriptor)
+
+
+def _read_run_bytes_at(
+    run_id: str, directory_fd: int
+) -> tuple[bytes, os.stat_result]:
+    _validate_run_id(run_id)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
-        info = directory.lstat()
-    except FileNotFoundError:
-        raise
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise ValueError("runs directory must be a real directory, not a symlink")
-    canonical = directory.resolve(strict=True)
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        descriptor = os.open(directory, flags)
+        descriptor = os.open(
+            f"{run_id}.json",
+            flags,
+            dir_fd=directory_fd,
+        )
     except OSError as exc:
-        raise ValueError("runs directory could not be opened safely") from exc
-    opened = os.fstat(descriptor)
-    if not stat.S_ISDIR(opened.st_mode):
+        if isinstance(exc, FileNotFoundError):
+            raise
+        raise ValueError("run file must be a regular file") from exc
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("run file must be a regular file")
+        if opened.st_size > MAX_RUN_FILE_BYTES:
+            raise ValueError("run file exceeds the size limit")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, MAX_RUN_FILE_BYTES + 1 - total),
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > MAX_RUN_FILE_BYTES:
+                raise ValueError("run file exceeds the size limit")
+            chunks.append(chunk)
+        return b"".join(chunks), opened
+    finally:
         os.close(descriptor)
-        raise ValueError("runs directory must be a regular directory")
-    if directory.resolve(strict=True) != canonical:
-        os.close(descriptor)
-        raise ValueError("runs directory changed while it was opened")
-    return directory, descriptor
 
 
 def _read_run_bytes(run_id: str, root_dir: Path | str | None) -> bytes:
     _validate_run_id(run_id)
-    _, directory_fd = _open_runs_directory(root_dir, create=False)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    flags |= getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-    try:
-        try:
-            descriptor = os.open(
-                f"{run_id}.json",
-                flags,
-                dir_fd=directory_fd,
-            )
-        except OSError as exc:
-            if isinstance(exc, FileNotFoundError):
-                raise
-            raise ValueError("run file must be a regular file") from exc
-        try:
-            opened = os.fstat(descriptor)
-            if not stat.S_ISREG(opened.st_mode):
-                raise ValueError("run file must be a regular file")
-            if opened.st_size > MAX_RUN_FILE_BYTES:
-                raise ValueError("run file exceeds the size limit")
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = os.read(
-                    descriptor,
-                    min(64 * 1024, MAX_RUN_FILE_BYTES + 1 - total),
-                )
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > MAX_RUN_FILE_BYTES:
-                    raise ValueError("run file exceeds the size limit")
-                chunks.append(chunk)
-            return b"".join(chunks)
-        finally:
-            os.close(descriptor)
-    finally:
-        os.close(directory_fd)
+    with _open_runs_directory(root_dir, create=False) as (_, _, directory_fd):
+        content, _opened = _read_run_bytes_at(run_id, directory_fd)
+        return content
 
 
 def _atomic_write_run(
@@ -131,56 +221,55 @@ def _atomic_write_run(
     if len(payload) > MAX_RUN_FILE_BYTES:
         raise ValueError("run file exceeds the size limit")
     path = run_path(run_id, root_dir=root_dir)
-    _, directory_fd = _open_runs_directory(root_dir, create=True)
-    temp_name = ""
-    descriptor = -1
-    try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        for _ in range(16):
-            temp_name = f".{run_id}.{secrets.token_hex(12)}.tmp"
-            try:
-                descriptor = os.open(
-                    temp_name,
-                    flags,
-                    0o600,
-                    dir_fd=directory_fd,
-                )
-                break
-            except FileExistsError:
-                continue
-        else:
-            raise OSError("could not allocate a unique run-store temporary file")
-        try:
-            os.fchmod(descriptor, 0o600)
-            remaining = memoryview(payload)
-            while remaining:
-                written = os.write(descriptor, remaining)
-                if written <= 0:
-                    raise OSError("short write while persisting run")
-                remaining = remaining[written:]
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-            descriptor = -1
-        os.replace(
-            temp_name,
-            f"{run_id}.json",
-            src_dir_fd=directory_fd,
-            dst_dir_fd=directory_fd,
-        )
+    with _open_runs_directory(root_dir, create=True) as (_, _, directory_fd):
         temp_name = ""
-        os.fsync(directory_fd)
-        return path
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        if temp_name:
+        descriptor = -1
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            for _ in range(16):
+                temp_name = f".{run_id}.{secrets.token_hex(12)}.tmp"
+                try:
+                    descriptor = os.open(
+                        temp_name,
+                        flags,
+                        0o600,
+                        dir_fd=directory_fd,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise OSError("could not allocate a unique run-store temporary file")
             try:
-                os.unlink(temp_name, dir_fd=directory_fd)
-            except FileNotFoundError:
-                pass
-        os.close(directory_fd)
+                os.fchmod(descriptor, 0o600)
+                remaining = memoryview(payload)
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("short write while persisting run")
+                    remaining = remaining[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+                descriptor = -1
+            os.replace(
+                temp_name,
+                f"{run_id}.json",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            temp_name = ""
+            os.fsync(directory_fd)
+            return path
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            if temp_name:
+                try:
+                    os.unlink(temp_name, dir_fd=directory_fd)
+                except FileNotFoundError:
+                    pass
 
 
 def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
@@ -196,7 +285,11 @@ def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
 
 
 def load_run(run_id: str, root_dir: Path | str | None = None) -> AgentState:
-    data = json.loads(_read_run_bytes(run_id, root_dir).decode("utf-8"))
+    return _state_from_run_bytes(_read_run_bytes(run_id, root_dir))
+
+
+def _state_from_run_bytes(content: bytes) -> AgentState:
+    data = json.loads(content.decode("utf-8"))
     return AgentState.model_validate(_clear_legacy_evaluator_patch_state(data))
 
 
@@ -241,8 +334,12 @@ def _clear_legacy_evaluator_patch_state(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def inspect_run(run_id: str, root_dir: Path | str | None = None) -> dict[str, Any]:
-    path = run_path(run_id, root_dir=root_dir)
-    return summarize_run(load_run(run_id, root_dir=root_dir), path=path)
+    _validate_run_id(run_id)
+    with _open_runs_directory(root_dir, create=False) as (_, _, directory_fd):
+        content, opened = _read_run_bytes_at(run_id, directory_fd)
+    summary = summarize_run(_state_from_run_bytes(content))
+    summary["updated_at"] = _updated_at_stat(opened)
+    return summary
 
 
 def replay_run(run_id: str, root_dir: Path | str | None = None) -> dict[str, Any]:
@@ -250,25 +347,24 @@ def replay_run(run_id: str, root_dir: Path | str | None = None) -> dict[str, Any
 
 
 def list_runs(root_dir: Path | str | None = None) -> list[dict[str, Any]]:
-    directory = runs_dir(root_dir=root_dir)
-    if not directory.exists():
-        return []
-    _, directory_fd = _open_runs_directory(root_dir, create=False)
     try:
-        names = sorted(
-            entry.name
-            for entry in os.scandir(directory_fd)
-            if entry.name.endswith(".json")
-            and _RUN_ID_RE.fullmatch(entry.name[:-5])
-            and entry.is_file(follow_symlinks=False)
-        )
-    finally:
-        os.close(directory_fd)
-    summaries = []
-    for name in names:
-        run_id = name[:-5]
-        path = run_path(run_id, root_dir=root_dir)
-        summaries.append(summarize_run(load_run(run_id, root_dir=root_dir), path=path))
+        with _open_runs_directory(root_dir, create=False) as (_, _, directory_fd):
+            names = sorted(
+                entry.name
+                for entry in os.scandir(directory_fd)
+                if entry.name.endswith(".json")
+                and _RUN_ID_RE.fullmatch(entry.name[:-5])
+                and entry.is_file(follow_symlinks=False)
+            )
+            summaries = []
+            for name in names:
+                run_id = name[:-5]
+                content, opened = _read_run_bytes_at(run_id, directory_fd)
+                summary = summarize_run(_state_from_run_bytes(content))
+                summary["updated_at"] = _updated_at_stat(opened)
+                summaries.append(summary)
+    except FileNotFoundError:
+        return []
     return summaries
 
 
@@ -487,3 +583,7 @@ def _selected_hypothesis(frame: Any) -> dict[str, Any] | None:
 
 def _updated_at(path: Path) -> str:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+
+
+def _updated_at_stat(info: os.stat_result) -> str:
+    return datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).isoformat()

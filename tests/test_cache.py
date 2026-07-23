@@ -25,12 +25,58 @@ async def test_cached_writes_under_configurable_repopilot_home(
 
     result = await fetch_value("alpha")
 
-    expected_path = repopilot_home / "cache" / f"{cache._cache_key('fetch_value', 'alpha')}.json"
+    expected_key = cache._cache_key(fetch_value, "alpha")
+    expected_path = repopilot_home / "cache" / f"{expected_key}.json"
     assert result == {"value": "alpha"}
     assert calls["count"] == 1
     assert expected_path.exists()
     assert expected_path.is_file()
-    assert cache._cache_path(cache._cache_key("fetch_value", "alpha")) == expected_path
+    assert cache._cache_path(expected_key) == expected_path
+
+
+def test_cache_key_includes_function_module_and_qualname(monkeypatch):
+    from src import cache
+
+    async def first(value):
+        return value
+
+    async def second(value):
+        return value
+
+    monkeypatch.setattr(first, "__module__", "package.one")
+    monkeypatch.setattr(first, "__qualname__", "fetch")
+    monkeypatch.setattr(second, "__module__", "package.two")
+    monkeypatch.setattr(second, "__qualname__", "fetch")
+
+    assert cache._cache_key(first, "x") != cache._cache_key(second, "x")
+
+
+def test_cache_key_uses_signature_binding_and_typed_arguments():
+    from src import cache
+
+    async def fetch(owner, limit=10):
+        return owner, limit
+
+    positional = cache._cache_key(fetch, "acme")
+    keyword = cache._cache_key(fetch, owner="acme", limit=10)
+
+    assert positional == keyword
+    assert cache._cache_key(fetch, 1) != cache._cache_key(fetch, "1")
+    assert cache._cache_key(fetch, ["acme"]) != cache._cache_key(fetch, ("acme",))
+
+
+def test_cache_key_rejects_unsupported_values_instead_of_stringifying_them():
+    from src import cache
+
+    class Ambiguous:
+        def __str__(self):
+            return "same"
+
+    async def fetch(value):
+        return value
+
+    with pytest.raises(TypeError, match="unsupported cache key value"):
+        cache._cache_key(fetch, Ambiguous())
 
 
 @pytest.mark.asyncio
@@ -280,7 +326,7 @@ async def test_github_cache_never_persists_or_logs_raw_token(
     await fetch_issue()
     await fetch_issue()
 
-    key = cache._cache_key("fetch_issue")
+    key = cache._cache_key(fetch_issue)
     files = list(cache.cache_dir().glob("*.json"))
     assert key.startswith("github-auth-")
     assert raw_token not in key

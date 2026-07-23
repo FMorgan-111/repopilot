@@ -187,6 +187,160 @@ def test_run_store_rejects_symlinked_runs_directory(tmp_path):
         run_store.save_run(paused_state("safe-id"), root_dir=root)
 
 
+def test_run_store_rejects_symlinked_root_directory(tmp_path):
+    real = tmp_path / "real-root"
+    real.mkdir()
+    root = tmp_path / "root"
+    root.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root directory"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
+def test_run_store_creates_missing_nested_root_through_anchored_walk(tmp_path):
+    root = tmp_path / "missing" / "nested" / "root"
+
+    saved = run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+    assert saved == root / "runs" / "safe-id.json"
+    assert run_store.load_run("safe-id", root_dir=root).trace_id == "safe-id"
+
+
+def test_run_store_rejects_symlinked_intermediate_root_component(tmp_path):
+    real = tmp_path / "real"
+    real.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root directory components"):
+        run_store.save_run(
+            paused_state("safe-id"), root_dir=linked / "nested" / "root"
+        )
+
+
+def test_run_store_rejects_runs_directory_swap_during_open(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    runs = root / "runs"
+    runs.mkdir(parents=True)
+    original_open = run_store.os.open
+    swapped = False
+
+    def swapping_open(path, flags, *args, **kwargs):
+        nonlocal swapped
+        if path == "runs" and kwargs.get("dir_fd") is not None and not swapped:
+            swapped = True
+            runs.rename(root / "old-runs")
+            runs.mkdir()
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(run_store.os, "open", swapping_open)
+
+    with pytest.raises(ValueError, match="changed while it was opened"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
+def test_list_runs_rejects_dangling_runs_symlink(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "runs").symlink_to(root / "missing", target_is_directory=True)
+
+    with pytest.raises(ValueError, match="runs directory"):
+        run_store.list_runs(root_dir=root)
+
+
+def test_first_runs_directory_creation_fsyncs_root(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    synced_identities = []
+    original_fsync = run_store.os.fsync
+
+    def recording_fsync(descriptor):
+        info = run_store.os.fstat(descriptor)
+        synced_identities.append((info.st_dev, info.st_ino, info.st_mode))
+        return original_fsync(descriptor)
+
+    monkeypatch.setattr(run_store.os, "fsync", recording_fsync)
+    run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+    parent_info = root.parent.stat()
+    assert (
+        parent_info.st_dev,
+        parent_info.st_ino,
+    ) in {(device, inode) for device, inode, _mode in synced_identities}
+    assert any(stat.S_ISDIR(mode) for _device, _inode, mode in synced_identities)
+
+
+def test_list_runs_uses_descriptor_anchored_timestamp(tmp_path, monkeypatch):
+    root = tmp_path / "root"
+    run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+    monkeypatch.setattr(
+        run_store,
+        "_updated_at",
+        lambda _path: pytest.fail("list_runs must not stat an unanchored path"),
+    )
+
+    [summary] = run_store.list_runs(root_dir=root)
+    inspected = run_store.inspect_run("safe-id", root_dir=root)
+
+    assert summary["run_id"] == "safe-id"
+    assert summary["updated_at"].endswith("+00:00")
+    assert inspected["updated_at"].endswith("+00:00")
+
+
+@pytest.mark.parametrize("failure", ["resolve", "stat", "open", "fstat"])
+def test_run_store_closes_descriptors_on_directory_validation_failure(
+    tmp_path, monkeypatch, failure
+):
+    root = tmp_path / "root"
+    (root / "runs").mkdir(parents=True)
+    before = len(os.listdir("/dev/fd"))
+
+    if failure == "resolve":
+        original = run_store.Path.resolve
+
+        def fail_resolve(self, *args, **kwargs):
+            if self == root:
+                raise OSError("injected resolve failure")
+            return original(self, *args, **kwargs)
+
+        monkeypatch.setattr(run_store.Path, "resolve", fail_resolve)
+    elif failure == "stat":
+        original = run_store.os.stat
+
+        def fail_stat(path, *args, **kwargs):
+            if path == root:
+                raise OSError("injected stat failure")
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(run_store.os, "stat", fail_stat)
+    elif failure == "open":
+        original = run_store.os.open
+
+        def fail_open(path, flags, *args, **kwargs):
+            if path == "runs":
+                raise OSError("injected open failure")
+            return original(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(run_store.os, "open", fail_open)
+    else:
+        original = run_store.os.fstat
+        calls = 0
+
+        def fail_fstat(descriptor):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("injected fstat failure")
+            return original(descriptor)
+
+        monkeypatch.setattr(run_store.os, "fstat", fail_fstat)
+
+    with pytest.raises((OSError, ValueError), match="injected|opened safely"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+    assert len(os.listdir("/dev/fd")) == before
+
+
 def test_run_store_rejects_non_directory_runs_path(tmp_path):
     root = tmp_path / "root"
     root.mkdir()

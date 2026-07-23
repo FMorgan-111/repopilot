@@ -27,7 +27,6 @@ import urllib.request as urllib_req
 from pathlib import Path
 from typing import Any
 
-import httpx
 from dotenv import load_dotenv
 
 # ── repo root ─────────────────────────────────────────────────────────────
@@ -35,38 +34,21 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-load_dotenv(REPO_ROOT / ".env", override=True)
+load_dotenv(REPO_ROOT / ".env", override=False)
 
 DEFAULT_BASE_URL = "https://linoapi.com.cn/v1"
 DEFAULT_MODEL = "gemini-3.5-flash:stable"
-_LLM_MODEL = os.getenv("LLM_MODEL", DEFAULT_MODEL)
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
-
-_llm_client: httpx.AsyncClient | None = None
+_bounded_llm_request = importlib.import_module("src.http_client").llm_request
+_model_provider = importlib.import_module("src.model_provider")
+get_model_config = _model_provider.get_model_config
+get_model_name = _model_provider.get_model_name
 
 
 def _get_llm_base_url() -> str:
-    return os.getenv("OPENAI_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-def _get_llm_api_key() -> str:
-    return (
-        os.getenv("LINOAPI_API_KEY")
-        or os.getenv("LLM_API_KEY")
-        or os.getenv("DEEPSEEK_API_KEY", "")
-    )
-
-
-def _get_client() -> httpx.AsyncClient:
-    global _llm_client
-    if _llm_client is None:
-        _llm_client = httpx.AsyncClient(
-            timeout=60.0,
-            limits=httpx.Limits(max_keepalive_connections=3, max_connections=6),
-        )
-    return _llm_client
+    return get_model_config("primary").base_url
 
 
 async def llm_request(
@@ -74,21 +56,12 @@ async def llm_request(
     model: str | None = None,
     temperature: float = 0.2,
 ) -> dict:
-    """Call the LLM API and return the raw response dict (includes usage)."""
-    url = f"{_get_llm_base_url()}/chat/completions"
-    payload = {
-        "model": model or _LLM_MODEL,
-        "messages": messages,
-        "temperature": temperature,
-    }
-    headers = {
-        "Authorization": f"Bearer {_get_llm_api_key()}",
-        "Content-Type": "application/json",
-    }
-    client = _get_client()
-    resp = await client.post(url, json=payload, headers=headers)
-    resp.raise_for_status()
-    return resp.json()
+    """Call the shared bounded LLM transport used by production."""
+    return await _bounded_llm_request(
+        messages,
+        model=model or get_model_name("primary"),
+        temperature=temperature,
+    )
 
 # ── paths ────────────────────────────────────────────────────────────────
 SAMPLES_PATH = REPO_ROOT / "data" / "samples" / "issues_fixes.jsonl"

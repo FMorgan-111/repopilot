@@ -84,6 +84,21 @@ def test_trace_utility_uses_the_shared_model_default():
     assert "setdefault('LLM_MODEL'" not in trace_source
 
 
+def test_runtime_entrypoints_preserve_explicit_environment_configuration():
+    main_source = _read("src/main.py")
+    harness_source = _read("eval/harness.py")
+
+    assert "load_dotenv(override=False)" in main_source
+    assert "load_dotenv(REPO_ROOT / \".env\", override=False)" in harness_source
+
+
+def test_authoritative_eval_workflow_uses_generic_llm_base_url():
+    workflow = _read(".github/workflows/swe-bench-oci-eval.yml")
+
+    assert "LLM_BASE_URL:" in workflow
+    assert "OPENAI_BASE_URL:" not in workflow
+
+
 def test_readme_documents_reproducible_swe_bench_evaluation():
     readme = _read("README.md")
 

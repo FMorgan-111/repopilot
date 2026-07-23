@@ -9,6 +9,7 @@ import pytest
 import src.nodes.execute as execute_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
+from src.nodes.commit import PRCancellationCleanupError
 from src.state import ModelInvocation, NoProgressEvent
 
 
@@ -601,6 +602,196 @@ async def test_fallback_graph_records_phase_timeout_diagnostic(monkeypatch):
     assert final_state.node_diagnostics[-1]["status"] == "timeout"
     assert final_state.node_diagnostics[-1]["error_type"] == "TimeoutError"
     assert final_state.node_diagnostics[-1]["phase_timeout_seconds"] == 0.01
+    assert "timeout_cause_type" not in final_state.node_diagnostics[-1]
+
+
+async def test_fallback_graph_preserves_redacted_pr_cleanup_timeout_cause(
+    monkeypatch,
+):
+    secret = "sk-" + "timeout-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                27,
+                cancellation,
+                OSError(f"close failed Authorization: Bearer {secret}"),
+            )
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph(
+        {"commit_fix": cleanup_fails_on_cancel}, "commit_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "timed out" in final_state.failure_reason
+    assert "pull request 27" in final_state.failure_reason
+    assert "OSError" in final_state.failure_reason
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_pr_number"] == 27
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+
+
+async def test_wrapped_node_preserves_redacted_pr_cleanup_timeout_cause(
+    monkeypatch,
+):
+    secret = "sk-" + "wrapped-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                31,
+                cancellation,
+                RuntimeError(f"cleanup token={secret}"),
+            )
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    wrapped = new_agent._wrap_node("commit_fix", cleanup_fails_on_cancel)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "timed out" in final_state.failure_reason
+    assert "pull request 31" in final_state.failure_reason
+    assert "RuntimeError" in final_state.failure_reason
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "RuntimeError"
+    assert diagnostic["cleanup_pr_number"] == 31
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+
+
+async def test_built_fallback_graph_preserves_pr_cleanup_timeout_cause(
+    monkeypatch, capsys,
+):
+    secret = "sk-" + "built-fallback-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                37,
+                cancellation,
+                OSError(f"close failed token={secret}"),
+            )
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "commit_fix", cleanup_fails_on_cancel)
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    compiled = new_agent.build_agent_graph(
+        start_phase=new_agent.Phase.COMMIT
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_pr_number"] == 37
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+    progress = [
+        line for line in capsys.readouterr().err.splitlines()
+        if "commit_fix" in line
+    ]
+    assert len(progress) == 2
+    assert "START" in progress[0]
+    assert "TIMEOUT" in progress[1]
+
+
+async def test_fallback_graph_does_not_persist_direct_timeout_message():
+    secret = "sk-" + "fallback-direct-timeout-secret-123456789"
+
+    async def direct_timeout(_state):
+        raise asyncio.TimeoutError(
+            f"Authorization: Bearer {secret}"
+        )
+
+    compiled = graph.FallbackCompiledGraph(
+        {"plan_fix": direct_timeout}, "plan_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["error"] == "TimeoutError"
+    assert "timeout_cause_type" not in diagnostic
+    assert secret not in json.dumps(diagnostic)
+
+
+async def test_wrapped_node_does_not_persist_direct_timeout_message():
+    secret = "sk-" + "wrapped-direct-timeout-secret-123456789"
+
+    async def direct_timeout(_state):
+        raise asyncio.TimeoutError(f"token={secret}")
+
+    wrapped = new_agent._wrap_node("commit_fix", direct_timeout)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["error"] == "TimeoutError"
+    assert "timeout_cause_type" not in diagnostic
+    assert secret not in json.dumps(diagnostic)
 
 
 async def test_phase_timeout_preserves_existing_node_diagnostics(monkeypatch):

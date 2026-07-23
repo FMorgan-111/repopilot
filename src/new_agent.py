@@ -143,11 +143,17 @@ def _wrap_node(name: str, fn: Any, *, record_route_decision: bool = False) -> An
         print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} START", file=sys.stderr, flush=True)
         try:
             result = await asyncio.wait_for(fn(state), timeout=timeout)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             elapsed = _time.monotonic() - t0
             print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} TIMEOUT ({elapsed:.1f}s)", file=sys.stderr, flush=True)
             s = _as_state(state)
-            s.failure_reason = f"Phase {name} timed out after {timeout}s"
+            from .timeout_diagnostics import extract_timeout_cleanup_evidence
+
+            cleanup_evidence = extract_timeout_cleanup_evidence(exc)
+            failure_reason = f"Phase {name} timed out after {timeout}s"
+            if cleanup_evidence is not None:
+                failure_reason += f"; {cleanup_evidence.summary()}"
+            s.failure_reason = failure_reason
             s.current_phase = Phase.FAILURE
             _record_node_diagnostic(
                 s,
@@ -157,6 +163,11 @@ def _wrap_node(name: str, fn: Any, *, record_route_decision: bool = False) -> An
                 elapsed_seconds=elapsed,
                 error=asyncio.TimeoutError(),
                 phase_timeout_seconds=timeout,
+                **(
+                    cleanup_evidence.diagnostic_details()
+                    if cleanup_evidence is not None
+                    else {}
+                ),
             )
             if record_route_decision:
                 route_from_state(s)
@@ -201,15 +212,15 @@ def build_agent_graph(start_phase: Phase = Phase.UNDERSTAND) -> Any:
     if StateGraph is None:
         graph = FallbackStateGraph()
         for name, fn in {
-            "understand_issue": _w("understand_issue", understand_issue),
-            "locate_code": _w("locate_code", locate_code),
-            "plan_fix": _w("plan_fix", plan_fix),
-            "reflect_on_failure": _w("reflect_on_failure", reflect_on_failure),
-            "execute_fix": _w("execute_fix", execute_fix),
-            "verify_fix": _w("verify_fix", verify_fix),
-            "ensure_coverage": _w("ensure_coverage", ensure_coverage),
-            "commit_fix": _w("commit_fix", commit_fix),
-            "handle_failure": _w("handle_failure", handle_failure),
+            "understand_issue": understand_issue,
+            "locate_code": locate_code,
+            "plan_fix": plan_fix,
+            "reflect_on_failure": reflect_on_failure,
+            "execute_fix": execute_fix,
+            "verify_fix": verify_fix,
+            "ensure_coverage": ensure_coverage,
+            "commit_fix": commit_fix,
+            "handle_failure": handle_failure,
         }.items():
             graph.add_node(name, fn)
         graph.set_entry_point(entry_point)

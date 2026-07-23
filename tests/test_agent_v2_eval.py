@@ -118,62 +118,25 @@ def test_legacy_harness_default_model_is_gemini_flash():
     assert harness.DEFAULT_MODEL == "gemini-3.5-flash:stable"
 
 
-def test_legacy_harness_base_url_falls_back_to_linoapi(monkeypatch):
+def test_legacy_harness_uses_primary_model_provider(monkeypatch):
     from eval import harness
 
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-
-    assert harness._get_llm_base_url() == "https://linoapi.com.cn/v1"
-
-
-def test_legacy_harness_base_url_honors_normalized_override(monkeypatch):
-    from eval import harness
-
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://example.test/v1/")
+    monkeypatch.setenv("LLM_BASE_URL", "https://example.test/v1/")
+    monkeypatch.setenv("LLM_API_KEY", "primary-key")
 
     assert harness._get_llm_base_url() == "https://example.test/v1"
 
 
-@pytest.mark.parametrize(
-    ("variable", "value"),
-    [
-        ("LINOAPI_API_KEY", "lino-key"),
-        ("LLM_API_KEY", "llm-key"),
-        ("DEEPSEEK_API_KEY", "deepseek-key"),
-    ],
-)
-def test_legacy_harness_resolves_each_supported_api_key(
-    monkeypatch, variable, value
-):
+def test_legacy_harness_rejects_cross_vendor_key_fallbacks(monkeypatch):
     from eval import harness
 
-    for name in ("LINOAPI_API_KEY", "LLM_API_KEY", "DEEPSEEK_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv(variable, value)
-
-    assert harness._get_llm_api_key() == value
-
-
-def test_legacy_harness_api_key_precedence_matches_production(monkeypatch):
-    from eval import harness
-
+    monkeypatch.delenv("LLM_API_KEY", raising=False)
     monkeypatch.setenv("LINOAPI_API_KEY", "lino-key")
-    monkeypatch.setenv("LLM_API_KEY", "llm-key")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
 
-    assert harness._get_llm_api_key() == "lino-key"
-
-    monkeypatch.delenv("LINOAPI_API_KEY")
-    assert harness._get_llm_api_key() == "llm-key"
-
-
-def test_legacy_harness_api_key_falls_back_to_empty(monkeypatch):
-    from eval import harness
-
-    for name in ("LINOAPI_API_KEY", "LLM_API_KEY", "DEEPSEEK_API_KEY"):
-        monkeypatch.delenv(name, raising=False)
-
-    assert harness._get_llm_api_key() == ""
+    with pytest.raises(ValueError, match="LLM_API_KEY"):
+        harness._get_llm_base_url()
 
 
 @pytest.mark.parametrize(
@@ -193,31 +156,34 @@ def test_eval_escalation_requires_explicit_flag_and_key(
     assert agent_v2_harness.escalation_is_configured() is expected
 
 
-async def test_legacy_harness_llm_request_resolves_api_key_at_request_time(
-    monkeypatch,
-):
+async def test_legacy_harness_llm_request_uses_bounded_shared_client(monkeypatch):
     from eval import harness
 
     captured = {}
 
-    class FakeResponse:
-        def raise_for_status(self):
-            return None
+    async def fake_bounded_request(messages, *, model, temperature):
+        captured.update(
+            messages=messages,
+            model=model,
+            temperature=temperature,
+        )
+        return {"choices": []}
 
-        def json(self):
-            return {"choices": []}
+    monkeypatch.setattr(harness, "_bounded_llm_request", fake_bounded_request)
+    monkeypatch.setattr(
+        harness, "get_model_name", lambda role="primary": "shared-model"
+    )
 
-    class FakeClient:
-        async def post(self, url, *, json, headers):
-            captured.update(headers)
-            return FakeResponse()
+    result = await harness.llm_request(
+        [{"role": "user", "content": "hi"}], temperature=0.1
+    )
 
-    monkeypatch.setattr(harness, "_get_client", lambda: FakeClient())
-    monkeypatch.setenv("LINOAPI_API_KEY", "request-time-key")
-
-    await harness.llm_request([{"role": "user", "content": "hi"}])
-
-    assert captured["Authorization"] == "Bearer request-time-key"
+    assert result == {"choices": []}
+    assert captured == {
+        "messages": [{"role": "user", "content": "hi"}],
+        "model": "shared-model",
+        "temperature": 0.1,
+    }
 
 
 def sample_record():
