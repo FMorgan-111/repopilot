@@ -555,25 +555,27 @@ async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
         ),
     ]
     last_error = ""
-    try:
-        for command in strategies:
-            try:
-                result = await _run_git_async(command, timeout=300)
-            except asyncio.TimeoutError:
-                last_error = "clone timed out"
-                _checked_remove_tree(cache_path)
-                continue
+    for command in strategies:
+        try:
+            result = await _run_git_async(command, timeout=300)
             if result.returncode == 0:
                 _remove_git_fetch_head(cache_path)
                 return
-            last_error = _redact_sensitive_error_text(
+        except asyncio.TimeoutError as failure:
+            last_error = "clone timed out"
+            _remove_tree_after_failure(cache_path, failure)
+            continue
+        except BaseException as failure:
+            _remove_tree_after_failure(cache_path, failure)
+            raise
+        clone_failure = RuntimeError(
+            _redact_sensitive_error_text(
                 (result.stderr or result.stdout).strip()
             )
-            _checked_remove_tree(cache_path)
-        raise RuntimeError(last_error)
-    except BaseException as failure:
-        _remove_tree_after_failure(cache_path, failure)
-        raise
+        )
+        last_error = str(clone_failure)
+        _remove_tree_after_failure(cache_path, clone_failure)
+    raise RuntimeError(last_error)
 
 
 async def git_clone(state: AgentState) -> str:

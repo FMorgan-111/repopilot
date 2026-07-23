@@ -979,6 +979,78 @@ async def test_cleanup_failure_is_chained_from_original_cancellation(
     assert str(caught.value.__cause__) == "original cancellation"
 
 
+async def test_live_clone_timeout_cleanup_failure_preserves_timeout(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    original_timeout = asyncio.TimeoutError("synthetic clone timeout")
+    clone_attempts = 0
+    cleanup_attempts = 0
+
+    async def run_git(_args, timeout, cwd=None):
+        nonlocal clone_attempts
+        clone_attempts += 1
+        (cache / ".git").mkdir(parents=True, exist_ok=True)
+        raise original_timeout
+
+    def failed_cleanup(_path):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        raise RuntimeError("injected timeout cleanup failure")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    monkeypatch.setattr(execute_node, "_checked_remove_tree", failed_cleanup)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected timeout cleanup failure",
+    ) as caught:
+        await execute_node._populate_live_cache(state, cache)
+
+    assert caught.value.__cause__ is original_timeout
+    assert clone_attempts == 1
+    assert cleanup_attempts == 1
+
+
+async def test_live_clone_result_cleanup_failure_preserves_clone_failure(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    clone_attempts = 0
+    cleanup_attempts = 0
+
+    async def run_git(_args, timeout, cwd=None):
+        nonlocal clone_attempts
+        clone_attempts += 1
+        (cache / ".git").mkdir(parents=True, exist_ok=True)
+        return execute_node._ProcResult(
+            128,
+            "",
+            "fatal: synthetic clone transport failure",
+        )
+
+    def failed_cleanup(_path):
+        nonlocal cleanup_attempts
+        cleanup_attempts += 1
+        raise RuntimeError("injected result cleanup failure")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    monkeypatch.setattr(execute_node, "_checked_remove_tree", failed_cleanup)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected result cleanup failure",
+    ) as caught:
+        await execute_node._populate_live_cache(state, cache)
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert str(caught.value.__cause__) == "fatal: synthetic clone transport failure"
+    assert clone_attempts == 1
+    assert cleanup_attempts == 1
+
+
 def test_workflow_never_enables_unsafe_host_execution():
     workflow = Path(".github/workflows/swe-bench-oci-eval.yml").read_text(
         encoding="utf-8"
