@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,39 @@ DATASET_CACHE_KEY = (
     "c104f840cc67f8b6eec6f759ebc8b2693d585d4a-"
     "f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c-v2"
 )
+LOCK_INSTALL = (
+    "python -m pip install --require-hashes -r requirements-eval.lock"
+)
+PROJECT_INSTALL = (
+    "python -m pip install --no-deps --no-build-isolation -e ."
+)
+ACTION_PINS = {
+    "actions/checkout": (
+        "11d5960a326750d5838078e36cf38b85af677262",
+        "v4",
+        3,
+    ),
+    "actions/setup-python": (
+        "a26af69be951a213d495a4c3e4e4022e16d87065",
+        "v5",
+        3,
+    ),
+    "actions/cache": (
+        "0057852bfaa89a56745cba8c7296529d2fc39830",
+        "v4",
+        1,
+    ),
+    "actions/upload-artifact": (
+        "ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "v4",
+        2,
+    ),
+    "actions/download-artifact": (
+        "d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "v4",
+        1,
+    ),
+}
 
 
 def _workflow_text() -> str:
@@ -47,6 +81,101 @@ def _mapping_block(text: str, key: str, indent: int) -> str:
     return "\n".join(lines[start:end])
 
 
+def _job_block(text: str, name: str) -> str:
+    return _mapping_block(_mapping_block(text, "jobs", 0), name, 2)
+
+
+def _step_blocks(job: str) -> list[tuple[str, str]]:
+    matches = list(re.finditer(r"(?m)^      - name: (?P<name>[^\n]+)$", job))
+    return [
+        (
+            match.group("name"),
+            job[
+                match.start() : (
+                    matches[index + 1].start()
+                    if index + 1 < len(matches)
+                    else len(job)
+                )
+            ],
+        )
+        for index, match in enumerate(matches)
+    ]
+
+
+def _pip_install_commands(text: str) -> list[str]:
+    pattern = re.compile(
+        r"(?:^|\s)(?:python\s+-m\s+|uv\s+)?pip(?:3)?\s+install(?:\s|$)"
+    )
+    return [
+        line.strip().removeprefix("run: ").strip()
+        for line in text.splitlines()
+        if pattern.search(line)
+    ]
+
+
+def _assert_action_pins(text: str) -> None:
+    uses_lines = [line for line in text.splitlines() if "uses:" in line]
+    parsed: list[tuple[str, str, str]] = []
+    for line in uses_lines:
+        match = re.fullmatch(
+            r"\s+uses: ([a-z0-9_.-]+/[a-z0-9_.-]+)@([0-9a-f]{40}) # (v[0-9]+)",
+            line,
+        )
+        assert match is not None, f"mutable or malformed action reference: {line}"
+        parsed.append(match.groups())
+
+    assert Counter(parsed) == Counter(
+        {
+            (action, commit, tag): count
+            for action, (commit, tag, count) in ACTION_PINS.items()
+        }
+    )
+
+
+def _assert_immutable_install_contract(text: str) -> None:
+    execution_steps = {
+        "prepare": "Build tracked instance matrix",
+        "instance": "Prepare OCI runtime",
+        "aggregate": "Aggregate verified artifacts",
+    }
+    jobs = _mapping_block(text, "jobs", 0)
+    assert re.findall(r"(?m)^  ([a-zA-Z_-]+):", jobs) == list(execution_steps)
+    all_install_lines = _pip_install_commands(text)
+    assert Counter(all_install_lines) == Counter(
+        {LOCK_INSTALL: 3, PROJECT_INSTALL: 3}
+    )
+
+    for job_name, first_execution in execution_steps.items():
+        steps = _step_blocks(_job_block(text, job_name))
+        names = [name for name, _block in steps]
+        lock_indexes = [
+            index for index, (_name, block) in enumerate(steps) if LOCK_INSTALL in block
+        ]
+        project_indexes = [
+            index
+            for index, (_name, block) in enumerate(steps)
+            if PROJECT_INSTALL in block
+        ]
+        assert len(lock_indexes) == 1
+        assert len(project_indexes) == 1
+        assert lock_indexes[0] < project_indexes[0] < names.index(first_execution)
+
+        install_blocks = [
+            block for _name, block in steps if _pip_install_commands(block)
+        ]
+        assert len(install_blocks) == 2
+        assert all("secrets." not in block for block in install_blocks)
+
+    instance_steps = _step_blocks(_job_block(text, "instance"))
+    instance_names = [name for name, _block in instance_steps]
+    generate_index = instance_names.index("Generate patch")
+    assert all(
+        index < generate_index
+        for index, (_name, block) in enumerate(instance_steps)
+        if _pip_install_commands(block)
+    )
+
+
 def _assert_manual_workflow_contract(text: str) -> None:
     triggers = _mapping_block(text, "on", 0)
     assert re.findall(r"(?m)^  ([a-zA-Z_-]+):", triggers) == ["workflow_dispatch"]
@@ -79,7 +208,10 @@ def _assert_workflow_concurrency_contract(text: str) -> None:
 def _assert_public_dataset_cache_contract(text: str) -> None:
     cache = _named_step(text, "Restore public SWE-bench dataset cache")
     assert re.findall(r"(?m)^        ([a-zA-Z_-]+):", cache) == ["uses", "with"]
-    assert re.findall(r"(?m)^        uses: (.+)$", cache) == ["actions/cache@v4"]
+    cache_commit, cache_tag, _count = ACTION_PINS["actions/cache"]
+    assert re.findall(r"(?m)^        uses: (.+)$", cache) == [
+        f"actions/cache@{cache_commit} # {cache_tag}"
+    ]
     assert re.findall(r"(?m)^          key: (.+)$", cache) == [
         DATASET_CACHE_KEY
     ]
@@ -144,8 +276,10 @@ def test_workflow_cache_is_public_dataset_only() -> None:
 
 def test_public_dataset_cache_contract_rejects_near_matches() -> None:
     text = _workflow_text()
+    cache_commit, cache_tag, _count = ACTION_PINS["actions/cache"]
+    pinned_cache = f"actions/cache@{cache_commit} # {cache_tag}"
     mutations = (
-        text.replace("actions/cache@v4", "actions/cache@v4-extra", 1),
+        text.replace(pinned_cache, f"{pinned_cache}-extra", 1),
         text.replace(
             f"key: {DATASET_CACHE_KEY}",
             f"key: {DATASET_CACHE_KEY}-extra",
@@ -161,6 +295,58 @@ def test_public_dataset_cache_contract_rejects_near_matches() -> None:
     for mutation in mutations:
         with pytest.raises(AssertionError):
             _assert_public_dataset_cache_contract(mutation)
+
+
+def test_workflow_actions_use_exact_audited_commits_and_tag_comments() -> None:
+    _assert_action_pins(_workflow_text())
+
+
+def test_action_pin_contract_rejects_mutable_or_unapproved_references() -> None:
+    text = _workflow_text()
+    checkout_commit, checkout_tag, _count = ACTION_PINS["actions/checkout"]
+    checkout = f"actions/checkout@{checkout_commit} # {checkout_tag}"
+    mutations = (
+        text.replace(checkout, "actions/checkout@v4", 1),
+        text.replace(checkout, f"actions/checkout@{'0' * 40} # v4", 1),
+        text.replace(checkout, f"other/checkout@{checkout_commit} # v4", 1),
+        text.replace(checkout, f"actions/checkout@{checkout_commit} # v5", 1),
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            _assert_action_pins(mutation)
+
+
+def test_every_job_uses_only_hash_locked_then_isolated_project_install() -> None:
+    _assert_immutable_install_contract(_workflow_text())
+
+
+def test_install_contract_rejects_unconstrained_or_secret_bearing_steps() -> None:
+    text = _workflow_text()
+    mutations = (
+        text.replace(LOCK_INSTALL, "python -m pip install -r requirements-eval.lock", 1),
+        text.replace(PROJECT_INSTALL, 'python -m pip install -e ".[memory,eval]"', 1),
+        text.replace(
+            f"        run: {LOCK_INSTALL}",
+            f"        env:\n          TOKEN: ${{{{ secrets.LLM_API_KEY }}}}\n"
+            f"        run: {LOCK_INSTALL}",
+            1,
+        ),
+        text.replace(
+            f"        run: {PROJECT_INSTALL}",
+            f"        run: {PROJECT_INSTALL} && python -m pip install requests",
+            1,
+        ),
+        text.replace(
+            f"        run: {PROJECT_INSTALL}",
+            "        run: |\n"
+            f"          {PROJECT_INSTALL}\n"
+            "          pip install requests",
+            1,
+        ),
+    )
+    for mutation in mutations:
+        with pytest.raises(AssertionError):
+            _assert_immutable_install_contract(mutation)
 
 
 def test_workflow_uses_one_instance_per_job_and_two_way_bound() -> None:

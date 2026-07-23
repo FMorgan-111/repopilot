@@ -1,0 +1,22 @@
+# RepoPilot runtime dependencies from pyproject.toml.
+aiosqlite
+fastapi
+httpx
+pydantic
+python-dotenv
+tenacity
+uvicorn
+langgraph
+
+# Optional memory dependencies used by evaluation runs.
+fastembed>=0.8,<0.9
+numpy>=1.24,<3
+sqlite-vec>=0.1.9,<0.2
+
+# SWE-bench evaluation dependencies.
+datasets>=3,<5
+swebench>=4.1,<5
+
+# Build tooling required by the no-build-isolation editable install.
+setuptools>=61
+wheel

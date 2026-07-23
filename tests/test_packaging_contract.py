@@ -19,6 +19,10 @@ _FIXED_EVAL_ID_FILES = (
     "eval/baseline_50_ids.txt",
     "eval/checkpoint_5_ids.txt",
 )
+_EVAL_REQUIREMENT_FILES = (
+    "requirements-eval.in",
+    "requirements-eval.lock",
+)
 
 
 def _dependency_names(dependencies: list[str]) -> set[str]:
@@ -26,6 +30,27 @@ def _dependency_names(dependencies: list[str]) -> set[str]:
         re.split(r"[<>=!~;\[]", dependency, maxsplit=1)[0].strip().lower()
         for dependency in dependencies
     }
+
+
+def _requirement_lines(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _locked_requirement_records(path: Path) -> list[list[str]]:
+    records: list[list[str]] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        if raw_line == raw_line.lstrip():
+            records.append([raw_line])
+        else:
+            assert records, f"orphaned lock continuation: {raw_line}"
+            records[-1].append(raw_line)
+    return records
 
 
 def test_memory_and_dev_extras_cover_optional_runtime_and_test_dependencies():
@@ -84,6 +109,81 @@ def test_fixed_eval_id_contract_files_are_not_ignored():
     )
 
     assert ignored.returncode == 1, ignored.stdout
+
+
+def test_eval_requirement_inputs_are_tracked_release_files() -> None:
+    for relative_path in _EVAL_REQUIREMENT_FILES:
+        assert (ROOT / relative_path).is_file()
+
+    tracked = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", *_EVAL_REQUIREMENT_FILES],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert tracked.returncode == 0, tracked.stderr
+
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", *_EVAL_REQUIREMENT_FILES],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert ignored.returncode == 1, ignored.stdout
+
+
+def test_eval_requirement_input_explicitly_covers_all_workflow_dependencies() -> None:
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    project = metadata["project"]
+    declared = _dependency_names(
+        _requirement_lines(ROOT / "requirements-eval.in")
+    )
+    required = _dependency_names(
+        project["dependencies"]
+        + project["optional-dependencies"]["memory"]
+        + project["optional-dependencies"]["eval"]
+        + metadata["build-system"]["requires"]
+    )
+
+    assert required | {"wheel"} <= declared
+    assert not any(
+        line.startswith(("-e ", ".", "-r ", "--requirement "))
+        for line in _requirement_lines(ROOT / "requirements-eval.in")
+    )
+
+
+def test_eval_lock_is_fully_pinned_and_hash_covered() -> None:
+    records = _locked_requirement_records(ROOT / "requirements-eval.lock")
+    assert records
+
+    locked_names: set[str] = set()
+    for record in records:
+        requirement = record[0].removesuffix("\\").strip()
+        match = re.fullmatch(
+            r"(?P<name>[A-Za-z0-9][A-Za-z0-9_.-]*)==[^\s;\\]+"
+            r"(?:\s*;\s*[^\\]+)?",
+            requirement,
+        )
+        assert match is not None, f"lock entry is not exactly pinned: {record[0]}"
+        locked_names.add(match.group("name").lower().replace("_", "-"))
+
+        rendered = " ".join(line.strip() for line in record)
+        hashes = re.findall(r"--hash=sha256:([0-9a-f]{64})(?:\s|\\|$)", rendered)
+        assert hashes, f"lock entry has no SHA-256 hash: {record[0]}"
+        without_hashes = re.sub(
+            r"\s*\\?\s*--hash=sha256:[0-9a-f]{64}", "", rendered
+        ).replace("\\", "").strip()
+        assert without_hashes == requirement
+
+    input_names = {
+        name.replace("_", "-")
+        for name in _dependency_names(
+            _requirement_lines(ROOT / "requirements-eval.in")
+        )
+    }
+    assert input_names <= locked_names
 
 
 def test_base_install_can_use_disabled_episode_memory_without_numpy():
