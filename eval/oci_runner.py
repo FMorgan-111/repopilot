@@ -35,6 +35,7 @@ from eval.swe_bench import (
     serialize_verified_rows,
     verified_row_sha256,
 )
+from src.exception_safety import normalize_exception_class
 from src.safe_subprocess import (
     BoundedProcessResult,
     ProcessTimeoutError,
@@ -137,6 +138,11 @@ def _runtime_record(
     row_sha256: str = "",
     error: BaseException | None = None,
 ) -> RuntimeRecord:
+    error_class = ""
+    if error is not None:
+        error_class = (
+            normalize_exception_class(error) or "RuntimeInfrastructureError"
+        )
     return RuntimeRecord(
         mode=mode,
         instance_id=instance_id,
@@ -145,7 +151,7 @@ def _runtime_record(
         remote_image=remote_image,
         image_sha=image_sha,
         row_sha256=row_sha256,
-        error_class=type(error).__name__ if error is not None else "",
+        error_class=error_class,
     )
 
 
@@ -497,7 +503,7 @@ def _project_official_report(
 
 def _scorer_infrastructure_result(
     runtime: RuntimeRecord,
-    error_class: str,
+    error: Any,
 ) -> OfficialResult:
     return OfficialResult(
         instance_id=runtime.instance_id,
@@ -505,7 +511,9 @@ def _scorer_infrastructure_result(
         submitted=False,
         completed=False,
         resolved=False,
-        error_class=error_class or "ScorerInfrastructureError",
+        error_class=(
+            normalize_exception_class(error) or "ScorerInfrastructureError"
+        ),
     )
 
 
@@ -619,7 +627,7 @@ def score_instance(
             raise OfficialReportContractError("official report must be an object")
         result = _project_official_report(report, runtime.instance_id)
     except Exception as exc:
-        result = _scorer_infrastructure_result(runtime, type(exc).__name__)
+        result = _scorer_infrastructure_result(runtime, exc)
     finally:
         os.chdir(original_cwd)
         if alias_created:
@@ -630,7 +638,7 @@ def score_instance(
                 )
             except Exception as exc:
                 result = _scorer_infrastructure_result(
-                    runtime, type(exc).__name__
+                    runtime, exc
                 )
     write_model(output_dir / "official_result.json", result)
     return result

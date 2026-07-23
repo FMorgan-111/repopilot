@@ -20,9 +20,8 @@ from pydantic import (
     model_validator,
 )
 
-from eval.safe_contracts import normalize_exception_class
-
 from .evaluator_safety import contains_evaluator_only, sanitize_evaluator_text
+from .exception_safety import normalize_exception_class
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
 

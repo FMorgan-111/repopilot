@@ -13,6 +13,15 @@ import unicodedata
 from pathlib import PurePosixPath
 from typing import Any
 
+from src.exception_safety import (
+    MODEL_GATEWAY_ERROR_CLASSES,
+)
+from src.exception_safety import (
+    normalize_exception_class as _normalize_exception_class,
+)
+
+normalize_exception_class = _normalize_exception_class
+
 VERIFIED_COVERAGE_STATUSES = frozenset(
     {"existing_verified", "generated_verified"}
 )
@@ -125,30 +134,9 @@ _MODEL_INVOCATION_NODES = frozenset(
         "outcome_summary",
     }
 )
-_MODEL_GATEWAY_ERROR_CLASSES = frozenset(
-    {
-        "APIConnectionError",
-        "APITimeoutError",
-        "ConnectError",
-        "ConnectTimeout",
-        "GatewayError",
-        "HTTPStatusError",
-        "PoolTimeout",
-        "RateLimitError",
-        "ReadError",
-        "ReadTimeout",
-        "RemoteProtocolError",
-        "TimeoutError",
-        "WriteError",
-        "WriteTimeout",
-    }
-)
-_SAFE_EXCEPTION_CLASS_RE = re.compile(
-    r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)"
-)
 _GENERATE_PLAN_GATEWAY_RE = re.compile(
     r"(?i)failed to generate fix plan:\s*(?:"
-    + "|".join(sorted(_MODEL_GATEWAY_ERROR_CLASSES))
+    + "|".join(sorted(MODEL_GATEWAY_ERROR_CLASSES))
     + r")\b"
 )
 
@@ -214,19 +202,6 @@ def safe_float(value: Any, default: float = 0.0) -> float:
 def normalize_official_resolved(value: Any) -> bool | None:
     """Only an actual JSON boolean is an official scorer result."""
     return value if type(value) is bool else None
-
-
-def normalize_exception_class(value: Any) -> str:
-    """Return only a safe exception type name, including gateway timeouts."""
-    if isinstance(value, BaseException):
-        candidate = type(value).__name__
-    else:
-        candidate = str(value or "").strip().partition(":")[0].strip()
-    if candidate in _MODEL_GATEWAY_ERROR_CLASSES:
-        return candidate
-    if _SAFE_EXCEPTION_CLASS_RE.fullmatch(candidate):
-        return candidate
-    return ""
 
 
 def _canonical_test_path(value: Any) -> str | None:
@@ -414,7 +389,7 @@ def has_structured_model_gateway_failure(sample: Any) -> bool:
             if (
                 invocation.get("node") in _MODEL_INVOCATION_NODES
                 and invocation.get("status") == "error"
-                and invocation.get("error_class") in _MODEL_GATEWAY_ERROR_CLASSES
+                and invocation.get("error_class") in MODEL_GATEWAY_ERROR_CLASSES
             ):
                 return True
     return False

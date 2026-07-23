@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -108,6 +109,44 @@ assert 'numpy' not in sys.modules
     subprocess.run(
         [sys.executable, "-c", code],
         cwd=ROOT,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_shipped_src_imports_state_and_cli_without_eval_package(
+    tmp_path: Path,
+) -> None:
+    shutil.copytree(
+        ROOT / "src",
+        tmp_path / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    code = """
+from pathlib import Path
+import os
+import src
+import src.state
+import src.cli
+
+source_root = Path(os.environ["REPOPILOT_TEST_SOURCE_ROOT"]).resolve()
+assert source_root not in {
+    Path(entry).resolve() for entry in __import__("sys").path if entry
+}
+assert Path(src.__file__).resolve().is_relative_to(
+    Path(os.environ["REPOPILOT_TEST_SHIPPED_ROOT"]).resolve()
+)
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(tmp_path)
+    env["REPOPILOT_TEST_SOURCE_ROOT"] = str(ROOT)
+    env["REPOPILOT_TEST_SHIPPED_ROOT"] = str(tmp_path)
+
+    subprocess.run(
+        [sys.executable, "-P", "-c", code],
+        cwd=tmp_path,
         env=env,
         check=True,
         capture_output=True,

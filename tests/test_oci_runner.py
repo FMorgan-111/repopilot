@@ -14,6 +14,7 @@ from eval.oci_runner import (
     OciImageInfrastructureError,
     _pull_and_pin_image,
     generate_instance,
+    package_instance,
     prepare_instance,
     score_instance,
 )
@@ -292,6 +293,53 @@ def test_prepare_records_dataset_infrastructure_without_docker(
     assert record.error_class == "ConnectionError"
     assert record.image_sha == ""
     assert docker_called is False
+
+
+async def test_arbitrary_dataset_exception_remains_packageable_infrastructure(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "output"
+    artifact_dir = tmp_path / "artifact"
+
+    def fail_dataset(instance_id: str):
+        raise StopIteration
+
+    runtime = prepare_instance(
+        "checkpoint_5",
+        INSTANCE_ID,
+        output_dir,
+        row_loader=fail_dataset,
+        command_runner=lambda argv, **kwargs: pytest.fail(
+            "Docker must not run after a dataset failure"
+        ),
+        commit_loader=lambda: COMMIT_SHA,
+    )
+    assert runtime.error_class == "RuntimeInfrastructureError"
+
+    await generate_instance(output_dir / "runtime.json", output_dir)
+    official = score_instance(
+        output_dir / "runtime.json",
+        output_dir,
+        scorer=lambda **kwargs: pytest.fail(
+            "The official scorer must not run for infrastructure"
+        ),
+    )
+    manifest = package_instance(
+        output_dir / "runtime.json",
+        output_dir,
+        artifact_dir,
+        row_loader=lambda instance_id: pytest.fail(
+            "A failed dataset must not be loaded while packaging"
+        ),
+    )
+
+    assert official.status == "scorer_infra"
+    assert official.error_class == "RuntimeInfrastructureError"
+    assert manifest.runtime_status == "dataset_infra"
+    persisted = json.loads(
+        (artifact_dir / "official_result.json").read_text(encoding="utf-8")
+    )
+    assert persisted["error_class"] == "RuntimeInfrastructureError"
 
 
 def test_prepare_rejects_non_official_image_before_pull(tmp_path: Path) -> None:
@@ -697,6 +745,33 @@ def test_score_fails_closed_when_private_dataset_write_fails(
     assert result.status == "scorer_infra"
     assert result.error_class == "OSError"
     assert scorer_called is False
+
+
+def test_score_normalizes_arbitrary_scorer_exception(
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    (tmp_path / "prediction.jsonl").write_text("{}\n", encoding="utf-8")
+    tags = {OFFICIAL_IMAGE: IMAGE_SHA, IMAGE_SHA: IMAGE_SHA}
+    commands: list[list[str]] = []
+
+    def fail_scorer(**kwargs):
+        raise StopIteration
+
+    result = score_instance(
+        runtime_path,
+        tmp_path,
+        scorer=fail_scorer,
+        command_runner=_docker_alias_runner(tags, commands),
+        row_loader=_row_loader,
+    )
+
+    assert result.status == "scorer_infra"
+    assert result.error_class == "ScorerInfrastructureError"
+    persisted = json.loads(
+        (tmp_path / "official_result.json").read_text(encoding="utf-8")
+    )
+    assert persisted["error_class"] == "ScorerInfrastructureError"
 
 
 def test_infrastructure_runtime_skips_official_scorer(tmp_path: Path) -> None:

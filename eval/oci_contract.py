@@ -17,15 +17,13 @@ from pydantic import (
     model_validator,
 )
 
-from eval.safe_contracts import (
-    has_verified_coverage_proof,
-    normalize_exception_class,
-)
+from eval.safe_contracts import has_verified_coverage_proof
 from eval.swe_bench import (
     DATASET_NAME,
     DATASET_REVISION,
     atomic_write_text,
 )
+from src.exception_safety import normalize_exception_class
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
