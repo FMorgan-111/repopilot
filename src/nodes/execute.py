@@ -232,6 +232,36 @@ def _repo_url(state: AgentState, *, include_token: bool) -> str:
     return f"https://github.com/{state.owner}/{state.repo}.git"
 
 
+def _git_transport_command(state: AgentState, *args: str) -> list[str]:
+    """Authenticate one Git invocation without persisting credentials."""
+    safe_url = _repo_url(state, include_token=False)
+    authenticated_url = _repo_url(state, include_token=True)
+    return [
+        "git",
+        "-c",
+        f"url.{authenticated_url}.insteadOf={safe_url}",
+        *args,
+    ]
+
+
+def _remove_tree_after_failure(path: str | Path, failure: BaseException) -> None:
+    """Clean a partially mutated tree while retaining the original failure."""
+    try:
+        _checked_remove_tree(path)
+    except BaseException as cleanup_error:
+        raise cleanup_error from failure
+
+
+def _remove_git_fetch_head(cache_path: Path) -> None:
+    """Remove transport URLs Git records outside repository configuration."""
+    try:
+        (cache_path / ".git" / "FETCH_HEAD").unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("failed to remove Git transport metadata") from exc
+
+
 def _clone_local_repo(cache_path: Path, target: str) -> None:  # pragma: no cover
     # Retained for backward-compat imports; the live path is the async variant.
     subprocess.run(
@@ -361,6 +391,25 @@ async def _checked_git(args: list[str], timeout: float) -> _ProcResult:
     return result
 
 
+async def _cache_origin_matches(state: AgentState, cache_path: Path) -> bool:
+    result = await _run_git_async(
+        [
+            "git",
+            "-C",
+            str(cache_path),
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ],
+        timeout=30,
+    )
+    return (
+        result.returncode == 0
+        and result.stdout.splitlines() == [_repo_url(state, include_token=False)]
+    )
+
+
 def _is_transient_git_transport_error(error: BaseException) -> bool:
     if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
         return True
@@ -369,12 +418,13 @@ def _is_transient_git_transport_error(error: BaseException) -> bool:
 
 
 async def _fetch_exact_ref(
+    state: AgentState,
     cache_path: Path,
     repo_ref: str,
     retry_delays: tuple[float, ...],
 ) -> None:
-    command = [
-        "git",
+    command = _git_transport_command(
+        state,
         "-C",
         str(cache_path),
         "fetch",
@@ -382,7 +432,7 @@ async def _fetch_exact_ref(
         "1",
         "origin",
         repo_ref,
-    ]
+    )
     for attempt in range(len(retry_delays) + 1):
         try:
             await _checked_git(command, 300)
@@ -397,35 +447,28 @@ async def _fetch_exact_ref(
 
 
 async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
-    tokenized_url = _repo_url(state, include_token=True)
-    safe_url = _repo_url(state, include_token=False)
-    await _checked_git(
-        [
-            "git",
-            "-C",
-            str(cache_path),
-            "remote",
-            "set-url",
-            "origin",
-            tokenized_url,
-        ],
-        60,
-    )
     try:
         await _checked_git(
-            ["git", "-C", str(cache_path), "fetch", "--prune", "origin"],
+            _git_transport_command(
+                state,
+                "-C",
+                str(cache_path),
+                "fetch",
+                "--prune",
+                "origin",
+            ),
             300,
         )
         await _checked_git(
-            [
-                "git",
+            _git_transport_command(
+                state,
                 "-C",
                 str(cache_path),
                 "remote",
                 "set-head",
                 "origin",
                 "-a",
-            ],
+            ),
             60,
         )
         await _checked_git(
@@ -439,19 +482,10 @@ async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
             ],
             60,
         )
-    finally:
-        await _checked_git(
-            [
-                "git",
-                "-C",
-                str(cache_path),
-                "remote",
-                "set-url",
-                "origin",
-                safe_url,
-            ],
-            60,
-        )
+        _remove_git_fetch_head(cache_path)
+    except BaseException as failure:
+        _remove_tree_after_failure(cache_path, failure)
+        raise
 
 
 async def _populate_ref_cache(
@@ -461,9 +495,8 @@ async def _populate_ref_cache(
     *,
     retry_delays: tuple[float, ...] = _EXACT_REF_FETCH_RETRY_DELAYS,
 ) -> None:
-    await _checked_git(["git", "init", str(cache_path)], 60)
-    remote_added = False
     try:
+        await _checked_git(["git", "init", str(cache_path)], 60)
         await _checked_git(
             [
                 "git",
@@ -472,12 +505,11 @@ async def _populate_ref_cache(
                 "remote",
                 "add",
                 "origin",
-                _repo_url(state, include_token=True),
+                _repo_url(state, include_token=False),
             ],
             60,
         )
-        remote_added = True
-        await _fetch_exact_ref(cache_path, repo_ref, retry_delays)
+        await _fetch_exact_ref(state, cache_path, repo_ref, retry_delays)
         await _checked_git(
             [
                 "git",
@@ -489,61 +521,59 @@ async def _populate_ref_cache(
             ],
             60,
         )
-    finally:
-        if remote_added:
-            await _checked_git(
-                [
-                    "git",
-                    "-C",
-                    str(cache_path),
-                    "remote",
-                    "set-url",
-                    "origin",
-                    _repo_url(state, include_token=False),
-                ],
-                60,
-            )
+        _remove_git_fetch_head(cache_path)
+    except BaseException as failure:
+        _remove_tree_after_failure(cache_path, failure)
+        raise
 
 
 async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
-    repo_url = _repo_url(state, include_token=True)
     safe_repo_url = _repo_url(state, include_token=False)
     strategies = [
-        ["git", "clone", "--depth", "1", "--single-branch", repo_url, str(cache_path)],
-        ["git", "clone", "--depth", "1", repo_url, str(cache_path)],
-        ["git", "clone", repo_url, str(cache_path)],
+        _git_transport_command(
+            state,
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            safe_repo_url,
+            str(cache_path),
+        ),
+        _git_transport_command(
+            state,
+            "clone",
+            "--depth",
+            "1",
+            safe_repo_url,
+            str(cache_path),
+        ),
+        _git_transport_command(
+            state,
+            "clone",
+            safe_repo_url,
+            str(cache_path),
+        ),
     ]
     last_error = ""
-    for command in strategies:
-        try:
-            result = await _run_git_async(command, timeout=300)
-        except asyncio.TimeoutError:
-            last_error = f"clone timed out: {' '.join(command[:4])}..."
-            _checked_remove_tree(cache_path)
-            continue
-        if result.returncode == 0:
+    try:
+        for command in strategies:
             try:
-                await _checked_git(
-                    [
-                        "git",
-                        "-C",
-                        str(cache_path),
-                        "remote",
-                        "set-url",
-                        "origin",
-                        safe_repo_url,
-                    ],
-                    60,
-                )
-            except Exception:
+                result = await _run_git_async(command, timeout=300)
+            except asyncio.TimeoutError:
+                last_error = "clone timed out"
                 _checked_remove_tree(cache_path)
-                raise
-            return
-        last_error = _redact_sensitive_error_text(
-            (result.stderr or result.stdout).strip()
-        )
-        _checked_remove_tree(cache_path)
-    raise RuntimeError(last_error)
+                continue
+            if result.returncode == 0:
+                _remove_git_fetch_head(cache_path)
+                return
+            last_error = _redact_sensitive_error_text(
+                (result.stderr or result.stdout).strip()
+            )
+            _checked_remove_tree(cache_path)
+        raise RuntimeError(last_error)
+    except BaseException as failure:
+        _remove_tree_after_failure(cache_path, failure)
+        raise
 
 
 async def git_clone(state: AgentState) -> str:
@@ -558,6 +588,19 @@ async def git_clone(state: AgentState) -> str:
         return await _git_clone_locked(state, repo_ref, cache_path, work)
 
 
+async def _clone_and_verify_local_checkout(
+    cache_path: Path,
+    work: str,
+    repo_ref: str,
+) -> str:
+    await _clone_local_repo_async(cache_path, work)
+    expected_head = repo_ref or await _worktree_head(str(cache_path))
+    if not expected_head:
+        raise RuntimeError("repository cache HEAD could not be established")
+    await _verify_clean_worktree(work, expected_head)
+    return work
+
+
 async def _git_clone_locked(
     state: AgentState,
     repo_ref: str,
@@ -566,22 +609,28 @@ async def _git_clone_locked(
 ) -> str:
     """Inspect and mutate one shared cache only while its advisory lock is held."""
 
+    reuse_work = False
     if repo_ref and (Path(work) / ".git").exists():
         if (
             await _worktree_is_healthy(work)
             and await _worktree_head(work) == repo_ref
         ):
-            _repo_cache_event("worktree_hit", state)
-            await _reset_work_tree_async(work, repo_ref)
-            return work
-        _repo_cache_event("ref_mismatch", state, target="worktree")
-        _checked_remove_tree(work)
+            reuse_work = True
+        else:
+            _repo_cache_event("ref_mismatch", state, target="worktree")
+            _checked_remove_tree(work)
 
     if repo_ref and (cache_path / ".git").exists():
         if (
             await _worktree_is_healthy(str(cache_path))
             and await _worktree_head(str(cache_path)) == repo_ref
+            and await _cache_origin_matches(state, cache_path)
         ):
+            try:
+                _remove_git_fetch_head(cache_path)
+            except BaseException as failure:
+                _remove_tree_after_failure(cache_path, failure)
+                raise
             _repo_cache_event("object_hit", state)
         else:
             _repo_cache_event("ref_mismatch", state, target="object_cache")
@@ -589,42 +638,56 @@ async def _git_clone_locked(
 
     if repo_ref and not (cache_path / ".git").exists():
         _repo_cache_event("remote_fetch", state)
-        try:
-            await _populate_ref_cache(state, cache_path, repo_ref)
-        except Exception:
-            _checked_remove_tree(cache_path)
-            raise
+        await _populate_ref_cache(state, cache_path, repo_ref)
 
     if not repo_ref:
         if (cache_path / ".git").exists():
-            _repo_cache_event("object_hit", state)
-            await _refresh_live_cache(state, cache_path)
-        else:
+            if await _cache_origin_matches(state, cache_path):
+                _repo_cache_event("object_hit", state)
+                await _refresh_live_cache(state, cache_path)
+            else:
+                _repo_cache_event("ref_mismatch", state, target="object_cache")
+                _checked_remove_tree(cache_path)
+        if not (cache_path / ".git").exists():
             _repo_cache_event("remote_fetch", state)
             await _populate_live_cache(state, cache_path)
 
+    if reuse_work:
+        _repo_cache_event("worktree_hit", state)
+        try:
+            await _reset_work_tree_async(work, repo_ref)
+        except BaseException as failure:
+            _remove_tree_after_failure(work, failure)
+            raise
+        return work
+
     _checked_remove_tree(work)
     try:
-        await _clone_local_repo_async(cache_path, work)
-        expected_head = repo_ref or await _worktree_head(str(cache_path))
-        if not expected_head:
-            raise RuntimeError("repository cache HEAD could not be established")
-        await _verify_clean_worktree(work, expected_head)
-        return work
-    except (subprocess.CalledProcessError, asyncio.TimeoutError, RuntimeError):
+        return await _clone_and_verify_local_checkout(cache_path, work, repo_ref)
+    except (
+        subprocess.CalledProcessError,
+        asyncio.TimeoutError,
+        RuntimeError,
+    ) as failure:
+        _remove_tree_after_failure(work, failure)
         _repo_cache_event("rebuild", state)
         _checked_remove_tree(cache_path)
-        _checked_remove_tree(work)
         if repo_ref:
             await _populate_ref_cache(state, cache_path, repo_ref)
         else:
             await _populate_live_cache(state, cache_path)
-        await _clone_local_repo_async(cache_path, work)
-        expected_head = repo_ref or await _worktree_head(str(cache_path))
-        if not expected_head:
-            raise RuntimeError("repository cache HEAD could not be established")
-        await _verify_clean_worktree(work, expected_head)
-        return work
+        try:
+            return await _clone_and_verify_local_checkout(
+                cache_path,
+                work,
+                repo_ref,
+            )
+        except BaseException as retry_failure:
+            _remove_tree_after_failure(work, retry_failure)
+            raise
+    except BaseException as failure:
+        _remove_tree_after_failure(work, failure)
+        raise
 
 
 def _git_apply_check(repo_path: str, patch_content: str) -> subprocess.CompletedProcess:

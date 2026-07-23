@@ -1324,9 +1324,17 @@ async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tm
     (cache_path / ".git").mkdir(parents=True)
     (work_path / ".git").mkdir(parents=True)
     commands = []
+    safe_url = "https://github.com/acme/widget.git"
 
     async def fake_run_git(args, timeout, cwd=None):
         commands.append(args)
+        if args[-4:] == [
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]:
+            return execute_node._ProcResult(0, safe_url + "\n", "")
         return execute_node._ProcResult(0, "", "")
 
     monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
@@ -1349,7 +1357,16 @@ async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tm
 
     repo_path = await execute_node.git_clone(state)
 
-    assert ["git", "-C", str(cache_path), "fetch", "--prune", "origin"] in commands
+    assert [
+        "git",
+        "-c",
+        f"url.{safe_url}.insteadOf={safe_url}",
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--prune",
+        "origin",
+    ] in commands
     assert [
         "git",
         "clone",
@@ -1414,6 +1431,9 @@ async def test_git_clone_fetches_exact_ref_into_commit_keyed_cache(
     assert repo_path == str(work_path)
     assert [
         "git",
+        "-c",
+        "url.https://github.com/acme/widget.git.insteadOf="
+        "https://github.com/acme/widget.git",
         "-C",
         str(cache_path),
         "fetch",
@@ -1441,7 +1461,7 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
 
     async def fake_run_git(args, timeout, cwd=None):
         commands.append(args)
-        if args[:2] == ["git", "clone"] and args[-1] == str(cache_path):
+        if "clone" in args and args[-1] == str(cache_path):
             (cache_path / ".git").mkdir(parents=True)
         return execute_node._ProcResult(0, "", "")
 
@@ -1464,22 +1484,22 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
 
     repo_path = await execute_node.git_clone(state)
 
-    assert commands[0][:2] == ["git", "clone"]
-    assert commands[0][-1] == str(cache_path)
-    assert any(
-        "https://x-access-token:gho_cachetoken@github.com/acme/widget.git" == part
-        for part in commands[0]
+    safe_url = "https://github.com/acme/widget.git"
+    authenticated_url = (
+        "https://x-access-token:gho_cachetoken@github.com/acme/widget.git"
     )
-    assert commands[1] == [
+    assert commands[0] == [
         "git",
-        "-C",
+        "-c",
+        f"url.{authenticated_url}.insteadOf={safe_url}",
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        safe_url,
         str(cache_path),
-        "remote",
-        "set-url",
-        "origin",
-        "https://github.com/acme/widget.git",
     ]
-    assert commands[2] == [
+    assert commands[1] == [
         "git",
         "clone",
         "--local",
@@ -1487,6 +1507,7 @@ async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_p
         str(cache_path),
         repo_path,
     ]
+    assert all("set-url" not in command for command in commands)
 
 
 async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_path):

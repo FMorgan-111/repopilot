@@ -35,6 +35,17 @@ def _git(root: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+def _bounded_git_metadata(root: Path, *, limit: int = 2_000_000) -> bytes:
+    metadata = bytearray()
+    for path in sorted((root / ".git").rglob("*")):
+        if path.is_symlink() or not path.is_file():
+            continue
+        content = path.read_bytes()
+        assert len(metadata) + len(content) <= limit
+        metadata.extend(content)
+    return bytes(metadata)
+
+
 def _approved_state(tmp_path: Path, *, command: str) -> AgentState:
     root = tmp_path / "repo"
     root.mkdir()
@@ -425,6 +436,9 @@ async def test_concurrent_clones_serialize_shared_cache_and_recheck_under_lock(
     async def head(_path):
         return ref
 
+    async def safe_origin(_state, _cache_path):
+        return True
+
     async def clone(cache_path, target):
         nonlocal active_clones, max_active_clones
         assert (cache_path / ".git").exists()
@@ -440,6 +454,7 @@ async def test_concurrent_clones_serialize_shared_cache_and_recheck_under_lock(
     monkeypatch.setattr(execute_node, "_populate_ref_cache", populate)
     monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
     monkeypatch.setattr(execute_node, "_worktree_head", head)
+    monkeypatch.setattr(execute_node, "_cache_origin_matches", safe_origin)
     monkeypatch.setattr(execute_node, "_clone_local_repo_async", clone)
     monkeypatch.setattr(execute_node, "_verify_clean_worktree", clean, raising=False)
     states = [
@@ -589,21 +604,379 @@ async def test_reset_removes_tracked_untracked_and_ignored_build_outputs(tmp_pat
     assert _git(work, "status", "--porcelain=v1", "--ignored=matching") == ""
 
 
-async def test_credential_free_remote_restoration_failure_fails(monkeypatch, tmp_path):
+async def test_exact_ref_transport_credentials_are_command_scoped(
+    monkeypatch, tmp_path
+):
     cache = tmp_path / "cache"
     ref = "a" * 40
+    token = "synthetic-command-scope-token"
     safe_url = "https://github.com/acme/widget.git"
+    authenticated_url = (
+        f"https://x-access-token:{token}@github.com/acme/widget.git"
+    )
+    commands: list[list[str]] = []
 
     async def checked(args, timeout):
-        if args[-2:] == ["origin", safe_url]:
-            raise RuntimeError("credential-free remote restoration failed")
+        commands.append(args)
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setattr(execute_node, "_checked_git", checked)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    await execute_node._populate_ref_cache(state, cache, ref, retry_delays=())
+
+    assert [
+        "git",
+        "-C",
+        str(cache),
+        "remote",
+        "add",
+        "origin",
+        safe_url,
+    ] in commands
+    fetch = next(command for command in commands if "fetch" in command)
+    assert fetch[:3] == [
+        "git",
+        "-c",
+        f"url.{authenticated_url}.insteadOf={safe_url}",
+    ]
+    assert all("set-url" not in command for command in commands)
+
+
+async def test_live_clone_transport_credentials_are_command_scoped(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    token = "synthetic-live-clone-token"
+    safe_url = "https://github.com/acme/widget.git"
+    authenticated_url = (
+        f"https://x-access-token:{token}@github.com/acme/widget.git"
+    )
+    commands: list[list[str]] = []
+
+    async def run_git(args, timeout, cwd=None):
+        commands.append(args)
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    await execute_node._populate_live_cache(state, cache)
+
+    assert commands == [
+        [
+            "git",
+            "-c",
+            f"url.{authenticated_url}.insteadOf={safe_url}",
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            safe_url,
+            str(cache),
+        ]
+    ]
+
+
+@pytest.mark.parametrize("operation", ["exact_ref", "live_clone", "live_refresh"])
+async def test_completed_cache_git_metadata_contains_no_transport_credentials(
+    monkeypatch, tmp_path, operation
+):
+    marker = "synthetic-transport-credential"
+    source = tmp_path / marker / "source"
+    source.mkdir(parents=True)
+    _git(source, "init", "-q")
+    _git(source, "config", "user.email", "test@example.invalid")
+    _git(source, "config", "user.name", "Test")
+    (source / "README.md").write_text("safe cache\n", encoding="utf-8")
+    _git(source, "add", "--all")
+    _git(source, "commit", "-qm", "base")
+    ref = _git(source, "rev-parse", "HEAD")
+    authenticated_url = source.resolve().as_uri()
+    safe_url = "https://github.example.invalid/acme/widget.git"
+    cache = tmp_path / "cache"
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    def repo_url(_state, *, include_token):
+        return authenticated_url if include_token else safe_url
+
+    monkeypatch.setattr(execute_node, "_repo_url", repo_url)
+    if operation == "exact_ref":
+        await execute_node._populate_ref_cache(
+            state,
+            cache,
+            ref,
+            retry_delays=(),
+        )
+    elif operation == "live_clone":
+        await execute_node._populate_live_cache(state, cache)
+    else:
+        cache.mkdir()
+        _git(cache, "init", "-q")
+        _git(cache, "remote", "add", "origin", safe_url)
+        await execute_node._refresh_live_cache(state, cache)
+
+    assert _git(
+        cache,
+        "config",
+        "--local",
+        "--get-all",
+        "remote.origin.url",
+    ) == safe_url
+    assert marker.encode() not in _bounded_git_metadata(cache)
+
+
+async def test_tokenized_legacy_cache_is_removed_and_rebuilt(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    work = tmp_path / "work"
+    (cache / ".git").mkdir(parents=True)
+    (work / ".git").mkdir(parents=True)
+    sentinel = cache / "legacy-tokenized-cache"
+    sentinel.write_text("legacy", encoding="utf-8")
+    ref = "a" * 40
+    safe_url = "https://github.com/acme/widget.git"
+    populate_calls = 0
+    origin_queries: list[list[str]] = []
+
+    async def run_git(args, timeout, cwd=None):
+        if args[-4:] == [
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]:
+            origin_queries.append(args)
+            return execute_node._ProcResult(
+                0,
+                "https://x-access-token:synthetic-legacy-token@github.com/"
+                "acme/widget.git\n",
+                "",
+            )
+        return execute_node._ProcResult(0, "", "")
+
+    async def healthy(_path):
+        return True
+
+    async def head(_path):
+        return ref
+
+    async def populate(_state, cache_path, _repo_ref, **_kwargs):
+        nonlocal populate_calls
+        populate_calls += 1
+        (cache_path / ".git").mkdir(parents=True)
+        (cache_path / "rebuilt-origin").write_text(safe_url, encoding="utf-8")
+
+    async def forbidden_clone(_cache_path, _target):
+        raise AssertionError("healthy mutable worktree should be reset, not cloned")
+
+    async def reset(_target, _ref):
+        return None
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
+    monkeypatch.setattr(execute_node, "_worktree_head", head)
+    monkeypatch.setattr(execute_node, "_populate_ref_cache", populate)
+    monkeypatch.setattr(execute_node, "_clone_local_repo_async", forbidden_clone)
+    monkeypatch.setattr(execute_node, "_reset_work_tree_async", reset)
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        owner="acme",
+        repo="widget",
+        repo_ref=ref,
+        trace_id="legacy-cache-test",
+    )
+
+    await execute_node._git_clone_locked(state, ref, cache, str(work))
+
+    assert populate_calls == 1
+    assert origin_queries == [
+        [
+            "git",
+            "-C",
+            str(cache),
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]
+    ]
+    assert not sentinel.exists()
+    assert (cache / "rebuilt-origin").read_text(encoding="utf-8") == safe_url
+
+
+async def test_live_refresh_cancellation_removes_mutated_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    (cache / ".git").mkdir(parents=True)
+
+    async def checked(args, timeout):
+        if "fetch" in args:
+            raise asyncio.CancelledError("cancel live refresh")
         return execute_node._ProcResult(0, "", "")
 
     monkeypatch.setattr(execute_node, "_checked_git", checked)
     state = SimpleNamespace(owner="acme", repo="widget")
 
-    with pytest.raises(RuntimeError, match="restoration failed"):
+    with pytest.raises(asyncio.CancelledError, match="cancel live refresh"):
+        await execute_node._refresh_live_cache(state, cache)
+
+    assert not cache.exists()
+
+
+async def test_exact_ref_cancellation_removes_partial_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+    ref = "a" * 40
+
+    async def checked(args, timeout):
+        if args[:2] == ["git", "init"]:
+            (cache / ".git").mkdir(parents=True)
+        if "fetch" in args:
+            raise asyncio.CancelledError("cancel exact ref")
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_checked_git", checked)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    with pytest.raises(asyncio.CancelledError, match="cancel exact ref"):
         await execute_node._populate_ref_cache(state, cache, ref, retry_delays=())
+
+    assert not cache.exists()
+
+
+async def test_live_clone_cancellation_removes_partial_cache(monkeypatch, tmp_path):
+    cache = tmp_path / "cache"
+
+    async def run_git(_args, timeout, cwd=None):
+        (cache / ".git").mkdir(parents=True)
+        raise asyncio.CancelledError("cancel live clone")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    with pytest.raises(asyncio.CancelledError, match="cancel live clone"):
+        await execute_node._populate_live_cache(state, cache)
+
+    assert not cache.exists()
+
+
+async def test_local_clone_cancellation_removes_worktree_but_preserves_cache(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    work = tmp_path / "work"
+    (cache / ".git").mkdir(parents=True)
+    verified_cache = cache / "verified-cache"
+    verified_cache.write_text("immutable", encoding="utf-8")
+    ref = "a" * 40
+    safe_url = "https://github.com/acme/widget.git"
+
+    async def run_git(args, timeout, cwd=None):
+        if args[-4:] == [
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]:
+            return execute_node._ProcResult(0, safe_url + "\n", "")
+        return execute_node._ProcResult(0, "", "")
+
+    async def healthy(_path):
+        return True
+
+    async def head(_path):
+        return ref
+
+    async def cancelled_clone(_cache_path, target):
+        (Path(target) / ".git").mkdir(parents=True)
+        raise asyncio.CancelledError("cancel local clone")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
+    monkeypatch.setattr(execute_node, "_worktree_head", head)
+    monkeypatch.setattr(execute_node, "_clone_local_repo_async", cancelled_clone)
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        owner="acme",
+        repo="widget",
+        repo_ref=ref,
+        trace_id="local-clone-cancel-test",
+    )
+
+    with pytest.raises(asyncio.CancelledError, match="cancel local clone"):
+        await execute_node._git_clone_locked(state, ref, cache, str(work))
+
+    assert verified_cache.read_text(encoding="utf-8") == "immutable"
+    assert not work.exists()
+
+
+async def test_local_reset_cancellation_removes_worktree_but_preserves_cache(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+    work = tmp_path / "work"
+    (cache / ".git").mkdir(parents=True)
+    (work / ".git").mkdir(parents=True)
+    verified_cache = cache / "verified-cache"
+    verified_cache.write_text("immutable", encoding="utf-8")
+    ref = "a" * 40
+
+    async def healthy(_path):
+        return True
+
+    async def head(_path):
+        return ref
+
+    async def safe_origin(_state, _cache_path):
+        return True
+
+    async def cancelled_reset(target, _ref):
+        (Path(target) / "partial-reset").write_text("partial", encoding="utf-8")
+        raise asyncio.CancelledError("cancel local reset")
+
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
+    monkeypatch.setattr(execute_node, "_worktree_head", head)
+    monkeypatch.setattr(execute_node, "_cache_origin_matches", safe_origin)
+    monkeypatch.setattr(execute_node, "_reset_work_tree_async", cancelled_reset)
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        owner="acme",
+        repo="widget",
+        repo_ref=ref,
+        trace_id="local-reset-cancel-test",
+    )
+
+    with pytest.raises(asyncio.CancelledError, match="cancel local reset"):
+        await execute_node._git_clone_locked(state, ref, cache, str(work))
+
+    assert verified_cache.read_text(encoding="utf-8") == "immutable"
+    assert not work.exists()
+
+
+async def test_cleanup_failure_is_chained_from_original_cancellation(
+    monkeypatch, tmp_path
+):
+    cache = tmp_path / "cache"
+
+    async def run_git(_args, timeout, cwd=None):
+        (cache / ".git").mkdir(parents=True)
+        raise asyncio.CancelledError("original cancellation")
+
+    def failed_cleanup(_path):
+        raise RuntimeError("injected cleanup failure")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", run_git)
+    monkeypatch.setattr(execute_node, "_checked_remove_tree", failed_cleanup)
+    state = SimpleNamespace(owner="acme", repo="widget")
+
+    with pytest.raises(RuntimeError, match="injected cleanup failure") as caught:
+        await execute_node._populate_live_cache(state, cache)
+
+    assert isinstance(caught.value.__cause__, asyncio.CancelledError)
+    assert str(caught.value.__cause__) == "original cancellation"
 
 
 def test_workflow_never_enables_unsafe_host_execution():
