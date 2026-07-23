@@ -893,8 +893,10 @@ async def generate_opus_repair(
     user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     if len(user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("verified edit prompt exceeds strict context budget")
-    def validate_edits(candidate: VerifiedEditBatch) -> VerifiedEditBatch:
-        if validate_edits:
+    should_validate_edits = validate_edits
+
+    def validate_edit_batch(candidate: VerifiedEditBatch) -> VerifiedEditBatch:
+        if should_validate_edits:
             _validate_batch(state, plan, candidate, evidence, snapshots)
         return candidate
 
@@ -903,7 +905,7 @@ async def generate_opus_repair(
         system=VERIFIED_EDIT_SYSTEM,
         user=user,
         schema=VerifiedEditBatch,
-        semantic_validate=validate_edits,
+        semantic_validate=validate_edit_batch,
         outcome_kind="verified_edits",
         router=router,
         policy_hook=policy_hook,

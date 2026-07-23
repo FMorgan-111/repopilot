@@ -993,6 +993,83 @@ async def test_generate_opus_repair_rejects_edit_outside_plan_and_exact_context(
     assert state.model_history[-1].error_class == "RepairContextError"
 
 
+async def test_generate_opus_repair_defers_missing_anchor_validation_when_disabled(
+    tmp_path, monkeypatch
+):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def compute(value):\n    return value\n"},
+    )
+    state = _state(repo, ref)
+    responses = [
+        _plan(target_symbols=[]).model_dump(),
+        {
+            "edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "node_target": None,
+                    "search": "missing anchor",
+                    "replace": "return value + 1",
+                    "intent": "Apply the offset through PatchGate.",
+                }
+            ]
+        },
+    ]
+
+    async def fake_llm_call(*args, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    plan, batch = await generate_opus_repair(
+        state,
+        build_escalation_packet(state),
+        validate_edits=False,
+    )
+
+    assert plan.target_files == ["src/widget.py"]
+    assert batch.edits[0].search == "missing anchor"
+    assert [item.status for item in state.model_history] == ["ok", "ok"]
+
+
+async def test_generate_opus_repair_rejects_missing_anchor_when_validation_enabled(
+    tmp_path, monkeypatch
+):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def compute(value):\n    return value\n"},
+    )
+    state = _state(repo, ref)
+    responses = [
+        _plan(target_symbols=[]).model_dump(),
+        {
+            "edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "node_target": None,
+                    "search": "missing anchor",
+                    "replace": "return value + 1",
+                    "intent": "Apply the offset.",
+                }
+            ]
+        },
+    ]
+
+    async def fake_llm_call(*args, **kwargs):
+        return responses.pop(0)
+
+    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+
+    with pytest.raises(RepairContextError, match="missing or not unique"):
+        await generate_opus_repair(
+            state,
+            build_escalation_packet(state),
+            validate_edits=True,
+        )
+
+    assert [item.status for item in state.model_history] == ["ok", "invalid_response"]
+
+
 async def test_generate_opus_repair_rejects_duplicate_new_file_edits(
     tmp_path, monkeypatch
 ):
