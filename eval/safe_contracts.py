@@ -129,7 +129,7 @@ _SENSITIVE_PATH_PARTS = frozenset(
         "secrets",
     }
 )
-_MODEL_INVOCATION_NODES = frozenset(
+MODEL_INVOCATION_NODES = frozenset(
     {
         "plan",
         "plan_fix",
@@ -393,7 +393,7 @@ def has_structured_model_gateway_failure(sample: Any) -> bool:
             if not isinstance(invocation, dict):
                 continue
             if (
-                invocation.get("node") in _MODEL_INVOCATION_NODES
+                invocation.get("node") in MODEL_INVOCATION_NODES
                 and invocation.get("status") == "error"
                 and invocation.get("error_class") in MODEL_GATEWAY_ERROR_CLASSES
             ):

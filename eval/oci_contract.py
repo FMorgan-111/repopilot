@@ -17,7 +17,10 @@ from pydantic import (
     model_validator,
 )
 
-from eval.safe_contracts import has_verified_coverage_proof
+from eval.safe_contracts import (
+    MODEL_INVOCATION_NODES,
+    has_verified_coverage_proof,
+)
 from eval.swe_bench import (
     DATASET_NAME,
     DATASET_REVISION,
@@ -70,7 +73,6 @@ _NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 _FiniteNonNegativeFloat = Annotated[
     float, Field(strict=True, ge=0, allow_inf_nan=False)
 ]
-_NonEmptyString = Annotated[str, Field(min_length=1)]
 _NonEmptyModels = Annotated[list[ModelName], Field(min_length=1)]
 
 _MODE_FILES: dict[str, str] = {
@@ -229,12 +231,19 @@ class ModelInvocationRecord(BaseModel):
 
     model: ModelName
     provider: ModelProvider
-    node: _NonEmptyString
+    node: Annotated[str, Field(strict=True)]
     elapsed_seconds: _FiniteNonNegativeFloat
     input_tokens: _NonNegativeInt
     output_tokens: _NonNegativeInt
     status: InvocationStatus
     error_class: str
+
+    @field_validator("node")
+    @classmethod
+    def validate_node(cls, value: str) -> str:
+        if value not in MODEL_INVOCATION_NODES:
+            raise ValueError("node must be an approved model invocation node")
+        return value
 
     @field_validator("error_class")
     @classmethod

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from eval import oci_contract
+from eval import oci_contract, safe_contracts
 from eval.oci_contract import (
     REPO_ROOT,
     InstanceManifest,
@@ -23,6 +23,15 @@ COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
 ROW_SHA = "c" * 64
 INSTANCE_ID = "pytest-dev__pytest-10081"
+APPROVED_MODEL_INVOCATION_NODES = (
+    "plan",
+    "plan_fix",
+    "reflect",
+    "reflect_on_failure",
+    "test_generation",
+    "test_generator",
+    "outcome_summary",
+)
 
 
 def _invocation_payload(**overrides: object) -> dict[str, object]:
@@ -379,6 +388,29 @@ def test_invocation_status_uses_closed_taxonomy() -> None:
 
     with pytest.raises(ValidationError, match="status"):
         _result_record_model().model_validate(payload)
+
+
+def test_safe_contract_exposes_exact_model_invocation_node_taxonomy() -> None:
+    assert getattr(safe_contracts, "MODEL_INVOCATION_NODES", None) == frozenset(
+        APPROVED_MODEL_INVOCATION_NODES
+    )
+
+
+@pytest.mark.parametrize("node", APPROVED_MODEL_INVOCATION_NODES)
+def test_invocation_accepts_approved_node(node: str) -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(model_invocations=[_invocation_payload(node=node)])
+    )
+
+    assert record.model_invocations[0].node == node
+
+
+@pytest.mark.parametrize("node", ["forged-node", "", b"plan", 1, True, None])
+def test_invocation_rejects_unknown_empty_or_coerced_node(node: object) -> None:
+    with pytest.raises(ValidationError, match="node"):
+        _result_record_model().model_validate(
+            _result_payload(model_invocations=[_invocation_payload(node=node)])
+        )
 
 
 @pytest.mark.parametrize(

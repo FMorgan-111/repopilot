@@ -548,9 +548,15 @@ def _summary(
         for manifest, payload in ordered
     )
     agreements = sum(
-        item.official.status != "scorer_infra"
+        manifest.runtime_status == "ready"
+        and item.official.completed
+        and item.official.status != "scorer_infra"
+        and usage_item is not None
+        and item.result.failure_class not in INFRASTRUCTURE_FAILURE_CLASSES
         and verdict == item.official.resolved
-        for (_manifest, item), verdict in zip(ordered, internal_verdicts)
+        for (manifest, item), verdict, usage_item in zip(
+            ordered, internal_verdicts, usage
+        )
     )
     model_tokens = sum(item[0] for item in usage if item is not None)
     try:

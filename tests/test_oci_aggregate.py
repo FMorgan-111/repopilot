@@ -720,6 +720,26 @@ def test_aggregate_rejects_non_list_model_invocations(tmp_path: Path) -> None:
         )
 
 
+def test_aggregate_rejects_forged_model_invocation_node(tmp_path: Path) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["model_invocations"][0]["node"] = "forged-node"
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
 @pytest.mark.parametrize(
     ("status", "error_class"),
     [("ok", "RuntimeError"), ("error", "")],
@@ -1497,6 +1517,10 @@ async def test_ready_generation_failure_packages_and_aggregates_real_projection(
     )
     assert combined["base_commit"] == ""
     assert combined["failure_class"] == "infra"
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Internal/official agreement | 0/1 |" in summary
+    assert "| Explicit internal/official agreement | 0/1 | 0.00/5 |" in summary
+    assert "| Engineering score | 0.00/100 |" in summary
 
 
 def test_incomplete_official_result_receives_no_budget_credit(
