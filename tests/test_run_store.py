@@ -1,11 +1,38 @@
 import json
+import multiprocessing
 import os
 import stat
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
 from src import new_agent, run_store
 from src.state import Evidence, ModelInvocation, NoProgressEvent
+
+
+def _claim_in_subprocess(
+    root_dir: str,
+    run_id: str,
+    expected_payload: dict,
+    start,
+    results,
+) -> None:
+    expected = new_agent.AgentState.model_validate(expected_payload)
+    start.wait()
+    try:
+        run_store.claim_run_for_resume(
+            run_id,
+            expected,
+            root_dir=Path(root_dir),
+        )
+    except run_store.ResumeConflictError:
+        results.put("conflict")
+    except BaseException as exc:
+        results.put(f"error:{type(exc).__name__}")
+    else:
+        results.put("claimed")
 
 
 def paused_state(trace_id: str = "abc123def456"):
@@ -375,6 +402,47 @@ def test_save_run_is_atomic_and_uses_mode_0600(tmp_path):
     assert list(saved.parent.glob("*.tmp")) == []
 
 
+@pytest.mark.parametrize(
+    "kind",
+    ["symlink", "fifo", "directory", "hardlink"],
+)
+def test_save_run_rejects_unsafe_per_run_lock(tmp_path, kind):
+    root = tmp_path / "root"
+    runs = root / "runs"
+    runs.mkdir(parents=True)
+    lock_path = runs / ".safe-id.lock"
+    if kind == "symlink":
+        outside = tmp_path / "outside.lock"
+        outside.write_text("", encoding="utf-8")
+        lock_path.symlink_to(outside)
+    elif kind == "fifo":
+        os.mkfifo(lock_path)
+    elif kind == "directory":
+        lock_path.mkdir()
+    else:
+        outside = tmp_path / "outside.lock"
+        outside.write_text("", encoding="utf-8")
+        os.link(outside, lock_path)
+
+    with pytest.raises(ValueError, match="run lock must be a regular file"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o666])
+def test_save_run_rejects_per_run_lock_without_exact_permissions(
+    tmp_path, mode
+):
+    root = tmp_path / "root"
+    runs = root / "runs"
+    runs.mkdir(parents=True)
+    lock_path = runs / ".safe-id.lock"
+    lock_path.write_text("", encoding="utf-8")
+    lock_path.chmod(mode)
+
+    with pytest.raises(ValueError, match="run lock must be a regular file"):
+        run_store.save_run(paused_state("safe-id"), root_dir=root)
+
+
 def test_save_run_replace_failure_preserves_previous_file_and_cleans_temp(
     tmp_path, monkeypatch
 ):
@@ -422,6 +490,207 @@ def test_save_and_load_paused_run_preserves_pause_state(tmp_path):
     assert loaded.human_input_request == state.human_input_request
     assert loaded.frame_history == state.frame_history
     assert loaded.route_decisions == state.route_decisions
+
+
+def test_claim_run_for_resume_atomically_consumes_paused_request(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("claim-once")
+    run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    expected_before = expected.model_copy(deep=True)
+
+    claimed = run_store.claim_run_for_resume(
+        original.trace_id,
+        expected,
+        root_dir=root_dir,
+    )
+    durable = run_store.load_run(original.trace_id, root_dir=root_dir)
+
+    assert expected == expected_before
+    assert claimed == durable
+    assert claimed is not expected
+    assert claimed.resume_in_progress is True
+    assert claimed.current_phase == new_agent.Phase.PLAN
+    assert claimed.pending_human_input is False
+    assert claimed.human_input_request == {}
+
+
+def test_claim_run_for_resume_rejects_stale_expected_state(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("stale-claim")
+    run_store.save_run(original, root_dir=root_dir)
+    stale = run_store.load_run(original.trace_id, root_dir=root_dir)
+    updated = stale.model_copy(deep=True)
+    updated.human_input_request["question"] = (
+        "Durably updated after authorization"
+    )
+    run_store.save_run(updated, root_dir=root_dir)
+
+    with pytest.raises(run_store.ResumeConflictError):
+        run_store.claim_run_for_resume(
+            original.trace_id,
+            stale,
+            root_dir=root_dir,
+        )
+
+    durable = run_store.load_run(original.trace_id, root_dir=root_dir)
+    assert durable == updated
+    assert durable.resume_in_progress is False
+
+
+def test_claim_run_for_resume_requires_matching_trace_id(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("trace-match")
+    run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    expected.trace_id = "different-run"
+
+    with pytest.raises(run_store.ResumeConflictError):
+        run_store.claim_run_for_resume(
+            original.trace_id,
+            expected,
+            root_dir=root_dir,
+        )
+
+    assert run_store.load_run(
+        original.trace_id, root_dir=root_dir
+    ).resume_in_progress is False
+
+
+def test_claim_run_for_resume_maps_missing_durable_state_to_conflict(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("missing-after-authorization")
+    path = run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    path.unlink()
+
+    with pytest.raises(run_store.ResumeConflictError):
+        run_store.claim_run_for_resume(
+            original.trace_id,
+            expected,
+            root_dir=root_dir,
+        )
+
+
+def test_claim_write_failure_preserves_unclaimed_pause(tmp_path, monkeypatch):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("claim-write-failure")
+    run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+
+    def fail_write(*_args, **_kwargs):
+        raise OSError("injected claim write failure")
+
+    monkeypatch.setattr(run_store, "_atomic_write_run_at", fail_write)
+
+    with pytest.raises(OSError, match="claim write failure"):
+        run_store.claim_run_for_resume(
+            original.trace_id,
+            expected,
+            root_dir=root_dir,
+        )
+
+    assert run_store.load_run(original.trace_id, root_dir=root_dir) == original
+    assert expected == original
+
+
+def test_simultaneous_claims_for_same_run_succeed_exactly_once(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("simultaneous-claim")
+    run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    start = threading.Barrier(2)
+
+    def attempt_claim():
+        start.wait(timeout=5)
+        try:
+            run_store.claim_run_for_resume(
+                original.trace_id,
+                expected,
+                root_dir=root_dir,
+            )
+        except run_store.ResumeConflictError:
+            return "conflict"
+        return "claimed"
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _index: attempt_claim(), range(2)))
+
+    assert sorted(results) == ["claimed", "conflict"]
+    assert run_store.load_run(
+        original.trace_id, root_dir=root_dir
+    ).resume_in_progress is True
+
+
+def test_cross_process_claims_for_same_run_succeed_exactly_once(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state("process-claim")
+    run_store.save_run(original, root_dir=root_dir)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_claim_in_subprocess,
+            args=(
+                str(root_dir),
+                original.trace_id,
+                expected.model_dump(mode="json"),
+                start,
+                results,
+            ),
+        )
+        for _index in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    start.set()
+    for process in processes:
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert sorted(results.get(timeout=2) for _index in range(2)) == [
+        "claimed",
+        "conflict",
+    ]
+
+
+def test_different_run_ids_use_independent_save_locks(tmp_path, monkeypatch):
+    root_dir = tmp_path / ".repopilot"
+    states = [paused_state("run-a"), paused_state("run-b")]
+    writes_started = threading.Barrier(2)
+    original_atomic_write = run_store._atomic_write_run_at
+
+    def synchronized_write(run_id, payload, directory_fd, path, **kwargs):
+        writes_started.wait(timeout=5)
+        return original_atomic_write(
+            run_id,
+            payload,
+            directory_fd,
+            path,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        run_store,
+        "_atomic_write_run_at",
+        synchronized_write,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        saved = list(
+            executor.map(
+                lambda state: run_store.save_run(state, root_dir=root_dir),
+                states,
+            )
+        )
+
+    assert {path.name for path in saved} == {"run-a.json", "run-b.json"}
 
 
 def test_save_and_load_preserves_model_routing_state(tmp_path):
@@ -493,6 +762,7 @@ def test_legacy_saved_state_loads_model_routing_defaults(tmp_path):
     assert loaded.no_progress_rounds == 0
     assert loaded.model_history == []
     assert loaded.no_progress_history == []
+    assert loaded.resume_in_progress is False
 
 
 def test_save_load_and_replay_preserve_outcome_summary_state(tmp_path):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -15,11 +16,18 @@ from typing import Any
 
 from .evaluator_safety import contains_evaluator_only
 from .home import repopilot_home
-from .state import AgentState
+from .state import AgentState, Phase
 from .summary_safety import sanitize_summary_text
 
 _RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 MAX_RUN_FILE_BYTES = 8 * 1024 * 1024
+
+
+class ResumeConflictError(RuntimeError):
+    """Raised when a durable run no longer matches a resume request."""
+
+    def __init__(self) -> None:
+        super().__init__("Run resume conflict.")
 
 
 def default_runs_dir() -> Path:
@@ -61,8 +69,12 @@ def _open_anchored_directory(path: Path, *, create: bool) -> int:
             except FileNotFoundError:
                 if not create:
                     raise
-                os.mkdir(part, 0o700, dir_fd=descriptor)
-                os.fsync(descriptor)
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+                else:
+                    os.fsync(descriptor)
                 before = os.stat(
                     part, dir_fd=descriptor, follow_symlinks=False
                 )
@@ -135,8 +147,12 @@ def _open_runs_directory(
         except FileNotFoundError:
             if not create:
                 raise
-            os.mkdir("runs", 0o700, dir_fd=root_descriptor)
-            os.fsync(root_descriptor)
+            try:
+                os.mkdir("runs", 0o700, dir_fd=root_descriptor)
+            except FileExistsError:
+                pass
+            else:
+                os.fsync(root_descriptor)
             runs_before = os.stat(
                 "runs", dir_fd=root_descriptor, follow_symlinks=False
             )
@@ -213,75 +229,261 @@ def _read_run_bytes(run_id: str, root_dir: Path | str | None) -> bytes:
         return content
 
 
+def _atomic_write_run_at(
+    run_id: str,
+    payload: bytes,
+    directory_fd: int,
+    path: Path,
+    *,
+    rollback_payload: bytes | None = None,
+) -> Path:
+    if len(payload) > MAX_RUN_FILE_BYTES:
+        raise ValueError("run file exceeds the size limit")
+    temp_name = ""
+    descriptor = -1
+    replaced = False
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        for _ in range(16):
+            temp_name = f".{run_id}.{secrets.token_hex(12)}.tmp"
+            try:
+                descriptor = os.open(
+                    temp_name,
+                    flags,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("could not allocate a unique run-store temporary file")
+        try:
+            os.fchmod(descriptor, 0o600)
+            remaining = memoryview(payload)
+            while remaining:
+                written = os.write(descriptor, remaining)
+                if written <= 0:
+                    raise OSError("short write while persisting run")
+                remaining = remaining[written:]
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+            descriptor = -1
+        os.replace(
+            temp_name,
+            f"{run_id}.json",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        temp_name = ""
+        replaced = True
+        os.fsync(directory_fd)
+        return path
+    except BaseException:
+        if replaced and rollback_payload is not None:
+            try:
+                _atomic_write_run_at(
+                    run_id,
+                    rollback_payload,
+                    directory_fd,
+                    path,
+                )
+            except BaseException:
+                pass
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        if temp_name:
+            try:
+                os.unlink(temp_name, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+
+
 def _atomic_write_run(
     run_id: str,
     payload: bytes,
     root_dir: Path | str | None,
 ) -> Path:
-    if len(payload) > MAX_RUN_FILE_BYTES:
-        raise ValueError("run file exceeds the size limit")
     path = run_path(run_id, root_dir=root_dir)
     with _open_runs_directory(root_dir, create=True) as (_, _, directory_fd):
-        temp_name = ""
-        descriptor = -1
+        return _atomic_write_run_at(run_id, payload, directory_fd, path)
+
+
+def _lock_is_safe(
+    info: os.stat_result,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> bool:
+    return (
+        stat.S_ISREG(info.st_mode)
+        and info.st_uid == os.geteuid()
+        and info.st_nlink == 1
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and (expected_identity is None or _identity(info) == expected_identity)
+    )
+
+
+@contextmanager
+def _run_lock(
+    run_id: str,
+    root_dir: Path | str | None,
+) -> Iterator[tuple[Path, int]]:
+    """Lock one run while retaining the descriptor that anchors its state."""
+    _validate_run_id(run_id)
+    lock_name = f".{run_id}.lock"
+    with _open_runs_directory(root_dir, create=True) as (
+        directory,
+        _root_descriptor,
+        directory_fd,
+    ):
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NONBLOCK", 0)
         try:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-            for _ in range(16):
-                temp_name = f".{run_id}.{secrets.token_hex(12)}.tmp"
-                try:
-                    descriptor = os.open(
-                        temp_name,
-                        flags,
-                        0o600,
-                        dir_fd=directory_fd,
-                    )
-                    break
-                except FileExistsError:
-                    continue
-            else:
-                raise OSError("could not allocate a unique run-store temporary file")
-            try:
-                os.fchmod(descriptor, 0o600)
-                remaining = memoryview(payload)
-                while remaining:
-                    written = os.write(descriptor, remaining)
-                    if written <= 0:
-                        raise OSError("short write while persisting run")
-                    remaining = remaining[written:]
-                os.fsync(descriptor)
-            finally:
-                os.close(descriptor)
-                descriptor = -1
-            os.replace(
-                temp_name,
-                f"{run_id}.json",
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
+            lock_fd = os.open(
+                lock_name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
             )
-            temp_name = ""
-            os.fsync(directory_fd)
-            return path
+        except OSError as exc:
+            raise ValueError("run lock must be a regular file") from exc
+
+        acquired = False
+        try:
+            opened = os.fstat(lock_fd)
+            if not _lock_is_safe(opened):
+                raise ValueError("run lock must be a regular file")
+            try:
+                named = os.stat(
+                    lock_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "run lock must be a regular file"
+                ) from exc
+            if not _lock_is_safe(
+                named,
+                expected_identity=_identity(opened),
+            ):
+                raise ValueError("run lock must be a regular file")
+
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            acquired = True
+
+            locked = os.fstat(lock_fd)
+            try:
+                named_after_lock = os.stat(
+                    lock_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    "run lock must be a regular file"
+                ) from exc
+            if (
+                not _lock_is_safe(
+                    locked,
+                    expected_identity=_identity(opened),
+                )
+                or not _lock_is_safe(
+                    named_after_lock,
+                    expected_identity=_identity(opened),
+                )
+            ):
+                raise ValueError("run lock must be a regular file")
+
+            yield directory, directory_fd
         finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            if temp_name:
-                try:
-                    os.unlink(temp_name, dir_fd=directory_fd)
-                except FileNotFoundError:
-                    pass
+            try:
+                if acquired:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
 
 
-def save_run(state: AgentState, root_dir: Path | str | None = None) -> Path:
+def _encoded_run_state(state: AgentState) -> bytes:
+    payload = state.model_dump(mode="json")
+    payload = _clear_legacy_evaluator_patch_state(payload)
+    payload["attempt_outcome_summary"] = _safe_outcome_summary(state)
+    return json.dumps(payload, indent=2).encode("utf-8")
+
+
+def save_run(
+    state: AgentState,
+    root_dir: Path | str | None = None,
+    *,
+    rollback_state: AgentState | None = None,
+) -> Path:
     if not state.trace_id:
         raise ValueError("Cannot save a run without a trace_id.")
 
     _validate_run_id(state.trace_id)
-    payload = state.model_dump(mode="json")
-    payload = _clear_legacy_evaluator_patch_state(payload)
-    payload["attempt_outcome_summary"] = _safe_outcome_summary(state)
-    encoded = json.dumps(payload, indent=2).encode("utf-8")
-    return _atomic_write_run(state.trace_id, encoded, root_dir)
+    path = run_path(state.trace_id, root_dir=root_dir)
+    with _run_lock(state.trace_id, root_dir) as (_, directory_fd):
+        return _atomic_write_run_at(
+            state.trace_id,
+            _encoded_run_state(state),
+            directory_fd,
+            path,
+            rollback_payload=(
+                _encoded_run_state(rollback_state)
+                if rollback_state is not None
+                else None
+            ),
+        )
+
+
+def claim_run_for_resume(
+    run_id: str,
+    expected_state: AgentState,
+    *,
+    root_dir: Path | str | None = None,
+) -> AgentState:
+    """Atomically consume one paused request and return its claimed state."""
+    _validate_run_id(run_id)
+    if not isinstance(expected_state, AgentState):
+        raise ResumeConflictError
+
+    path = run_path(run_id, root_dir=root_dir)
+    with _run_lock(run_id, root_dir) as (_, directory_fd):
+        try:
+            content, _opened = _read_run_bytes_at(run_id, directory_fd)
+        except FileNotFoundError:
+            raise ResumeConflictError from None
+        durable = _state_from_run_bytes(content)
+        if (
+            durable.trace_id != run_id
+            or expected_state.trace_id != run_id
+            or durable.model_dump(mode="json")
+            != expected_state.model_dump(mode="json")
+            or durable.current_phase != Phase.WAITING_FOR_USER
+            or not durable.pending_human_input
+            or not durable.human_input_request
+            or durable.resume_in_progress
+        ):
+            raise ResumeConflictError
+
+        claimed = durable.model_copy(deep=True)
+        claimed.resume_in_progress = True
+        claimed.current_phase = Phase.PLAN
+        claimed.pending_human_input = False
+        claimed.human_input_request = {}
+        _atomic_write_run_at(
+            run_id,
+            _encoded_run_state(claimed),
+            directory_fd,
+            path,
+        )
+        return claimed
 
 
 def load_run(run_id: str, root_dir: Path | str | None = None) -> AgentState:

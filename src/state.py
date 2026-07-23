@@ -866,6 +866,7 @@ class AgentState(BaseModel):
     node_diagnostics: list[dict[str, Any]] = Field(default_factory=list)
     pending_human_input: bool = False
     human_input_request: dict[str, Any] = Field(default_factory=dict)
+    resume_in_progress: bool = False
     active_model: str = "gemini-3.5-flash:stable"
     active_provider: Literal["primary", "escalation"] = "primary"
     escalated: bool = False

@@ -5,7 +5,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
-from src import main
+from src import main, new_agent, run_store
 from src.state import AgentState, Phase
 
 API_TOKEN = "test-api-token"
@@ -538,6 +538,40 @@ async def test_resume_authorizes_stored_run_before_invocation(monkeypatch, api_c
     assert response.status_code == 200
     assert response.json()["success"] is True
     assert calls == [("abc123def456", "Proceed.", state)]
+
+
+async def test_serial_second_resume_returns_stable_conflict(
+    monkeypatch, tmp_path, api_client
+):
+    root_dir = tmp_path / ".repopilot"
+    monkeypatch.setenv("REPOPILOT_HOME", str(root_dir))
+    run_store.save_run(_state(), root_dir=root_dir)
+
+    async def fake_run_graph(graph, state):
+        state.current_phase = Phase.DONE
+        return state
+
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    request = {
+        "run_id": "abc123def456",
+        "human_answer": "Proceed.",
+    }
+    first = await api_client.post(
+        "/agent/v2/resume",
+        headers=AUTHORIZED_HEADERS,
+        json=request,
+    )
+    second = await api_client.post(
+        "/agent/v2/resume",
+        headers=AUTHORIZED_HEADERS,
+        json=request,
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json() == {"detail": "Run resume conflict."}
 
 
 @pytest.mark.parametrize(

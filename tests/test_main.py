@@ -4,7 +4,7 @@ import json
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from src import main
+from src import main, run_store
 from src.state import AgentState, Phase
 
 API_TOKEN = "test-api-token"
@@ -245,6 +245,27 @@ async def test_post_agent_v2_resume_rejects_non_paused_run(monkeypatch, api_clie
 
     assert response.status_code == 400
     assert response.json() == {"detail": "Agent request failed."}
+
+
+async def test_post_agent_v2_resume_maps_claim_conflict_to_stable_409(
+    monkeypatch, api_client
+):
+    async def conflicting_resume(run_id, human_answer, *, state):
+        raise run_store.ResumeConflictError
+
+    monkeypatch.setattr(main, "resume_agent_v2", conflicting_resume)
+    monkeypatch.setattr(main, "load_run", lambda run_id: _authorized_saved_state())
+
+    response = await api_client.post(
+        "/agent/v2/resume",
+        json={
+            "run_id": "abc123def456",
+            "human_answer": "Breaking changes are not allowed.",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Run resume conflict."}
 
 
 async def test_post_agent_v2_resume_returns_404_for_missing_saved_run(

@@ -21,6 +21,7 @@ from src.agent import analyze_issue
 from src.agent_loop import agent_analyze
 from src.new_agent import agent_v2, intelligent_analyze_issue, resume_agent_v2
 from src.run_store import (
+    ResumeConflictError,
     format_replay_markdown,
     load_run,
     summarize_replay,
@@ -448,6 +449,8 @@ async def agent_v2_resume_endpoint(req: AgentV2ResumeRequest):
                 req.human_answer,
                 state=state,
             )
+        except ResumeConflictError:
+            return _error_response(409, "Run resume conflict.")
         except Exception:
             return _error_response(502, "Agent request failed.")
 

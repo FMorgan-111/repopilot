@@ -32,7 +32,7 @@ from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
 from .nodes.verify import verify_fix
-from .run_store import load_run, save_run
+from .run_store import claim_run_for_resume, load_run, save_run
 from .safe_subprocess import tool_sandbox_config_from_env
 from .state import (
     DEFAULT_AGENT_V2_TOKEN_BUDGET,
@@ -514,15 +514,8 @@ async def resume_agent_v2(
     """Resume a paused RepoPilot v2 run with a human answer."""
     if state is None:
         state = load_run(run_id)
-    if (
-        state.current_phase != Phase.WAITING_FOR_USER
-        or not state.pending_human_input
-        or not state.human_input_request
-    ):
-        payload = agent_payload_from_state(state, len(state.tool_calls))
-        payload["success"] = False
-        payload["error"] = f"Run {run_id} is not waiting for user input."
-        return payload
+    state = claim_run_for_resume(run_id, state)
+    claimed_state = state.model_copy(deep=True)
 
     _remember(
         state,
@@ -537,10 +530,9 @@ async def resume_agent_v2(
 
     graph = build_agent_graph(start_phase=Phase.PLAN)
     final_state = await run_graph(graph, state)
+    final_state.resume_in_progress = False
+    save_run(final_state, rollback_state=claimed_state)
     payload = agent_payload_from_state(final_state, len(final_state.tool_calls))
-
-    if final_state.current_phase == Phase.WAITING_FOR_USER:
-        _best_effort_save_run(final_state)
 
     tracer = Tracer()
     tracer.trace_id = state.trace_id

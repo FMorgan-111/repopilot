@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import json
+import stat
 import subprocess
 from types import SimpleNamespace
 
@@ -971,17 +972,17 @@ async def test_resume_agent_v2_rejects_non_paused_run(monkeypatch):
         current_phase=new_agent.Phase.DONE,
     )
 
+    def reject_claim(run_id, expected_state):
+        raise run_store.ResumeConflictError
+
     monkeypatch.setattr(new_agent, "load_run", lambda run_id: state)
+    monkeypatch.setattr(new_agent, "claim_run_for_resume", reject_claim)
 
-    payload = await new_agent.resume_agent_v2(
-        "abc123def456",
-        "Breaking changes are not allowed.",
-    )
-
-    assert payload["success"] is False
-    assert payload["waiting_for_user"] is False
-    assert payload["final_phase"] == "DONE"
-    assert payload["error"] == "Run abc123def456 is not waiting for user input."
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "abc123def456",
+            "Breaking changes are not allowed.",
+        )
 
 
 async def test_resume_agent_v2_uses_preloaded_authorized_state(monkeypatch):
@@ -991,19 +992,31 @@ async def test_resume_agent_v2_uses_preloaded_authorized_state(monkeypatch):
         current_phase=new_agent.Phase.DONE,
     )
 
+    claimed = []
+
     def forbidden_load(run_id):
         raise AssertionError("an API-authorized snapshot must not be loaded again")
 
-    monkeypatch.setattr(new_agent, "load_run", forbidden_load)
+    def fake_claim(run_id, expected_state):
+        claimed.append((run_id, expected_state))
+        raise run_store.ResumeConflictError
 
-    payload = await new_agent.resume_agent_v2(
-        "abc123def456",
-        "Proceed.",
-        state=state,
+    monkeypatch.setattr(new_agent, "load_run", forbidden_load)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
     )
 
-    assert payload["success"] is False
-    assert payload["error"] == "Run abc123def456 is not waiting for user input."
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "abc123def456",
+            "Proceed.",
+            state=state,
+        )
+
+    assert claimed == [("abc123def456", state)]
 
 
 async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch):
@@ -1040,7 +1053,30 @@ async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch)
         state.current_phase = new_agent.Phase.DONE
         return state
 
+    def fake_claim(run_id, expected_state):
+        claimed = expected_state.model_copy(deep=True)
+        claimed.resume_in_progress = True
+        claimed.current_phase = new_agent.Phase.PLAN
+        claimed.pending_human_input = False
+        claimed.human_input_request = {}
+        return claimed
+
+    saved_states = []
+
     monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **_kwargs: saved_states.append(
+            state.model_copy(deep=True)
+        ),
+    )
     monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
 
@@ -1064,6 +1100,7 @@ async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch)
     assert payload["success"] is False
     assert payload["run_id"] == "abc123def456"
     assert payload["final_phase"] == "DONE"
+    assert saved_states[0].resume_in_progress is False
 
 
 async def test_resume_agent_v2_starts_graph_at_plan(monkeypatch):
@@ -1095,7 +1132,22 @@ async def test_resume_agent_v2_starts_graph_at_plan(monkeypatch):
         state.current_phase = new_agent.Phase.DONE
         return state
 
+    def fake_claim(run_id, expected_state):
+        claimed = expected_state.model_copy(deep=True)
+        claimed.resume_in_progress = True
+        claimed.current_phase = new_agent.Phase.PLAN
+        claimed.pending_human_input = False
+        claimed.human_input_request = {}
+        return claimed
+
     monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
+    )
+    monkeypatch.setattr(new_agent, "save_run", lambda state, **_kwargs: None)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
     monkeypatch.setattr(new_agent, "understand_issue", understand)
     monkeypatch.setattr(new_agent, "plan_fix", plan)
@@ -1140,13 +1192,33 @@ async def test_resume_agent_v2_saves_run_when_it_pauses_again(monkeypatch, tmp_p
         }
         return state
 
-    monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    root_dir = tmp_path / ".repopilot"
+    run_store.save_run(paused_state, root_dir=root_dir)
+    monkeypatch.setattr(
+        new_agent,
+        "load_run",
+        lambda run_id: run_store.load_run(run_id, root_dir=root_dir),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         new_agent,
         "save_run",
-        lambda state: run_store.save_run(state, root_dir=tmp_path / ".repopilot"),
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
     )
 
     payload = await new_agent.resume_agent_v2(
@@ -1155,7 +1227,380 @@ async def test_resume_agent_v2_saves_run_when_it_pauses_again(monkeypatch, tmp_p
     )
 
     assert payload["waiting_for_user"] is True
-    assert (tmp_path / ".repopilot" / "runs" / "abc123def456.json").exists()
+    durable = run_store.load_run("abc123def456", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.WAITING_FOR_USER
+    assert durable.resume_in_progress is False
+
+
+async def test_simultaneous_resumes_execute_graph_exactly_once(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="same-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    expected = run_store.load_run("same-run", root_dir=root_dir)
+    graph_calls = 0
+
+    async def fake_run_graph(graph, state):
+        nonlocal graph_calls
+        graph_calls += 1
+        await asyncio.sleep(0)
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    results = await asyncio.gather(
+        new_agent.resume_agent_v2(
+            "same-run",
+            "Proceed.",
+            state=expected.model_copy(deep=True),
+        ),
+        new_agent.resume_agent_v2(
+            "same-run",
+            "Proceed.",
+            state=expected.model_copy(deep=True),
+        ),
+        return_exceptions=True,
+    )
+
+    assert graph_calls == 1
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(
+        isinstance(result, run_store.ResumeConflictError) for result in results
+    ) == 1
+
+
+async def test_different_run_ids_resume_concurrently(monkeypatch, tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    for run_id in ("run-a", "run-b"):
+        run_store.save_run(
+            new_agent.AgentState(
+                issue_url=f"https://github.com/acme/widget/issues/{run_id[-1]}",
+                trace_id=run_id,
+                current_phase=new_agent.Phase.WAITING_FOR_USER,
+                pending_human_input=True,
+                human_input_request={"question": "Proceed?"},
+            ),
+            root_dir=root_dir,
+        )
+    both_started = asyncio.Event()
+    started: set[str] = set()
+
+    async def fake_run_graph(graph, state):
+        started.add(state.trace_id)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    results = await asyncio.gather(
+        *(
+            new_agent.resume_agent_v2(
+                run_id,
+                "Proceed.",
+                state=run_store.load_run(run_id, root_dir=root_dir),
+            )
+            for run_id in ("run-a", "run-b")
+        )
+    )
+
+    assert started == {"run-a", "run-b"}
+    assert {result["run_id"] for result in results} == {"run-a", "run-b"}
+
+
+async def test_cancelled_resume_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="cancelled-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    graph_started = asyncio.Event()
+
+    async def fake_run_graph(graph, state):
+        graph_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-run",
+            "Proceed.",
+            state=run_store.load_run("cancelled-run", root_dir=root_dir),
+        )
+    )
+    await graph_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = run_store.load_run("cancelled-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.pending_human_input is False
+    assert durable.human_input_request == {}
+    assert all(
+        turn.content != "Human answer for paused run cancelled-run:\nProceed."
+        for turn in durable.conversation_history
+    )
+
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "cancelled-run",
+            "Proceed again.",
+            state=durable,
+        )
+
+
+async def test_crashed_resume_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="crashed-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+
+    async def crashing_graph(graph, state):
+        raise RuntimeError("injected graph crash")
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", crashing_graph)
+
+    with pytest.raises(RuntimeError, match="graph crash"):
+        await new_agent.resume_agent_v2(
+            "crashed-run",
+            "Proceed.",
+            state=run_store.load_run("crashed-run", root_dir=root_dir),
+        )
+
+    durable = run_store.load_run("crashed-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.conversation_history == paused.conversation_history
+
+
+async def test_resume_completion_save_failure_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="save-failure-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+
+    def fail_save(state, **_kwargs):
+        raise OSError("injected completion save failure")
+
+    monkeypatch.setattr(new_agent, "save_run", fail_save)
+
+    with pytest.raises(OSError, match="completion save failure"):
+        await new_agent.resume_agent_v2(
+            "save-failure-run",
+            "Proceed.",
+            state=run_store.load_run("save-failure-run", root_dir=root_dir),
+        )
+
+    durable = run_store.load_run("save-failure-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+
+
+async def test_post_replace_completion_failure_restores_claimed_snapshot(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="post-replace-failure",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    graph_returned = False
+    failed_directory_sync = False
+
+    async def completed_graph(graph, state):
+        nonlocal graph_returned
+        state.current_phase = new_agent.Phase.DONE
+        graph_returned = True
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+    real_fsync = run_store.os.fsync
+
+    def fail_first_completion_directory_sync(descriptor):
+        nonlocal failed_directory_sync
+        descriptor_info = run_store.os.fstat(descriptor)
+        if (
+            graph_returned
+            and not failed_directory_sync
+            and stat.S_ISDIR(descriptor_info.st_mode)
+        ):
+            failed_directory_sync = True
+            raise OSError("injected post-replace directory sync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        run_store.os,
+        "fsync",
+        fail_first_completion_directory_sync,
+    )
+
+    with pytest.raises(OSError, match="post-replace directory sync failure"):
+        await new_agent.resume_agent_v2(
+            "post-replace-failure",
+            "Proceed.",
+            state=run_store.load_run(
+                "post-replace-failure",
+                root_dir=root_dir,
+            ),
+        )
+
+    durable = run_store.load_run("post-replace-failure", root_dir=root_dir)
+    assert failed_directory_sync is True
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.pending_human_input is False
+    assert durable.human_input_request == {}
+    assert durable.conversation_history == []
 
 
 async def test_verify_fix_replans_failed_attempt_once():
