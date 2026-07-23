@@ -6,10 +6,18 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    field_validator,
+    model_validator,
+)
 
+from eval.safe_contracts import has_verified_coverage_proof
 from eval.swe_bench import (
     DATASET_NAME,
     DATASET_REVISION,
@@ -28,6 +36,41 @@ RuntimeStatus = Literal[
 OfficialStatus = Literal[
     "resolved", "unresolved", "empty_patch", "scorer_infra"
 ]
+FailureClass = Literal[
+    "agent_success",
+    "resolved",
+    "opus_no_progress_limit",
+    "patch_gate_rejected",
+    "model_gateway_infra",
+    "coverage_infra",
+    "test_generation_failed",
+    "wrong_file_path",
+    "invalid_diff",
+    "empty_patch",
+    "search_not_found",
+    "test_failed",
+    "infra",
+    "budget",
+    "other",
+]
+ModelProvider = Literal["primary", "escalation"]
+ModelName = Literal[
+    "gemini-3.5-flash:stable", "claude-opus-4-8:stable"
+]
+InvocationStatus = Literal["ok", "invalid_response", "error"]
+CoverageStatus = Literal[
+    "pending", "existing_verified", "generated_verified", "failed"
+]
+INFRASTRUCTURE_FAILURE_CLASSES = frozenset(
+    {"infra", "model_gateway_infra", "coverage_infra"}
+)
+
+_NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+_FiniteNonNegativeFloat = Annotated[
+    float, Field(strict=True, ge=0, allow_inf_nan=False)
+]
+_NonEmptyString = Annotated[str, Field(min_length=1)]
+_NonEmptyModels = Annotated[list[ModelName], Field(min_length=1)]
 
 _MODE_FILES: dict[str, str] = {
     "checkpoint_5": "checkpoint_5_ids.txt",
@@ -155,6 +198,103 @@ class OfficialResult(BaseModel):
             raise ValueError("scorer infrastructure failure cannot be resolved")
         if self.status != "scorer_infra" and self.error_class:
             raise ValueError("terminal scorer result cannot have error_class")
+        return self
+
+
+class ModelInvocationRecord(BaseModel):
+    """One complete, configured model invocation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: ModelName
+    provider: ModelProvider
+    node: _NonEmptyString
+    elapsed_seconds: _FiniteNonNegativeFloat
+    input_tokens: _NonNegativeInt
+    output_tokens: _NonNegativeInt
+    status: InvocationStatus
+    error_class: str
+
+    @model_validator(mode="after")
+    def validate_provider_model_pair(self) -> ModelInvocationRecord:
+        configured_model = {
+            "primary": PRIMARY_MODEL,
+            "escalation": ESCALATION_MODEL,
+        }[self.provider]
+        if self.model != configured_model:
+            raise ValueError("provider does not match configured model")
+        return self
+
+
+class ResultRecord(BaseModel):
+    """Complete pre-official Agent V2 result accepted for OCI scoring."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    mode: Literal["agent_v2"]
+    evaluation_mode: Literal["oracle_files", "end_to_end"]
+    model: Literal["gemini-3.5-flash:stable"]
+    commit_sha: str
+    repo: str
+    issue_url: str
+    issue_title: str
+    success: StrictBool
+    agent_success: StrictBool
+    official_resolved: None
+    waiting_for_user: StrictBool
+    final_phase: str
+    run_id: str
+    trace_id: str
+    turns_taken: _NonNegativeInt
+    token_used: _NonNegativeInt
+    error: str | None
+    replay: dict[str, Any] | None
+    replay_error: str | None
+    models_used: _NonEmptyModels
+    escalated: StrictBool
+    escalation_reason: str
+    model_invocations: list[ModelInvocationRecord]
+    tool_invocations: list[dict[str, Any]]
+    unique_evidence_count: _NonNegativeInt
+    max_consecutive_no_progress: _NonNegativeInt
+    attempt_outcome_summary: str
+    coverage_status: CoverageStatus
+    coverage_test_files: list[str]
+    coverage_test_command: str
+    coverage_proof: dict[str, Any] | None
+    coverage_failure_reason: str
+    test_generation_attempts: _NonNegativeInt
+    failure_class: FailureClass
+    instance_id: str
+    base_commit: str
+    model_patch: str
+
+    @field_validator("commit_sha")
+    @classmethod
+    def validate_commit_sha(cls, value: str) -> str:
+        if not _COMMIT_SHA_RE.fullmatch(value):
+            raise ValueError("commit_sha must be a 40-character lowercase hex SHA")
+        return value
+
+    @model_validator(mode="after")
+    def validate_internal_verdict(self) -> ResultRecord:
+        if self.id != self.instance_id:
+            raise ValueError("id must match instance_id")
+        if self.success is not self.agent_success:
+            raise ValueError("success and agent_success must match")
+        if self.agent_success and self.failure_class != "agent_success":
+            raise ValueError("successful result requires agent_success failure class")
+        if self.agent_success and not has_verified_coverage_proof(
+            self.coverage_status,
+            self.coverage_proof,
+        ):
+            raise ValueError("agent_success requires verified coverage proof")
+        if not self.agent_success and self.failure_class in {
+            "agent_success",
+            "resolved",
+        }:
+            raise ValueError("failed result cannot claim a success failure class")
         return self
 
 

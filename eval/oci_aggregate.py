@@ -16,11 +16,14 @@ from typing import Any
 
 from eval.oci_contract import (
     ESCALATION_MODEL,
+    INFRASTRUCTURE_FAILURE_CLASSES,
     PRIMARY_MODEL,
     REPO_ROOT,
     EvalMode,
     InstanceManifest,
+    ModelInvocationRecord,
     OfficialResult,
+    ResultRecord,
     load_mode_instance_ids,
 )
 from eval.safe_contracts import sanitize_output_text
@@ -45,7 +48,7 @@ class ArtifactContractError(RuntimeError):
 
 @dataclass(frozen=True)
 class VerifiedPayload:
-    result: dict[str, Any]
+    result: ResultRecord
     prediction: dict[str, str]
     official: OfficialResult
 
@@ -238,81 +241,23 @@ def _snapshot_artifacts(artifacts_dir: Path) -> list[_BundleSnapshot]:
         os.close(root_fd)
 
 
-def _model_invocations(result: dict[str, Any]) -> tuple[dict[str, Any], ...]:
-    invocations = result.get("model_invocations", [])
-    if not isinstance(invocations, list):
-        return ()
-    return tuple(
-        invocation for invocation in invocations if isinstance(invocation, dict)
-    )
-
-
-def _model_usage(
-    source: dict[str, Any] | tuple[dict[str, Any], ...],
-) -> tuple[int, float]:
-    tokens = 0
-    elapsed = 0.0
-    invocations = _model_invocations(source) if isinstance(source, dict) else source
-    for invocation in invocations:
-        for key in ("input_tokens", "output_tokens"):
-            value = invocation.get(key)
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                tokens += value
-        duration = invocation.get("elapsed_seconds")
-        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
-            continue
-        try:
-            projected_duration = float(duration)
-        except (OverflowError, ValueError):
-            continue
-        if math.isfinite(projected_duration) and projected_duration > 0:
-            elapsed += projected_duration
-    return tokens, elapsed
-
-
-def _internal_verdict(result: dict[str, Any]) -> bool | None:
-    verdict = result.get("agent_success")
-    if type(verdict) is not bool:
-        return None
-    reported_success = result.get("success", verdict)
-    if type(reported_success) is not bool or reported_success is not verdict:
-        return None
-    return verdict
-
-
 def _complete_model_usage(
-    invocations: tuple[dict[str, Any], ...],
+    invocations: list[ModelInvocationRecord],
 ) -> tuple[int, float] | None:
     if not invocations:
         return None
-    tokens = 0
-    durations: list[float] = []
-    for invocation in invocations:
-        if invocation.get("model") not in {PRIMARY_MODEL, ESCALATION_MODEL}:
-            return None
-        if not isinstance(invocation.get("status"), str) or not invocation["status"]:
-            return None
-        for key in ("input_tokens", "output_tokens"):
-            value = invocation.get(key)
-            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-                return None
-            tokens += value
-        duration = invocation.get("elapsed_seconds")
-        if not isinstance(duration, (int, float)) or isinstance(duration, bool):
-            return None
-        try:
-            projected_duration = float(duration)
-        except (OverflowError, ValueError):
-            return None
-        if not math.isfinite(projected_duration) or projected_duration < 0:
-            return None
-        durations.append(projected_duration)
+    tokens = sum(
+        invocation.input_tokens + invocation.output_tokens
+        for invocation in invocations
+    )
     try:
-        elapsed = math.fsum(durations)
+        elapsed = math.fsum(
+            invocation.elapsed_seconds for invocation in invocations
+        )
     except OverflowError:
-        return None
+        raise ArtifactContractError("model elapsed total is not finite") from None
     if not math.isfinite(elapsed):
-        return None
+        raise ArtifactContractError("model elapsed total is not finite")
     return tokens, elapsed
 
 
@@ -354,6 +299,10 @@ def _parse_safe_payload_bytes(
         or not isinstance(result_payload[0], dict)
     ):
         raise ArtifactContractError("result.json must contain exactly one result")
+    try:
+        result = ResultRecord.model_validate(result_payload[0])
+    except (ValueError, TypeError) as exc:
+        raise ArtifactContractError("invalid safe artifact payload") from exc
     if len(prediction_lines) != 1:
         raise ArtifactContractError("prediction.jsonl must contain exactly one row")
     try:
@@ -369,18 +318,17 @@ def _parse_safe_payload_bytes(
     if any(not isinstance(value, str) for value in prediction.values()):
         raise ArtifactContractError("prediction fields must be strings")
 
-    result = result_payload[0]
     if (
-        result.get("instance_id") != expected_instance_id
-        or result.get("commit_sha") != expected_commit
-        or result.get("model") != PRIMARY_MODEL
+        result.instance_id != expected_instance_id
+        or result.commit_sha != expected_commit
+        or result.model != PRIMARY_MODEL
         or prediction["instance_id"] != expected_instance_id
         or prediction["model_name_or_path"] != PRIMARY_MODEL
-        or prediction["model_patch"] != result.get("model_patch")
+        or prediction["model_patch"] != result.model_patch
         or official.instance_id != expected_instance_id
     ):
         raise ArtifactContractError("cross-file artifact identity mismatch")
-    _assert_safe_tree(result)
+    _assert_safe_tree(result.model_dump(mode="json"))
     _assert_safe_tree(prediction)
     _assert_safe_tree(official.model_dump(mode="json"))
     return VerifiedPayload(result=result, prediction=prediction, official=official)
@@ -433,6 +381,26 @@ def snapshot_safe_payloads(
     return payload, files
 
 
+def _validate_bundle_consistency(
+    manifest: InstanceManifest,
+    payload: VerifiedPayload,
+) -> None:
+    result = payload.result
+    official = payload.official
+    if manifest.runtime_status != "ready" and (
+        official.status != "scorer_infra"
+        or official.completed
+        or result.failure_class != "infra"
+        or bool(result.model_patch)
+        or bool(result.model_invocations)
+    ):
+        raise ArtifactContractError("inconsistent artifact bundle")
+    if official.status == "empty_patch" and result.model_patch:
+        raise ArtifactContractError("inconsistent artifact bundle")
+    if official.completed and not result.model_patch:
+        raise ArtifactContractError("inconsistent artifact bundle")
+
+
 def _verify_bundle(
     snapshot: _BundleSnapshot,
     *,
@@ -463,6 +431,7 @@ def _verify_bundle(
         expected_instance_id=expected_instance_id,
         expected_commit=expected_commit,
     )
+    _validate_bundle_consistency(manifest, payload)
     return manifest, payload
 
 
@@ -474,36 +443,54 @@ def _summary(
     requested = len(ordered)
     completed = sum(item.official.completed for _manifest, item in ordered)
     internal_verdicts = [
-        _internal_verdict(item.result) for _manifest, item in ordered
+        item.result.agent_success for _manifest, item in ordered
     ]
-    internal_success = sum(verdict is True for verdict in internal_verdicts)
+    internal_success = sum(internal_verdicts)
     official_resolved = sum(item.official.resolved for _manifest, item in ordered)
     official_terminal = sum(
         item.official.status != "scorer_infra" for _manifest, item in ordered
     )
+    invocation_groups = [
+        item.result.model_invocations for _manifest, item in ordered
+    ]
+    usage = [_complete_model_usage(invocations) for invocations in invocation_groups]
     non_infrastructure = sum(
         manifest.runtime_status == "ready"
-        and item.official.status != "scorer_infra"
-        and item.result.get("failure_class") != "infra"
-        for manifest, item in ordered
+        and payload.official.completed
+        and payload.official.status != "scorer_infra"
+        and usage_item is not None
+        and payload.result.failure_class not in INFRASTRUCTURE_FAILURE_CLASSES
+        for (manifest, payload), usage_item in zip(ordered, usage)
     )
-    infrastructure = requested - non_infrastructure
+    infrastructure = sum(
+        manifest.runtime_status != "ready"
+        or payload.official.status == "scorer_infra"
+        or payload.result.failure_class in INFRASTRUCTURE_FAILURE_CLASSES
+        for manifest, payload in ordered
+    )
     agreements = sum(
         item.official.status != "scorer_infra"
-        and verdict is not None
         and verdict == item.official.resolved
         for (_manifest, item), verdict in zip(ordered, internal_verdicts)
     )
-    invocation_groups = [_model_invocations(item.result) for _manifest, item in ordered]
-    usage = [_complete_model_usage(invocations) for invocations in invocation_groups]
     model_tokens = sum(item[0] for item in usage if item is not None)
-    model_elapsed = math.fsum(item[1] for item in usage if item is not None)
+    try:
+        model_elapsed = math.fsum(
+            item[1] for item in usage if item is not None
+        )
+    except OverflowError:
+        raise ArtifactContractError("model elapsed total is not finite") from None
+    if not math.isfinite(model_elapsed):
+        raise ArtifactContractError("model elapsed total is not finite")
     within_budget = sum(
-        payload.official.completed
+        manifest.runtime_status == "ready"
+        and payload.official.completed
+        and payload.official.status != "scorer_infra"
         and item is not None
+        and payload.result.failure_class not in INFRASTRUCTURE_FAILURE_CLASSES
         and item[0] <= 100_000
         and item[1] <= 360 * 60
-        for (_manifest, payload), item in zip(ordered, usage)
+        for (manifest, payload), item in zip(ordered, usage)
     )
     official_score = 100.0 * official_resolved / requested
     resolution_component = 80.0 * official_resolved / requested
@@ -519,14 +506,12 @@ def _summary(
         + budget_component
     )
     failure_counts = Counter(
-        str(item.result.get("failure_class") or "unknown")
-        for _manifest, item in ordered
+        item.result.failure_class for _manifest, item in ordered
     )
     model_counts = Counter(
-        str(invocation.get("model"))
+        invocation.model
         for invocations in invocation_groups
         for invocation in invocations
-        if invocation.get("model")
     )
     lines = [
         f"# SWE-bench OCI evaluation: {mode}",
@@ -578,11 +563,7 @@ def _summary(
             instance=manifest.instance_id,
             runtime=manifest.runtime_status,
             internal=(
-                "unavailable"
-                if verdict is None
-                else "success"
-                if verdict
-                else "failed"
+                "success" if verdict else "failed"
             ),
             official=payload.official.status,
             tokens="unavailable" if item is None else str(item[0]),
@@ -629,7 +610,10 @@ def aggregate_artifacts(
     ]
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    results = [payload.result for _manifest, payload in ordered]
+    results = [
+        payload.result.model_dump(mode="json")
+        for _manifest, payload in ordered
+    ]
     predictions = [payload.prediction for _manifest, payload in ordered]
     official = [
         payload.official.model_dump(mode="json") for _manifest, payload in ordered

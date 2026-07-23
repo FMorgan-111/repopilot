@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from eval import oci_contract
 from eval.oci_contract import (
     REPO_ROOT,
     InstanceManifest,
@@ -22,6 +23,92 @@ COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
 ROW_SHA = "c" * 64
 INSTANCE_ID = "pytest-dev__pytest-10081"
+
+
+def _invocation_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "model": "gemini-3.5-flash:stable",
+        "provider": "primary",
+        "node": "plan",
+        "elapsed_seconds": 1.0,
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "status": "ok",
+        "error_class": "",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _coverage_proof() -> dict[str, object]:
+    passing_run = {
+        "outcome": "pass",
+        "failing_test_ids": [],
+        "assertion_fingerprint": "",
+    }
+    failing_run = {
+        "outcome": "assertion_failure",
+        "failing_test_ids": ["tests/test_auth.py::test_login"],
+        "assertion_fingerprint": "f" * 64,
+    }
+    return {
+        "source": "generated",
+        "status": "generated_verified",
+        "test_files": ["tests/test_auth.py"],
+        "fixed_runs": [dict(passing_run), dict(passing_run)],
+        "base_runs": [dict(failing_run), dict(failing_run)],
+    }
+
+
+def _result_payload(**overrides: object) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "id": INSTANCE_ID,
+        "mode": "agent_v2",
+        "evaluation_mode": "end_to_end",
+        "model": "gemini-3.5-flash:stable",
+        "commit_sha": COMMIT_SHA,
+        "repo": "pytest-dev/pytest",
+        "issue_url": "https://github.com/pytest-dev/pytest/issues/10081",
+        "issue_title": "A regression",
+        "success": False,
+        "agent_success": False,
+        "official_resolved": None,
+        "waiting_for_user": False,
+        "final_phase": "FAILED",
+        "run_id": "run-1",
+        "trace_id": "trace-1",
+        "turns_taken": 2,
+        "token_used": 15,
+        "error": None,
+        "replay": None,
+        "replay_error": None,
+        "models_used": ["gemini-3.5-flash:stable"],
+        "escalated": False,
+        "escalation_reason": "",
+        "model_invocations": [_invocation_payload()],
+        "tool_invocations": [],
+        "unique_evidence_count": 0,
+        "max_consecutive_no_progress": 0,
+        "attempt_outcome_summary": "tests failed",
+        "coverage_status": "failed",
+        "coverage_test_files": [],
+        "coverage_test_command": "",
+        "coverage_proof": None,
+        "coverage_failure_reason": "test_failed",
+        "test_generation_attempts": 0,
+        "failure_class": "test_failed",
+        "instance_id": INSTANCE_ID,
+        "base_commit": "d" * 40,
+        "model_patch": "diff --git a/a.py b/a.py\n",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _result_record_model():
+    model = getattr(oci_contract, "ResultRecord", None)
+    assert model is not None, "ResultRecord contract is missing"
+    return model
 
 
 def _manifest_payload(**overrides: object) -> dict[str, object]:
@@ -191,6 +278,148 @@ def test_official_empty_patch_is_submitted_but_not_completed() -> None:
     )
 
     assert result.status == "empty_patch"
+
+
+def test_result_record_accepts_complete_producer_schema() -> None:
+    record = _result_record_model().model_validate(_result_payload())
+
+    assert record.instance_id == INSTANCE_ID
+    assert record.model_invocations[0].provider == "primary"
+
+
+@pytest.mark.parametrize("scope", ["result", "invocation"])
+def test_result_record_forbids_unknown_fields(scope: str) -> None:
+    payload = _result_payload()
+    if scope == "result":
+        payload["unexpected"] = "unsafe"
+    else:
+        invocation = dict(payload["model_invocations"][0])
+        invocation["unexpected"] = "unsafe"
+        payload["model_invocations"] = [invocation]
+
+    with pytest.raises(ValidationError, match="unexpected"):
+        _result_record_model().model_validate(payload)
+
+
+@pytest.mark.parametrize("failure_class", [None, "unknown_failure"])
+def test_result_record_requires_known_failure_class(
+    failure_class: str | None,
+) -> None:
+    payload = _result_payload()
+    if failure_class is None:
+        del payload["failure_class"]
+    else:
+        payload["failure_class"] = failure_class
+
+    with pytest.raises(ValidationError, match="failure_class"):
+        _result_record_model().model_validate(payload)
+
+
+def test_invocation_status_uses_closed_taxonomy() -> None:
+    payload = _result_payload(
+        model_invocations=[_invocation_payload(status="garbage")]
+    )
+
+    with pytest.raises(ValidationError, match="status"):
+        _result_record_model().model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("provider", "model"),
+    [
+        ("primary", "claude-opus-4-8:stable"),
+        ("escalation", "gemini-3.5-flash:stable"),
+    ],
+)
+def test_invocation_provider_must_match_configured_model(
+    provider: str,
+    model: str,
+) -> None:
+    payload = _result_payload(
+        model_invocations=[
+            _invocation_payload(provider=provider, model=model)
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="provider"):
+        _result_record_model().model_validate(payload)
+
+
+def test_invocation_accepts_both_configured_provider_model_pairs() -> None:
+    payload = _result_payload(
+        models_used=[
+            "gemini-3.5-flash:stable",
+            "claude-opus-4-8:stable",
+        ],
+        model_invocations=[
+            _invocation_payload(),
+            _invocation_payload(
+                provider="escalation",
+                model="claude-opus-4-8:stable",
+            ),
+        ],
+    )
+
+    record = _result_record_model().model_validate(payload)
+
+    assert [item.provider for item in record.model_invocations] == [
+        "primary",
+        "escalation",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("elapsed_seconds", float("nan")),
+        ("elapsed_seconds", float("inf")),
+        ("elapsed_seconds", -1.0),
+        ("input_tokens", float("nan")),
+        ("input_tokens", float("inf")),
+        ("input_tokens", -1),
+        ("output_tokens", -1),
+        ("input_tokens", True),
+    ],
+)
+def test_invocation_rejects_non_finite_negative_or_coerced_numbers(
+    field: str,
+    value: object,
+) -> None:
+    payload = _result_payload(
+        model_invocations=[_invocation_payload(**{field: value})]
+    )
+
+    with pytest.raises(ValidationError, match=field):
+        _result_record_model().model_validate(payload)
+
+
+def test_result_record_rejects_bool_as_nonnegative_integer() -> None:
+    with pytest.raises(ValidationError, match="turns_taken"):
+        _result_record_model().model_validate(_result_payload(turns_taken=True))
+
+
+def test_result_record_requires_matching_result_and_instance_ids() -> None:
+    with pytest.raises(ValidationError, match="instance_id"):
+        _result_record_model().model_validate(_result_payload(id="other-id"))
+
+
+def test_agent_success_requires_verified_coverage_proof() -> None:
+    successful = {
+        "success": True,
+        "agent_success": True,
+        "failure_class": "agent_success",
+        "coverage_status": "generated_verified",
+    }
+    with pytest.raises(ValidationError, match="coverage"):
+        _result_record_model().model_validate(
+            _result_payload(**successful, coverage_proof=None)
+        )
+
+    record = _result_record_model().model_validate(
+        _result_payload(**successful, coverage_proof=_coverage_proof())
+    )
+
+    assert record.agent_success is True
 
 
 def test_sha256_file_hashes_exact_bytes(tmp_path: Path) -> None:
