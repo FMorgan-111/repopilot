@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -39,9 +40,9 @@ DEFAULT_MODEL = "gemini-3.5-flash:stable"
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
-minimal_subprocess_env = importlib.import_module(
-    "src.safe_subprocess"
-).minimal_subprocess_env
+_safe_subprocess = importlib.import_module("src.safe_subprocess")
+minimal_subprocess_env = _safe_subprocess.minimal_subprocess_env
+run_bounded_process = _safe_subprocess.run_bounded_process
 
 
 def get_model_config(provider: str):
@@ -89,6 +90,9 @@ MAX_SOURCE_FILE_BYTES = 512 * 1024
 MAX_SEARCH_FILES = 10_000
 MAX_SEARCH_BYTES = 8 * 1024 * 1024
 MAX_SEARCH_RESULTS = 300
+MAX_TRACKED_LIST_BYTES = 4_000_000
+MAX_TRACKED_FILES = 10_000
+MAX_TRACKED_PATH_BYTES = 1_024
 DEEPSEEK_PRICING = {
     "input": 0.27 / 1_000_000,   # $0.27 per 1M input tokens
     "output": 0.36 / 1_000_000,  # $0.36 per 1M output tokens (cached miss)
@@ -332,15 +336,63 @@ async def _llm_search_context(
         return [], []
 
 
+def _prepare_eval_root(path: Path) -> Path:
+    """Create or validate a real private directory without following symlinks."""
+    absolute = Path(os.path.abspath(path))
+    if path.is_symlink():
+        raise ValueError("legacy eval root cannot be a symlink")
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    resolved = path.resolve(strict=True)
+    if resolved != absolute or not resolved.is_dir():
+        raise ValueError("legacy eval root must be an exact directory")
+    resolved.chmod(0o700)
+    return resolved
+
+
+def _validated_eval_child(eval_root: Path, path: Path, name: str) -> Path:
+    """Require an exact direct child before any destructive operation."""
+    root = Path(os.path.abspath(eval_root))
+    if eval_root.is_symlink():
+        raise ValueError("legacy eval root cannot be a symlink")
+    try:
+        resolved_root = eval_root.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("legacy eval root is unavailable") from exc
+    candidate = Path(os.path.abspath(path))
+    expected = resolved_root / name
+    if (
+        root != resolved_root
+        or not resolved_root.is_dir()
+        or candidate != expected
+        or candidate.parent != resolved_root
+    ):
+        raise ValueError(f"{name} must be an exact child of the eval root")
+    return expected
+
+
+def _remove_eval_child(eval_root: Path, path: Path, name: str) -> None:
+    exact = _validated_eval_child(eval_root, path, name)
+    try:
+        if exact.is_symlink() or exact.is_file():
+            exact.unlink()
+        else:
+            shutil.rmtree(exact)
+    except FileNotFoundError:
+        pass
+
+
 def clone_repo(
     owner: str,
     repo: str,
     base_commit: str,
     target: Path,
+    *,
+    eval_root: Path,
     timeout: int = 600,
 ) -> bool:
     """Fetch and verify one exact commit in a detached checkout."""
     base_commit = _validate_base_commit(base_commit)
+    target = _validated_eval_child(eval_root, target, "checkout")
     url = f"https://github.com/{owner}/{repo}.git"
     git_prefix = [
         "git",
@@ -369,19 +421,11 @@ def clone_repo(
         ],
         [*git_prefix, "-C", str(target), "checkout", "--detach", base_commit],
     ]
-    def remove_path(path: Path) -> None:
-        try:
-            if path.is_symlink() or path.is_file():
-                path.unlink()
-            else:
-                shutil.rmtree(path)
-        except FileNotFoundError:
-            pass
-
-    remove_path(target)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    git_home = target.parent / f".{target.name}-git-home"
-    remove_path(git_home)
+    _remove_eval_child(eval_root, target, "checkout")
+    git_home = _validated_eval_child(
+        eval_root, eval_root / ".checkout-git-home", ".checkout-git-home"
+    )
+    _remove_eval_child(eval_root, git_home, ".checkout-git-home")
     git_home.mkdir(mode=0o700)
     git_home.chmod(0o700)
     env = minimal_subprocess_env({"HOME": str(git_home)})
@@ -427,15 +471,56 @@ def clone_repo(
     except Exception as exc:
         print(f"    exact checkout error: {exc}", flush=True)
     finally:
-        remove_path(git_home)
+        _remove_eval_child(eval_root, git_home, ".checkout-git-home")
         if not success:
-            remove_path(target)
+            _remove_eval_child(eval_root, target, "checkout")
     return False
+
+
+def _safe_tracked_path(path: str) -> bool:
+    if (
+        not path
+        or path.startswith("/")
+        or "\\" in path
+        or len(path.encode("utf-8")) > MAX_TRACKED_PATH_BYTES
+        or any(ord(character) < 32 for character in path)
+    ):
+        return False
+    parts = path.split("/")
+    return not any(
+        not part or part in {".", ".."} or part.casefold() == ".git"
+        for part in parts
+    )
+
+
+def _load_tracked_files(repo_path: Path) -> tuple[tuple[str, ...], frozenset[str]]:
+    result = run_bounded_process(
+        ["git", "ls-files", "-z"],
+        cwd=repo_path,
+        timeout=15,
+        max_output_bytes=MAX_TRACKED_LIST_BYTES,
+        decode_errors="strict",
+    )
+    if result.returncode != 0:
+        raise ValueError("tracked file list command failed")
+    if result.stdout and not result.stdout.endswith("\0"):
+        raise ValueError("tracked file list is not NUL terminated")
+    paths = result.stdout.split("\0")[:-1] if result.stdout else []
+    if len(paths) > MAX_TRACKED_FILES:
+        raise ValueError("too many tracked files")
+    if any(not _safe_tracked_path(path) for path in paths):
+        raise ValueError("tracked file list contains an unsafe path")
+    tracked = tuple(paths)
+    tracked_set = frozenset(tracked)
+    if len(tracked_set) != len(tracked):
+        raise ValueError("tracked file list contains duplicate paths")
+    return tracked, tracked_set
 
 
 def grep_repo(
     repo_path: Path,
-    tracked_files: list[str],
+    tracked_files: tuple[str, ...],
+    tracked_set: frozenset[str],
     terms: list[str],
     *,
     max_files: int = MAX_SEARCH_RESULTS,
@@ -461,6 +546,7 @@ def grep_repo(
         content = read_file_content(
             repo_path,
             rel_path,
+            tracked_files=tracked_set,
             max_bytes=min(MAX_SOURCE_FILE_BYTES, remaining),
         )
         scanned_files += 1
@@ -478,21 +564,34 @@ def read_file_content(
     repo_path: Path,
     rel_path: str,
     *,
+    tracked_files: frozenset[str],
     max_bytes: int = MAX_SOURCE_FILE_BYTES,
 ) -> str:
     """Boundedly read a non-symlink regular file contained in the checkout."""
-    relative = Path(rel_path)
-    if relative.is_absolute() or ".." in relative.parts:
+    if not isinstance(tracked_files, frozenset) or rel_path not in tracked_files:
         return ""
+    if not _safe_tracked_path(rel_path):
+        return ""
+    relative = Path(rel_path)
     full = repo_path / relative
     try:
+        if repo_path.is_symlink():
+            return ""
         root = repo_path.resolve(strict=True)
-        if full.is_symlink():
-            return ""
+        current = root
+        for part in relative.parts:
+            current = current / part
+            info = current.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                return ""
         resolved = full.resolve(strict=True)
-        if not resolved.is_relative_to(root) or not resolved.is_file():
+        resolved_relative = resolved.relative_to(root)
+        if any(part.casefold() == ".git" for part in resolved_relative.parts):
             return ""
-        if max_bytes < 0 or resolved.stat().st_size > max_bytes:
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode):
+            return ""
+        if max_bytes < 0 or info.st_size > max_bytes:
             return ""
         data = resolved.read_bytes()
         if len(data) > max_bytes:
@@ -891,13 +990,11 @@ async def evaluate_sample(
     workspace = None
     if _eval_root is None:
         workspace = tempfile.TemporaryDirectory(prefix="repopilot-legacy-eval-")
-        eval_root = Path(workspace.name)
+        eval_root = _prepare_eval_root(Path(workspace.name))
     else:
-        eval_root = _eval_root
-        eval_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        eval_root.chmod(0o700)
+        eval_root = _prepare_eval_root(_eval_root)
     t_start = time.monotonic()
-    repo_path = eval_root / sample_id.replace("/", "_").replace("#", "_").replace(":", "_")
+    repo_path = _validated_eval_child(eval_root, eval_root / "checkout", "checkout")
     owner, repo_name = repo_info["owner"], repo_info["name"]
 
     try:
@@ -909,6 +1006,7 @@ async def evaluate_sample(
             repo_name,
             base_commit,
             repo_path,
+            eval_root=eval_root,
             timeout=CLONE_TIMEOUT,
         ):
             result["error"] = "clone_failed"
@@ -916,18 +1014,7 @@ async def evaluate_sample(
         clone_time = time.monotonic() - t_start
         print(f"  [{sample_id}] Exact checkout done in {clone_time:.1f}s", flush=True)
 
-        ls_result = subprocess.run(
-            ["git", "ls-files", "-z"],
-            cwd=str(repo_path),
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=minimal_subprocess_env(),
-        )
-        if ls_result.returncode != 0:
-            result["error"] = "ls_files_failed"
-            return result
-        all_files = [path for path in ls_result.stdout.split("\0") if path]
+        all_files, tracked_set = _load_tracked_files(repo_path)
 
         # Search the exact local checkout by both path and content.
         search_terms = _extract_search_terms(issue["title"], issue["body"])
@@ -936,7 +1023,12 @@ async def evaluate_sample(
         for term in search_terms[:10]:
             for f in search_files_by_name(all_files, term, max_results=30):
                 candidate_set.add(f)
-        for path in grep_repo(repo_path, all_files, search_terms[:10]):
+        for path in grep_repo(
+            repo_path,
+            all_files,
+            tracked_set,
+            search_terms[:10],
+        ):
             candidate_set.add(path)
 
         path_derived_terms: set[str] = set()
@@ -981,7 +1073,11 @@ async def evaluate_sample(
 
         top_files: list[dict] = []
         for path in files_to_read[:5]:
-            content = read_file_content(repo_path, path)
+            content = read_file_content(
+                repo_path,
+                path,
+                tracked_files=tracked_set,
+            )
             if content:
                 top_files.append({"path": path, "content": content})
         print(f"  [{sample_id}] Read {len(top_files)} local files", flush=True)
@@ -1036,8 +1132,7 @@ async def evaluate_sample(
         # ── 9. cleanup ──
         elapsed = time.monotonic() - t_start
         print(f"  [{sample_id}] Done in {elapsed:.1f}s", flush=True)
-        if repo_path.exists():
-            shutil.rmtree(repo_path, ignore_errors=True)
+        _remove_eval_child(eval_root, repo_path, "checkout")
         if workspace is not None:
             workspace.cleanup()
 

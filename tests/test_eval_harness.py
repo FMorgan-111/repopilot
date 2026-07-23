@@ -6,8 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from eval import harness
-from src.safe_subprocess import minimal_subprocess_env
-
+from src.safe_subprocess import ProcessOutputLimitError, minimal_subprocess_env
 
 BASE_COMMIT = "a" * 40
 
@@ -210,7 +209,9 @@ def test_clone_fetches_and_verifies_exact_detached_commit(monkeypatch, tmp_path)
 
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
 
-    assert harness.clone_repo("acme", "widget", BASE_COMMIT, target)
+    assert harness.clone_repo(
+        "acme", "widget", BASE_COMMIT, target, eval_root=tmp_path
+    )
 
     commands = [command for command, _kwargs in calls]
     assert any(command[-2:] == ["init", str(target)] for command in commands)
@@ -276,9 +277,75 @@ def test_clone_rejects_malformed_commit_before_filesystem_or_subprocess(
     )
 
     with pytest.raises(ValueError, match="base_commit"):
-        harness.clone_repo("acme", "widget", "main", target)
+        harness.clone_repo(
+            "acme", "widget", "main", target, eval_root=tmp_path
+        )
 
     assert not target.exists()
+
+
+def test_clone_rejects_checkout_outside_exact_eval_root_before_removal(
+    monkeypatch, tmp_path
+):
+    eval_root = tmp_path / "eval"
+    eval_root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    monkeypatch.setattr(
+        harness.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("subprocess called for escaped checkout")
+        ),
+    )
+
+    with pytest.raises(ValueError, match="checkout.*eval root"):
+        harness.clone_repo(
+            "acme",
+            "widget",
+            BASE_COMMIT,
+            eval_root / ".." / "outside",
+            eval_root=eval_root,
+        )
+
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
+
+
+@pytest.mark.parametrize(
+    "sample_id",
+    ["..", "../outside", "./.", "a/b", "a\\b", ".#.:.."],
+)
+async def test_sample_id_never_controls_checkout_or_cleanup_path(
+    monkeypatch, tmp_path, sample_id
+):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+    eval_root = tmp_path / "eval"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    sentinel = outside / "sentinel.txt"
+    sentinel.write_text("preserve", encoding="utf-8")
+    seen = []
+
+    def fake_clone(_owner, _repo, _commit, target, *, eval_root, **_kwargs):
+        seen.append((target, eval_root))
+        return False
+
+    monkeypatch.setattr(harness, "clone_repo", fake_clone)
+    sample = _sample()
+    sample["id"] = sample_id
+
+    result = await harness.evaluate_sample(
+        sample,
+        0,
+        unsafe_allow_host_execution=True,
+        _eval_root=eval_root,
+    )
+
+    assert result["error"] == "clone_failed"
+    assert seen == [(eval_root / "checkout", eval_root)]
+    assert sentinel.read_text(encoding="utf-8") == "preserve"
 
 
 @pytest.mark.parametrize(
@@ -300,7 +367,11 @@ def test_clone_rejects_head_mismatch_or_attached_checkout(
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
 
     assert not harness.clone_repo(
-        "acme", "widget", BASE_COMMIT, tmp_path / "checkout"
+        "acme",
+        "widget",
+        BASE_COMMIT,
+        tmp_path / "checkout",
+        eval_root=tmp_path,
     )
 
 
@@ -321,7 +392,9 @@ def test_clone_removes_partial_checkout_when_subprocess_raises_baseexception(
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
 
     with pytest.raises(KeyboardInterrupt, match="cancelled"):
-        harness.clone_repo("acme", "widget", BASE_COMMIT, target)
+        harness.clone_repo(
+            "acme", "widget", BASE_COMMIT, target, eval_root=tmp_path
+        )
 
     assert not target.exists()
     assert not (tmp_path / ".checkout-git-home").exists()
@@ -389,8 +462,8 @@ async def test_legacy_evaluation_uses_exact_checkout_local_search_not_github_sea
     monkeypatch.setattr(harness, "fetch_file_content", forbidden)
     monkeypatch.setattr(harness, "search_code_via_github", forbidden)
     monkeypatch.setattr(
-        harness.subprocess,
-        "run",
+        harness,
+        "run_bounded_process",
         lambda *_args, **_kwargs: SimpleNamespace(
             returncode=0, stdout="src/widget.py\0", stderr=""
         ),
@@ -447,9 +520,11 @@ def test_every_legacy_subprocess_uses_production_minimal_environment(
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(harness.subprocess, "run", fake_run)
-    repo_path = tmp_path / "repo"
+    repo_path = tmp_path / "checkout"
 
-    assert harness.clone_repo("acme", "widget", BASE_COMMIT, repo_path)
+    assert harness.clone_repo(
+        "acme", "widget", BASE_COMMIT, repo_path, eval_root=tmp_path
+    )
     harness.apply_patch(repo_path, "not a patch")
     harness.run_tests(repo_path)
 
@@ -474,7 +549,8 @@ def test_tracked_search_excludes_git_metadata_and_untracked_files(tmp_path):
 
     results = harness.grep_repo(
         repo,
-        [".git/config", "src/tracked.py"],
+        (".git/config", "src/tracked.py"),
+        frozenset({".git/config", "src/tracked.py"}),
         ["needle"],
     )
 
@@ -489,7 +565,8 @@ def test_tracked_search_scans_once_with_aggregate_byte_budget(tmp_path):
 
     results = harness.grep_repo(
         repo,
-        ["one.py", "two.py", "three.py"],
+        ("one.py", "two.py", "three.py"),
+        frozenset({"one.py", "two.py", "three.py"}),
         ["needle", "other", "third"],
         max_total_bytes=150,
     )
@@ -497,7 +574,7 @@ def test_tracked_search_scans_once_with_aggregate_byte_budget(tmp_path):
     assert results == ["one.py"]
 
 
-async def test_internal_ls_files_uses_minimal_environment(monkeypatch, tmp_path):
+async def test_internal_ls_files_uses_bounded_output(monkeypatch, tmp_path):
     monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
     monkeypatch.setenv("LLM_API_KEY", "model-secret")
     monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
@@ -509,7 +586,7 @@ async def test_internal_ls_files_uses_minimal_environment(monkeypatch, tmp_path)
         seen.append((command, kwargs))
         return SimpleNamespace(returncode=0, stdout="src/widget.py\0", stderr="")
 
-    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+    monkeypatch.setattr(harness, "run_bounded_process", fake_run)
 
     async def fake_locate(*_args, **_kwargs):
         return [], 0, 0
@@ -528,23 +605,109 @@ async def test_internal_ls_files_uses_minimal_environment(monkeypatch, tmp_path)
     )
 
     ls_call = next(call for call in seen if call[0] == ["git", "ls-files", "-z"])
-    assert ls_call[1]["env"] == minimal_subprocess_env()
-    assert "LLM_API_KEY" not in ls_call[1]["env"]
-    assert "GITHUB_TOKEN" not in ls_call[1]["env"]
+    assert ls_call[1]["max_output_bytes"] == harness.MAX_TRACKED_LIST_BYTES
+    assert ls_call[1]["decode_errors"] == "strict"
+    assert "env_overrides" not in ls_call[1]
 
 
-def test_read_file_content_rejects_traversal_symlinks_and_oversized_files(tmp_path):
+def test_tracked_file_list_rejects_too_many_entries(monkeypatch, tmp_path):
+    output = "x\0" * (harness.MAX_TRACKED_FILES + 1)
+    monkeypatch.setattr(
+        harness,
+        "run_bounded_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=output, stderr=""
+        ),
+    )
+
+    with pytest.raises(ValueError, match="too many tracked files"):
+        harness._load_tracked_files(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "unterminated",
+        "dup.py\0dup.py\0",
+        "../escape.py\0",
+        ".git/config\0",
+        ("x" * 1_025) + "\0",
+    ],
+)
+def test_tracked_file_list_rejects_malformed_paths(monkeypatch, tmp_path, output):
+    monkeypatch.setattr(
+        harness,
+        "run_bounded_process",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=output, stderr=""
+        ),
+    )
+
+    with pytest.raises(ValueError, match="tracked file list"):
+        harness._load_tracked_files(tmp_path)
+
+
+async def test_tracked_file_output_overflow_fails_before_llm(monkeypatch, tmp_path):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+    monkeypatch.setattr(harness, "clone_repo", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        harness,
+        "run_bounded_process",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProcessOutputLimitError("truncated", "")
+        ),
+    )
+
+    async def forbidden_llm(*_args, **_kwargs):
+        raise AssertionError("LLM called after tracked-file output overflow")
+
+    monkeypatch.setattr(harness, "locate_files_phase", forbidden_llm)
+    monkeypatch.setattr(harness, "generate_patch_phase", forbidden_llm)
+
+    result = await harness.evaluate_sample(
+        _sample(),
+        0,
+        unsafe_allow_host_execution=True,
+        _eval_root=tmp_path,
+    )
+
+    assert result["error"].startswith("ProcessOutputLimitError:")
+
+
+def test_read_file_content_requires_tracked_safe_path(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     outside = tmp_path / "outside.txt"
     outside.write_text("host secret", encoding="utf-8")
     (repo / "link.txt").symlink_to(outside)
+    (repo / ".git").mkdir()
+    (repo / ".git" / "config").write_text("git secret", encoding="utf-8")
+    (repo / "alias").symlink_to(repo / ".git", target_is_directory=True)
+    (repo / "untracked.txt").write_text("untracked", encoding="utf-8")
+    (repo / "tracked.txt").write_text("tracked", encoding="utf-8")
     oversized = repo / "oversized.txt"
     oversized.write_bytes(b"x" * (harness.MAX_SOURCE_FILE_BYTES + 1))
+    tracked = frozenset(
+        {
+            "../outside.txt",
+            "link.txt",
+            ".git/config",
+            "alias/config",
+            "tracked.txt",
+            "oversized.txt",
+        }
+    )
 
-    assert harness.read_file_content(repo, "../outside.txt") == ""
-    assert harness.read_file_content(repo, "link.txt") == ""
-    assert harness.read_file_content(repo, "oversized.txt") == ""
+    assert harness.read_file_content(repo, "../outside.txt", tracked_files=tracked) == ""
+    assert harness.read_file_content(repo, "link.txt", tracked_files=tracked) == ""
+    assert harness.read_file_content(repo, ".git/config", tracked_files=tracked) == ""
+    assert harness.read_file_content(repo, "alias/config", tracked_files=tracked) == ""
+    assert harness.read_file_content(repo, "untracked.txt", tracked_files=tracked) == ""
+    assert harness.read_file_content(repo, "oversized.txt", tracked_files=tracked) == ""
+    assert (
+        harness.read_file_content(repo, "tracked.txt", tracked_files=tracked)
+        == "tracked"
+    )
 
 
 def test_apply_patch_uses_only_strict_git_apply(monkeypatch, tmp_path):
