@@ -79,6 +79,9 @@ _MODE_FILES: dict[str, str] = {
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _IMAGE_SHA_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _COMMIT_SHA_RE = re.compile(r"[0-9a-f]{40}")
+_EXCEPTION_CLASS_RE = re.compile(
+    r"(?:[A-Z][A-Za-z0-9_]*(?:Error|Exception)|Exception|BaseException)"
+)
 _SAFE_FILES = frozenset(
     {"result.json", "prediction.jsonl", "official_result.json"}
 )
@@ -175,9 +178,9 @@ class OfficialResult(BaseModel):
     schema_version: Literal[1] = 1
     instance_id: str
     status: OfficialStatus
-    submitted: bool
-    completed: bool
-    resolved: bool
+    submitted: StrictBool
+    completed: StrictBool
+    resolved: StrictBool
     error_class: str = ""
 
     @model_validator(mode="after")
@@ -196,6 +199,10 @@ class OfficialResult(BaseModel):
             raise ValueError("empty_patch status has inconsistent result flags")
         if self.status == "scorer_infra" and self.resolved:
             raise ValueError("scorer infrastructure failure cannot be resolved")
+        if self.status == "scorer_infra" and not self.error_class:
+            raise ValueError(
+                "scorer infrastructure failure requires error_class"
+            )
         if self.status != "scorer_infra" and self.error_class:
             raise ValueError("terminal scorer result cannot have error_class")
         return self
@@ -215,6 +222,13 @@ class ModelInvocationRecord(BaseModel):
     status: InvocationStatus
     error_class: str
 
+    @field_validator("error_class")
+    @classmethod
+    def validate_error_class(cls, value: str) -> str:
+        if value and not _EXCEPTION_CLASS_RE.fullmatch(value):
+            raise ValueError("error_class must be a sanitized exception class")
+        return value
+
     @model_validator(mode="after")
     def validate_provider_model_pair(self) -> ModelInvocationRecord:
         configured_model = {
@@ -223,6 +237,10 @@ class ModelInvocationRecord(BaseModel):
         }[self.provider]
         if self.model != configured_model:
             raise ValueError("provider does not match configured model")
+        if self.status == "ok" and self.error_class:
+            raise ValueError("ok invocation cannot have error_class")
+        if self.status == "error" and not self.error_class:
+            raise ValueError("error invocation requires error_class")
         return self
 
 
@@ -277,6 +295,15 @@ class ResultRecord(BaseModel):
             raise ValueError("commit_sha must be a 40-character lowercase hex SHA")
         return value
 
+    @field_validator("base_commit")
+    @classmethod
+    def validate_base_commit(cls, value: str) -> str:
+        if value and not _COMMIT_SHA_RE.fullmatch(value):
+            raise ValueError(
+                "base_commit must be empty or a 40-character lowercase hex SHA"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_internal_verdict(self) -> ResultRecord:
         if self.id != self.instance_id:
@@ -295,6 +322,39 @@ class ResultRecord(BaseModel):
             "resolved",
         }:
             raise ValueError("failed result cannot claim a success failure class")
+        invocation_models = list(
+            dict.fromkeys(
+                invocation.model for invocation in self.model_invocations
+            )
+        )
+        expected_models = invocation_models or [PRIMARY_MODEL]
+        if self.models_used != expected_models:
+            raise ValueError(
+                "models_used must match ordered unique invocation history"
+            )
+        if (
+            any(
+                invocation.provider == "escalation"
+                for invocation in self.model_invocations
+            )
+            and not self.escalated
+        ):
+            raise ValueError("escalation invocation requires escalated")
+        if self.escalated and not self.escalation_reason:
+            raise ValueError("escalated result requires escalation_reason")
+        if not self.escalated and self.escalation_reason:
+            raise ValueError(
+                "non-escalated result cannot have escalation_reason"
+            )
+        if self.model_patch and not self.agent_success:
+            raise ValueError("model_patch requires agent_success")
+        if self.model_patch and not self.model_invocations:
+            raise ValueError("model_patch requires model invocation history")
+        if self.model_patch and not any(
+            invocation.status == "ok"
+            for invocation in self.model_invocations
+        ):
+            raise ValueError("model_patch requires a successful model invocation")
         return self
 
 

@@ -99,7 +99,7 @@ def _result_payload(**overrides: object) -> dict[str, object]:
         "failure_class": "test_failed",
         "instance_id": INSTANCE_ID,
         "base_commit": "d" * 40,
-        "model_patch": "diff --git a/a.py b/a.py\n",
+        "model_patch": "",
     }
     payload.update(overrides)
     return payload
@@ -280,6 +280,45 @@ def test_official_empty_patch_is_submitted_but_not_completed() -> None:
     assert result.status == "empty_patch"
 
 
+def test_official_scorer_infrastructure_requires_error_class() -> None:
+    with pytest.raises(ValidationError, match="error_class"):
+        OfficialResult(
+            instance_id=INSTANCE_ID,
+            status="scorer_infra",
+            submitted=False,
+            completed=False,
+            resolved=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("submitted", 1),
+        ("submitted", "true"),
+        ("completed", 0),
+        ("completed", "false"),
+        ("resolved", 1),
+        ("resolved", "true"),
+    ],
+)
+def test_official_result_rejects_coerced_boolean_flags(
+    field: str,
+    value: object,
+) -> None:
+    payload: dict[str, object] = {
+        "instance_id": INSTANCE_ID,
+        "status": "resolved",
+        "submitted": True,
+        "completed": True,
+        "resolved": True,
+    }
+    payload[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        OfficialResult.model_validate(payload)
+
+
 def test_result_record_accepts_complete_producer_schema() -> None:
     record = _result_record_model().model_validate(_result_payload())
 
@@ -351,6 +390,8 @@ def test_invocation_accepts_both_configured_provider_model_pairs() -> None:
             "gemini-3.5-flash:stable",
             "claude-opus-4-8:stable",
         ],
+        escalated=True,
+        escalation_reason="repeated_no_progress",
         model_invocations=[
             _invocation_payload(),
             _invocation_payload(
@@ -366,6 +407,182 @@ def test_invocation_accepts_both_configured_provider_model_pairs() -> None:
         "primary",
         "escalation",
     ]
+
+
+@pytest.mark.parametrize(
+    ("status", "error_class"),
+    [
+        ("ok", "RuntimeError"),
+        ("error", ""),
+    ],
+)
+def test_invocation_status_requires_consistent_error_class(
+    status: str,
+    error_class: str,
+) -> None:
+    payload = _result_payload(
+        model_invocations=[
+            _invocation_payload(status=status, error_class=error_class)
+        ]
+    )
+
+    with pytest.raises(ValidationError, match="error_class"):
+        _result_record_model().model_validate(payload)
+
+
+@pytest.mark.parametrize("error_class", ["", "ValueError"])
+def test_invalid_response_allows_sanitized_or_empty_error_class(
+    error_class: str,
+) -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_invocations=[
+                _invocation_payload(
+                    status="invalid_response",
+                    error_class=error_class,
+                )
+            ]
+        )
+    )
+
+    assert record.model_invocations[0].error_class == error_class
+
+
+def test_invocation_rejects_unsanitized_error_class() -> None:
+    with pytest.raises(ValidationError, match="error_class"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=[
+                    _invocation_payload(
+                        status="error",
+                        error_class="gateway exploded",
+                    )
+                ]
+            )
+        )
+
+
+def test_result_models_used_match_ordered_unique_invocation_history() -> None:
+    escalation = _invocation_payload(
+        provider="escalation",
+        model="claude-opus-4-8:stable",
+    )
+    payload = _result_payload(
+        models_used=[
+            "claude-opus-4-8:stable",
+            "gemini-3.5-flash:stable",
+        ],
+        escalated=True,
+        escalation_reason="repeated_no_progress",
+        model_invocations=[
+            _invocation_payload(),
+            escalation,
+            dict(escalation),
+        ],
+    )
+
+    with pytest.raises(ValidationError, match="models_used"):
+        _result_record_model().model_validate(payload)
+
+
+def test_escalation_invocation_requires_escalated_flag() -> None:
+    payload = _result_payload(
+        models_used=[
+            "gemini-3.5-flash:stable",
+            "claude-opus-4-8:stable",
+        ],
+        model_invocations=[
+            _invocation_payload(),
+            _invocation_payload(
+                provider="escalation",
+                model="claude-opus-4-8:stable",
+            ),
+        ],
+    )
+
+    with pytest.raises(ValidationError, match="escalated"):
+        _result_record_model().model_validate(payload)
+
+
+def test_escalated_result_may_precede_first_escalation_invocation() -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(
+            escalated=True,
+            escalation_reason="invalid_structured_response_after_retries",
+        )
+    )
+
+    assert record.escalated is True
+    assert [item.provider for item in record.model_invocations] == ["primary"]
+
+
+def test_empty_invocation_history_uses_primary_model_fallback() -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(model_invocations=[])
+    )
+
+    assert record.models_used == ["gemini-3.5-flash:stable"]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "model_patch": "diff --git a/a.py b/a.py\n",
+            "success": False,
+            "agent_success": False,
+        },
+        {
+            "model_patch": "diff --git a/a.py b/a.py\n",
+            "success": True,
+            "agent_success": True,
+            "failure_class": "agent_success",
+            "coverage_status": "generated_verified",
+            "coverage_proof": _coverage_proof(),
+            "model_invocations": [],
+        },
+        {
+            "model_patch": "diff --git a/a.py b/a.py\n",
+            "success": True,
+            "agent_success": True,
+            "failure_class": "agent_success",
+            "coverage_status": "generated_verified",
+            "coverage_proof": _coverage_proof(),
+            "model_invocations": [
+                _invocation_payload(
+                    status="error",
+                    error_class="RuntimeError",
+                )
+            ],
+        },
+    ],
+)
+def test_nonempty_patch_requires_successful_model_history(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match="model_patch|invocation"):
+        _result_record_model().model_validate(_result_payload(**overrides))
+
+
+@pytest.mark.parametrize(
+    "base_commit",
+    ["D" * 40, "d" * 39, "not-a-commit"],
+)
+def test_result_record_rejects_invalid_nonempty_base_commit(
+    base_commit: str,
+) -> None:
+    with pytest.raises(ValidationError, match="base_commit"):
+        _result_record_model().model_validate(
+            _result_payload(base_commit=base_commit)
+        )
+
+
+def test_result_record_allows_empty_base_commit_for_synthetic_failure() -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(base_commit="", model_invocations=[])
+    )
+
+    assert record.base_commit == ""
 
 
 @pytest.mark.parametrize(

@@ -277,6 +277,17 @@ def _assert_safe_tree(value: Any) -> None:
         sanitized = sanitize_output_text(value, len(value) + 1)
         if sanitized != value.strip():
             raise ArtifactContractError("unsafe string in artifact")
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ArtifactContractError("non-finite number in artifact")
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _strict_json_loads(value: str | bytes) -> Any:
+    return json.loads(value, parse_constant=_reject_json_constant)
 
 
 def _parse_safe_payload_bytes(
@@ -288,9 +299,10 @@ def _parse_safe_payload_bytes(
     expected_commit: str,
 ) -> VerifiedPayload:
     try:
-        result_payload = json.loads(result_bytes)
+        result_payload = _strict_json_loads(result_bytes)
         prediction_lines = prediction_bytes.decode("utf-8").splitlines()
-        official = OfficialResult.model_validate_json(official_bytes)
+        official_payload = _strict_json_loads(official_bytes)
+        official = OfficialResult.model_validate(official_payload)
     except (UnicodeError, ValueError, TypeError) as exc:
         raise ArtifactContractError("invalid safe artifact payload") from exc
     if (
@@ -306,8 +318,8 @@ def _parse_safe_payload_bytes(
     if len(prediction_lines) != 1:
         raise ArtifactContractError("prediction.jsonl must contain exactly one row")
     try:
-        prediction = json.loads(prediction_lines[0])
-    except (json.JSONDecodeError, TypeError) as exc:
+        prediction = _strict_json_loads(prediction_lines[0])
+    except (ValueError, TypeError) as exc:
         raise ArtifactContractError("invalid prediction row") from exc
     if not isinstance(prediction, dict) or set(prediction) != {
         "instance_id",
@@ -389,15 +401,37 @@ def _validate_bundle_consistency(
     official = payload.official
     if manifest.runtime_status != "ready" and (
         official.status != "scorer_infra"
+        or official.submitted
         or official.completed
+        or official.resolved
+        or not official.error_class
         or result.failure_class != "infra"
+        or result.success
+        or result.agent_success
+        or result.final_phase != "FAILED"
+        or bool(result.base_commit)
         or bool(result.model_patch)
         or bool(result.model_invocations)
+        or result.models_used != [PRIMARY_MODEL]
+        or result.escalated
+        or bool(result.escalation_reason)
+        or result.coverage_status != "failed"
+        or result.coverage_proof is not None
     ):
+        raise ArtifactContractError("inconsistent artifact bundle")
+    if manifest.runtime_status == "ready" and not result.base_commit:
         raise ArtifactContractError("inconsistent artifact bundle")
     if official.status == "empty_patch" and result.model_patch:
         raise ArtifactContractError("inconsistent artifact bundle")
     if official.completed and not result.model_patch:
+        raise ArtifactContractError("inconsistent artifact bundle")
+    if result.model_patch and (
+        not result.model_invocations
+        or not any(
+            invocation.status == "ok"
+            for invocation in result.model_invocations
+        )
+    ):
         raise ArtifactContractError("inconsistent artifact bundle")
 
 

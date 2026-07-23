@@ -134,6 +134,12 @@ def _completed_output(
         )
     runtime = RuntimeRecord.model_validate(runtime_payload)
     runtime_path = write_model(output_dir / "runtime.json", runtime)
+    status = official_status or ("resolved" if resolved else "unresolved")
+    internal_success = (
+        status in {"resolved", "unresolved"}
+        if agent_success in {None, _MISSING_AGENT_VERDICT}
+        else bool(agent_success)
+    )
     invocations = (
         [
             {
@@ -151,7 +157,7 @@ def _completed_output(
         else model_invocations
     )
     patch = (
-        "diff --git a/a.py b/a.py\n"
+        ("diff --git a/a.py b/a.py\n" if internal_success else "")
         if model_patch is _DEFAULT_MODEL_PATCH
         else model_patch
     )
@@ -166,10 +172,10 @@ def _completed_output(
         "issue_url": "https://github.com/owner/repo/issues/1",
         "issue_title": "A regression",
         "model_patch": patch,
-        "success": resolved,
+        "success": internal_success,
         "official_resolved": None,
         "waiting_for_user": False,
-        "final_phase": "DONE" if resolved else "FAILED",
+        "final_phase": "DONE" if internal_success else "FAILED",
         "run_id": "run-1",
         "trace_id": "trace-1",
         "turns_taken": 2,
@@ -185,25 +191,26 @@ def _completed_output(
         "unique_evidence_count": 0,
         "max_consecutive_no_progress": 0,
         "attempt_outcome_summary": "complete",
-        "coverage_status": "generated_verified" if resolved else "failed",
+        "coverage_status": (
+            "generated_verified" if internal_success else "failed"
+        ),
         "coverage_test_files": [],
         "coverage_test_command": "",
-        "coverage_proof": _coverage_proof() if resolved else None,
-        "coverage_failure_reason": "" if resolved else "test_failed",
+        "coverage_proof": _coverage_proof() if internal_success else None,
+        "coverage_failure_reason": "" if internal_success else "test_failed",
         "test_generation_attempts": 0,
         "failure_class": failure_class
-        or ("agent_success" if resolved else "test_failed"),
-        "base_commit": "d" * 40,
+        or ("agent_success" if internal_success else "test_failed"),
+        "base_commit": "d" * 40 if runtime_status == "ready" else "",
     }
     if agent_success is not _MISSING_AGENT_VERDICT:
         result["agent_success"] = (
-            resolved if agent_success is None else agent_success
+            internal_success if agent_success is None else agent_success
         )
     (output_dir / "result.json").write_text(
         json.dumps([result]) + "\n", encoding="utf-8"
     )
     write_predictions([result], output_dir / "prediction.jsonl")
-    status = official_status or ("resolved" if resolved else "unresolved")
     official = OfficialResult(
         instance_id=instance_id,
         status=status,
@@ -386,6 +393,68 @@ def test_package_rejects_runtime_dataset_row_digest_mismatch(
     assert not artifact_dir.exists() or not any(artifact_dir.iterdir())
 
 
+@pytest.mark.parametrize("value", [1, "true"])
+def test_package_rejects_coerced_official_boolean(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    official_path = runtime_path.parent / "official_result.json"
+    official = json.loads(official_path.read_text(encoding="utf-8"))
+    official["completed"] = value
+    official_path.write_text(json.dumps(official) + "\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_package_rejects_nonfinite_number_in_nested_result_telemetry(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work", "owner__repo-1"
+    )
+    result_path = runtime_path.parent / "result.json"
+    results = json.loads(result_path.read_text(encoding="utf-8"))
+    results[0]["tool_invocations"] = [{"unsafe_number": value}]
+    result_path.write_text(json.dumps(results) + "\n", encoding="utf-8")
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
+def test_package_rejects_completed_patch_without_model_history(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work",
+        "owner__repo-1",
+        model_invocations=[],
+    )
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
 def test_aggregate_rejects_oversized_regular_payload_before_parsing(
     tmp_path: Path,
 ) -> None:
@@ -460,21 +529,21 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
     assert [item["instance_id"] for item in official] == instance_ids
     summary = summary_path.read_text(encoding="utf-8")
     assert "Requested | 2" in summary
-    assert "Internal success | 1" in summary
+    assert "Internal success | 2" in summary
     assert "Official resolved | 1" in summary
     assert "Infrastructure failure | 0" in summary
     assert "| Official score | 50.00/100 |" in summary
     assert "| Official terminal coverage | 2/2 |" in summary
-    assert "| Internal/official agreement | 2/2 |" in summary
+    assert "| Internal/official agreement | 1/2 |" in summary
     assert "| Model tokens | 30 |" in summary
     assert "| Model elapsed seconds | 2.000 |" in summary
-    assert "| Engineering score | 60.00/100 |" in summary
+    assert "| Engineering score | 57.50/100 |" in summary
     assert "| Official resolution | 1/2 | 40.00/80 |" in summary
     assert "| Non-infrastructure | 2/2 | 10.00/10 |" in summary
-    assert "| Explicit internal/official agreement | 2/2 | 5.00/5 |" in summary
+    assert "| Explicit internal/official agreement | 1/2 | 2.50/5 |" in summary
     assert "| Completed within time/token budget | 2/2 | 5.00/5 |" in summary
     assert (
-        "| owner__repo-2 | ready | failed | unresolved | 15 | 1.000 |"
+        "| owner__repo-2 | ready | success | unresolved | 15 | 1.000 |"
         in summary
     )
     assert summary.index("| Official score |") < summary.index("| Engineering score |")
@@ -576,6 +645,136 @@ def test_aggregate_rejects_non_list_model_invocations(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("status", "error_class"),
+    [("ok", "RuntimeError"), ("error", "")],
+)
+def test_aggregate_rejects_inconsistent_invocation_error_class(
+    tmp_path: Path,
+    status: str,
+    error_class: str,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["model_invocations"] = [
+        _invocation(status=status, error_class=error_class)
+    ]
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_rejects_completed_bundle_with_only_error_invocation(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["model_invocations"] = [
+        _invocation(status="error", error_class="RuntimeError")
+    ]
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+@pytest.mark.parametrize("value", [1, "true"])
+def test_aggregate_rejects_coerced_official_boolean(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    official = json.loads(
+        (bundle / "official_result.json").read_text(encoding="utf-8")
+    )
+    official["completed"] = value
+    _rewrite_bundle_json(bundle, "official_result.json", official)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_aggregate_rejects_nonfinite_nested_result_number(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["replay"] = {"unsafe_number": value}
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_aggregate_strictly_rejects_nonfinite_prediction_number(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    prediction = json.loads(
+        (bundle / "prediction.jsonl").read_text(encoding="utf-8")
+    )
+    prediction["model_patch"] = value
+    _rewrite_bundle_json(bundle, "prediction.jsonl", prediction)
+
+    with pytest.raises(ArtifactContractError, match="invalid prediction row"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
 def test_aggregate_rejects_missing_internal_verdict(
     tmp_path: Path,
 ) -> None:
@@ -637,7 +836,13 @@ def test_every_infrastructure_class_receives_zero_noninfra_and_budget_credit(
     repo_root = _repo_root(tmp_path, [instance_id])
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    _package(artifacts, instance_id, failure_class=failure_class)
+    _package(
+        artifacts,
+        instance_id,
+        official_status="scorer_infra",
+        agent_success=False,
+        failure_class=failure_class,
+    )
 
     summary_path = aggregate_artifacts(
         "checkpoint_5",
@@ -773,32 +978,61 @@ def test_aggregate_rejects_extra_result_or_invocation_fields(
 
 
 @pytest.mark.parametrize(
-    ("official_status", "model_patch", "model_invocations"),
-    [
-        ("unresolved", "", []),
-        ("scorer_infra", "diff --git a/a.py b/a.py\n", []),
-        ("scorer_infra", "", [_invocation()]),
-    ],
+    "mutation",
+    ["terminal_official", "model_patch", "model_invocations"],
 )
 def test_nonready_runtime_rejects_terminal_patch_or_invocations(
     tmp_path: Path,
-    official_status: str,
-    model_patch: str,
-    model_invocations: list[dict[str, object]],
+    mutation: str,
 ) -> None:
     instance_id = "owner__repo-1"
     repo_root = _repo_root(tmp_path, [instance_id])
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    _package(
+    bundle = _package(
         artifacts,
         instance_id,
-        official_status=official_status,
-        model_patch=model_patch,
-        model_invocations=model_invocations,
+        official_status="scorer_infra",
+        model_patch="",
+        model_invocations=[],
         failure_class="infra",
         runtime_status="dataset_infra",
     )
+    if mutation == "terminal_official":
+        official = json.loads(
+            (bundle / "official_result.json").read_text(encoding="utf-8")
+        )
+        official.update(
+            status="unresolved",
+            submitted=True,
+            completed=True,
+            error_class="",
+        )
+        _rewrite_bundle_json(bundle, "official_result.json", official)
+    else:
+        results = json.loads(
+            (bundle / "result.json").read_text(encoding="utf-8")
+        )
+        if mutation == "model_patch":
+            results[0].update(
+                success=True,
+                agent_success=True,
+                final_phase="DONE",
+                model_patch="diff --git a/a.py b/a.py\n",
+                model_invocations=[_invocation()],
+                coverage_status="generated_verified",
+                coverage_proof=_coverage_proof(),
+                coverage_failure_reason="",
+                failure_class="agent_success",
+            )
+            prediction = json.loads(
+                (bundle / "prediction.jsonl").read_text(encoding="utf-8")
+            )
+            prediction["model_patch"] = results[0]["model_patch"]
+            _rewrite_bundle_json(bundle, "prediction.jsonl", prediction)
+        else:
+            results[0]["model_invocations"] = [_invocation()]
+        _rewrite_bundle_json(bundle, "result.json", results)
 
     with pytest.raises(ArtifactContractError, match="inconsistent artifact bundle"):
         aggregate_artifacts(
@@ -810,26 +1044,118 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
         )
 
 
-def test_ready_completed_result_without_invocations_receives_no_credit(
+@pytest.mark.parametrize(
+    ("scope", "field", "value"),
+    [
+        ("official", "submitted", True),
+        ("official", "completed", True),
+        ("official", "error_class", ""),
+        ("result", "final_phase", "DONE"),
+        ("result", "base_commit", "d" * 40),
+        ("result", "coverage_status", "existing_verified"),
+        ("result", "coverage_proof", {"status": "existing_verified"}),
+    ],
+)
+def test_nonready_runtime_rejects_nonproducer_telemetry(
+    tmp_path: Path,
+    scope: str,
+    field: str,
+    value: object,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(
+        artifacts,
+        instance_id,
+        official_status="scorer_infra",
+        model_patch="",
+        model_invocations=[],
+        failure_class="infra",
+        runtime_status="dataset_infra",
+    )
+    filename = (
+        "official_result.json" if scope == "official" else "result.json"
+    )
+    payload = json.loads((bundle / filename).read_text(encoding="utf-8"))
+    target = payload if scope == "official" else payload[0]
+    target[field] = value
+    _rewrite_bundle_json(bundle, filename, payload)
+
+    with pytest.raises(
+        ArtifactContractError,
+        match="invalid safe artifact payload|inconsistent artifact bundle",
+    ):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_ready_runtime_rejects_empty_base_commit(tmp_path: Path) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["base_commit"] = ""
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="inconsistent artifact bundle"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_rejects_models_used_history_mismatch(tmp_path: Path) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["models_used"] = [ESCALATION_MODEL]
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_rejects_ready_completed_result_without_invocations(
     tmp_path: Path,
 ) -> None:
     instance_id = "owner__repo-1"
     repo_root = _repo_root(tmp_path, [instance_id])
     artifacts = tmp_path / "artifacts"
     artifacts.mkdir()
-    _package(artifacts, instance_id, model_invocations=[])
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["model_invocations"] = []
+    _rewrite_bundle_json(bundle, "result.json", results)
 
-    summary_path = aggregate_artifacts(
-        "checkpoint_5",
-        artifacts,
-        tmp_path / "combined",
-        expected_commit=COMMIT_SHA,
-        repo_root=repo_root,
-    )
-
-    summary = summary_path.read_text(encoding="utf-8")
-    assert "| Non-infrastructure | 0/1 | 0.00/10 |" in summary
-    assert "| Completed within time/token budget | 0/1 | 0.00/5 |" in summary
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
 
 
 def test_valid_nonready_infrastructure_bundle_scores_zero(
@@ -893,7 +1219,7 @@ def test_incomplete_official_result_receives_no_budget_credit(
 
 @pytest.mark.parametrize(
     ("input_tokens", "expected_score"),
-    [(100_000, "20.00"), (100_001, "15.00")],
+    [(100_000, "15.00"), (100_001, "10.00")],
 )
 def test_engineering_score_has_exact_token_budget_threshold(
     tmp_path: Path,
