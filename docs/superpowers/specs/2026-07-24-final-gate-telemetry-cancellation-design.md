@@ -163,6 +163,14 @@ agent result.
   boundary.
 - Production patch state and generated-test authorization are restored on every
   failed or budget-stopped generation attempt.
+- Applied generated-test rollback preserves direct cancellation just as it
+  preserves an existing drain: successful rollback re-raises the identical
+  pending object. If rollback itself fails under a direct
+  `asyncio.CancelledError`, the boundary promotes both failures into
+  `CancellationDrainError("generated test rollback", cancellation,
+  rollback_error)` and chains the rollback error so phase-timeout diagnostics
+  retain generic-drain cleanup evidence. An existing `CancellationDrainError`
+  remains the identical object with the rollback error as its cause.
 - Diagnostic output contains exception classes and bounded redacted summaries,
   not credentials or full external responses.
 
@@ -195,6 +203,10 @@ Implementation will follow red-green-refactor with these regression cases:
     when durable state cannot be loaded.
 11. An escalated/two-stage PLAN tool drain escapes by identity without a forged
     model-error invocation or token debit.
+12. Applied generated-test cancellation restores generated files and production
+    state before propagating. A simultaneous rollback failure promotes direct
+    cancellation into a generic drain whose operation and cleanup class survive
+    the real phase-timeout evidence extractor.
 
 After focused tests pass, run the affected suites on Python 3.10, 3.11, and
 3.12, then the complete suite, Ruff, `git diff --check`, clean-archive tests and

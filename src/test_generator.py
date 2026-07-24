@@ -420,7 +420,7 @@ async def run_test_generation_attempts(
             break
         snapshot: dict[str, bytes | None] = {}
         applied = False
-        pending_drain: CancellationDrainError | None = None
+        pending_drain: asyncio.CancelledError | CancellationDrainError | None = None
         rollback_error: BaseException | None = None
         try:
             batch = await request_test_batch(state, reason)
@@ -492,7 +492,7 @@ async def run_test_generation_attempts(
                     state.coverage_failure_reason = ""
                     return decision
                 reason = decision.reason
-        except CancellationDrainError as error:
+        except (asyncio.CancelledError, CancellationDrainError) as error:
             pending_drain = error
         except _TestGenerationPreflightError:
             reason = _TEST_GENERATION_PREFLIGHT_REASON
@@ -531,7 +531,13 @@ async def run_test_generation_attempts(
 
         if pending_drain is not None:
             if rollback_error is not None:
-                raise pending_drain from rollback_error
+                if isinstance(pending_drain, CancellationDrainError):
+                    raise pending_drain from rollback_error
+                raise CancellationDrainError(
+                    "generated test rollback",
+                    pending_drain,
+                    rollback_error,
+                ) from rollback_error
             raise pending_drain
 
         if state.test_generation_attempts == 1 and state.active_provider == "primary":

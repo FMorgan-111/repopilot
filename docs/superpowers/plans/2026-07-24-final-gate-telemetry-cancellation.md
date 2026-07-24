@@ -566,6 +566,16 @@ prompt changes, or cohort changes.
   exception-class-only persistence, and package/aggregate parsing of the
   internal timeout artifact. Prove a cancelled record alone cannot support
   generated coverage.
+- Whole-stage review addendum: applied generated-test cleanup must also capture
+  direct `asyncio.CancelledError`. Successful rollback re-raises the identical
+  pending cancellation or drain. If rollback fails under direct cancellation,
+  raise a new `CancellationDrainError("generated test rollback", cancellation,
+  rollback_error)` from the rollback error; if the pending object is already a
+  drain, re-raise that identical object from the rollback error. Preserve the
+  ordinary no-cancellation `generated_test_rollback_failed` result. Cover direct
+  success, direct rollback failure, and a real `wait_for_phase` timeout whose
+  extracted evidence reports `generic_drain`, `generated test rollback`, and
+  the rollback error class.
 
 **Public payload fallback:**
 
