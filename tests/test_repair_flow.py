@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -6,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src.async_safety import CancellationDrainError
 from src.escalation import (
     ESCALATION_PACKET_RENDER_LIMIT,
     EVIDENCE_CONTENT_LIMIT,
@@ -275,6 +277,53 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
         "plan_fix",
         "plan_fix",
     ]
+
+
+async def test_escalated_plan_tool_drain_propagates_without_model_telemetry_or_debit(
+    tmp_path,
+    monkeypatch,
+):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def compute(value):\n    return value\n"},
+    )
+    state = _state(repo, ref)
+    cancellation = asyncio.CancelledError("plan cancelled")
+    cleanup_error = RuntimeError("tool cleanup failed")
+    sentinel = CancellationDrainError(
+        "escalated plan tool",
+        cancellation,
+        cleanup_error,
+    )
+
+    async def select_tool(*_args, **_kwargs):
+        return {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "compute"},
+                "reason": "confirm the target",
+                "expected_evidence": "matching source",
+            },
+        }
+
+    async def fail_during_tool(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr("src.repair_flow.llm_call", select_tool)
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await generate_opus_repair(
+            state,
+            build_escalation_packet(state),
+            router=fail_during_tool,
+        )
+
+    assert raised.value is sentinel
+    assert raised.value.cancellation is cancellation
+    assert raised.value.cleanup_error is cleanup_error
+    assert state.model_history == []
+    assert state.token_usage == 0
 
 
 async def test_opus_inner_repair_tool_uses_delta_evidence_and_pre_call_policy(

@@ -17,6 +17,7 @@ from typing import Awaitable, Callable, TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from .async_safety import CancellationDrainError
 from .escalation import (
     EscalationPacket,
     build_escalation_packet,
@@ -585,6 +586,8 @@ async def _call_schema(
                 payload = {key: value for key, value in raw.items() if key != "kind"}
                 parsed = schema.model_validate(payload)
                 result = semantic_validate(parsed)
+        except CancellationDrainError:
+            raise
         except Exception as exc:
             elapsed = time.monotonic() - started
             record_model_invocation(
