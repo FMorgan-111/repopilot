@@ -53,12 +53,34 @@ class PRCancellationCleanupError(CancellationDrainError):
         pr_number: int | None,
         cancellation: asyncio.CancelledError,
         cleanup_error: BaseException,
+        *,
+        transaction_error: BaseException | None = None,
     ) -> None:
         label = str(pr_number) if pr_number is not None else "unknown"
         super().__init__(
             f"pull request {label} cleanup", cancellation, cleanup_error
         )
         self.pr_number = pr_number
+        self.transaction_error = transaction_error
+
+
+class PRCancellationTransactionError(CancellationDrainError):
+    """Cancellation was preserved, but the in-flight PR transaction failed."""
+
+    def __init__(
+        self,
+        pr_number: int | None,
+        cancellation: asyncio.CancelledError,
+        transaction_error: BaseException,
+    ) -> None:
+        label = str(pr_number) if pr_number is not None else "unknown"
+        super().__init__(
+            f"pull request {label} transaction",
+            cancellation,
+            transaction_error,
+        )
+        self.pr_number = pr_number
+        self.transaction_error = transaction_error
 
 
 def _repo_api_root(state: AgentState) -> str:
@@ -921,10 +943,12 @@ async def create_pr(
     try:
         return await asyncio.shield(transaction)
     except asyncio.CancelledError as cancellation:
+        transaction_error: BaseException | None = None
         try:
             await _drain_shielded_task(transaction)
-        except BaseException:
-            pass
+        except BaseException as error:
+            if not isinstance(error, asyncio.CancelledError):
+                transaction_error = error
         cleanup = await _run_cleanup_shielded(
             _cleanup_pr_transaction(
                 state,
@@ -936,8 +960,17 @@ async def create_pr(
         )
         if cleanup.error is not None:
             raise PRCancellationCleanupError(
-                outcome.number, cancellation, cleanup.error
+                outcome.number,
+                cancellation,
+                cleanup.error,
+                transaction_error=transaction_error,
             ) from cleanup.error
+        if transaction_error is not None:
+            raise PRCancellationTransactionError(
+                outcome.number,
+                cancellation,
+                transaction_error,
+            ) from transaction_error
         raise cancellation
     except BaseException as validation_error:
         cleanup = await _run_cleanup_shielded(

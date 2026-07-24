@@ -34,24 +34,30 @@ class TaskDrainOutcome(Generic[T]):
     delayed_cancellation: asyncio.CancelledError | None
 
 
+async def _settle_task(task: asyncio.Future[T]) -> TaskDrainOutcome[T]:
+    try:
+        result = await task
+    except BaseException as error:
+        return TaskDrainOutcome(None, error, None)
+    return TaskDrainOutcome(result, None, None)
+
+
 async def drain_task(task: asyncio.Future[T]) -> TaskDrainOutcome[T]:
     """Wait for *task* to finish while retaining the first caller cancellation."""
+    settlement = asyncio.create_task(_settle_task(task))
     delayed_cancellation: asyncio.CancelledError | None = None
-    while not task.done():
+    while not settlement.done():
         try:
-            await asyncio.shield(task)
+            await asyncio.shield(settlement)
         except asyncio.CancelledError as cancellation:
-            if task.done():
-                break
             if delayed_cancellation is None:
                 delayed_cancellation = cancellation
-        except BaseException:
-            break
-    try:
-        result = task.result()
-    except BaseException as error:
-        return TaskDrainOutcome(None, error, delayed_cancellation)
-    return TaskDrainOutcome(result, None, delayed_cancellation)
+    outcome = settlement.result()
+    return TaskDrainOutcome(
+        outcome.result,
+        outcome.error,
+        delayed_cancellation,
+    )
 
 
 def _raise_external_cancellation(
