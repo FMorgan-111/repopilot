@@ -988,8 +988,13 @@ async def create_pr(
                     outcome.number,
                     cleanup.delayed_cancellation,
                     cleanup.error,
+                    transaction_error=validation_error,
                 ) from cleanup.error
-            raise cleanup.delayed_cancellation
+            raise PRCancellationTransactionError(
+                outcome.number,
+                cleanup.delayed_cancellation,
+                validation_error,
+            ) from validation_error
         if cleanup.error is not None:
             raise PRCleanupError(
                 outcome.number, validation_error, cleanup.error

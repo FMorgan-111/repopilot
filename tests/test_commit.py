@@ -1395,6 +1395,131 @@ async def test_create_pr_cancellation_surfaces_transaction_and_cleanup_failures(
 
 
 @pytest.mark.asyncio
+async def test_create_pr_transaction_failure_then_cancellation_preserves_both(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    transaction_error = OSError("transaction validation failed")
+    closed = []
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def fail_refs(*_args, **_kwargs):
+        raise transaction_error
+
+    async def close(_state, number):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        closed.append(number)
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_assert_pr_refs_unchanged", fail_refs)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await cleanup_started.wait()
+    task.cancel("cancel transaction cleanup")
+    release_cleanup.set()
+
+    with pytest.raises(commit_node.PRCancellationTransactionError) as caught:
+        await task
+
+    error = caught.value
+    assert error.pr_number == 12
+    assert error.cancellation.args == ("cancel transaction cleanup",)
+    assert error.transaction_error is transaction_error
+    assert error.cleanup_error is transaction_error
+    assert error.__cause__ is transaction_error
+    assert closed == [12]
+
+
+@pytest.mark.asyncio
+async def test_create_pr_transaction_failure_then_cancellation_keeps_cleanup_failure(
+    tmp_path, monkeypatch
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    state.branch_name = "repopilot-fix-7-aaaaaaaaaaaa-bbbbbbbbbbbbbbbb"
+    state.base_branch = "main"
+    head_sha = "d" * 40
+    payload = _pr_payload(state, head_sha)
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    transaction_error = OSError("transaction validation failed")
+    cleanup_error = RuntimeError("cleanup failed")
+    _mock_pr_repo(monkeypatch, state)
+
+    async def verify(*_args, **_kwargs):
+        return head_sha
+
+    async def create(*_args, **_kwargs):
+        return payload
+
+    async def get_pr(*_args, **_kwargs):
+        return payload
+
+    async def fail_refs(*_args, **_kwargs):
+        raise transaction_error
+
+    async def close(*_args, **_kwargs):
+        cleanup_started.set()
+        await release_cleanup.wait()
+        raise cleanup_error
+
+    monkeypatch.setattr(commit_node, "_verify_remote_branch", verify)
+    monkeypatch.setattr(commit_node, "_github_create_pr", create)
+    monkeypatch.setattr(commit_node, "_github_get_pr", get_pr)
+    monkeypatch.setattr(commit_node, "_assert_pr_refs_unchanged", fail_refs)
+    monkeypatch.setattr(commit_node, "_github_close_pr", close)
+
+    task = asyncio.create_task(
+        create_pr(
+            state,
+            verified_head_sha=head_sha,
+            commit_chain=(head_sha,),
+            repository_identity=_repo_identity(state),
+        )
+    )
+    await cleanup_started.wait()
+    task.cancel("cancel double cleanup failure")
+    release_cleanup.set()
+
+    with pytest.raises(commit_node.PRCancellationCleanupError) as caught:
+        await task
+
+    error = caught.value
+    assert error.pr_number == 12
+    assert error.cancellation.args == ("cancel double cleanup failure",)
+    assert error.transaction_error is transaction_error
+    assert error.cleanup_error is cleanup_error
+    assert error.__cause__ is cleanup_error
+
+
+@pytest.mark.asyncio
 async def test_create_pr_second_cancellation_does_not_misreport_successful_cleanup(
     tmp_path, monkeypatch
 ):
