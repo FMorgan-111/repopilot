@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from eval.oci_runner import (
     score_instance,
 )
 from eval.swe_bench import verified_row_sha256
+from src.async_safety import CancellationDrainError
 from src.safe_subprocess import BoundedProcessResult, ProcessTimeoutError
 
 INSTANCE_ID = "pytest-dev__pytest-10081"
@@ -487,6 +489,54 @@ async def test_generate_uses_exact_limits_and_temporary_oci_environment(
         "REPOPILOT_TOOL_PIDS_LIMIT": "256",
     }
     assert all(name not in os.environ for name in managed_names)
+
+
+async def test_generate_reraises_agent_drain_by_identity(
+    tmp_path: Path,
+) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    sentinel = CancellationDrainError(
+        "OCI generation",
+        asyncio.CancelledError("cancel OCI generation"),
+        OSError("OCI generation drain failed"),
+    )
+
+    async def fail_with_drain(*_args, **_kwargs):
+        raise sentinel
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await generate_instance(
+            runtime_path,
+            tmp_path,
+            agent_runner=fail_with_drain,
+        )
+
+    assert caught.value is sentinel
+    assert not (tmp_path / "result.json").exists()
+    assert not (tmp_path / "prediction.jsonl").exists()
+
+
+async def test_generate_keeps_safe_runtime_failure(tmp_path: Path) -> None:
+    runtime_path = _write_runtime(tmp_path)
+    secret = "private OCI generation detail"
+
+    async def fail_with_runtime_error(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    await generate_instance(
+        runtime_path,
+        tmp_path,
+        agent_runner=fail_with_runtime_error,
+    )
+
+    [result] = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    prediction = json.loads(
+        (tmp_path / "prediction.jsonl").read_text(encoding="utf-8")
+    )
+    assert result["failure_class"] == "infra"
+    assert result["error"] == "Sample evaluation failed."
+    assert prediction["model_patch"] == ""
+    assert secret not in json.dumps({"result": result, "prediction": prediction})
 
 
 async def test_generate_infrastructure_runtime_writes_empty_prediction_without_agent(

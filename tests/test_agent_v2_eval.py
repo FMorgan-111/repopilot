@@ -11,6 +11,7 @@ from eval.oci_aggregate import aggregate_artifacts
 from eval.oci_contract import OfficialResult, RuntimeRecord, write_model
 from eval.oci_runner import package_instance
 from src import new_agent
+from src.async_safety import CancellationDrainError
 
 
 def coverage_proof():
@@ -1476,6 +1477,98 @@ async def test_run_exact_verified_instance_loads_only_one_row_and_fixed_limits(
     ] == instance_id
 
 
+async def test_run_exact_verified_instance_reraises_drain_by_identity(
+    monkeypatch,
+    tmp_path,
+):
+    sentinel = CancellationDrainError(
+        "exact eval",
+        asyncio.CancelledError("cancel exact eval"),
+        OSError("exact eval drain failed"),
+    )
+    closed = []
+
+    async def fail_with_drain(*_args, **_kwargs):
+        raise sentinel
+
+    async def close_resources():
+        closed.append(True)
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_instance",
+        lambda _instance_id: {"instance_id": "acme__widget-8"},
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "normalize_verified_row",
+        lambda _row: swe_bench_sample(),
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "evaluate_agent_v2_sample",
+        fail_with_drain,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_close_shared_resources",
+        close_resources,
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await agent_v2_harness.run_exact_verified_instance(
+            "acme__widget-8",
+            output_dir=tmp_path,
+        )
+
+    assert caught.value is sentinel
+    assert closed == [True]
+    assert not (tmp_path / "result.json").exists()
+    assert not (tmp_path / "prediction.jsonl").exists()
+
+
+async def test_run_exact_verified_instance_keeps_safe_runtime_failure(
+    monkeypatch,
+    tmp_path,
+):
+    secret = "private exact eval detail"
+
+    async def fail_with_runtime_error(*_args, **_kwargs):
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_verified_instance",
+        lambda _instance_id: {"instance_id": "acme__widget-8"},
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "normalize_verified_row",
+        lambda _row: swe_bench_sample(),
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "evaluate_agent_v2_sample",
+        fail_with_runtime_error,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_close_shared_resources",
+        lambda: asyncio.sleep(0),
+    )
+
+    result = await agent_v2_harness.run_exact_verified_instance(
+        "acme__widget-8",
+        output_dir=tmp_path,
+    )
+
+    assert result["failure_class"] == "other"
+    assert result["error"] == "Sample evaluation failed."
+    assert secret not in json.dumps(result)
+    assert (tmp_path / "result.json").exists()
+    assert (tmp_path / "prediction.jsonl").exists()
+
+
 def test_agent_v2_eval_cli_forwards_sample_ids_and_results_path(
     monkeypatch, tmp_path
 ):
@@ -1683,6 +1776,45 @@ async def test_run_agent_v2_eval_records_sample_failure_and_preserves_cleanup_wa
     captured = capsys.readouterr()
     assert "cleanup failed" in captured.err
     assert "sample-secret-sentinel" not in captured.out + captured.err
+
+
+async def test_run_agent_v2_eval_reraises_sample_drain_by_identity(
+    monkeypatch,
+    tmp_path,
+):
+    sentinel = CancellationDrainError(
+        "sample eval",
+        asyncio.CancelledError("cancel sample eval"),
+        OSError("sample eval drain failed"),
+    )
+
+    async def fail_with_drain(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_samples",
+        lambda _count, sample_id=None, **_kwargs: [sample_record()],
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "evaluate_agent_v2_sample",
+        fail_with_drain,
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_close_shared_resources",
+        lambda: asyncio.sleep(0),
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await agent_v2_harness.run_agent_v2_eval(
+            n_samples=1,
+            results_path=tmp_path / "results.json",
+        )
+
+    assert caught.value is sentinel
+    assert not (tmp_path / "results.json").exists()
 
 
 @pytest.mark.parametrize(

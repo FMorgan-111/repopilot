@@ -29,6 +29,9 @@ safe_prediction_patch = _evaluator_safety.safe_prediction_patch
 sanitize_evaluator_text = _evaluator_safety.sanitize_evaluator_text
 repopilot_home = importlib.import_module("src.home").repopilot_home
 close_store = importlib.import_module("src.memory").close_store
+CancellationDrainError = importlib.import_module(
+    "src.async_safety"
+).CancellationDrainError
 AgentState = importlib.import_module("src.state").AgentState
 Tracer = importlib.import_module("src.tracer").Tracer
 CoverageProof = importlib.import_module("src.state").CoverageProof
@@ -778,6 +781,8 @@ async def run_exact_verified_instance(
                 token_budget=token_budget,
                 seed_gold_files=False,
             )
+        except CancellationDrainError:
+            raise
         except Exception as exc:
             result = safe_failed_sample_result(sample, exc)
         _write_results_with_fallback([result], output_dir / "result.json")
@@ -873,6 +878,8 @@ async def run_agent_v2_eval(
                     token_budget=token_budget,
                     seed_gold_files=seed_gold_files,
                 )
+            except CancellationDrainError:
+                raise
             except Exception as exc:
                 result = safe_failed_sample_result(
                     sample,

@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from src import main, new_agent, run_store
+from src.async_safety import CancellationDrainError
 from src.state import AgentState, Phase
 
 API_TOKEN = "test-api-token"
@@ -871,6 +872,94 @@ async def test_concurrency_slot_is_released_after_handler_error(monkeypatch, cap
     assert secret not in failed.text
     assert secret not in caplog.text
     assert recovered.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("endpoint_name", "dependency_name", "request_model"),
+    [
+        (
+            "intelligent_agent",
+            "intelligent_analyze_issue",
+            main.IntelligentAgentRequest(issue_url=ISSUE_URL),
+        ),
+        (
+            "agent_v2_endpoint",
+            "agent_v2",
+            main.AgentV2Request(issue_url=ISSUE_URL),
+        ),
+        (
+            "agent_v2_resume_endpoint",
+            "resume_agent_v2",
+            main.AgentV2ResumeRequest(
+                run_id="abc123def456",
+                human_answer="Proceed.",
+            ),
+        ),
+    ],
+)
+async def test_agent_endpoints_reraise_cancellation_drain_by_identity(
+    monkeypatch,
+    endpoint_name,
+    dependency_name,
+    request_model,
+):
+    sentinel = CancellationDrainError(
+        "outer endpoint",
+        asyncio.CancelledError("cancel endpoint"),
+        OSError("endpoint drain failed"),
+    )
+
+    async def fail_with_drain(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(main, dependency_name, fail_with_drain)
+    monkeypatch.setattr(main, "_load_authorized_run", lambda _run_id: _state())
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await getattr(main, endpoint_name)(request_model)
+
+    assert caught.value is sentinel
+
+
+@pytest.mark.parametrize(
+    ("endpoint_name", "dependency_name", "request_model"),
+    [
+        (
+            "intelligent_agent",
+            "intelligent_analyze_issue",
+            main.IntelligentAgentRequest(issue_url=ISSUE_URL),
+        ),
+        (
+            "agent_v2_endpoint",
+            "agent_v2",
+            main.AgentV2Request(issue_url=ISSUE_URL),
+        ),
+        (
+            "agent_v2_resume_endpoint",
+            "resume_agent_v2",
+            main.AgentV2ResumeRequest(
+                run_id="abc123def456",
+                human_answer="Proceed.",
+            ),
+        ),
+    ],
+)
+async def test_agent_endpoints_keep_safe_runtime_error_response(
+    monkeypatch,
+    endpoint_name,
+    dependency_name,
+    request_model,
+):
+    async def fail_with_runtime_error(*_args, **_kwargs):
+        raise RuntimeError("private endpoint detail")
+
+    monkeypatch.setattr(main, dependency_name, fail_with_runtime_error)
+    monkeypatch.setattr(main, "_load_authorized_run", lambda _run_id: _state())
+
+    response = await getattr(main, endpoint_name)(request_model)
+
+    assert response.status_code == 502
+    assert json.loads(response.body) == {"detail": "Agent request failed."}
 
 
 async def test_concurrency_slot_is_released_after_cancellation(

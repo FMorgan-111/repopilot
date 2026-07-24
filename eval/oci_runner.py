@@ -35,6 +35,7 @@ from eval.swe_bench import (
     serialize_verified_rows,
     verified_row_sha256,
 )
+from src.async_safety import CancellationDrainError
 from src.exception_safety import normalize_exception_class
 from src.safe_subprocess import (
     BoundedProcessResult,
@@ -416,6 +417,8 @@ async def generate_instance(
                 max_retries=3,
                 token_budget=100_000,
             )
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         _write_generation_failure(runtime, output_dir, exc)
 

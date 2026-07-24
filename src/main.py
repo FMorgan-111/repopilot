@@ -19,6 +19,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from src.agent import analyze_issue
 from src.agent_loop import agent_analyze
+from src.async_safety import CancellationDrainError
 from src.new_agent import agent_v2, intelligent_analyze_issue, resume_agent_v2
 from src.run_store import (
     ResumeConflictError,
@@ -411,6 +412,8 @@ async def intelligent_agent(req: IntelligentAgentRequest):
                 max_retries=min(req.max_turns, 3),
                 token_budget=req.token_budget,
             )
+        except CancellationDrainError:
+            raise
         except Exception:
             return _error_response(502, "Agent request failed.")
     if result.get("error"):
@@ -430,6 +433,8 @@ async def agent_v2_endpoint(req: AgentV2Request):
                 max_retries=req.max_retries,
                 token_budget=req.token_budget,
             )
+        except CancellationDrainError:
+            raise
         except Exception:
             return _error_response(502, "Agent request failed.")
     if result.get("error"):
@@ -451,6 +456,8 @@ async def agent_v2_resume_endpoint(req: AgentV2ResumeRequest):
             )
         except ResumeConflictError:
             return _error_response(409, "Run resume conflict.")
+        except CancellationDrainError:
+            raise
         except Exception:
             return _error_response(502, "Agent request failed.")
 

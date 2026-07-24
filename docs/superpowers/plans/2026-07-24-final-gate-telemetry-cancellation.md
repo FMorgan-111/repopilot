@@ -605,6 +605,20 @@ prompt changes, or cohort changes.
   `package_instance()`, and `aggregate_artifacts()` with durable loading forced
   unavailable; the exact call/count/token telemetry must survive.
 
+**Outermost cancellation-drain consumers:**
+
+- Whole-stage review continuation: add an explicit bare re-raise for
+  `CancellationDrainError` before the ordinary generic fallback at exactly six
+  newly reachable consumers: `intelligent_agent()`, `agent_v2_endpoint()`, and
+  `agent_v2_resume_endpoint()` in `src/main.py`;
+  `run_exact_verified_instance()` and the per-sample catch in
+  `run_agent_v2_eval()`; and `generate_instance()` in `eval/oci_runner.py`.
+  Keep the eval harness import compatible with direct script execution.
+- Do not expand this change to synchronous inspect/replay routes or unrelated
+  legacy catches. At every named boundary assert sentinel identity; paired
+  ordinary `RuntimeError` controls must retain the existing safe 502, failed
+  eval result, or OCI infrastructure artifact behavior.
+
 **Escalated PLAN tool cancellation:**
 
 - Import `CancellationDrainError` in `src/repair_flow.py` and re-raise it

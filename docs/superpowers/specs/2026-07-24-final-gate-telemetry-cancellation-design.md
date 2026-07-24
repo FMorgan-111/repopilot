@@ -178,6 +178,12 @@ agent result.
   generation-attempt, and coverage telemetry; a requested final run is still
   saved best-effort. The crash reason is redacted and bounded before it reaches
   state, payload, trace, or stderr.
+- `CancellationDrainError` also has strict precedence at the reachable outer
+  consumers: the intelligent-agent, agent-v2, and agent-v2-resume HTTP
+  handlers; exact-instance and per-sample Agent V2 evaluation; and OCI
+  generation. Each boundary re-raises the identical drain before its ordinary
+  exception fallback, while ordinary exceptions keep their existing safe HTTP
+  or artifact result.
 - Diagnostic output contains exception classes and bounded redacted summaries,
   not credentials or full external responses.
 
@@ -218,6 +224,10 @@ Implementation will follow red-green-refactor with these regression cases:
     retains the exact attempt, token, invocation, and coverage fields in the
     public crash payload, requested durable run, and package/aggregate output
     even when the evaluator cannot load durable state.
+14. Sentinel drains escape by identity from all three agent HTTP endpoints,
+    exact-instance evaluation, per-sample evaluation, and OCI generation;
+    paired ordinary `RuntimeError` controls retain the existing bounded safe
+    responses.
 
 After focused tests pass, run the affected suites on Python 3.10, 3.11, and
 3.12, then the complete suite, Ruff, `git diff --check`, clean-archive tests and
