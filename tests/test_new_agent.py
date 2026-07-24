@@ -165,6 +165,18 @@ def test_agent_payload_includes_only_safe_model_routing_history(monkeypatch):
     assert "api_key" not in serialized
 
 
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_agent_payload_preserves_exact_test_generation_attempts(attempts):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        test_generation_attempts=attempts,
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["test_generation_attempts"] == attempts
+
+
 def test_agent_payload_rejects_hostile_routing_strings():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",

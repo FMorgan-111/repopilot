@@ -357,6 +357,7 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 invocation.model_dump(mode="json")
                 for invocation in state.model_history
             ],
+            "test_generation_attempts": state.test_generation_attempts,
             "no_progress_history": [
                 event.model_dump(mode="json")
                 for event in state.no_progress_history

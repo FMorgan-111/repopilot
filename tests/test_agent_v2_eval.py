@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from eval import agent_v2_harness, swe_bench
+from eval.oci_contract import ResultRecord
 
 
 def coverage_proof():
@@ -605,6 +606,90 @@ async def test_eval_result_exposes_safe_success_first_fields(monkeypatch):
     assert "summary" not in json.dumps(result["coverage_proof"])
     assert result["coverage_failure_reason"] == ""
     assert result["test_generation_attempts"] == 1
+
+
+@pytest.mark.parametrize("attempts", [1, 2])
+async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
+    monkeypatch,
+    attempts,
+):
+    invocations = [
+        {
+            "model": "gemini-3.5-flash:stable",
+            "provider": "primary",
+            "node": "test_generation",
+            "elapsed_seconds": 1.0,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "status": "ok",
+            "error_class": "",
+        }
+    ]
+    if attempts == 2:
+        invocations.append(
+            {
+                "model": "claude-opus-4-8:stable",
+                "provider": "escalation",
+                "node": "test_generation",
+                "elapsed_seconds": 2.0,
+                "input_tokens": 200,
+                "output_tokens": 0,
+                "status": "error",
+                "error_class": "RuntimeError",
+            }
+        )
+
+    async def fake_agent(*_args, **_kwargs):
+        return {
+            "success": False,
+            "waiting_for_user": False,
+            "final_phase": "FAILED",
+            "run_id": "payload-only-run",
+            "trace_id": "payload-only-run",
+            "turns_taken": 2,
+            "token_used": sum(
+                item["input_tokens"] + item["output_tokens"]
+                for item in invocations
+            ),
+            "error": "Test generation failed.",
+            "model_patch": "",
+            "escalated": attempts == 2,
+            "escalation_reason": "test_generation_retry" if attempts == 2 else "",
+            "model_history": invocations,
+            "coverage_status": "failed",
+            "coverage_test_files": [],
+            "coverage_test_command": "",
+            "coverage_proof": None,
+            "coverage_failure_reason": "test_generation_failed",
+            "test_generation_attempts": attempts,
+        }
+
+    async def no_seed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "_build_eval_seed", no_seed)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_run",
+        lambda _run_id: (_ for _ in ()).throw(OSError("durable state unavailable")),
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_configured_model",
+        lambda: "gemini-3.5-flash:stable",
+    )
+    monkeypatch.setattr(agent_v2_harness, "_current_commit_sha", lambda: "a" * 40)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+
+    assert result["test_generation_attempts"] == attempts
+    assert len(result["model_invocations"]) == attempts
+    assert ResultRecord.model_validate(result).test_generation_attempts == attempts
 
 
 @pytest.mark.parametrize(
