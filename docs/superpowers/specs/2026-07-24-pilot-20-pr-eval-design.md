@@ -2,7 +2,7 @@
 
 Date: 2026-07-24
 
-Status: ready for written-spec review; independent design review passed
+Status: approved; independent design review passed; implementation pending
 
 Branch: `fix/release-readiness-20260717`
 
