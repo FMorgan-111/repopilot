@@ -14,12 +14,14 @@ from src.coverage_gate import ChangedTarget, CoverageDecision
 from src.patch_gate import validate_patch_batch
 from src.state import (
     AgentState,
+    CoverageProof,
     PatchEdit,
     RepairPlan,
     SnapshotManifestEntry,
     ToolPatchApproval,
     VerifiedEdit,
     VerifiedEditBatch,
+    TestRunFingerprint as RunFingerprint,
     _estimate_tokens,
     tool_manifest_fingerprint,
 )
@@ -140,6 +142,52 @@ def _good_batch() -> VerifiedEditBatch:
             )
         ]
     )
+
+
+class _UnknownModelError(Exception):
+    pass
+
+
+def _seed_coverage_snapshot(state: AgentState) -> CoverageProof:
+    approval = state.tool_patch_approval
+    assert approval is not None
+    fixed = [RunFingerprint(exit_code=0, outcome="pass", summary="pass")] * 2
+    base = [
+        RunFingerprint(
+            exit_code=1,
+            outcome="assertion_failure",
+            failing_test_ids=["tests/test_smoke.py::test_smoke"],
+            assertion_fingerprint="a" * 64,
+            summary="assertion_failure",
+        )
+    ] * 2
+    proof = CoverageProof(
+        source="existing",
+        status="existing_verified",
+        test_files=["tests/test_smoke.py"],
+        argv=["python", "-m", "pytest", "tests/test_smoke.py", "-q"],
+        fixed_runs=fixed,
+        base_runs=base,
+        base_ref=state.repo_ref,
+        patch_sha256=approval.patch_sha256,
+        patch_gate_fingerprint=approval.patch_gate_fingerprint,
+        manifest_fingerprint=approval.manifest_fingerprint,
+        test_content_digests={"tests/test_smoke.py": "b" * 64},
+    )
+    state.coverage_status = "existing_verified"
+    state.coverage_test_files = ["tests/test_smoke.py"]
+    state.coverage_test_command = "python -m pytest tests/test_smoke.py -q"
+    state.coverage_failure_reason = "prior_coverage_failure"
+    state.coverage_proof = proof
+    return proof
+
+
+def _assert_coverage_snapshot(state: AgentState, proof: CoverageProof) -> None:
+    assert state.coverage_status == "existing_verified"
+    assert state.coverage_test_files == ["tests/test_smoke.py"]
+    assert state.coverage_test_command == "python -m pytest tests/test_smoke.py -q"
+    assert state.coverage_failure_reason == "prior_coverage_failure"
+    assert state.coverage_proof == proof
 
 
 def test_patch_gate_test_only_rejects_production_even_when_plan_allows_it(
@@ -516,6 +564,7 @@ async def test_budget_before_request_restores_production_state_without_generatio
         "escalation": 0,
     }
     generation_state.token_usage = generation_state.token_budget
+    original_coverage_proof = _seed_coverage_snapshot(generation_state)
 
     async def request(*_args, **_kwargs):
         calls["request"] += 1
@@ -563,6 +612,7 @@ async def test_budget_before_request_restores_production_state_without_generatio
     assert generation_state.patch_content == original_patch
     assert generation_state.generated_test_approvals == []
     assert not (root / "tests" / "test_answer.py").exists()
+    _assert_coverage_snapshot(generation_state, original_coverage_proof)
 
 
 @pytest.mark.asyncio
@@ -585,6 +635,7 @@ async def test_budget_after_request_restores_production_state_before_patch_gate(
         "escalation": 0,
     }
     generation_state.token_budget = 1
+    original_coverage_proof = _seed_coverage_snapshot(generation_state)
 
     async def request(*_args, **_kwargs):
         calls["request"] += 1
@@ -634,6 +685,7 @@ async def test_budget_after_request_restores_production_state_before_patch_gate(
     assert generation_state.patch_content == original_patch
     assert generation_state.generated_test_approvals == []
     assert not (root / "tests" / "test_answer.py").exists()
+    _assert_coverage_snapshot(generation_state, original_coverage_proof)
 
 
 @pytest.mark.asyncio
@@ -650,6 +702,7 @@ async def test_budget_after_failed_request_stops_before_escalation_or_retry(
     original_patch = generation_state.patch_content
     calls = {"request": 0, "escalation": 0}
     generation_state.token_budget = 1
+    original_coverage_proof = _seed_coverage_snapshot(generation_state)
 
     async def request(*_args, **_kwargs):
         calls["request"] += 1
@@ -674,6 +727,54 @@ async def test_budget_after_failed_request_stops_before_escalation_or_retry(
     assert generation_state.patch_content == original_patch
     assert generation_state.generated_test_approvals == []
     assert not (root / "tests" / "test_answer.py").exists()
+    _assert_coverage_snapshot(generation_state, original_coverage_proof)
+
+
+@pytest.mark.asyncio
+async def test_budget_after_unknown_request_error_stops_without_escalation_or_retry(
+    generation_state,
+    monkeypatch,
+):
+    original_coverage_proof = _seed_coverage_snapshot(generation_state)
+    calls = {"request": 0, "escalation": 0}
+    generation_state.token_budget = 1
+
+    async def request(*_args, **_kwargs):
+        calls["request"] += 1
+        raise _UnknownModelError()
+
+    def escalation(*args, **kwargs):
+        calls["escalation"] += 1
+        return original_escalation(*args, **kwargs)
+
+    original_escalation = test_generator.apply_escalation
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+    monkeypatch.setattr("src.test_generator.escalation_is_configured", lambda: True)
+    monkeypatch.setattr("src.test_generator.apply_escalation", escalation)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert result.reason == "token_budget_exceeded"
+    assert calls == {"request": 1, "escalation": 0}
+    _assert_coverage_snapshot(generation_state, original_coverage_proof)
+
+
+@pytest.mark.asyncio
+async def test_unknown_request_error_without_budget_is_reraised(
+    generation_state,
+    monkeypatch,
+):
+    error = _UnknownModelError()
+
+    async def request(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+
+    with pytest.raises(_UnknownModelError) as raised:
+        await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert raised.value is error
 
 
 @pytest.mark.asyncio

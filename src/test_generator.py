@@ -396,11 +396,13 @@ async def run_test_generation_attempts(
     production = _capture_production_state(state)
     reason = _safe_text(rejection_reason, limit=300) or "no_coverage_candidate"
     last = _failed(reason)
+    budget_terminal = False
 
     while state.test_generation_attempts < 2:
         _restore_production_state(state, production)
         if _is_budget_exceeded(state):
             last = _failed(_TEST_GENERATION_BUDGET_REASON)
+            budget_terminal = True
             break
         snapshot: dict[str, bytes | None] = {}
         applied = False
@@ -408,6 +410,7 @@ async def run_test_generation_attempts(
             batch = await request_test_batch(state, reason)
             if _is_budget_exceeded(state):
                 last = _failed(_TEST_GENERATION_BUDGET_REASON)
+                budget_terminal = True
                 break
             plan = _test_plan(batch)
             state.active_repair_plan = plan
@@ -482,9 +485,16 @@ async def run_test_generation_attempts(
         except (OSError, RuntimeError, ValueError):
             if _is_budget_exceeded(state):
                 last = _failed(_TEST_GENERATION_BUDGET_REASON)
+                budget_terminal = True
                 break
             reason = "invalid_generated_test"
             last = _failed(reason)
+        except Exception:
+            if _is_budget_exceeded(state):
+                last = _failed(_TEST_GENERATION_BUDGET_REASON)
+                budget_terminal = True
+                break
+            raise
         finally:
             if applied and not last.verified:
                 try:
@@ -512,8 +522,9 @@ async def run_test_generation_attempts(
                 )
 
     _restore_production_state(state, production)
-    state.coverage_status = "failed"
-    state.coverage_failure_reason = last.reason
+    if not budget_terminal:
+        state.coverage_status = "failed"
+        state.coverage_failure_reason = last.reason
     return last
 
 
