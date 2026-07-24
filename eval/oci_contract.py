@@ -27,6 +27,7 @@ from eval.swe_bench import (
     atomic_write_text,
 )
 from src.exception_safety import normalize_exception_class
+from src.state import APPROVED_ESCALATION_REASONS
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
@@ -70,6 +71,7 @@ INFRASTRUCTURE_FAILURE_CLASSES = frozenset(
 )
 
 _NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
+_TestGenerationAttempts = Annotated[int, Field(strict=True, ge=0, le=2)]
 _FiniteNonNegativeFloat = Annotated[
     float, Field(strict=True, ge=0, allow_inf_nan=False)
 ]
@@ -305,7 +307,7 @@ class ResultRecord(BaseModel):
     coverage_test_command: str
     coverage_proof: dict[str, Any] | None
     coverage_failure_reason: str
-    test_generation_attempts: _NonNegativeInt
+    test_generation_attempts: _TestGenerationAttempts
     failure_class: FailureClass
     instance_id: str
     base_commit: str
@@ -345,6 +347,21 @@ class ResultRecord(BaseModel):
             "resolved",
         }:
             raise ValueError("failed result cannot claim a success failure class")
+        generation_invocations = [
+            invocation
+            for invocation in self.model_invocations
+            if invocation.node == "test_generation"
+        ]
+        if len(generation_invocations) != self.test_generation_attempts:
+            raise ValueError(
+                "test generation attempts do not match invocation history"
+            )
+        if self.coverage_status == "generated_verified" and not any(
+            invocation.status == "ok" for invocation in generation_invocations
+        ):
+            raise ValueError(
+                "generated coverage requires a successful invocation"
+            )
         invocation_models = list(
             dict.fromkeys(
                 invocation.model for invocation in self.model_invocations
@@ -355,6 +372,26 @@ class ResultRecord(BaseModel):
             raise ValueError(
                 "models_used must match ordered unique invocation history"
             )
+        if any(
+            invocation.provider == "escalation"
+            for invocation in generation_invocations
+        ):
+            if not self.escalated:
+                raise ValueError("escalation invocation requires escalated")
+            if self.escalation_reason not in APPROVED_ESCALATION_REASONS:
+                raise ValueError(
+                    "canonical escalation requires an approved escalation_reason"
+                )
+            if ESCALATION_MODEL not in self.models_used:
+                raise ValueError("canonical escalation requires escalation model")
+        escalation_seen = False
+        for invocation in generation_invocations:
+            if invocation.provider == "escalation":
+                escalation_seen = True
+            elif escalation_seen and invocation.provider == "primary":
+                raise ValueError(
+                    "test generation provider order cannot return to primary"
+                )
         if (
             any(
                 invocation.provider == "escalation"

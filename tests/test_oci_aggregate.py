@@ -28,6 +28,7 @@ ESCALATION_MODEL = "claude-opus-4-8:stable"
 _DEFAULT_MODEL_INVOCATIONS = object()
 _MISSING_AGENT_VERDICT = object()
 _DEFAULT_MODEL_PATCH = object()
+_DEFAULT_COVERAGE_PROOF = object()
 
 
 def _artifact_row(instance_id: str) -> dict[str, str]:
@@ -121,6 +122,9 @@ def _completed_output(
     model_invocations: object = _DEFAULT_MODEL_INVOCATIONS,
     failure_class: str | None = None,
     model_patch: object = _DEFAULT_MODEL_PATCH,
+    test_generation_attempts: int = 0,
+    coverage_status: str | None = None,
+    coverage_proof: object = _DEFAULT_COVERAGE_PROOF,
     runtime_status: str = "ready",
 ) -> tuple[Path, Path]:
     output_dir = root / "output"
@@ -186,6 +190,18 @@ def _completed_output(
         if model_patch is _DEFAULT_MODEL_PATCH
         else model_patch
     )
+    result_coverage_status = coverage_status or (
+        "existing_verified" if internal_success else "failed"
+    )
+    result_coverage_proof = (
+        _coverage_proof(source="existing")
+        if internal_success and coverage_proof is _DEFAULT_COVERAGE_PROOF
+        else (
+            None
+            if coverage_proof is _DEFAULT_COVERAGE_PROOF
+            else coverage_proof
+        )
+    )
     result = {
         "id": instance_id,
         "mode": "agent_v2",
@@ -208,7 +224,10 @@ def _completed_output(
         "error": None,
         "replay": None,
         "replay_error": None,
-        "models_used": [PRIMARY_MODEL],
+        "models_used": (
+            list(dict.fromkeys(item["model"] for item in invocations))
+            or [PRIMARY_MODEL]
+        ),
         "escalated": False,
         "escalation_reason": "",
         "model_invocations": invocations,
@@ -216,14 +235,12 @@ def _completed_output(
         "unique_evidence_count": 0,
         "max_consecutive_no_progress": 0,
         "attempt_outcome_summary": "complete",
-        "coverage_status": (
-            "generated_verified" if internal_success else "failed"
-        ),
+        "coverage_status": result_coverage_status,
         "coverage_test_files": [],
         "coverage_test_command": "",
-        "coverage_proof": _coverage_proof() if internal_success else None,
+        "coverage_proof": result_coverage_proof,
         "coverage_failure_reason": "" if internal_success else "test_failed",
-        "test_generation_attempts": 0,
+        "test_generation_attempts": test_generation_attempts,
         "failure_class": failure_class
         or ("agent_success" if internal_success else "test_failed"),
         "base_commit": "d" * 40 if runtime_status == "ready" else "",
@@ -261,6 +278,9 @@ def _package(
     model_invocations: object = _DEFAULT_MODEL_INVOCATIONS,
     failure_class: str | None = None,
     model_patch: object = _DEFAULT_MODEL_PATCH,
+    test_generation_attempts: int = 0,
+    coverage_status: str | None = None,
+    coverage_proof: object = _DEFAULT_COVERAGE_PROOF,
     runtime_status: str = "ready",
 ) -> Path:
     work = artifacts_root.parent / f"work-{instance_id}"
@@ -276,6 +296,9 @@ def _package(
         model_invocations=model_invocations,
         failure_class=failure_class,
         model_patch=model_patch,
+        test_generation_attempts=test_generation_attempts,
+        coverage_status=coverage_status,
+        coverage_proof=coverage_proof,
         runtime_status=runtime_status,
     )
     package_instance(
@@ -322,7 +345,7 @@ def _invocation(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def _coverage_proof() -> dict[str, object]:
+def _coverage_proof(*, source: str = "generated") -> dict[str, object]:
     passing_run = {
         "outcome": "pass",
         "failing_test_ids": [],
@@ -334,8 +357,8 @@ def _coverage_proof() -> dict[str, object]:
         "assertion_fingerprint": "f" * 64,
     }
     return {
-        "source": "generated",
-        "status": "generated_verified",
+        "source": source,
+        "status": f"{source}_verified",
         "test_files": ["tests/test_auth.py"],
         "fixed_runs": [dict(passing_run), dict(passing_run)],
         "base_runs": [dict(failing_run), dict(failing_run)],
@@ -738,6 +761,108 @@ def test_aggregate_rejects_forged_model_invocation_node(tmp_path: Path) -> None:
             expected_commit=COMMIT_SHA,
             repo_root=repo_root,
         )
+
+
+def test_package_rejects_generation_attempt_history_mismatch(
+    tmp_path: Path,
+) -> None:
+    runtime_path, artifact_dir = _completed_output(
+        tmp_path / "work",
+        "owner__repo-1",
+        test_generation_attempts=1,
+    )
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        package_instance(
+            runtime_path,
+            runtime_path.parent,
+            artifact_dir,
+            row_loader=_artifact_row,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["missing", "extra", "failed_only", "legacy_alias_only"],
+)
+def test_aggregate_rejects_contradictory_generation_telemetry(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(artifacts, instance_id)
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    result = results[0]
+    generation = _invocation(node="test_generation")
+    if mutation == "missing":
+        result["test_generation_attempts"] = 1
+    elif mutation == "extra":
+        result["model_invocations"] = [generation]
+        result["test_generation_attempts"] = 0
+    elif mutation == "failed_only":
+        result.update(
+            coverage_status="generated_verified",
+            coverage_proof=_coverage_proof(),
+            model_invocations=[
+                _invocation(
+                    node="test_generation",
+                    status="error",
+                    error_class="RuntimeError",
+                )
+            ],
+            test_generation_attempts=1,
+        )
+    else:
+        result["model_invocations"] = [_invocation(node="test_generator")]
+        result["test_generation_attempts"] = 1
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_counts_canonical_generation_telemetry(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        model_invocations=[
+            _invocation(input_tokens=10, output_tokens=5, elapsed_seconds=1.0),
+            _invocation(
+                node="test_generation",
+                input_tokens=20,
+                output_tokens=10,
+                elapsed_seconds=2.0,
+            ),
+        ],
+        test_generation_attempts=1,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert "| Model tokens | 45 |" in summary
+    assert "| Model elapsed seconds | 3.000 |" in summary
 
 
 @pytest.mark.parametrize(
@@ -1181,10 +1306,11 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
                 agent_success=True,
                 final_phase="DONE",
                 model_patch="diff --git a/a.py b/a.py\n",
-                model_invocations=[_invocation()],
+                model_invocations=[_invocation(node="test_generation")],
                 coverage_status="generated_verified",
                 coverage_proof=_coverage_proof(),
                 coverage_failure_reason="",
+                test_generation_attempts=1,
                 failure_class="agent_success",
             )
             prediction = json.loads(

@@ -49,7 +49,7 @@ def _invocation_payload(**overrides: object) -> dict[str, object]:
     return payload
 
 
-def _coverage_proof() -> dict[str, object]:
+def _coverage_proof(*, source: str = "generated") -> dict[str, object]:
     passing_run = {
         "outcome": "pass",
         "failing_test_ids": [],
@@ -61,12 +61,20 @@ def _coverage_proof() -> dict[str, object]:
         "assertion_fingerprint": "f" * 64,
     }
     return {
-        "source": "generated",
-        "status": "generated_verified",
+        "source": source,
+        "status": f"{source}_verified",
         "test_files": ["tests/test_auth.py"],
         "fixed_runs": [dict(passing_run), dict(passing_run)],
         "base_runs": [dict(failing_run), dict(failing_run)],
     }
+
+
+def _generation_invocation(**overrides: object) -> dict[str, object]:
+    return _invocation_payload(node="test_generation", **overrides)
+
+
+def _models_used_for(invocations: list[dict[str, object]]) -> list[str]:
+    return list(dict.fromkeys(str(item["model"]) for item in invocations))
 
 
 def _result_payload(**overrides: object) -> dict[str, object]:
@@ -399,7 +407,10 @@ def test_safe_contract_exposes_exact_model_invocation_node_taxonomy() -> None:
 @pytest.mark.parametrize("node", APPROVED_MODEL_INVOCATION_NODES)
 def test_invocation_accepts_approved_node(node: str) -> None:
     record = _result_record_model().model_validate(
-        _result_payload(model_invocations=[_invocation_payload(node=node)])
+        _result_payload(
+            model_invocations=[_invocation_payload(node=node)],
+            test_generation_attempts=(1 if node == "test_generation" else 0),
+        )
     )
 
     assert record.model_invocations[0].node == node
@@ -591,6 +602,195 @@ def test_escalated_result_may_precede_first_escalation_invocation() -> None:
     assert [item.provider for item in record.model_invocations] == ["primary"]
 
 
+@pytest.mark.parametrize(
+    ("invocations", "attempts"),
+    [
+        ([_invocation_payload()], 1),
+        ([_generation_invocation()], 0),
+        ([_invocation_payload(node="test_generator")], 1),
+    ],
+    ids=["missing", "extra", "legacy_alias_only"],
+)
+def test_result_rejects_generation_attempt_history_mismatch(
+    invocations: list[dict[str, object]], attempts: int
+) -> None:
+    with pytest.raises(ValidationError, match="test generation attempts"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=invocations,
+                test_generation_attempts=attempts,
+            )
+        )
+
+
+def test_generated_coverage_requires_successful_canonical_generation() -> None:
+    with pytest.raises(ValidationError, match="generated coverage requires"):
+        _result_record_model().model_validate(
+            _result_payload(
+                coverage_status="generated_verified",
+                coverage_proof=_coverage_proof(),
+                model_invocations=[
+                    _generation_invocation(
+                        status="error", error_class="RuntimeError"
+                    )
+                ],
+                test_generation_attempts=1,
+            )
+        )
+
+
+def test_result_accepts_successful_canonical_generation_history() -> None:
+    invocation = _generation_invocation()
+
+    record = _result_record_model().model_validate(
+        _result_payload(
+            coverage_status="generated_verified",
+            coverage_proof=_coverage_proof(),
+            model_invocations=[invocation],
+            models_used=_models_used_for([invocation]),
+            test_generation_attempts=1,
+        )
+    )
+
+    assert [item.node for item in record.model_invocations] == [
+        "test_generation"
+    ]
+
+
+@pytest.mark.parametrize("attempts", [-1, 3, True, 1.0])
+def test_result_rejects_non_strict_or_out_of_range_generation_attempts(
+    attempts: object,
+) -> None:
+    with pytest.raises(ValidationError, match="test_generation_attempts"):
+        _result_record_model().model_validate(
+            _result_payload(test_generation_attempts=attempts)
+        )
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"escalated": False, "escalation_reason": ""},
+        {"escalated": True, "escalation_reason": ""},
+        {"escalated": True, "escalation_reason": "not_approved"},
+    ],
+    ids=["false_flag", "missing_reason", "unapproved_reason"],
+)
+def test_canonical_escalation_generation_requires_coherent_claims(
+    overrides: dict[str, object],
+) -> None:
+    primary = _generation_invocation()
+    escalation = _generation_invocation(
+        provider="escalation", model="claude-opus-4-8:stable"
+    )
+    with pytest.raises(ValidationError, match="escalat"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=[primary, escalation],
+                models_used=_models_used_for([primary, escalation]),
+                test_generation_attempts=2,
+                **overrides,
+            )
+        )
+
+
+def test_canonical_escalation_generation_accepts_coherent_claims() -> None:
+    primary = _generation_invocation()
+    escalation = _generation_invocation(
+        provider="escalation", model="claude-opus-4-8:stable"
+    )
+
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_invocations=[primary, escalation],
+            models_used=_models_used_for([primary, escalation]),
+            escalated=True,
+            escalation_reason="test_generation_retry",
+            test_generation_attempts=2,
+        )
+    )
+
+    assert [item.provider for item in record.model_invocations] == [
+        "primary",
+        "escalation",
+    ]
+
+
+@pytest.mark.parametrize(
+    "invocations",
+    [
+        [
+            _generation_invocation(
+                provider="escalation", model="claude-opus-4-8:stable"
+            ),
+            _generation_invocation(),
+        ],
+        [
+            _generation_invocation(
+                provider="escalation", model="claude-opus-4-8:stable"
+            ),
+            _invocation_payload(node="plan"),
+            _generation_invocation(),
+        ],
+    ],
+    ids=["reversed", "interleaved"],
+)
+def test_result_rejects_primary_after_canonical_escalation_generation(
+    invocations: list[dict[str, object]],
+) -> None:
+    with pytest.raises(ValidationError, match="generation provider order"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=invocations,
+                models_used=_models_used_for(invocations),
+                escalated=True,
+                escalation_reason="test_generation_retry",
+                test_generation_attempts=2,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "invocations",
+    [
+        [
+            _generation_invocation(),
+            _generation_invocation(
+                provider="escalation", model="claude-opus-4-8:stable"
+            ),
+        ],
+        [
+            _generation_invocation(
+                provider="escalation", model="claude-opus-4-8:stable"
+            )
+        ],
+        [
+            _generation_invocation(
+                provider="escalation", model="claude-opus-4-8:stable"
+            ),
+            _invocation_payload(node="outcome_summary"),
+        ],
+    ],
+    ids=["primary_then_escalation", "escalation_only", "summary_after_escalation"],
+)
+def test_result_accepts_generation_local_provider_order(
+    invocations: list[dict[str, object]],
+) -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_invocations=invocations,
+            models_used=_models_used_for(invocations),
+            escalated=True,
+            escalation_reason="test_generation_retry",
+            test_generation_attempts=sum(
+                item["node"] == "test_generation" for item in invocations
+            ),
+        )
+    )
+
+    assert record.test_generation_attempts >= 1
+
+
 def test_empty_invocation_history_uses_primary_model_fallback() -> None:
     record = _result_record_model().model_validate(
         _result_payload(model_invocations=[])
@@ -700,7 +900,7 @@ def test_agent_success_requires_verified_coverage_proof() -> None:
         "success": True,
         "agent_success": True,
         "failure_class": "agent_success",
-        "coverage_status": "generated_verified",
+        "coverage_status": "existing_verified",
     }
     with pytest.raises(ValidationError, match="coverage"):
         _result_record_model().model_validate(
@@ -708,7 +908,9 @@ def test_agent_success_requires_verified_coverage_proof() -> None:
         )
 
     record = _result_record_model().model_validate(
-        _result_payload(**successful, coverage_proof=_coverage_proof())
+        _result_payload(
+            **successful, coverage_proof=_coverage_proof(source="existing")
+        )
     )
 
     assert record.agent_success is True
