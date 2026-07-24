@@ -1065,12 +1065,17 @@ async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
     assert secret not in emitted
 
 
-async def test_agent_v2_crash_payload_survives_safe_final_run_save_failure(
+@pytest.mark.parametrize("failure_kind", ["oversized_state", "atomic_replace"])
+async def test_agent_v2_crash_payload_survives_real_final_run_save_failure(
     monkeypatch,
     capsys,
+    tmp_path,
+    failure_kind,
 ):
     secret = "sk-savefailuresecret123456789"
-    saved_traces = []
+    run_root = tmp_path / ".repopilot"
+    trace_path = tmp_path / "trace.json"
+    real_save_trace = new_agent._save_trace
 
     async def crash_graph(_graph, state):
         state.token_usage = 7
@@ -1087,22 +1092,25 @@ async def test_agent_v2_crash_payload_survives_safe_final_run_save_failure(
                 error_class="CancelledError",
             )
         )
+        if failure_kind == "oversized_state":
+            state.issue_body = "x" * (run_store.MAX_RUN_FILE_BYTES + 1)
         raise RuntimeError("provider failed")
 
-    def failing_save_run(_state):
-        raise ValueError(f"run file exceeds the size limit: {secret}")
+    def save_run(state):
+        return run_store.save_run(state, root_dir=run_root)
 
     def save_trace(tracer, path, state=None):
-        saved_traces.append(
-            {
-                "path": path,
-                "trace_id": tracer.trace_id,
-                "state": state.model_copy(deep=True),
-            }
-        )
+        real_save_trace(tracer, str(trace_path), state)
+
+    if failure_kind == "atomic_replace":
+
+        def fail_replace(*_args, **_kwargs):
+            raise OSError(f"injected replace failure: {secret}")
+
+        monkeypatch.setattr(run_store.os, "replace", fail_replace)
 
     monkeypatch.setattr(new_agent, "run_graph", crash_graph)
-    monkeypatch.setattr(new_agent, "save_run", failing_save_run)
+    monkeypatch.setattr(new_agent, "save_run", save_run)
     monkeypatch.setattr(new_agent, "_save_trace", save_trace)
 
     payload = await new_agent.agent_v2(
@@ -1116,12 +1124,19 @@ async def test_agent_v2_crash_payload_survives_safe_final_run_save_failure(
     assert payload["token_used"] == 7
     assert payload["test_generation_attempts"] == 1
     assert payload["model_history"][0]["status"] == "cancelled"
-    [trace] = saved_traces
-    assert trace["state"].current_phase == new_agent.Phase.FAILED
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["trace_id"] == payload["trace_id"]
+    assert trace["steps"][-1]["step"] == "agent_v2_crash"
+    assert list((run_root / "runs").glob("*.json")) == []
+    assert list((run_root / "runs").glob("*.tmp")) == []
     captured = capsys.readouterr()
-    emitted = json.dumps(payload) + captured.out + captured.err
+    emitted = json.dumps({"payload": payload, "trace": trace})
+    emitted += captured.out + captured.err
     assert secret not in emitted
-    assert "[REDACTED]" in captured.err
+    if failure_kind == "atomic_replace":
+        assert "[REDACTED]" in captured.err
+    else:
+        assert "ValueError: run file exceeds the size limit" in captured.err
 
 
 def test_best_effort_save_run_reraises_drain_by_identity(monkeypatch):
