@@ -171,6 +171,13 @@ agent result.
   rollback_error)` and chains the rollback error so phase-timeout diagnostics
   retain generic-drain cleanup evidence. An existing `CancellationDrainError`
   remains the identical object with the rollback error as its cause.
+- An ordinary top-level graph crash terminalizes the mutated run state as
+  `FAILED`, clears pending human-input state, and builds its public response
+  through `agent_payload_from_state()` before overriding only the public phase
+  to `CRASHED` and success fields to false. This preserves safe model, token,
+  generation-attempt, and coverage telemetry; a requested final run is still
+  saved best-effort. The crash reason is redacted and bounded before it reaches
+  state, payload, trace, or stderr.
 - Diagnostic output contains exception classes and bounded redacted summaries,
   not credentials or full external responses.
 
@@ -207,6 +214,10 @@ Implementation will follow red-green-refactor with these regression cases:
     state before propagating. A simultaneous rollback failure promotes direct
     cancellation into a generic drain whose operation and cleanup class survive
     the real phase-timeout evidence extractor.
+13. A graph that records one cancelled generation invocation and then crashes
+    retains the exact attempt, token, invocation, and coverage fields in the
+    public crash payload, requested durable run, and package/aggregate output
+    even when the evaluator cannot load durable state.
 
 After focused tests pass, run the affected suites on Python 3.10, 3.11, and
 3.12, then the complete suite, Ruff, `git diff --check`, clean-archive tests and

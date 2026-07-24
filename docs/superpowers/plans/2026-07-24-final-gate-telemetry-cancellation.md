@@ -587,6 +587,24 @@ prompt changes, or cohort changes.
   histories from the public payload must retain their exact count and pass
   package/aggregate validation.
 
+**Graph-crash telemetry persistence:**
+
+- Whole-stage review continuation: replace the ordinary `run_graph()` crash
+  branch's handcrafted response with a safe projection of the mutated
+  `AgentState`. Set the durable state phase to `FAILED`, clear pending human
+  input, redact and bound the crash reason, call `agent_payload_from_state()`,
+  and then expose public `final_phase="CRASHED"`, `done=true`, `success=false`,
+  `waiting_for_user=false`, no successful patch claim, and empty model patch.
+- When `save_final_run=True`, run the existing best-effort save before writing
+  the trace. Preserve exact token usage, cancelled generation invocation,
+  generation-attempt count, and coverage fields in both payload and saved
+  state; no exception secret may reach payload, trace, or stderr.
+- Add a unit RED test for a graph that records one canonical cancelled
+  generation invocation with seven input tokens and then raises. Add an
+  end-to-end RED test through `evaluate_agent_v2_sample()`,
+  `package_instance()`, and `aggregate_artifacts()` with durable loading forced
+  unavailable; the exact call/count/token telemetry must survive.
+
 **Escalated PLAN tool cancellation:**
 
 - Import `CancellationDrainError` in `src/repair_flow.py` and re-raise it

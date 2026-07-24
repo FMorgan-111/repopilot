@@ -968,26 +968,101 @@ async def test_phase_timeout_preserves_existing_node_diagnostics(monkeypatch):
     assert final_state.node_diagnostics[-1]["status"] == "timeout"
 
 
-async def test_agent_v2_crash_payload_exposes_human_input_defaults(monkeypatch):
+async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
+    monkeypatch,
+    capsys,
+):
+    secret = "sk-crashtelemetrysecret123"
+    saved_runs = []
     saved_traces = []
 
-    async def crash_graph(graph, state):
-        raise RuntimeError("boom")
+    async def crash_graph(_graph, state):
+        state.token_usage = 7
+        state.test_generation_attempts = 1
+        state.model_history.append(
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="test_generation",
+                elapsed_seconds=0.25,
+                input_tokens=7,
+                output_tokens=0,
+                status="cancelled",
+                error_class="CancelledError",
+            )
+        )
+        state.coverage_status = "failed"
+        state.coverage_test_files = ["tests/test_regression.py"]
+        state.coverage_test_command = "pytest tests/test_regression.py"
+        state.coverage_failure_reason = "test_generation_failed"
+        raise RuntimeError(f"provider failed with {secret}")
 
     def save_trace(tracer, path, state=None):
-        saved_traces.append({"path": path, "trace_id": tracer.trace_id, "state": state})
+        saved_traces.append(
+            {
+                "path": path,
+                "trace_id": tracer.trace_id,
+                "steps": list(tracer.steps),
+                "state": state.model_copy(deep=True),
+            }
+        )
 
     monkeypatch.setattr(new_agent, "run_graph", crash_graph)
     monkeypatch.setattr(new_agent, "_save_trace", save_trace)
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state: saved_runs.append(state.model_copy(deep=True)),
+    )
 
-    payload = await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
 
     assert payload["done"] is True
     assert payload["success"] is False
     assert payload["waiting_for_user"] is False
     assert payload["final_phase"] == "CRASHED"
     assert payload["human_input_request"] == {}
-    assert saved_traces[0]["state"].issue_url == "https://github.com/acme/widget/issues/7"
+    assert payload["token_used"] == 7
+    assert payload["test_generation_attempts"] == 1
+    assert payload["model_history"] == [
+        {
+            "model": "gemini-3.5-flash:stable",
+            "provider": "primary",
+            "node": "test_generation",
+            "elapsed_seconds": 0.25,
+            "input_tokens": 7,
+            "output_tokens": 0,
+            "status": "cancelled",
+            "error_class": "CancelledError",
+        }
+    ]
+    assert payload["coverage_status"] == "failed"
+    assert payload["coverage_test_files"] == ["tests/test_regression.py"]
+    assert payload["coverage_test_command"] == "pytest tests/test_regression.py"
+    assert payload["coverage_failure_reason"] == "test_generation_failed"
+    assert payload["coverage_proof"] is None
+    assert payload["error"].startswith("Graph crashed: RuntimeError:")
+    assert len(payload["error"]) <= 500
+
+    [saved] = saved_runs
+    assert saved.current_phase == new_agent.Phase.FAILED
+    assert saved.pending_human_input is False
+    assert saved.human_input_request == {}
+    assert saved.token_usage == 7
+    assert saved.test_generation_attempts == 1
+    assert saved.model_history[0].status == "cancelled"
+    assert saved.coverage_failure_reason == "test_generation_failed"
+
+    [trace] = saved_traces
+    assert trace["state"].current_phase == new_agent.Phase.FAILED
+    assert trace["state"].issue_url == "https://github.com/acme/widget/issues/7"
+    captured = capsys.readouterr()
+    emitted = json.dumps({"payload": payload, "steps": trace["steps"]})
+    emitted += captured.out + captured.err
+    assert secret not in emitted
 
 
 async def test_agent_v2_reraises_graph_drain_error_by_identity(monkeypatch):

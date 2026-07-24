@@ -10,6 +10,7 @@ from eval import agent_v2_harness, swe_bench
 from eval.oci_aggregate import aggregate_artifacts
 from eval.oci_contract import OfficialResult, RuntimeRecord, write_model
 from eval.oci_runner import package_instance
+from src import new_agent
 
 
 def coverage_proof():
@@ -327,6 +328,80 @@ def swe_bench_sample_with_id(instance_id):
     sample["id"] = instance_id
     sample["instance_id"] = instance_id
     return sample
+
+
+def _package_and_aggregate_result(result, tmp_path):
+    raw_row = {
+        "repo": "acme/widget",
+        "instance_id": "acme__widget-8",
+        "base_commit": "a" * 40,
+        "patch": "",
+        "test_patch": "",
+        "problem_statement": "Login crash",
+        "hints_text": "",
+        "created_at": "2026-01-01",
+        "version": "1.0",
+        "FAIL_TO_PASS": "[]",
+        "PASS_TO_PASS": "[]",
+        "environment_setup_commit": "e" * 40,
+        "difficulty": "medium",
+    }
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    runtime_path = write_model(
+        output_dir / "runtime.json",
+        RuntimeRecord(
+            mode="checkpoint_5",
+            instance_id="acme__widget-8",
+            row_sha256=swe_bench.verified_row_sha256(raw_row),
+            commit_sha="a" * 40,
+            status="ready",
+            remote_image=(
+                "swebench/sweb.eval.x86_64.acme_widget-8:latest"
+            ),
+            image_sha="sha256:" + "b" * 64,
+        ),
+    )
+    (output_dir / "result.json").write_text(
+        json.dumps([result]) + "\n",
+        encoding="utf-8",
+    )
+    swe_bench.write_predictions([result], output_dir / "prediction.jsonl")
+    write_model(
+        output_dir / "official_result.json",
+        OfficialResult(
+            instance_id="acme__widget-8",
+            status="empty_patch",
+            submitted=True,
+            completed=False,
+            resolved=False,
+        ),
+    )
+    artifacts_dir = tmp_path / "artifacts"
+    package_instance(
+        runtime_path,
+        output_dir,
+        artifacts_dir / "bundle-acme__widget-8",
+        row_loader=lambda _instance_id: raw_row,
+    )
+    repo_root = tmp_path / "repo"
+    eval_dir = repo_root / "eval"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "checkpoint_5_ids.txt").write_text(
+        "acme__widget-8\n",
+        encoding="utf-8",
+    )
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts_dir,
+        tmp_path / "combined",
+        expected_commit="a" * 40,
+        repo_root=repo_root,
+    )
+    [aggregated] = json.loads(
+        (summary_path.parent / "results.json").read_text(encoding="utf-8")
+    )
+    return aggregated
 
 
 async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
@@ -693,80 +768,98 @@ async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
     assert result["test_generation_attempts"] == attempts
     assert len(result["model_invocations"]) == attempts
 
-    raw_row = {
-        "repo": "acme/widget",
-        "instance_id": "acme__widget-8",
-        "base_commit": "a" * 40,
-        "patch": "",
-        "test_patch": "",
-        "problem_statement": "Login crash",
-        "hints_text": "",
-        "created_at": "2026-01-01",
-        "version": "1.0",
-        "FAIL_TO_PASS": "[]",
-        "PASS_TO_PASS": "[]",
-        "environment_setup_commit": "e" * 40,
-        "difficulty": "medium",
-    }
-    output_dir = tmp_path / "output"
-    output_dir.mkdir()
-    runtime_path = write_model(
-        output_dir / "runtime.json",
-        RuntimeRecord(
-            mode="checkpoint_5",
-            instance_id="acme__widget-8",
-            row_sha256=swe_bench.verified_row_sha256(raw_row),
-            commit_sha="a" * 40,
-            status="ready",
-            remote_image=(
-                "swebench/sweb.eval.x86_64.acme_widget-8:latest"
-            ),
-            image_sha="sha256:" + "b" * 64,
-        ),
-    )
-    (output_dir / "result.json").write_text(
-        json.dumps([result]) + "\n",
-        encoding="utf-8",
-    )
-    swe_bench.write_predictions([result], output_dir / "prediction.jsonl")
-    write_model(
-        output_dir / "official_result.json",
-        OfficialResult(
-            instance_id="acme__widget-8",
-            status="empty_patch",
-            submitted=True,
-            completed=False,
-            resolved=False,
-        ),
-    )
-    artifacts_dir = tmp_path / "artifacts"
-    package_instance(
-        runtime_path,
-        output_dir,
-        artifacts_dir / "bundle-acme__widget-8",
-        row_loader=lambda _instance_id: raw_row,
-    )
-    repo_root = tmp_path / "repo"
-    eval_dir = repo_root / "eval"
-    eval_dir.mkdir(parents=True)
-    (eval_dir / "checkpoint_5_ids.txt").write_text(
-        "acme__widget-8\n",
-        encoding="utf-8",
-    )
-
-    summary_path = aggregate_artifacts(
-        "checkpoint_5",
-        artifacts_dir,
-        tmp_path / "combined",
-        expected_commit="a" * 40,
-        repo_root=repo_root,
-    )
-    [aggregated] = json.loads(
-        (summary_path.parent / "results.json").read_text(encoding="utf-8")
-    )
+    aggregated = _package_and_aggregate_result(result, tmp_path)
 
     assert aggregated["test_generation_attempts"] == attempts
     assert aggregated["model_invocations"] == invocations
+
+
+async def test_crash_after_cancelled_generation_packages_public_telemetry(
+    monkeypatch,
+    tmp_path,
+):
+    secret = "sk-crashartifactsecret123"
+    saved_states = []
+
+    async def crash_after_generation(_graph, state):
+        state.token_usage = 7
+        state.test_generation_attempts = 1
+        state.model_history.append(
+            new_agent.ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="test_generation",
+                elapsed_seconds=0.25,
+                input_tokens=7,
+                output_tokens=0,
+                status="cancelled",
+                error_class="CancelledError",
+            )
+        )
+        state.coverage_status = "failed"
+        state.coverage_failure_reason = "test_generation_failed"
+        raise RuntimeError(f"provider failed with {secret}")
+
+    async def no_seed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(new_agent, "run_graph", crash_after_generation)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state: saved_states.append(state.model_copy(deep=True)),
+    )
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", new_agent.agent_v2)
+    monkeypatch.setattr(agent_v2_harness, "_build_eval_seed", no_seed)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_run",
+        lambda _run_id: (_ for _ in ()).throw(
+            OSError("durable state unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_configured_model",
+        lambda: "gemini-3.5-flash:stable",
+    )
+    monkeypatch.setattr(agent_v2_harness, "_current_commit_sha", lambda: "a" * 40)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+
+    [saved] = saved_states
+    assert saved.current_phase == new_agent.Phase.FAILED
+    assert saved.token_usage == 7
+    assert saved.test_generation_attempts == 1
+    assert result["final_phase"] == "CRASHED"
+    assert result["token_used"] == 7
+    assert result["test_generation_attempts"] == 1
+    assert result["failure_class"] == "test_generation_failed"
+    assert secret not in json.dumps(result)
+
+    aggregated = _package_and_aggregate_result(result, tmp_path)
+
+    assert aggregated["final_phase"] == "CRASHED"
+    assert aggregated["token_used"] == 7
+    assert aggregated["test_generation_attempts"] == 1
+    assert aggregated["model_invocations"] == [
+        {
+            "model": "gemini-3.5-flash:stable",
+            "provider": "primary",
+            "node": "test_generation",
+            "elapsed_seconds": 0.25,
+            "input_tokens": 7,
+            "output_tokens": 0,
+            "status": "cancelled",
+            "error_class": "CancelledError",
+        }
+    ]
+    assert secret not in json.dumps(aggregated)
 
 
 @pytest.mark.parametrize(

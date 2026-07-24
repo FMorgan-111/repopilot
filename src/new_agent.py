@@ -65,6 +65,7 @@ from .state import (
     _remember,
     sanitize_node_diagnostics,
 )
+from .summary_safety import sanitize_summary_text
 from .tracer import Tracer
 
 __all__ = [
@@ -461,26 +462,40 @@ async def agent_v2(
         raise
     except Exception as exc:
         elapsed = _time.monotonic() - t_start
-        print(f"[agent_v2] Graph crashed after {elapsed:.1f}s: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        crash_error = sanitize_summary_text(
+            f"Graph crashed: {type(exc).__name__}: {exc}",
+            500,
+        ) or "Graph crashed."
+        print(
+            f"[agent_v2] {crash_error} after {elapsed:.1f}s",
+            file=sys.stderr,
+            flush=True,
+        )
         tracer.log(
             "agent_v2_crash",
             {"issue_url": issue_url},
-            {"error": f"{type(exc).__name__}: {exc}"},
-            error=str(exc),
+            {"error": crash_error},
+            error=crash_error,
         )
-        # Save partial trace
+        state.current_phase = Phase.FAILED
+        state.pending_human_input = False
+        state.human_input_request = {}
+        state.failure_reason = crash_error
+        payload = agent_payload_from_state(state, len(state.tool_calls))
+        payload.update(
+            {
+                "done": True,
+                "success": False,
+                "fix_applied": False,
+                "waiting_for_user": False,
+                "final_phase": "CRASHED",
+                "model_patch": "",
+            }
+        )
+        if save_final_run:
+            _best_effort_save_run(state)
         _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", state)
-        return {
-            "error": f"Graph crashed: {type(exc).__name__}: {exc}",
-            "trace_id": tracer.trace_id,
-            "run_id": tracer.trace_id,
-            "done": True,
-            "success": False,
-            "waiting_for_user": False,
-            "final_phase": "CRASHED",
-            "human_input_request": {},
-            "node_diagnostics": state.node_diagnostics,
-        }
+        return payload
 
     elapsed = _time.monotonic() - t_start
     tracer.log(
