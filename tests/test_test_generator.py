@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from src.async_safety import CancellationDrainError
 from src.coverage_gate import ChangedTarget, CoverageDecision
 from src.patch_gate import validate_patch_batch
 from src.state import (
@@ -16,9 +19,11 @@ from src.state import (
     ToolPatchApproval,
     VerifiedEdit,
     VerifiedEditBatch,
+    _estimate_tokens,
     tool_manifest_fingerprint,
 )
 from src.test_generator import (
+    _SYSTEM_PROMPT,
     is_allowed_test_path,
     request_test_batch,
     run_test_generation_attempts,
@@ -167,9 +172,12 @@ async def test_test_generator_is_test_only_and_escalates_second_attempt(
     monkeypatch,
 ):
     responses = iter([_bad_batch(), _good_batch()])
+    requests: list[tuple[str, str, dict[str, object]]] = []
 
-    async def request(_state, _reason):
-        return next(responses)
+    async def request(system, prompt, **_kwargs):
+        raw = next(responses).model_dump()
+        requests.append((system, prompt, raw))
+        return raw
 
     async def verify(_state, candidate):
         return CoverageDecision(
@@ -179,7 +187,7 @@ async def test_test_generator_is_test_only_and_escalates_second_attempt(
             candidate=candidate,
         )
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", request)
+    monkeypatch.setattr("src.test_generator.llm_call", request)
     monkeypatch.setattr("src.test_generator.validate_differential_coverage", verify)
     monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
     monkeypatch.setenv("LLM_ESCALATION_API_KEY", "sentinel-not-for-prompts")
@@ -189,6 +197,26 @@ async def test_test_generator_is_test_only_and_escalates_second_attempt(
     assert result.verified is True
     assert generation_state.test_generation_attempts == 2
     assert generation_state.active_provider == "escalation"
+    assert [entry.provider for entry in generation_state.model_history] == [
+        "primary",
+        "escalation",
+    ]
+    assert [entry.model for entry in generation_state.model_history] == [
+        "gemini-3.5-flash:stable",
+        "claude-opus-4-8:stable",
+    ]
+    assert generation_state.token_usage == sum(
+        _estimate_tokens(system, prompt)
+        + _estimate_tokens(
+            json.dumps(
+                raw,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=lambda value: type(value).__name__,
+            )
+        )
+        for system, prompt, raw in requests
+    )
     assert all(
         is_allowed_test_path(Path(generation_state.repo_path), path)
         for path in generation_state.coverage_test_files
@@ -203,11 +231,11 @@ async def test_missing_escalation_credentials_retries_primary(
 ):
     calls: list[str] = []
 
-    async def invalid(state, _reason):
-        calls.append(state.active_provider)
-        return _bad_batch()
+    async def invalid(*_args, **kwargs):
+        calls.append(kwargs["provider"])
+        return _bad_batch().model_dump()
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", invalid)
+    monkeypatch.setattr("src.test_generator.llm_call", invalid)
     result = await run_test_generation_attempts(generation_state, "no_candidate")
     assert result.verified is False
     assert calls == ["primary", "primary"]
@@ -224,10 +252,10 @@ async def test_invalid_generation_restores_exact_production_authorization(
     original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
     original_patch = generation_state.patch_content
 
-    async def invalid(*_):
-        return _bad_batch()
+    async def invalid(*_args, **_kwargs):
+        return _bad_batch().model_dump()
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", invalid)
+    monkeypatch.setattr("src.test_generator.llm_call", invalid)
     result = await run_test_generation_attempts(generation_state, "no_candidate")
     assert result.verified is False
     assert generation_state.active_repair_plan == original_plan
@@ -249,8 +277,8 @@ async def test_successful_generation_keeps_production_and_builds_combined_bindin
         generation_state.tool_patch_approval.changed_manifest
     )
 
-    async def good(*_):
-        return _good_batch()
+    async def good(*_args, **_kwargs):
+        return _good_batch().model_dump()
 
     async def verified(_state, candidate):
         return CoverageDecision(
@@ -260,7 +288,7 @@ async def test_successful_generation_keeps_production_and_builds_combined_bindin
             candidate=candidate,
         )
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", good)
+    monkeypatch.setattr("src.test_generator.llm_call", good)
     monkeypatch.setattr("src.test_generator.validate_differential_coverage", verified)
     result = await run_test_generation_attempts(generation_state, "no_candidate")
     approval = generation_state.tool_patch_approval
@@ -289,10 +317,10 @@ async def test_rollback_failure_hard_stops_without_second_request_or_prediction_
     original_patch = generation_state.patch_content
     requests = 0
 
-    async def good(*_):
+    async def good(*_args, **_kwargs):
         nonlocal requests
         requests += 1
-        return _good_batch()
+        return _good_batch().model_dump()
 
     async def rejected(_state, candidate):
         return CoverageDecision(
@@ -302,7 +330,7 @@ async def test_rollback_failure_hard_stops_without_second_request_or_prediction_
             candidate=candidate,
         )
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", good)
+    monkeypatch.setattr("src.test_generator.llm_call", good)
     monkeypatch.setattr("src.test_generator.validate_differential_coverage", rejected)
     monkeypatch.setattr(
         "src.test_generator._restore_test_files",
@@ -327,14 +355,169 @@ async def test_already_escalated_provider_never_downgrades(
     generation_state.escalated = True
     calls: list[str] = []
 
-    async def invalid(state, _reason):
-        calls.append(state.active_provider)
-        return _bad_batch()
+    async def invalid(*_args, **kwargs):
+        calls.append(kwargs["provider"])
+        return _bad_batch().model_dump()
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", invalid)
+    monkeypatch.setattr("src.test_generator.llm_call", invalid)
     await run_test_generation_attempts(generation_state, "no_candidate")
     assert calls == ["escalation", "escalation"]
     assert generation_state.active_model == "claude-opus-4-8:stable"
+
+
+@pytest.mark.asyncio
+async def test_successful_test_generation_records_the_complete_request(
+    generation_state,
+    monkeypatch,
+):
+    captured: dict[str, str] = {}
+    raw = _good_batch().model_dump()
+
+    async def good(system, prompt, **kwargs):
+        captured.update(system=system, prompt=prompt, **kwargs)
+        return raw
+
+    monkeypatch.setattr("src.test_generator.llm_call", good)
+
+    batch = await request_test_batch(generation_state, "no_candidate")
+
+    response_text = json.dumps(
+        raw,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=lambda value: type(value).__name__,
+    )
+    expected_input = _estimate_tokens(_SYSTEM_PROMPT, captured["prompt"])
+    expected_output = _estimate_tokens(response_text)
+    assert batch == _good_batch()
+    assert generation_state.test_generation_attempts == 1
+    assert generation_state.token_usage == expected_input + expected_output
+    assert len(generation_state.model_history) == 1
+    invocation = generation_state.model_history[0]
+    assert invocation.model == "gemini-3.5-flash:stable"
+    assert invocation.provider == "primary"
+    assert invocation.node == "test_generation"
+    assert invocation.status == "ok"
+    assert invocation.elapsed_seconds >= 0
+    assert invocation.input_tokens == expected_input
+    assert invocation.output_tokens == expected_output
+    assert invocation.error_class == ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [[], {"edits": []}])
+async def test_invalid_test_generation_responses_are_debited_and_recorded(
+    generation_state,
+    monkeypatch,
+    raw,
+):
+    captured: dict[str, str] = {}
+
+    async def invalid(_system, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        return raw
+
+    monkeypatch.setattr("src.test_generator.llm_call", invalid)
+
+    with pytest.raises(ValueError):
+        await request_test_batch(generation_state, "no_candidate")
+
+    response_text = json.dumps(
+        raw,
+        ensure_ascii=False,
+        sort_keys=True,
+        default=lambda value: type(value).__name__,
+    )
+    expected_input = _estimate_tokens(_SYSTEM_PROMPT, captured["prompt"])
+    expected_output = _estimate_tokens(response_text)
+    assert generation_state.test_generation_attempts == 1
+    assert generation_state.token_usage == expected_input + expected_output
+    assert len(generation_state.model_history) == 1
+    invocation = generation_state.model_history[0]
+    assert invocation.status == "invalid_response"
+    assert invocation.error_class == "ValueError"
+    assert invocation.input_tokens == expected_input
+    assert invocation.output_tokens == expected_output
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [OSError("gateway"), RuntimeError("gateway"), ValueError("gateway")],
+)
+async def test_model_call_failures_are_errors_and_store_only_their_class(
+    generation_state,
+    monkeypatch,
+    error,
+):
+    captured: dict[str, str] = {}
+
+    async def failed(_system, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        raise error
+
+    monkeypatch.setattr("src.test_generator.llm_call", failed)
+
+    with pytest.raises(type(error)):
+        await request_test_batch(generation_state, "no_candidate")
+
+    expected_input = _estimate_tokens(_SYSTEM_PROMPT, captured["prompt"])
+    assert generation_state.test_generation_attempts == 1
+    assert generation_state.token_usage == expected_input
+    assert len(generation_state.model_history) == 1
+    invocation = generation_state.model_history[0]
+    assert invocation.status == "error"
+    assert invocation.error_class == type(error).__name__
+    assert invocation.input_tokens == expected_input
+    assert invocation.output_tokens == 0
+
+
+@pytest.mark.asyncio
+async def test_preflight_failure_terminates_without_a_model_request(
+    generation_state,
+    monkeypatch,
+):
+    calls = 0
+
+    def preflight_failure(*_args):
+        nonlocal calls
+        calls += 1
+        raise ValueError("oversized prompt")
+
+    monkeypatch.setattr("src.test_generator._generation_prompt", preflight_failure)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert calls == 1
+    assert result.reason == "test_generation_preflight_failed"
+    assert generation_state.test_generation_attempts == 0
+    assert generation_state.token_usage == 0
+    assert generation_state.model_history == []
+
+
+@pytest.mark.asyncio
+async def test_cancellation_drain_is_reraised_without_model_error_telemetry(
+    generation_state,
+    monkeypatch,
+):
+    error = CancellationDrainError(
+        "test generation",
+        asyncio.CancelledError(),
+        RuntimeError("cleanup"),
+    )
+
+    async def cancelled(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr("src.test_generator.llm_call", cancelled)
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await request_test_batch(generation_state, "no_candidate")
+
+    assert raised.value is error
+    assert generation_state.test_generation_attempts == 1
+    assert generation_state.token_usage == 0
+    assert generation_state.model_history == []
 
 
 def test_allowed_test_path_requires_established_safe_layout(tmp_path: Path):

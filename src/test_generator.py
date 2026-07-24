@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from pydantic import ValidationError
 
+from .async_safety import CancellationDrainError
 from .coverage_gate import (
     ChangedTarget,
     CoverageCandidate,
@@ -18,6 +20,7 @@ from .coverage_gate import (
     validate_differential_coverage,
 )
 from .evaluator_safety import sanitize_evaluator_text
+from .escalation import record_model_invocation
 from .llm import llm_call
 from .model_policy import EscalationDecision, apply_escalation
 from .model_provider import escalation_is_configured, redact_secrets
@@ -31,6 +34,7 @@ from .state import (
     RepairPlan,
     ToolPatchApproval,
     VerifiedEditBatch,
+    _estimate_tokens,
     tool_manifest_fingerprint,
 )
 from .test_path_policy import is_allowed_test_path
@@ -44,6 +48,11 @@ _SYSTEM_PROMPT = (
     "dependencies, generated artifacts, or binary files."
 )
 _PROMPT_LIMIT = 32_000
+_TEST_GENERATION_PREFLIGHT_REASON = "test_generation_preflight_failed"
+
+
+class _TestGenerationPreflightError(ValueError):
+    """Prompt construction failed before a test-generation model request."""
 
 
 def _safe_text(value: object, *, limit: int) -> str:
@@ -126,13 +135,83 @@ async def request_test_batch(
     rejection_reason: str,
 ) -> VerifiedEditBatch:
     """Request one structured batch without including runtime or evaluator data."""
-    raw = await llm_call(
-        _SYSTEM_PROMPT,
-        _generation_prompt(state, rejection_reason),
-        model=state.active_model,
-        provider=state.active_provider,
-        temperature=0.0,
+    try:
+        prompt = _generation_prompt(state, rejection_reason)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise _TestGenerationPreflightError(
+            _TEST_GENERATION_PREFLIGHT_REASON
+        ) from exc
+    state.test_generation_attempts += 1
+    model, provider = state.active_model, state.active_provider
+    input_tokens = _estimate_tokens(_SYSTEM_PROMPT, prompt)
+    response_text = ""
+    started = time.monotonic()
+    try:
+        raw = await llm_call(
+            _SYSTEM_PROMPT,
+            prompt,
+            model=model,
+            provider=provider,
+            temperature=0.0,
+        )
+    except CancellationDrainError:
+        raise
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        record_model_invocation(
+            state,
+            model=model,
+            provider=provider,
+            node="test_generation",
+            elapsed_seconds=elapsed,
+            input_tokens=input_tokens,
+            output_tokens=0,
+            status="error",
+            error=exc,
+        )
+        state.token_usage += input_tokens
+        raise
+    try:
+        response_text = json.dumps(
+            raw,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=lambda value: type(value).__name__,
+        )
+        batch = _validate_test_batch(raw)
+    except (TypeError, ValueError, RecursionError) as exc:
+        elapsed = time.monotonic() - started
+        output_tokens = _estimate_tokens(response_text)
+        record_model_invocation(
+            state,
+            model=model,
+            provider=provider,
+            node="test_generation",
+            elapsed_seconds=elapsed,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            status="invalid_response",
+            error=exc,
+        )
+        state.token_usage += input_tokens + output_tokens
+        raise
+    elapsed = time.monotonic() - started
+    output_tokens = _estimate_tokens(response_text)
+    record_model_invocation(
+        state,
+        model=model,
+        provider=provider,
+        node="test_generation",
+        elapsed_seconds=elapsed,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        status="ok",
     )
+    state.token_usage += input_tokens + output_tokens
+    return batch
+
+
+def _validate_test_batch(raw: object) -> VerifiedEditBatch:
     if not isinstance(raw, dict):
         raise ValueError("test generator response must be a JSON object")
     payload = {key: value for key, value in raw.items() if key != "kind"}
@@ -317,7 +396,6 @@ async def run_test_generation_attempts(
     last = _failed(reason)
 
     while state.test_generation_attempts < 2:
-        state.test_generation_attempts += 1
         _restore_production_state(state, production)
         snapshot: dict[str, bytes | None] = {}
         applied = False
@@ -387,6 +465,12 @@ async def run_test_generation_attempts(
                     state.coverage_failure_reason = ""
                     return decision
                 reason = decision.reason
+        except CancellationDrainError:
+            raise
+        except _TestGenerationPreflightError:
+            reason = _TEST_GENERATION_PREFLIGHT_REASON
+            last = _failed(reason)
+            break
         except (OSError, RuntimeError, ValueError):
             reason = "invalid_generated_test"
             last = _failed(reason)

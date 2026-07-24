@@ -321,7 +321,7 @@ async def test_two_invalid_generated_tests_fail_without_pr(
     monkeypatch.setattr("src.nodes.coverage.collect_changed_targets", lambda *_: [])
     monkeypatch.setattr("src.nodes.coverage.discover_coverage_candidates", lambda *_: [])
 
-    async def invalid(_state, _reason):
+    async def invalid(*_args, **_kwargs):
         return VerifiedEditBatch(
             edits=[
                 {
@@ -331,9 +331,9 @@ async def test_two_invalid_generated_tests_fail_without_pr(
                     "intent": "bad production edit",
                 }
             ]
-        )
+        ).model_dump()
 
-    monkeypatch.setattr("src.test_generator.request_test_batch", invalid)
+    monkeypatch.setattr("src.test_generator.llm_call", invalid)
     result = await ensure_coverage(state)
     assert result.coverage_status == "failed"
     assert result.current_phase == Phase.FAILURE
