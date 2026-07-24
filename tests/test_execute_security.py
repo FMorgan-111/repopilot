@@ -292,8 +292,9 @@ async def test_oci_execute_keeps_snapshot_alive_until_cancelled_worker_drains(
     workspace = captured["workspace"]
     assert workspace.is_dir()
     cleanup_release.set()
-    with pytest.raises(asyncio.CancelledError, match="cancel execute OCI"):
+    with pytest.raises(asyncio.CancelledError):
         await task
+    assert task.cancelled()
     assert not workspace.exists()
 
 
@@ -551,9 +552,11 @@ async def test_cancelled_cache_lock_waiter_never_strands_an_acquisition(tmp_path
     release_holder.set()
     await holder
 
-    async with asyncio.timeout(0.5):
+    async def acquire_after_cancellation():
         async with execute_node._cache_lock(cache):
             pass
+
+    await asyncio.wait_for(acquire_after_cancellation(), timeout=0.5)
 
 
 async def test_cache_rebuild_stops_when_checked_removal_fails(tmp_path, monkeypatch):

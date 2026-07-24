@@ -1264,15 +1264,17 @@ async def test_create_pr_cancellation_cleanup_failure_preserves_cancel_semantics
         )
     )
     await post_created.wait()
-    task.cancel()
+    task.cancel("cancel PR cleanup")
     release_post.set()
 
     with pytest.raises(commit_node.PRCancellationCleanupError) as exc_info:
         await task
 
-    assert isinstance(exc_info.value, asyncio.CancelledError)
+    assert not isinstance(exc_info.value, asyncio.CancelledError)
     assert exc_info.value.pr_number == 12
+    assert exc_info.value.cancellation.args == ("cancel PR cleanup",)
     assert isinstance(exc_info.value.cleanup_error, OSError)
+    assert exc_info.value.__cause__ is exc_info.value.cleanup_error
 
 
 @pytest.mark.asyncio

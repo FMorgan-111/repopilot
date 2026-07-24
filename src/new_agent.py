@@ -12,6 +12,7 @@ import asyncio
 import re
 from typing import Any
 
+from .async_safety import CancellationDrainError, drain_task, wait_for_phase
 from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
 from .evaluator_safety import safe_prediction_patch
 from .graph import (
@@ -142,7 +143,7 @@ def _wrap_node(name: str, fn: Any, *, record_route_decision: bool = False) -> An
         t0 = _time.monotonic()
         print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} START", file=sys.stderr, flush=True)
         try:
-            result = await asyncio.wait_for(fn(state), timeout=timeout)
+            result = await wait_for_phase(fn(state), timeout=timeout)
         except asyncio.TimeoutError as exc:
             elapsed = _time.monotonic() - t0
             print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} TIMEOUT ({elapsed:.1f}s)", file=sys.stderr, flush=True)
@@ -552,17 +553,11 @@ async def _run_store_call(operation, /, *args, **kwargs):
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError as original_cancel:
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                break
-        try:
-            worker.result()
-        except BaseException as worker_error:
-            raise original_cancel from worker_error
+        outcome = await drain_task(worker)
+        if outcome.error is not None:
+            raise CancellationDrainError(
+                "run store call", original_cancel, outcome.error
+            ) from outcome.error
         raise original_cancel
 
 

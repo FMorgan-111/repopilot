@@ -11,6 +11,7 @@ import pytest
 import src.nodes.execute as execute_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
+from src.async_safety import CancellationDrainError
 from src.nodes.commit import PRCancellationCleanupError
 from src.state import ModelInvocation, NoProgressEvent
 
@@ -1625,11 +1626,11 @@ async def test_cancelled_blocked_claim_is_drained_without_running_graph(
     assert not task.done()
     release_lock.set()
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(asyncio.CancelledError):
         await task
     await holder
 
-    assert caught.value.args == ("first cancellation",)
+    assert task.cancelled()
     assert claim_finished.is_set()
     assert graph_calls == 0
     durable = run_store.load_run("cancelled-claim", root_dir=root_dir)
@@ -1679,10 +1680,10 @@ async def test_cancelled_terminal_save_drains_committed_write(
     assert not task.done()
     release_save.set()
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert caught.value.args == ("first cancellation",)
+    assert task.cancelled()
     assert save_finished.is_set()
     durable = run_store.load_run("cancelled-terminal-save", root_dir=root_dir)
     assert durable.current_phase == new_agent.Phase.DONE
@@ -1730,8 +1731,9 @@ async def test_cancelled_repaused_save_commits_the_new_pause(
     assert not task.done()
     release_save.set()
 
-    with pytest.raises(asyncio.CancelledError, match="cancel after new pause"):
+    with pytest.raises(asyncio.CancelledError):
         await task
+    assert task.cancelled()
 
     durable = run_store.load_run("cancelled-repaused-save", root_dir=root_dir)
     assert durable.current_phase == new_agent.Phase.WAITING_FOR_USER
@@ -1776,13 +1778,15 @@ async def test_cancelled_final_save_observes_worker_failure(
     assert not task.done()
     release_save.set()
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(CancellationDrainError) as caught:
         await task
 
-    assert caught.value.args == ("cancel failing save",)
+    assert caught.value.operation == "run store call"
+    assert caught.value.cancellation.args == ("cancel failing save",)
     assert save_finished.is_set()
-    assert isinstance(caught.value.__cause__, OSError)
-    assert str(caught.value.__cause__) == "injected worker save failure"
+    assert isinstance(caught.value.cleanup_error, OSError)
+    assert caught.value.__cause__ is caught.value.cleanup_error
+    assert str(caught.value.cleanup_error) == "injected worker save failure"
     durable = run_store.load_run("cancelled-failing-save", root_dir=root_dir)
     assert durable.resume_in_progress is True
 

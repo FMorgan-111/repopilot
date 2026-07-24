@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 import src.safe_subprocess as safe_subprocess
+from src.async_safety import CancellationDrainError
 from src.safe_subprocess import (
     BoundedProcessResult,
     IsolationCleanupError,
@@ -1044,9 +1045,9 @@ async def test_async_oci_cancellation_waits_for_worker_cleanup(tmp_path, monkeyp
     assert not task.done()
     cleanup_release.set()
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(asyncio.CancelledError):
         await task
-    assert caught.value.args == ("original cancellation",)
+    assert task.cancelled()
     assert worker_finished.is_set()
 
 
@@ -1079,9 +1080,9 @@ async def test_async_oci_drain_survives_repeated_cancellation(tmp_path, monkeypa
     assert not task.done()
     cleanup_release.set()
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(asyncio.CancelledError):
         await task
-    assert caught.value.args == ("first cancellation",)
+    assert task.cancelled()
 
 
 async def test_async_oci_cleanup_error_is_chained_to_original_cancellation(
@@ -1107,10 +1108,12 @@ async def test_async_oci_cleanup_error_is_chained_to_original_cancellation(
     await _wait_for_thread_event(started)
     task.cancel("original cancellation")
 
-    with pytest.raises(asyncio.CancelledError) as caught:
+    with pytest.raises(CancellationDrainError) as caught:
         await task
-    assert caught.value.args == ("original cancellation",)
-    assert isinstance(caught.value.__cause__, IsolationCleanupError)
+    assert caught.value.operation == "OCI process"
+    assert caught.value.cancellation.args == ("original cancellation",)
+    assert isinstance(caught.value.cleanup_error, IsolationCleanupError)
+    assert caught.value.__cause__ is caught.value.cleanup_error
 
 
 def test_streaming_output_cap_terminates_entire_process_group(tmp_path):

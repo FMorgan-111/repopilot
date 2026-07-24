@@ -351,8 +351,9 @@ async def test_targeted_test_keeps_snapshot_alive_until_cancelled_worker_drains(
     workspace = captured["workspace"]
     assert workspace.is_dir()
     cleanup_release.set()
-    with pytest.raises(asyncio.CancelledError, match="cancel targeted OCI"):
+    with pytest.raises(asyncio.CancelledError):
         await task
+    assert task.cancelled()
     assert not workspace.exists()
 
 

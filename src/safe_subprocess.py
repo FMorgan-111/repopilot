@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Literal, Sequence
 
+from .async_safety import CancellationDrainError, drain_task
 from .state import ToolSandboxConfig
 
 _TRUSTED_EXECUTABLE_DIRS = (
@@ -550,21 +551,13 @@ async def run_oci_process_async(
         return await asyncio.shield(worker)
     except asyncio.CancelledError as original_cancel:
         cancellation_event.set()
-        while not worker.done():
-            try:
-                await asyncio.shield(worker)
-            except asyncio.CancelledError:
-                continue
-            except BaseException:
-                continue
-        try:
-            worker.result()
-        except ProcessCancellationRequested:
-            pass
-        except IsolationCleanupError as cleanup_error:
-            raise original_cancel from cleanup_error
-        except BaseException:
-            pass
+        outcome = await drain_task(worker)
+        if isinstance(outcome.error, ProcessCancellationRequested):
+            raise original_cancel
+        if outcome.error is not None:
+            raise CancellationDrainError(
+                "OCI process", original_cancel, outcome.error
+            ) from outcome.error
         raise original_cancel
 
 

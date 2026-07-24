@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 import httpx
 
+from ..async_safety import CancellationDrainError, drain_task
 from ..coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
 from ..memory import _fire_and_forget, get_store
 from ..state import AgentState, Phase, _as_state, _record_tool
@@ -44,7 +45,7 @@ class PRCleanupError(RuntimeError):
         self.cleanup_error = cleanup_error
 
 
-class PRCancellationCleanupError(asyncio.CancelledError):
+class PRCancellationCleanupError(CancellationDrainError):
     """Cancellation was preserved, but PR cleanup also failed."""
 
     def __init__(
@@ -55,11 +56,9 @@ class PRCancellationCleanupError(asyncio.CancelledError):
     ) -> None:
         label = str(pr_number) if pr_number is not None else "unknown"
         super().__init__(
-            f"pull request {label} cancellation cleanup failed"
+            f"pull request {label} cleanup", cancellation, cleanup_error
         )
         self.pr_number = pr_number
-        self.cancellation = cancellation
-        self.cleanup_error = cleanup_error
 
 
 def _repo_api_root(state: AgentState) -> str:
@@ -617,32 +616,21 @@ async def _execute_pr_transaction(
 
 
 async def _drain_shielded_task(task: asyncio.Task) -> object:
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError:
-            continue
-    return task.result()
+    outcome = await drain_task(task)
+    if outcome.error is not None:
+        raise outcome.error
+    return outcome.result
 
 
 async def _run_cleanup_shielded(
     coro: Coroutine[Any, Any, None],
 ) -> _ShieldedCleanupOutcome:
     task = asyncio.create_task(coro)
-    delayed_cancellation: asyncio.CancelledError | None = None
-    while not task.done():
-        try:
-            await asyncio.shield(task)
-        except asyncio.CancelledError as exc:
-            delayed_cancellation = delayed_cancellation or exc
-            continue
-        except BaseException:
-            continue
-    try:
-        task.result()
-    except BaseException as error:
-        return _ShieldedCleanupOutcome(error, delayed_cancellation)
-    return _ShieldedCleanupOutcome(None, delayed_cancellation)
+    outcome = await drain_task(task)
+    return _ShieldedCleanupOutcome(
+        outcome.error,
+        outcome.delayed_cancellation,
+    )
 
 
 async def _cleanup_pr_transaction(

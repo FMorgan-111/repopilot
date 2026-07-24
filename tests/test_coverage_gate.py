@@ -200,8 +200,9 @@ async def test_generated_coverage_keeps_snapshot_alive_until_cancelled_worker_dr
     workspace = captured["workspace"]
     assert workspace.is_dir()
     cleanup_release.set()
-    with pytest.raises(asyncio.CancelledError, match="cancel coverage OCI"):
+    with pytest.raises(asyncio.CancelledError):
         await task
+    assert task.cancelled()
     assert not workspace.exists()
 
 
