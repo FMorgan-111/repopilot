@@ -2,7 +2,8 @@
 
 Date: 2026-07-24
 
-Status: approved; independent design review passed; implementation pending
+Status: approved; independent design review passed; implementation pending;
+owner-approved CI-only pre-Pilot push exception recorded 2026-07-24
 
 Branch: `fix/release-readiness-20260717`
 
@@ -495,28 +496,42 @@ parent mismatch is therefore a release-integrity failure, not an accepted race.
 
 1. Implement the approved final-gate telemetry and cancellation remediation
    with focused TDD.
-2. Add the fixed cohort, strict provenance, pilot gate, atomic aggregate,
+2. Run the final-gate affected and complete suites, Ruff, and
+   `git diff --check`, then obtain a fresh independent whole-stage review. Do
+   not push until every finding attributable to `7636b13..latest` is fixed and
+   the resulting latest head has a fresh re-review with no unresolved Critical,
+   Important, or Minor range finding. Explicitly deferred pre-base Minor items
+   remain separately tracked.
+3. Because no local Python 3.10 runtime is available, use the owner-approved
+   exception to push the feature branch solely to bind and run the existing CI
+   workflow. If CI fails, return to focused TDD and fresh review before a
+   follow-up evidence push. This step does not authorize Pilot implementation,
+   secrets, paid inference, any environment action, merge, prompt changes, or
+   cohort changes. Before step 4, the exact-head run must finish with overall
+   `success`: all six Ubuntu and macOS Python 3.10/3.11/3.12 matrix jobs,
+   `lint`, and `oci-integration` must pass.
+4. Add the fixed cohort, strict provenance, pilot gate, atomic aggregate,
    independent verifier, protected-environment workflow, and tests with focused
    TDD.
-3. Run focused suites on Python 3.10, 3.11, and 3.12, then the complete suite,
+5. Run focused suites on Python 3.10, 3.11, and 3.12, then the complete suite,
    Ruff, `git diff --check`, clean-archive tests/build, packaging, workflow, and
    credential checks.
-4. Obtain a fresh independent whole-branch review. Do not push with any
+6. Obtain a fresh independent whole-branch review. Do not proceed with any
    Critical or Important finding.
-5. Push the branch. Configure and verify the protected environment and move the
-   two model secrets there without reading or printing their values. Remove
-   repository-level copies.
-6. Set `REPOPILOT_EVAL_CANDIDATE_SHA` to the exact pushed head. Add the exact
+7. Push or confirm the already pushed exact branch head. Configure and verify
+   the protected environment and move the two model secrets there without
+   reading or printing their values. Remove repository-level copies.
+8. Set `REPOPILOT_EVAL_CANDIDATE_SHA` to the exact pushed head. Add the exact
    approval label once and approve the protected environment deployment.
-7. Monitor the run. Download its aggregate and all 20 instance artifacts, then
+9. Monitor the run. Download its aggregate and all 20 instance artifacts, then
    use `eval.oci_verify` to verify the candidate, run ID, hashes, fixed cohort,
    20 determined outcomes, zero infrastructure failures, and score.
-8. For an invalid run, diagnose and start a complete new authorized run. For a
+10. For an invalid run, diagnose and start a complete new authorized run. For a
    valid run, freeze candidate and base.
-9. Configure/verify the no-bypass strict `master` ruleset and required
+11. Configure/verify the no-bypass strict `master` ruleset and required
    `pilot_release_gate`, recheck live PR identity, then merge PR 2 with the
    expected-head precondition. Verify direct parents and remote `master`.
-10. Record `R/20` and final provenance. The project is complete.
+12. Record `R/20` and final provenance. The project is complete.
 
 ## Test strategy
 

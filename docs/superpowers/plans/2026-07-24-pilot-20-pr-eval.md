@@ -38,8 +38,17 @@ GitHub REST API / `gh` CLI.
 - Never place model credentials in repository secrets, commands, logs, files,
   artifacts, workflow job-level environments, or tool-call output. When secret
   values are needed, pause for the owner to enter fresh values interactively.
-- Do not push, authorize paid inference, configure merge rules, or merge until
-  the preceding local and review gates are complete.
+- Do not authorize paid inference, configure merge rules, or merge until the
+  preceding local and review gates are complete. Owner-approved exception
+  `A,A` permits a feature-branch push after final-gate code findings are fixed
+  and freshly reviewed, solely to obtain the existing Python 3.10/3.11/3.12 CI
+  matrix evidence when no local Python 3.10 exists. If CI exposes a defect,
+  reviewed fix follow-up pushes remain limited to that same evidence loop. This
+  does not permit Pilot implementation, secrets, paid evaluation, any
+  environment action, merge, prompt changes, or cohort changes. Pilot work
+  remains blocked until the exact-head CI run has overall `success`, including
+  all six Ubuntu and macOS Python 3.10/3.11/3.12 test jobs, `lint`, and
+  `oci-integration`.
 - Stage files explicitly for each commit; never use `git add -A` or `git add .`.
 
 ---

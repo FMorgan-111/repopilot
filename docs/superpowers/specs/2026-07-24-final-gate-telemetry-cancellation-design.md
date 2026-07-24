@@ -2,7 +2,8 @@
 
 Date: 2026-07-24
 
-Status: approved; implementation pending
+Status: approved; implementation in progress; whole-stage review amendment A/A
+approved by the owner on 2026-07-24
 
 ## Context
 
@@ -65,10 +66,17 @@ request:
    logical-call estimation contract.
 5. Append exactly one invocation with node `test_generation` for each logical
    request. Record `ok` on a valid `VerifiedEditBatch`, `invalid_response` for
-   malformed or schema-invalid output, and `error` for other model failures.
-   Store only the normalized exception class.
-6. Debit `state.token_usage` on every success, invalid-response, and error path,
-   then return or re-raise the original error.
+   malformed or schema-invalid output, `error` for other model failures, and
+   `cancelled` when `asyncio.CancelledError` or `CancellationDrainError`
+   interrupts the in-flight request. A cancelled record uses the already
+   snapshotted model/provider, bounded elapsed time, the input estimate, zero
+   output tokens, and only the normalized cancellation exception class. It is
+   cancellation accounting, not a model-gateway error, and the identical
+   cancellation object is immediately re-raised.
+6. Debit `state.token_usage` on every success, invalid-response, error, and
+   cancelled path, then return or re-raise the original terminal object. Prompt
+   preflight failures remain outside attempts, invocation history, and token
+   usage.
 
 `run_test_generation_attempts()` will check the budget before each request and
 again immediately after a successful request, before validating or applying
@@ -78,16 +86,22 @@ bounded token-budget failure. `ensure_coverage()` will preserve that as an
 explicit budget terminal reason rather than misclassifying it as an invalid
 generated test.
 
-This makes the payload's `model_history`, `token_used`, and the OCI aggregate's
-model token/time totals derive from the same calls.
+This makes the payload's `model_history`, `test_generation_attempts`,
+`token_used`, and the OCI aggregate's model token/time totals derive from the
+same calls. `agent_payload_from_state()` must serialize
+`test_generation_attempts` so the evaluation harness preserves the equality
+when durable-state loading fails and it falls back to the public payload.
 
 The strict OCI result contract will cross-check the generation claim against
 that telemetry. A `generated_verified` result must contain at least one
-successful `test_generation` invocation; the number of generation invocations
-must agree with `test_generation_attempts`; and an escalation-provider
-generation invocation must agree with the run's escalation fields. Missing,
-extra, or contradictory generation telemetry rejects the artifact bundle
-instead of merely removing budget credit.
+successful `test_generation` invocation; a `cancelled` invocation never proves
+generated coverage. The number of all canonical generation invocations,
+including cancelled ones, must agree with `test_generation_attempts`; and an
+escalation-provider generation invocation must agree with the run's escalation
+fields. `cancelled` requires a normalized nonempty cancellation class, just as
+`error` requires a normalized nonempty error class. Missing, extra, or
+contradictory generation telemetry rejects the artifact bundle instead of
+merely removing budget credit.
 
 ### 2. Cancellation-drain propagation
 
@@ -101,6 +115,8 @@ their broad recovery handlers. The required paths are:
 - fixed/base OCI coverage runs through `validate_differential_coverage` and
   generated-test orchestration;
 - PLAN and REFLECT reasoning loops after a model-selected tool call;
+- the escalated/two-stage PLAN schema helper in `repair_flow._call_schema()`,
+  which must re-raise tool drains before model-error telemetry or token debit;
 - phase wrappers, fallback graph execution, and `agent_v2`'s top-level crash
   mapping, which could otherwise normalize an externally propagated drain
   failure.
@@ -138,7 +154,9 @@ agent result.
 ## Error handling
 
 - Model or schema failures are recorded once and then retain their existing
-  control flow.
+  control flow. In-flight test-generation cancellation is recorded once with
+  the distinct `cancelled` status and input-only debit before the same object is
+  re-raised.
 - Cancellation-drain failures are never converted into tool errors, coverage
   failures, ordinary commit failures, or generic API errors.
 - A generated test is never applied after the token budget reaches its terminal
@@ -170,6 +188,13 @@ Implementation will follow red-green-refactor with these regression cases:
    `CancellationDrainError` instances instead of returning ordinary failures.
 8. A generic OCI cleanup failure appears as bounded timeout-cleanup evidence;
    existing PR-specific evidence tests remain unchanged.
+9. A real in-flight generation cancellation records one canonical cancelled
+   invocation, one attempt, input-only token usage, and remains package- and
+   aggregate-parseable after the internal phase timeout is serialized.
+10. Public-payload fallback preserves one- and two-attempt generation histories
+    when durable state cannot be loaded.
+11. An escalated/two-stage PLAN tool drain escapes by identity without a forged
+    model-error invocation or token debit.
 
 After focused tests pass, run the affected suites on Python 3.10, 3.11, and
 3.12, then the complete suite, Ruff, `git diff --check`, clean-archive tests and
@@ -187,6 +212,16 @@ the unstaged `run_trace.py` modification throughout.
 - PR and OCI cancellation cleanup failures survive real node and phase-wrapper
   boundaries and are represented in bounded diagnostics.
 - Existing ordinary-error behavior and model-selection policy remain stable.
-- No unresolved Critical or Important review findings remain before push.
-- The branch is pushed and PR evidence is updated only after all final gates
-  pass; merge and paid evaluation remain separately authorized actions.
+- Review `7636b13..latest`, fix every finding attributable to that final-gate
+  range, and fresh re-review the resulting latest head until no Critical,
+  Important, or Minor range finding remains before push. The deferred pre-base
+  Minor items listed under Non-goals remain separately tracked and are not
+  silently pulled into this amendment.
+- After all code findings are fixed and a fresh review has no unresolved
+  finding, the feature branch may be pushed solely to run the existing CI. The
+  exact-head run must finish with overall `success`: all six OS/Python matrix
+  jobs (Ubuntu and macOS on Python 3.10/3.11/3.12), `lint`, and
+  `oci-integration` must pass. This owner-approved exception does not authorize
+  secrets, paid evaluation, any environment action, merge, a prompt/cohort
+  change, or Pilot implementation. Pilot implementation remains blocked until
+  that CI evidence is green.

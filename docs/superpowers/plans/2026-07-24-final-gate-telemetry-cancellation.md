@@ -75,7 +75,11 @@ except (OSError, RuntimeError, ValueError) as exc:
   the original bounded exception after recording it.
 - A `CancellationDrainError` is re-raised before the ordinary model-error
   telemetry path. It is cancellation/cleanup evidence, not a model response
-  error. The orchestration-level recovery is closed in Task 4.
+  error. The orchestration-level recovery is closed in Task 4. The
+  owner-approved whole-stage review amendment in Task 7 supersedes only the
+  original absence of cancellation accounting: an in-flight cancellation gets
+  a distinct `cancelled` invocation before the identical object is re-raised;
+  it is never classified as `error`.
 - Move attempt ownership out of `run_test_generation_attempts()` and into this
   request boundary. Update existing tests that stubbed `request_test_batch()` to
   stub `llm_call()` instead, so they exercise real telemetry and cannot loop with
@@ -511,6 +515,102 @@ class TimeoutCleanupEvidence:
   spec. Do not begin pilot workflow implementation with any unresolved
   Critical or Important finding.
 
+---
+
+### Task 7: Close whole-stage review findings and obtain Python 3.10 CI evidence
+
+**Owner-approved choices:** `A,A` on 2026-07-24. Use a canonical
+`status="cancelled"` invocation for in-flight generation cancellation. After
+all code findings are fixed and freshly reviewed, push the feature branch only
+to obtain the existing CI matrix evidence; this does not authorize Pilot
+implementation, secrets, paid evaluation, any environment action, merge,
+prompt changes, or cohort changes.
+
+**Files:**
+
+- Modify: `src/state.py`
+- Modify: `src/escalation.py`
+- Modify: `src/test_generator.py`
+- Modify: `src/new_agent.py`
+- Modify: `src/repair_flow.py`
+- Modify: `eval/oci_contract.py`
+- Test: `tests/test_test_generator.py`
+- Test: `tests/test_new_agent.py`
+- Test: `tests/test_agent_v2_eval.py`
+- Test: `tests/test_repair_flow.py`
+- Test: `tests/test_oci_contract.py`
+- Test: `tests/test_oci_aggregate.py`
+- Test: `tests/test_escalation_packet.py`
+- Test: `tests/test_decision_frame.py`
+
+**Cancelled generation accounting:**
+
+- Extend the runtime and OCI invocation status literals with exactly
+  `"cancelled"`.
+- In `request_test_batch()`, after prompt success, attempt increment, model and
+  provider snapshot, input estimate, and timer start, catch both
+  `asyncio.CancelledError` and `CancellationDrainError` before ordinary model
+  errors. Append exactly one `test_generation` invocation with the snapshotted
+  model/provider, nonnegative elapsed time, estimated input tokens, zero output
+  tokens, `status="cancelled"`, and only the normalized cancellation class.
+  Debit exactly the input estimate, then use bare `raise` so object identity,
+  cancellation fields, cleanup fields, and cause chains remain intact.
+- `cancelled` is not `error`, cannot prove `generated_verified`, and requires a
+  nonempty normalized exception class at the OCI boundary. Keep the canonical
+  equality unchanged: all `test_generation` records, including cancelled
+  records, must equal `test_generation_attempts`.
+- Add RED tests for direct `asyncio.CancelledError`, generic
+  `CancellationDrainError`, and a real internally timed-out generation path.
+  Assert one attempt, one cancelled invocation, input-only debit, no output
+  estimate, original exception identity for direct cancellation, bounded
+  exception-class-only persistence, and package/aggregate parsing of the
+  internal timeout artifact. Prove a cancelled record alone cannot support
+  generated coverage.
+
+**Public payload fallback:**
+
+- Add exact `"test_generation_attempts": state.test_generation_attempts` to
+  `agent_payload_from_state()` beside coverage/model telemetry. Do not derive
+  attempts from history or coerce it at the producer.
+- Add RED tests for the payload field and for `eval/agent_v2_harness.py` when
+  durable `load_run()` fails: canonical one-attempt and two-attempt generation
+  histories from the public payload must retain their exact count and pass
+  package/aggregate validation.
+
+**Escalated PLAN tool cancellation:**
+
+- Import `CancellationDrainError` in `src/repair_flow.py` and re-raise it
+  immediately before `_call_schema()`'s broad `except Exception` handler.
+  Preserve ordinary model/schema/tool handling unchanged.
+- Add a RED test that uses the real escalated/two-stage PLAN route, has a
+  model-selected tool raise a sentinel drain, and asserts identical propagation
+  with no forged `status="error"` invocation and no token debit for that schema
+  call.
+
+**TDD and commits:**
+
+- Run the new focused tests before production changes and retain the exact RED
+  failures in the task report.
+- Implement the three findings as the smallest compatible changes. Suggested
+  commit boundaries:
+  1. `fix(telemetry): account for cancelled generation requests`
+  2. `fix(eval): preserve generation attempts in public payload`
+  3. `fix(plan): propagate escalated tool cancellation`
+- Run the complete affected suite from Task 6, then the full suite, Ruff, and
+  `git diff --check`. Verify status shows only the original `run_trace.py` user
+  change and its recorded SHA-256 is unchanged.
+- Generate a fresh whole-stage review package from `7636b13` through the new
+  head. Resolve every finding attributable to that range and fresh re-review
+  the resulting latest head; repeat until it has no unresolved Critical,
+  Important, or Minor range finding. The design's explicitly deferred pre-base
+  Minor items remain out of scope and separately tracked.
+- Push only `fix/release-readiness-20260717`, bind the GitHub Actions `CI` run
+  to the exact pushed head SHA, and require overall `success`: all six Ubuntu
+  and macOS Python 3.10/3.11/3.12 matrix jobs, `lint`, and `oci-integration`
+  must pass. A CI failure returns to TDD and fresh review; it never authorizes
+  Pilot work, paid inference, secrets, any environment action, merge,
+  prompt/cohort changes, or a rerun of the evaluation workflow.
+
 ## Completion evidence
 
 Record in the handoff:
@@ -518,6 +618,7 @@ Record in the handoff:
 - focused and full-suite command outputs;
 - Python 3.10/3.11/3.12 counts;
 - Ruff and `git diff --check` results;
-- the five task commit SHAs;
+- all task and whole-stage remediation commit SHAs;
 - reviewer verdict and any follow-up commit;
+- the exact pushed head SHA and its green Python 3.10/3.11/3.12 CI run URL;
 - confirmation that `run_trace.py` was neither staged nor modified.
