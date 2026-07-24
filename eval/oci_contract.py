@@ -69,6 +69,9 @@ CoverageStatus = Literal[
 INFRASTRUCTURE_FAILURE_CLASSES = frozenset(
     {"infra", "model_gateway_infra", "coverage_infra"}
 )
+_CANCELLATION_ERROR_CLASSES = frozenset(
+    {"CancelledError", "CancellationDrainError"}
+)
 
 _NonNegativeInt = Annotated[int, Field(strict=True, ge=0)]
 _TestGenerationAttempts = Annotated[int, Field(strict=True, ge=0, le=2)]
@@ -266,8 +269,15 @@ class ModelInvocationRecord(BaseModel):
             raise ValueError("ok invocation cannot have error_class")
         if self.status == "error" and not self.error_class:
             raise ValueError("error invocation requires error_class")
-        if self.status == "cancelled" and not self.error_class:
-            raise ValueError("cancelled invocation requires error_class")
+        if self.status == "cancelled" and (
+            self.node != "test_generation"
+            or self.error_class not in _CANCELLATION_ERROR_CLASSES
+            or self.output_tokens != 0
+            or self.input_tokens <= 0
+        ):
+            raise ValueError(
+                "cancelled invocation must be canonical test generation"
+            )
         return self
 
 
@@ -337,6 +347,14 @@ class ResultRecord(BaseModel):
             raise ValueError("id must match instance_id")
         if self.success is not self.agent_success:
             raise ValueError("success and agent_success must match")
+        invocation_token_total = sum(
+            invocation.input_tokens + invocation.output_tokens
+            for invocation in self.model_invocations
+        )
+        if self.token_used < invocation_token_total:
+            raise ValueError(
+                "token_used must cover complete model invocation history"
+            )
         if self.agent_success and self.failure_class != "agent_success":
             raise ValueError("successful result requires agent_success failure class")
         if self.agent_success and not has_verified_coverage_proof(

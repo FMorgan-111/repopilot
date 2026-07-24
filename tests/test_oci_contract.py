@@ -77,6 +77,28 @@ def _models_used_for(invocations: list[dict[str, object]]) -> list[str]:
     return list(dict.fromkeys(str(item["model"]) for item in invocations))
 
 
+def _serialized_token_total(
+    invocations: object,
+) -> int | None:
+    if not isinstance(invocations, list):
+        return None
+    total = 0
+    for invocation in invocations:
+        if not isinstance(invocation, dict):
+            return None
+        input_tokens = invocation.get("input_tokens")
+        output_tokens = invocation.get("output_tokens")
+        if (
+            type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            return None
+        total += input_tokens + output_tokens
+    return total
+
+
 def _result_payload(**overrides: object) -> dict[str, object]:
     payload: dict[str, object] = {
         "id": INSTANCE_ID,
@@ -119,6 +141,10 @@ def _result_payload(**overrides: object) -> dict[str, object]:
         "model_patch": "",
     }
     payload.update(overrides)
+    if "token_used" not in overrides:
+        token_total = _serialized_token_total(payload["model_invocations"])
+        if token_total is not None:
+            payload["token_used"] = token_total
     return payload
 
 
@@ -509,10 +535,16 @@ def test_invalid_response_allows_sanitized_or_empty_error_class(
     assert record.model_invocations[0].error_class == error_class
 
 
-def test_cancelled_generation_invocation_accepts_normalized_exception_class() -> None:
+@pytest.mark.parametrize(
+    "error_class",
+    ["CancelledError", "CancellationDrainError"],
+)
+def test_cancelled_generation_invocation_accepts_canonical_exception_class(
+    error_class: str,
+) -> None:
     invocation = _generation_invocation(
         status="cancelled",
-        error_class="CancelledError",
+        error_class=error_class,
         output_tokens=0,
     )
 
@@ -525,7 +557,39 @@ def test_cancelled_generation_invocation_accepts_normalized_exception_class() ->
     )
 
     assert record.model_invocations[0].status == "cancelled"
-    assert record.model_invocations[0].error_class == "CancelledError"
+    assert record.model_invocations[0].error_class == error_class
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("node", "plan"),
+        ("node", "test_generator"),
+        ("error_class", "RuntimeError"),
+        ("output_tokens", 1),
+        ("input_tokens", 0),
+    ],
+)
+def test_cancelled_invocation_requires_canonical_generation_shape(
+    field: str,
+    value: object,
+) -> None:
+    invocation = _generation_invocation(
+        status="cancelled",
+        error_class="CancelledError",
+        output_tokens=0,
+    )
+    invocation[field] = value
+
+    with pytest.raises(ValidationError, match="cancelled invocation"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=[invocation],
+                test_generation_attempts=(
+                    1 if invocation["node"] == "test_generation" else 0
+                ),
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -628,6 +692,25 @@ def test_result_models_used_match_ordered_unique_invocation_history() -> None:
 
     with pytest.raises(ValidationError, match="models_used"):
         _result_record_model().model_validate(payload)
+
+
+def test_result_token_used_covers_every_serialized_model_invocation() -> None:
+    invocations = [
+        _invocation_payload(input_tokens=10, output_tokens=5),
+        _invocation_payload(
+            node="reflect",
+            input_tokens=7,
+            output_tokens=3,
+        ),
+    ]
+
+    with pytest.raises(ValidationError, match="token_used"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=invocations,
+                token_used=24,
+            )
+        )
 
 
 def test_escalation_invocation_requires_escalated_flag() -> None:

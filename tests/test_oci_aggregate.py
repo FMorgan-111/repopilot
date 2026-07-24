@@ -205,6 +205,7 @@ def _completed_output(
             else coverage_proof
         )
     )
+    serialized_token_total = _serialized_token_total(invocations)
     result = {
         "id": instance_id,
         "mode": "agent_v2",
@@ -223,7 +224,11 @@ def _completed_output(
         "run_id": "run-1",
         "trace_id": "trace-1",
         "turns_taken": 2,
-        "token_used": 15,
+        "token_used": (
+            serialized_token_total
+            if serialized_token_total is not None
+            else 15
+        ),
         "error": None,
         "replay": None,
         "replay_error": None,
@@ -346,6 +351,26 @@ def _invocation(**overrides: object) -> dict[str, object]:
     }
     payload.update(overrides)
     return payload
+
+
+def _serialized_token_total(invocations: object) -> int | None:
+    if not isinstance(invocations, list):
+        return None
+    total = 0
+    for invocation in invocations:
+        if not isinstance(invocation, dict):
+            return None
+        input_tokens = invocation.get("input_tokens")
+        output_tokens = invocation.get("output_tokens")
+        if (
+            type(input_tokens) is not int
+            or type(output_tokens) is not int
+            or input_tokens < 0
+            or output_tokens < 0
+        ):
+            return None
+        total += input_tokens + output_tokens
+    return total
 
 
 def _coverage_proof(*, source: str = "generated") -> dict[str, object]:
@@ -821,6 +846,91 @@ def test_aggregate_rejects_contradictory_generation_telemetry(
     else:
         result["model_invocations"] = [_invocation(node="test_generator")]
         result["test_generation_attempts"] = 1
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "value"),
+    [
+        ("node", "plan"),
+        ("node", "test_generator"),
+        ("error_class", "RuntimeError"),
+        ("output_tokens", 1),
+        ("input_tokens", 0),
+    ],
+)
+def test_aggregate_rejects_noncanonical_cancelled_invocation(
+    tmp_path: Path,
+    mutation: str,
+    value: object,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    cancelled = _invocation(
+        node="test_generation",
+        status="cancelled",
+        error_class="CancelledError",
+        output_tokens=0,
+    )
+    bundle = _package(
+        artifacts,
+        instance_id,
+        official_status="empty_patch",
+        agent_success=False,
+        model_patch="",
+        model_invocations=[cancelled],
+        failure_class="other",
+        test_generation_attempts=1,
+    )
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    invocation = results[0]["model_invocations"][0]
+    invocation[mutation] = value
+    results[0]["test_generation_attempts"] = (
+        1 if invocation["node"] == "test_generation" else 0
+    )
+    token_total = _serialized_token_total(results[0]["model_invocations"])
+    assert token_total is not None
+    results[0]["token_used"] = token_total
+    _rewrite_bundle_json(bundle, "result.json", results)
+
+    with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
+        aggregate_artifacts(
+            "checkpoint_5",
+            artifacts,
+            tmp_path / "combined",
+            expected_commit=COMMIT_SHA,
+            repo_root=repo_root,
+        )
+
+
+def test_aggregate_rejects_token_used_below_complete_invocation_total(
+    tmp_path: Path,
+) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    bundle = _package(
+        artifacts,
+        instance_id,
+        model_invocations=[
+            _invocation(input_tokens=10, output_tokens=5),
+            _invocation(node="reflect", input_tokens=7, output_tokens=3),
+        ],
+    )
+    results = json.loads((bundle / "result.json").read_text(encoding="utf-8"))
+    results[0]["token_used"] = 24
     _rewrite_bundle_json(bundle, "result.json", results)
 
     with pytest.raises(ArtifactContractError, match="invalid safe artifact payload"):
@@ -1387,6 +1497,11 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
             _rewrite_bundle_json(bundle, "prediction.jsonl", prediction)
         else:
             results[0]["model_invocations"] = [_invocation()]
+        token_total = _serialized_token_total(
+            results[0]["model_invocations"]
+        )
+        assert token_total is not None
+        results[0]["token_used"] = token_total
         _rewrite_bundle_json(bundle, "result.json", results)
 
     with pytest.raises(ArtifactContractError, match="inconsistent artifact bundle"):
