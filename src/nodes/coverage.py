@@ -17,7 +17,10 @@ from ..coverage_gate import (
     validate_terminal_coverage_binding,
 )
 from ..state import AgentState, CoverageProof, Phase, _as_state
-from ..test_generator import run_test_generation_attempts
+from ..test_generator import (
+    _TEST_GENERATION_BUDGET_REASON,
+    run_test_generation_attempts,
+)
 
 
 def _persist_verified(state: AgentState, decision: CoverageDecision) -> None:
@@ -115,7 +118,10 @@ async def ensure_coverage(state: AgentState | dict[str, Any]) -> AgentState:
     state.coverage_status = "failed"
     state.coverage_failure_reason = reason[:300]
     state.coverage_proof = None
-    state.failure_reason = f"test_generation_failed:{reason[:300]}"
+    if reason == _TEST_GENERATION_BUDGET_REASON:
+        state.failure_reason = "Token budget exceeded during test generation."
+    else:
+        state.failure_reason = f"test_generation_failed:{reason[:300]}"
     state.pr_url = None
     state.current_phase = Phase.FAILURE
     return state

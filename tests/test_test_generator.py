@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import src.test_generator as test_generator
 from src.async_safety import CancellationDrainError
 from src.coverage_gate import ChangedTarget, CoverageDecision
 from src.patch_gate import validate_patch_batch
@@ -493,6 +494,186 @@ async def test_preflight_failure_terminates_without_a_model_request(
     assert generation_state.test_generation_attempts == 0
     assert generation_state.token_usage == 0
     assert generation_state.model_history == []
+
+
+@pytest.mark.asyncio
+async def test_budget_before_request_restores_production_state_without_generation(
+    generation_state,
+    monkeypatch,
+):
+    root = Path(generation_state.repo_path)
+    original_plan = generation_state.active_repair_plan.model_copy(deep=True)
+    original_edits = [
+        edit.model_copy(deep=True) for edit in generation_state.patch_edits
+    ]
+    original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
+    original_patch = generation_state.patch_content
+    calls = {
+        "request": 0,
+        "patch_gate": 0,
+        "apply": 0,
+        "coverage": 0,
+        "escalation": 0,
+    }
+    generation_state.token_usage = generation_state.token_budget
+
+    async def request(*_args, **_kwargs):
+        calls["request"] += 1
+        return _good_batch().model_dump()
+
+    def patch_gate(*args, **kwargs):
+        calls["patch_gate"] += 1
+        return original_patch_gate(*args, **kwargs)
+
+    def apply(*args, **kwargs):
+        calls["apply"] += 1
+        return original_apply(*args, **kwargs)
+
+    async def coverage(*_args, **_kwargs):
+        calls["coverage"] += 1
+        return CoverageDecision(verified=False, status="failed", reason="unexpected")
+
+    def escalation(*args, **kwargs):
+        calls["escalation"] += 1
+        return original_escalation(*args, **kwargs)
+
+    original_patch_gate = test_generator.validate_patch_batch
+    original_apply = test_generator.apply_approved_patch
+    original_escalation = test_generator.apply_escalation
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+    monkeypatch.setattr("src.test_generator.validate_patch_batch", patch_gate)
+    monkeypatch.setattr("src.test_generator.apply_approved_patch", apply)
+    monkeypatch.setattr("src.test_generator.validate_differential_coverage", coverage)
+    monkeypatch.setattr("src.test_generator.escalation_is_configured", lambda: True)
+    monkeypatch.setattr("src.test_generator.apply_escalation", escalation)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert result.reason == "token_budget_exceeded"
+    assert calls == {
+        "request": 0,
+        "patch_gate": 0,
+        "apply": 0,
+        "coverage": 0,
+        "escalation": 0,
+    }
+    assert generation_state.active_repair_plan == original_plan
+    assert generation_state.patch_edits == original_edits
+    assert generation_state.tool_patch_approval == original_approval
+    assert generation_state.patch_content == original_patch
+    assert generation_state.generated_test_approvals == []
+    assert not (root / "tests" / "test_answer.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_budget_after_request_restores_production_state_before_patch_gate(
+    generation_state,
+    monkeypatch,
+):
+    root = Path(generation_state.repo_path)
+    original_plan = generation_state.active_repair_plan.model_copy(deep=True)
+    original_edits = [
+        edit.model_copy(deep=True) for edit in generation_state.patch_edits
+    ]
+    original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
+    original_patch = generation_state.patch_content
+    calls = {
+        "request": 0,
+        "patch_gate": 0,
+        "apply": 0,
+        "coverage": 0,
+        "escalation": 0,
+    }
+    generation_state.token_budget = 1
+
+    async def request(*_args, **_kwargs):
+        calls["request"] += 1
+        return _good_batch().model_dump()
+
+    def patch_gate(*args, **kwargs):
+        calls["patch_gate"] += 1
+        return original_patch_gate(*args, **kwargs)
+
+    def apply(*args, **kwargs):
+        calls["apply"] += 1
+        return original_apply(*args, **kwargs)
+
+    async def coverage(*_args, **_kwargs):
+        calls["coverage"] += 1
+        return CoverageDecision(
+            verified=True, status="generated_verified", reason="verified"
+        )
+
+    def escalation(*args, **kwargs):
+        calls["escalation"] += 1
+        return original_escalation(*args, **kwargs)
+
+    original_patch_gate = test_generator.validate_patch_batch
+    original_apply = test_generator.apply_approved_patch
+    original_escalation = test_generator.apply_escalation
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+    monkeypatch.setattr("src.test_generator.validate_patch_batch", patch_gate)
+    monkeypatch.setattr("src.test_generator.apply_approved_patch", apply)
+    monkeypatch.setattr("src.test_generator.validate_differential_coverage", coverage)
+    monkeypatch.setattr("src.test_generator.escalation_is_configured", lambda: True)
+    monkeypatch.setattr("src.test_generator.apply_escalation", escalation)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert result.reason == "token_budget_exceeded"
+    assert calls == {
+        "request": 1,
+        "patch_gate": 0,
+        "apply": 0,
+        "coverage": 0,
+        "escalation": 0,
+    }
+    assert generation_state.active_repair_plan == original_plan
+    assert generation_state.patch_edits == original_edits
+    assert generation_state.tool_patch_approval == original_approval
+    assert generation_state.patch_content == original_patch
+    assert generation_state.generated_test_approvals == []
+    assert not (root / "tests" / "test_answer.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_budget_after_failed_request_stops_before_escalation_or_retry(
+    generation_state,
+    monkeypatch,
+):
+    root = Path(generation_state.repo_path)
+    original_plan = generation_state.active_repair_plan.model_copy(deep=True)
+    original_edits = [
+        edit.model_copy(deep=True) for edit in generation_state.patch_edits
+    ]
+    original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
+    original_patch = generation_state.patch_content
+    calls = {"request": 0, "escalation": 0}
+    generation_state.token_budget = 1
+
+    async def request(*_args, **_kwargs):
+        calls["request"] += 1
+        raise RuntimeError("request failed")
+
+    def escalation(*args, **kwargs):
+        calls["escalation"] += 1
+        return original_escalation(*args, **kwargs)
+
+    original_escalation = test_generator.apply_escalation
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+    monkeypatch.setattr("src.test_generator.escalation_is_configured", lambda: True)
+    monkeypatch.setattr("src.test_generator.apply_escalation", escalation)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert result.reason == "token_budget_exceeded"
+    assert calls == {"request": 1, "escalation": 0}
+    assert generation_state.active_repair_plan == original_plan
+    assert generation_state.patch_edits == original_edits
+    assert generation_state.tool_patch_approval == original_approval
+    assert generation_state.patch_content == original_patch
+    assert generation_state.generated_test_approvals == []
+    assert not (root / "tests" / "test_answer.py").exists()
 
 
 @pytest.mark.asyncio

@@ -35,6 +35,7 @@ from .state import (
     ToolPatchApproval,
     VerifiedEditBatch,
     _estimate_tokens,
+    _is_budget_exceeded,
     tool_manifest_fingerprint,
 )
 from .test_path_policy import is_allowed_test_path
@@ -49,6 +50,7 @@ _SYSTEM_PROMPT = (
 )
 _PROMPT_LIMIT = 32_000
 _TEST_GENERATION_PREFLIGHT_REASON = "test_generation_preflight_failed"
+_TEST_GENERATION_BUDGET_REASON = "token_budget_exceeded"
 
 
 class _TestGenerationPreflightError(ValueError):
@@ -397,10 +399,16 @@ async def run_test_generation_attempts(
 
     while state.test_generation_attempts < 2:
         _restore_production_state(state, production)
+        if _is_budget_exceeded(state):
+            last = _failed(_TEST_GENERATION_BUDGET_REASON)
+            break
         snapshot: dict[str, bytes | None] = {}
         applied = False
         try:
             batch = await request_test_batch(state, reason)
+            if _is_budget_exceeded(state):
+                last = _failed(_TEST_GENERATION_BUDGET_REASON)
+                break
             plan = _test_plan(batch)
             state.active_repair_plan = plan
             gate = validate_patch_batch(state, plan, batch, test_only=True)
@@ -472,6 +480,9 @@ async def run_test_generation_attempts(
             last = _failed(reason)
             break
         except (OSError, RuntimeError, ValueError):
+            if _is_budget_exceeded(state):
+                last = _failed(_TEST_GENERATION_BUDGET_REASON)
+                break
             reason = "invalid_generated_test"
             last = _failed(reason)
         finally:

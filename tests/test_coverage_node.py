@@ -339,3 +339,30 @@ async def test_two_invalid_generated_tests_fail_without_pr(
     assert result.current_phase == Phase.FAILURE
     assert result.failure_reason.startswith("test_generation_failed:")
     assert result.pr_url is None
+
+
+@pytest.mark.asyncio
+async def test_exhausted_budget_is_a_terminal_generation_failure_without_requests(
+    tmp_path: Path,
+    monkeypatch,
+):
+    state = _state(tmp_path)
+    state.token_usage = state.token_budget
+    requests = 0
+    monkeypatch.setattr("src.nodes.coverage.collect_changed_targets", lambda *_: [])
+    monkeypatch.setattr("src.nodes.coverage.discover_coverage_candidates", lambda *_: [])
+
+    async def request(*_args, **_kwargs):
+        nonlocal requests
+        requests += 1
+        return {"edits": []}
+
+    monkeypatch.setattr("src.test_generator.llm_call", request)
+    result = await ensure_coverage(state)
+
+    assert requests == 0
+    assert result.test_generation_attempts == 0
+    assert result.model_history == []
+    assert result.coverage_failure_reason == "token_budget_exceeded"
+    assert result.failure_reason == "Token budget exceeded during test generation."
+    assert result.current_phase == Phase.FAILURE
