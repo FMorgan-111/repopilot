@@ -12,6 +12,7 @@ from .model_provider import redact_secrets
 
 _MAX_CAUSE_DEPTH = 8
 _MAX_OPERATION = 120
+_MAX_EXCEPTION_CLASS = 120
 _MAX_ERROR_SUMMARY = 300
 _MAX_EVIDENCE_SUMMARY = 480
 
@@ -32,30 +33,41 @@ class TimeoutCleanupEvidence:
     pr_number: int | None = None
 
     def summary(self) -> str:
+        pr_number = _rendered_pr_number(
+            self.failure_kind, self.pr_number
+        )
         if self.failure_kind == "pr_cleanup":
-            target = _pr_target(self.pr_number)
+            target = _pr_target(pr_number)
             message = f"PR cancellation cleanup failed for {target}"
         elif self.failure_kind == "pr_transaction":
-            target = _pr_target(self.pr_number)
+            target = _pr_target(pr_number)
             message = f"PR cancellation transaction failed for {target}"
         else:
             message = f"Cancellation cleanup failed during {self.operation}"
+        cleanup_error_type = _safe_exception_class(
+            self.cleanup_error_type
+        )
         rendered = (
-            f"{message} ({self.cleanup_error_type}: {self.cleanup_error})"
+            f"{message} ({cleanup_error_type}: {self.cleanup_error})"
         )
         return _safe_text(rendered, _MAX_EVIDENCE_SUMMARY)
 
     def diagnostic_details(self) -> dict[str, object]:
         details: dict[str, object] = {
             "timeout_cleanup_kind": self.failure_kind,
-            "timeout_cause_type": self.cause_type,
-            "cleanup_error_type": self.cleanup_error_type,
+            "timeout_cause_type": _safe_exception_class(self.cause_type),
+            "cleanup_error_type": _safe_exception_class(
+                self.cleanup_error_type
+            ),
             "cleanup_error": self.cleanup_error,
         }
         if self.failure_kind == "generic_drain":
             details["cleanup_operation"] = self.operation
-        if self.pr_number is not None:
-            details["cleanup_pr_number"] = self.pr_number
+        pr_number = _rendered_pr_number(
+            self.failure_kind, self.pr_number
+        )
+        if pr_number is not None:
+            details["cleanup_pr_number"] = pr_number
         return details
 
 
@@ -71,8 +83,15 @@ def _safe_text(value: str, limit: int) -> str:
     return normalized[:limit]
 
 
+def _safe_exception_class(value: object) -> str:
+    normalized = normalize_exception_class(value)
+    if normalized and len(normalized) <= _MAX_EXCEPTION_CLASS:
+        return normalized
+    return "BaseException"
+
+
 def _safe_exception_type(error: BaseException) -> str:
-    return normalize_exception_class(error) or "BaseException"
+    return _safe_exception_class(error)
 
 
 def _safe_error_summary(error: BaseException) -> str:
@@ -94,6 +113,14 @@ def _positive_pr_number(value: object) -> int | None:
     if type(value) is int and value > 0:
         return value
     return None
+
+
+def _rendered_pr_number(
+    failure_kind: TimeoutFailureKind, value: object
+) -> int | None:
+    if failure_kind not in {"pr_cleanup", "pr_transaction"}:
+        return None
+    return _positive_pr_number(value)
 
 
 def _evidence_for_drain(

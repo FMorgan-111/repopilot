@@ -306,6 +306,93 @@ async def test_generic_oci_drain_evidence_has_exact_safe_interface():
     )
 
 
+@pytest.mark.parametrize(
+    "failure_kind, pr_number",
+    [
+        ("pr_cleanup", True),
+        ("pr_transaction", 0),
+        ("pr_cleanup", -1),
+        ("pr_transaction", "19"),
+    ],
+)
+async def test_direct_pr_evidence_rejects_invalid_pr_number_at_render_boundary(
+    failure_kind,
+    pr_number,
+):
+    evidence = TimeoutCleanupEvidence(
+        failure_kind=failure_kind,
+        cause_type="CancellationDrainError",
+        cleanup_error_type="OSError",
+        cleanup_error="failed",
+        pr_number=pr_number,
+    )
+
+    assert "for an unknown pull request" in evidence.summary()
+    assert "cleanup_pr_number" not in evidence.diagnostic_details()
+
+
+async def test_direct_generic_evidence_never_renders_pr_number():
+    evidence = TimeoutCleanupEvidence(
+        failure_kind="generic_drain",
+        cause_type="CancellationDrainError",
+        cleanup_error_type="OSError",
+        cleanup_error="failed",
+        operation="OCI cleanup",
+        pr_number=71,
+    )
+
+    assert evidence.summary().startswith(
+        "Cancellation cleanup failed during OCI cleanup"
+    )
+    assert "71" not in evidence.summary()
+    assert "cleanup_pr_number" not in evidence.diagnostic_details()
+
+
+async def test_direct_evidence_collapses_oversized_exception_classes():
+    oversized = "Oversized" * 20 + "Error"
+    evidence = TimeoutCleanupEvidence(
+        failure_kind="generic_drain",
+        cause_type=oversized,
+        cleanup_error_type=oversized,
+        cleanup_error="failed",
+        operation="OCI cleanup",
+    )
+
+    details = evidence.diagnostic_details()
+    assert details["timeout_cause_type"] == "BaseException"
+    assert details["cleanup_error_type"] == "BaseException"
+    assert len(details["timeout_cause_type"]) <= 120
+    assert len(details["cleanup_error_type"]) <= 120
+    assert oversized not in evidence.summary()
+    assert "(BaseException: failed)" in evidence.summary()
+
+
+async def test_extractor_collapses_oversized_exception_classes():
+    drain_class = type(
+        "OversizedDrain" * 20 + "Error",
+        (CancellationDrainError,),
+        {},
+    )
+    cleanup_class = type(
+        "OversizedCleanup" * 20 + "Error",
+        (RuntimeError,),
+        {},
+    )
+    drain = drain_class(
+        "OCI cleanup",
+        asyncio.CancelledError("cancel"),
+        cleanup_class("failed"),
+    )
+
+    evidence = extract_timeout_cleanup_evidence(drain)
+
+    assert evidence is not None
+    assert evidence.cause_type == "BaseException"
+    assert evidence.cleanup_error_type == "BaseException"
+    assert evidence.diagnostic_details()["timeout_cause_type"] == "BaseException"
+    assert evidence.diagnostic_details()["cleanup_error_type"] == "BaseException"
+
+
 async def test_pr_transaction_evidence_uses_transaction_error():
     cancellation = asyncio.CancelledError("cancel transaction")
     transaction_error = ValueError(" transaction   failed ")
