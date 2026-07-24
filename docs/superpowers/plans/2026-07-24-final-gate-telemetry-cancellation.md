@@ -555,10 +555,13 @@ prompt changes, or cohort changes.
   tokens, `status="cancelled"`, and only the normalized cancellation class.
   Debit exactly the input estimate, then use bare `raise` so object identity,
   cancellation fields, cleanup fields, and cause chains remain intact.
-- `cancelled` is not `error`, cannot prove `generated_verified`, and requires a
-  nonempty normalized exception class at the OCI boundary. Keep the canonical
-  equality unchanged: all `test_generation` records, including cancelled
-  records, must equal `test_generation_attempts`.
+- `cancelled` is not `error` and cannot prove `generated_verified`. At the OCI
+  boundary it is canonical only for node `test_generation`, positive input
+  tokens, zero output tokens, and error class exactly `CancelledError` or
+  `CancellationDrainError`. Keep the canonical equality unchanged: all
+  `test_generation` records, including cancelled records, must equal
+  `test_generation_attempts`. Require `token_used` to cover the sum of input
+  and output tokens from every serialized invocation.
 - Add RED tests for direct `asyncio.CancelledError`, generic
   `CancellationDrainError`, and a real internally timed-out generation path.
   Assert one attempt, one cancelled invocation, input-only debit, no output
@@ -589,6 +592,13 @@ prompt changes, or cohort changes.
 
 **Graph-crash telemetry persistence:**
 
+- Latest whole-stage review addendum: use a real compiled `StateGraph` in the
+  regression because LangGraph copies the invocation input before executing a
+  node. Install a per-run, `ContextVar`-isolated callback in `run_graph()` to
+  observe live `AgentState` objects. On an ordinary graph exception, deep-copy
+  the latest observed state before terminalizing it; fall back to the initial
+  state only if no live state was observed. Do not change `run_graph()`'s
+  public signature, fallback-graph behavior, or cancellation-drain identity.
 - Whole-stage review continuation: replace the ordinary `run_graph()` crash
   branch's handcrafted response with a safe projection of the mutated
   `AgentState`. Set the durable state phase to `FAILED`, clear pending human

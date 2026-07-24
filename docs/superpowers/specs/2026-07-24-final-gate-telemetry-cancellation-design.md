@@ -98,10 +98,13 @@ successful `test_generation` invocation; a `cancelled` invocation never proves
 generated coverage. The number of all canonical generation invocations,
 including cancelled ones, must agree with `test_generation_attempts`; and an
 escalation-provider generation invocation must agree with the run's escalation
-fields. `cancelled` requires a normalized nonempty cancellation class, just as
-`error` requires a normalized nonempty error class. Missing, extra, or
-contradictory generation telemetry rejects the artifact bundle instead of
-merely removing budget credit.
+fields. The OCI boundary accepts `cancelled` only for node `test_generation`,
+with positive input tokens, zero output tokens, and error class exactly
+`CancelledError` or `CancellationDrainError`; other nodes, classes, or token
+shapes are noncanonical. The result's `token_used` must be at least the sum of
+input and output tokens in every serialized model invocation. Missing, extra,
+or contradictory telemetry rejects the artifact bundle instead of merely
+removing budget credit.
 
 ### 2. Cancellation-drain propagation
 
@@ -176,8 +179,14 @@ agent result.
   through `agent_payload_from_state()` before overriding only the public phase
   to `CRASHED` and success fields to false. This preserves safe model, token,
   generation-attempt, and coverage telemetry; a requested final run is still
-  saved best-effort. The crash reason is redacted and bounded before it reaches
-  state, payload, trace, or stderr.
+  saved best-effort. Because real LangGraph execution copies the invocation
+  input, the graph runner installs a per-run, context-isolated callback that
+  observes the latest live `AgentState` delivered to a node. On an ordinary
+  graph exception the outer agent deep-copies that latest observed state before
+  terminalizing it, falling back to the initial state only when no live state
+  was observed. The observer never changes cancellation-drain propagation or
+  identity. The crash reason is redacted and bounded before it reaches state,
+  payload, trace, or stderr.
 - `CancellationDrainError` also has strict precedence at the reachable outer
   consumers: the intelligent-agent, agent-v2, and agent-v2-resume HTTP
   handlers; exact-instance and per-sample Agent V2 evaluation; and OCI
