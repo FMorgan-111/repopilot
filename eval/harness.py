@@ -43,6 +43,7 @@ DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
 _safe_subprocess = importlib.import_module("src.safe_subprocess")
 minimal_subprocess_env = _safe_subprocess.minimal_subprocess_env
 run_bounded_process = _safe_subprocess.run_bounded_process
+PYTEST_BOOTSTRAP = importlib.import_module("src.tool_policy").PYTEST_BOOTSTRAP
 
 
 def get_model_config(provider: str):
@@ -682,7 +683,15 @@ def run_tests(repo_path: Path) -> tuple[bool, str]:
     """Run pytest in the repo. Returns (success, output)."""
     # Try common test commands
     candidates = [
-        [sys.executable, "-P", "-m", "pytest", "-x", "-q", "--tb=short"],
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            PYTEST_BOOTSTRAP,
+            "-x",
+            "-q",
+            "--tb=short",
+        ],
     ]
     for cmd in candidates:
         try:

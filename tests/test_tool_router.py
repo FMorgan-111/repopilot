@@ -234,12 +234,13 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     )
 
     assert result.status == "ok"
-    assert isinstance(captured["argv"], list)
-    assert captured["argv"][:4] == [
+    assert captured["argv"] == [
         "/usr/bin/python3",
-        "-P",
+        "-I",
         "-c",
         PYTEST_BOOTSTRAP,
+        "tests/test_widget.py::test_render",
+        "-q",
     ]
     assert captured["root"] != root_repo
     assert captured["sandbox"].workspace == captured["root"]

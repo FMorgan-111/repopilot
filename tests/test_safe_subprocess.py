@@ -282,10 +282,14 @@ def test_oci_runner_probes_python_and_pytest_and_forces_cleanup(
         for argv in create_calls
     }
     assert {call[-1] for call in cleanup_calls} == run_names
-    probe = " ".join(create_calls[0])
-    assert "/usr/bin/python3" in probe
-    assert " -P " in f" {probe} "
-    assert " -m pytest --version" in probe
+    assert "--entrypoint=/usr/bin/python3" in create_calls[0]
+    assert create_calls[0][-5:] == [
+        _IMAGE,
+        "-I",
+        "-m",
+        "pytest",
+        "--version",
+    ]
     assert all(call[-1].startswith("repopilot-") for call in cleanup_calls)
 
 

@@ -256,7 +256,7 @@ def test_prepare_pulls_official_image_and_preflights_digest(tmp_path: Path) -> N
         ["docker", "image", "inspect", "--format={{.Id}}", OFFICIAL_IMAGE],
     ]
     command, config = preflights[0]
-    assert command == [TESTBED_PYTHON, "-P", "-c", "import pytest"]
+    assert command == [TESTBED_PYTHON, "-I", "-c", "import pytest"]
     assert config.image == IMAGE_SHA
     assert config.user == "65532:65532"
     assert config.memory == "4g"

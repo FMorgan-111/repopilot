@@ -288,7 +288,7 @@ def _checkout_head(root: Path) -> str:
 
 def fixed_pytest_argv(python_executable: str, args: Sequence[str]) -> list[str]:
     """Import trusted pytest before exposing the repository import path."""
-    return [python_executable, "-P", "-c", PYTEST_BOOTSTRAP, *args]
+    return [python_executable, "-I", "-c", PYTEST_BOOTSTRAP, *args]
 
 
 def _test_argv(root: Path, state: AgentState, command: object) -> tuple[list[str], str]:

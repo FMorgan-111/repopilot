@@ -487,7 +487,7 @@ def run_oci_process(
         sandbox,
         [
             config.python_executable,
-            "-P",
+            "-I",
             "-m",
             "pytest",
             "--version",

@@ -249,7 +249,7 @@ def test_accepts_python_module_pytest_and_existing_project_command(tmp_path):
 
     assert python.approved is True
     assert project.approved is True
-    assert python.argv[:4] == ["/usr/bin/python3", "-P", "-c", PYTEST_BOOTSTRAP]
+    assert python.argv[:4] == ["/usr/bin/python3", "-I", "-c", PYTEST_BOOTSTRAP]
     assert project.argv[0] == "/usr/bin/npm"
 
 
@@ -683,7 +683,7 @@ def test_public_fixed_test_argv_uses_sandbox_python_and_preserves_selector(tmp_p
     )
     assert argv == [
         "/usr/bin/python3",
-        "-P",
+        "-I",
         "-c",
         PYTEST_BOOTSTRAP,
         "tests/test_widget.py",

@@ -234,7 +234,7 @@ def _preflight_image(
     )
     sandbox = SandboxPaths.create(Path(output_dir) / "preflight")
     result = oci_runner(
-        [TESTBED_PYTHON, "-P", "-c", "import pytest"],
+        [TESTBED_PYTHON, "-I", "-c", "import pytest"],
         sandbox=sandbox,
         config=config,
         timeout=60,

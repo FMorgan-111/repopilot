@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,6 +8,7 @@ import pytest
 
 from eval import harness
 from src.safe_subprocess import ProcessOutputLimitError, minimal_subprocess_env
+from src.tool_policy import PYTEST_BOOTSTRAP
 
 BASE_COMMIT = "a" * 40
 
@@ -537,6 +539,33 @@ def test_every_legacy_subprocess_uses_production_minimal_environment(
         assert kwargs["env"] == expected
         assert not sentinels.keys() & kwargs["env"].keys()
         assert kwargs["env"]["PATH"] != str(tmp_path / "hostile-bin")
+
+
+def test_run_tests_uses_version_stable_trusted_pytest_bootstrap(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured.update(kwargs)
+        return SimpleNamespace(returncode=0, stdout="1 passed", stderr="")
+
+    monkeypatch.setattr(harness.subprocess, "run", fake_run)
+
+    success, output = harness.run_tests(tmp_path)
+
+    assert success is True
+    assert "1 passed" in output
+    assert captured["command"] == [
+        sys.executable,
+        "-I",
+        "-c",
+        PYTEST_BOOTSTRAP,
+        "-x",
+        "-q",
+        "--tb=short",
+    ]
+    assert captured["cwd"] == str(tmp_path)
+    assert captured["env"] == minimal_subprocess_env()
 
 
 def test_tracked_search_excludes_git_metadata_and_untracked_files(tmp_path):
