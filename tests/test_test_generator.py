@@ -877,17 +877,63 @@ async def test_unknown_request_error_without_budget_is_reraised(
 
 
 @pytest.mark.asyncio
-async def test_cancellation_drain_is_reraised_without_model_error_telemetry(
+async def test_direct_cancellation_is_recorded_and_reraised_by_identity(
     generation_state,
     monkeypatch,
 ):
-    error = CancellationDrainError(
-        "test generation",
-        asyncio.CancelledError(),
-        RuntimeError("cleanup"),
+    error = asyncio.CancelledError("external cancellation details")
+    captured: dict[str, str] = {}
+    token_estimates: list[tuple[str, ...]] = []
+    original_estimate = test_generator._estimate_tokens
+
+    def estimate(*parts: str) -> int:
+        token_estimates.append(parts)
+        return original_estimate(*parts)
+
+    async def cancelled(_system, prompt, **_kwargs):
+        captured["prompt"] = prompt
+        raise error
+
+    monkeypatch.setattr("src.test_generator._estimate_tokens", estimate)
+    monkeypatch.setattr("src.test_generator.llm_call", cancelled)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await request_test_batch(generation_state, "no_candidate")
+
+    expected_input = original_estimate(_SYSTEM_PROMPT, captured["prompt"])
+    assert raised.value is error
+    assert generation_state.test_generation_attempts == 1
+    assert generation_state.token_usage == expected_input
+    assert token_estimates == [(_SYSTEM_PROMPT, captured["prompt"])]
+    assert len(generation_state.model_history) == 1
+    invocation = generation_state.model_history[0]
+    assert invocation.node == "test_generation"
+    assert invocation.status == "cancelled"
+    assert invocation.input_tokens == expected_input
+    assert invocation.output_tokens == 0
+    assert invocation.elapsed_seconds >= 0
+    assert invocation.error_class == "CancelledError"
+    assert "external cancellation details" not in json.dumps(
+        generation_state.model_dump(mode="json")
     )
 
-    async def cancelled(*_args, **_kwargs):
+
+@pytest.mark.asyncio
+async def test_cancellation_drain_is_recorded_and_reraised_without_losing_evidence(
+    generation_state,
+    monkeypatch,
+):
+    cancellation = asyncio.CancelledError("cancel-secret")
+    cleanup_error = RuntimeError("cleanup-secret")
+    error = CancellationDrainError(
+        "test generation",
+        cancellation,
+        cleanup_error,
+    )
+    captured: dict[str, str] = {}
+
+    async def cancelled(_system, prompt, **_kwargs):
+        captured["prompt"] = prompt
         raise error
 
     monkeypatch.setattr("src.test_generator.llm_call", cancelled)
@@ -896,9 +942,22 @@ async def test_cancellation_drain_is_reraised_without_model_error_telemetry(
         await request_test_batch(generation_state, "no_candidate")
 
     assert raised.value is error
+    assert raised.value.cancellation is cancellation
+    assert raised.value.cleanup_error is cleanup_error
+    expected_input = _estimate_tokens(_SYSTEM_PROMPT, captured["prompt"])
     assert generation_state.test_generation_attempts == 1
-    assert generation_state.token_usage == 0
-    assert generation_state.model_history == []
+    assert generation_state.token_usage == expected_input
+    assert len(generation_state.model_history) == 1
+    invocation = generation_state.model_history[0]
+    assert invocation.node == "test_generation"
+    assert invocation.status == "cancelled"
+    assert invocation.input_tokens == expected_input
+    assert invocation.output_tokens == 0
+    assert invocation.elapsed_seconds >= 0
+    assert invocation.error_class == "CancellationDrainError"
+    serialized = json.dumps(generation_state.model_dump(mode="json"))
+    assert "cancel-secret" not in serialized
+    assert "cleanup-secret" not in serialized
 
 
 def test_allowed_test_path_requires_established_safe_layout(tmp_path: Path):

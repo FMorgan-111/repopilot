@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import subprocess
@@ -156,7 +157,20 @@ async def request_test_batch(
             provider=provider,
             temperature=0.0,
         )
-    except CancellationDrainError:
+    except (asyncio.CancelledError, CancellationDrainError) as exc:
+        elapsed = time.monotonic() - started
+        record_model_invocation(
+            state,
+            model=model,
+            provider=provider,
+            node="test_generation",
+            elapsed_seconds=elapsed,
+            input_tokens=input_tokens,
+            output_tokens=0,
+            status="cancelled",
+            error=exc,
+        )
+        state.token_usage += input_tokens
         raise
     except Exception as exc:
         elapsed = time.monotonic() - started

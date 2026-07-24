@@ -340,7 +340,7 @@ class ModelInvocation(BaseModel):
     elapsed_seconds: float
     input_tokens: int
     output_tokens: int
-    status: Literal["ok", "invalid_response", "error"]
+    status: Literal["ok", "invalid_response", "error", "cancelled"]
     error_class: str = ""
 
     @field_validator("error_class", mode="before")

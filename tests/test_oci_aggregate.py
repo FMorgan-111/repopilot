@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
@@ -18,8 +19,10 @@ from eval.oci_runner import (
     score_instance,
 )
 from eval.swe_bench import verified_row_sha256, write_predictions
+from src import test_generator
+from src.async_safety import wait_for_phase
 from src.safe_subprocess import BoundedProcessResult
-from src.state import ModelInvocation
+from src.state import AgentState, ModelInvocation
 
 COMMIT_SHA = "a" * 40
 IMAGE_SHA = "sha256:" + "b" * 64
@@ -937,6 +940,70 @@ def test_package_and_aggregate_accept_gateway_timeout_invocation(
     )
 
     assert summary_path.is_file()
+
+
+@pytest.mark.asyncio
+async def test_internal_generation_timeout_packages_and_aggregates_cancelled_invocation(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    state = AgentState(
+        issue_url="https://github.com/owner/repo/issues/1",
+        active_model=PRIMARY_MODEL,
+        active_provider="primary",
+    )
+
+    async def in_flight_request(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        test_generator,
+        "_generation_prompt",
+        lambda *_args: "bounded generation prompt",
+    )
+    monkeypatch.setattr(test_generator, "llm_call", in_flight_request)
+
+    with pytest.raises(asyncio.TimeoutError):
+        await wait_for_phase(
+            test_generator.request_test_batch(state, "no_candidate"),
+            timeout=0.01,
+        )
+
+    assert state.test_generation_attempts == 1
+    assert len(state.model_history) == 1
+    invocation = state.model_history[0]
+    assert invocation.status == "cancelled"
+    assert invocation.error_class == "CancelledError"
+    assert invocation.output_tokens == 0
+    assert invocation.input_tokens > 0
+    assert state.token_usage == invocation.input_tokens
+
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        official_status="empty_patch",
+        agent_success=False,
+        model_patch="",
+        model_invocations=[invocation.model_dump(mode="json")],
+        failure_class="other",
+        test_generation_attempts=state.test_generation_attempts,
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    summary = summary_path.read_text(encoding="utf-8")
+    assert f"| Model tokens | {invocation.input_tokens} |" in summary
+    assert f"| Model elapsed seconds | {invocation.elapsed_seconds:.3f} |" in summary
 
 
 def test_aggregate_rejects_completed_bundle_with_only_error_invocation(

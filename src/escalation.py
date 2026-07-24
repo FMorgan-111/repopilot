@@ -729,7 +729,7 @@ def record_model_invocation(
     elapsed_seconds: float,
     input_tokens: int,
     output_tokens: int,
-    status: Literal["ok", "invalid_response", "error"],
+    status: Literal["ok", "invalid_response", "error", "cancelled"],
     error: BaseException | None = None,
 ) -> None:
     """Persist a bounded invocation record without exception messages."""

@@ -62,7 +62,7 @@ ModelProvider = Literal["primary", "escalation"]
 ModelName = Literal[
     "gemini-3.5-flash:stable", "claude-opus-4-8:stable"
 ]
-InvocationStatus = Literal["ok", "invalid_response", "error"]
+InvocationStatus = Literal["ok", "invalid_response", "error", "cancelled"]
 CoverageStatus = Literal[
     "pending", "existing_verified", "generated_verified", "failed"
 ]
@@ -266,6 +266,8 @@ class ModelInvocationRecord(BaseModel):
             raise ValueError("ok invocation cannot have error_class")
         if self.status == "error" and not self.error_class:
             raise ValueError("error invocation requires error_class")
+        if self.status == "cancelled" and not self.error_class:
+            raise ValueError("cancelled invocation requires error_class")
         return self
 
 

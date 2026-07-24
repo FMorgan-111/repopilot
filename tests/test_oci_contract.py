@@ -509,6 +509,65 @@ def test_invalid_response_allows_sanitized_or_empty_error_class(
     assert record.model_invocations[0].error_class == error_class
 
 
+def test_cancelled_generation_invocation_accepts_normalized_exception_class() -> None:
+    invocation = _generation_invocation(
+        status="cancelled",
+        error_class="CancelledError",
+        output_tokens=0,
+    )
+
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_invocations=[invocation],
+            models_used=_models_used_for([invocation]),
+            test_generation_attempts=1,
+        )
+    )
+
+    assert record.model_invocations[0].status == "cancelled"
+    assert record.model_invocations[0].error_class == "CancelledError"
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    ["", "CancelledError: request secret", "api_key=cancel-secret"],
+)
+def test_cancelled_invocation_requires_safe_nonempty_error_class(
+    error_class: str,
+) -> None:
+    with pytest.raises(ValidationError, match="error_class"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=[
+                    _generation_invocation(
+                        status="cancelled",
+                        error_class=error_class,
+                        output_tokens=0,
+                    )
+                ],
+                test_generation_attempts=1,
+            )
+        )
+
+
+def test_cancelled_generation_cannot_prove_generated_coverage() -> None:
+    with pytest.raises(ValidationError, match="generated coverage requires"):
+        _result_record_model().model_validate(
+            _result_payload(
+                coverage_status="generated_verified",
+                coverage_proof=_coverage_proof(),
+                model_invocations=[
+                    _generation_invocation(
+                        status="cancelled",
+                        error_class="CancelledError",
+                        output_tokens=0,
+                    )
+                ],
+                test_generation_attempts=1,
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "error_class",
     ["gateway exploded", "ReadTimeout: secret-token", "api_key=secret-value"],

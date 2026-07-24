@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -8,6 +9,7 @@ from src.escalation import (
     EscalationPacket,
     build_escalation_packet,
     immediate_model_policy_reason,
+    record_model_invocation,
     render_escalation_packet,
 )
 from src.http_client import LLMResponseError
@@ -92,6 +94,26 @@ def test_empty_completion_after_transport_retries_is_an_immediate_policy_event()
     )
 
     assert reason == "empty_completion_after_retries"
+
+
+def test_model_invocation_helper_records_cancelled_status_with_class_only():
+    state = _escalated_state()
+
+    record_model_invocation(
+        state,
+        model=state.active_model,
+        provider=state.active_provider,
+        node="test_generation",
+        elapsed_seconds=0.1,
+        input_tokens=12,
+        output_tokens=0,
+        status="cancelled",
+        error=asyncio.CancelledError("do not persist cancellation details"),
+    )
+
+    invocation = state.model_history[-1]
+    assert invocation.status == "cancelled"
+    assert invocation.error_class == "CancelledError"
 
 
 def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
