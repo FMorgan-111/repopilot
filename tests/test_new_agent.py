@@ -1065,6 +1065,87 @@ async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
     assert secret not in emitted
 
 
+async def test_agent_v2_crash_payload_survives_safe_final_run_save_failure(
+    monkeypatch,
+    capsys,
+):
+    secret = "sk-savefailuresecret123456789"
+    saved_traces = []
+
+    async def crash_graph(_graph, state):
+        state.token_usage = 7
+        state.test_generation_attempts = 1
+        state.model_history.append(
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="test_generation",
+                elapsed_seconds=0.25,
+                input_tokens=7,
+                output_tokens=0,
+                status="cancelled",
+                error_class="CancelledError",
+            )
+        )
+        raise RuntimeError("provider failed")
+
+    def failing_save_run(_state):
+        raise ValueError(f"run file exceeds the size limit: {secret}")
+
+    def save_trace(tracer, path, state=None):
+        saved_traces.append(
+            {
+                "path": path,
+                "trace_id": tracer.trace_id,
+                "state": state.model_copy(deep=True),
+            }
+        )
+
+    monkeypatch.setattr(new_agent, "run_graph", crash_graph)
+    monkeypatch.setattr(new_agent, "save_run", failing_save_run)
+    monkeypatch.setattr(new_agent, "_save_trace", save_trace)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
+
+    assert payload["done"] is True
+    assert payload["success"] is False
+    assert payload["final_phase"] == "CRASHED"
+    assert payload["token_used"] == 7
+    assert payload["test_generation_attempts"] == 1
+    assert payload["model_history"][0]["status"] == "cancelled"
+    [trace] = saved_traces
+    assert trace["state"].current_phase == new_agent.Phase.FAILED
+    captured = capsys.readouterr()
+    emitted = json.dumps(payload) + captured.out + captured.err
+    assert secret not in emitted
+    assert "[REDACTED]" in captured.err
+
+
+def test_best_effort_save_run_reraises_drain_by_identity(monkeypatch):
+    sentinel = CancellationDrainError(
+        "run persistence",
+        asyncio.CancelledError("external cancel"),
+        OSError("save drain failed"),
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="trace-7",
+    )
+
+    def fail_with_drain(_state):
+        raise sentinel
+
+    monkeypatch.setattr(new_agent, "save_run", fail_with_drain)
+
+    with pytest.raises(CancellationDrainError) as raised:
+        new_agent._best_effort_save_run(state)
+
+    assert raised.value is sentinel
+
+
 async def test_agent_v2_reraises_graph_drain_error_by_identity(monkeypatch):
     sentinel = CancellationDrainError(
         "agent graph",

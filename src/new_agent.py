@@ -388,15 +388,15 @@ def _best_effort_save_run(state: AgentState) -> None:
 
     try:
         save_run(state)
-    except OSError as exc:
+    except CancellationDrainError:
+        raise
+    except Exception as exc:
+        error_summary = sanitize_summary_text(
+            f"{type(exc).__name__}: {exc}",
+            300,
+        ) or type(exc).__name__
         print(
-            f"[agent_v2] Failed to save run {state.trace_id}: {type(exc).__name__}: {exc}",
-            file=sys.stderr,
-            flush=True,
-        )
-    except PermissionError as exc:
-        print(
-            f"[agent_v2] Failed to save run {state.trace_id}: {type(exc).__name__}: {exc}",
+            f"[agent_v2] Failed to save run {state.trace_id}: {error_summary}",
             file=sys.stderr,
             flush=True,
         )
