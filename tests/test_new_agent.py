@@ -968,15 +968,20 @@ async def test_phase_timeout_preserves_existing_node_diagnostics(monkeypatch):
     assert final_state.node_diagnostics[-1]["status"] == "timeout"
 
 
-async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
+async def test_agent_v2_real_langgraph_crash_preserves_latest_state_and_run(
     monkeypatch,
     capsys,
+    tmp_path,
 ):
-    secret = "sk-crashtelemetrysecret123"
-    saved_runs = []
-    saved_traces = []
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
 
-    async def crash_graph(_graph, state):
+    secret = "sk-crashtelemetrysecret123"
+    run_root = tmp_path / ".repopilot"
+    trace_path = tmp_path / "trace.json"
+    real_save_trace = new_agent._save_trace
+
+    async def crash_after_telemetry(state):
         state.token_usage = 7
         state.test_generation_attempts = 1
         state.model_history.append(
@@ -997,22 +1002,22 @@ async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
         state.coverage_failure_reason = "test_generation_failed"
         raise RuntimeError(f"provider failed with {secret}")
 
-    def save_trace(tracer, path, state=None):
-        saved_traces.append(
-            {
-                "path": path,
-                "trace_id": tracer.trace_id,
-                "steps": list(tracer.steps),
-                "state": state.model_copy(deep=True),
-            }
-        )
+    def build_crashing_graph(*, start_phase):
+        del start_phase
+        builder = new_agent.StateGraph(new_agent.AgentState)
+        builder.add_node("crash_after_telemetry", crash_after_telemetry)
+        builder.set_entry_point("crash_after_telemetry")
+        return builder.compile()
 
-    monkeypatch.setattr(new_agent, "run_graph", crash_graph)
+    def save_trace(tracer, path, state=None):
+        real_save_trace(tracer, str(trace_path), state)
+
+    monkeypatch.setattr(new_agent, "build_agent_graph", build_crashing_graph)
     monkeypatch.setattr(new_agent, "_save_trace", save_trace)
     monkeypatch.setattr(
         new_agent,
         "save_run",
-        lambda state: saved_runs.append(state.model_copy(deep=True)),
+        lambda state: run_store.save_run(state, root_dir=run_root),
     )
 
     payload = await new_agent.agent_v2(
@@ -1047,7 +1052,7 @@ async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
     assert payload["error"].startswith("Graph crashed: RuntimeError:")
     assert len(payload["error"]) <= 500
 
-    [saved] = saved_runs
+    saved = run_store.load_run(payload["run_id"], root_dir=run_root)
     assert saved.current_phase == new_agent.Phase.FAILED
     assert saved.pending_human_input is False
     assert saved.human_input_request == {}
@@ -1056,11 +1061,12 @@ async def test_agent_v2_crash_payload_preserves_state_and_saves_terminal_run(
     assert saved.model_history[0].status == "cancelled"
     assert saved.coverage_failure_reason == "test_generation_failed"
 
-    [trace] = saved_traces
-    assert trace["state"].current_phase == new_agent.Phase.FAILED
-    assert trace["state"].issue_url == "https://github.com/acme/widget/issues/7"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["trace_id"] == payload["trace_id"]
+    assert trace["coverage_status"] == "failed"
+    assert trace["steps"][-1]["step"] == "agent_v2_crash"
     captured = capsys.readouterr()
-    emitted = json.dumps({"payload": payload, "steps": trace["steps"]})
+    emitted = json.dumps({"payload": payload, "trace": trace})
     emitted += captured.out + captured.err
     assert secret not in emitted
 

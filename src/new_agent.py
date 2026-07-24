@@ -20,6 +20,7 @@ from .graph import (
     FallbackCompiledGraph,
     FallbackStateGraph,
     StateGraph,
+    capture_graph_states,
     route_from_state,
     run_graph,
 )
@@ -455,9 +456,15 @@ async def agent_v2(
     print("[agent_v2] Building agent graph...", file=sys.stderr, flush=True)
     graph = build_agent_graph(start_phase=start_phase)
     print(f"[agent_v2] Running graph (trace={tracer.trace_id})...", file=sys.stderr, flush=True)
+    latest_graph_state = state
+
+    def observe_graph_state(candidate: AgentState) -> None:
+        nonlocal latest_graph_state
+        latest_graph_state = candidate
 
     try:
-        final_state = await run_graph(graph, state)
+        with capture_graph_states(observe_graph_state):
+            final_state = await run_graph(graph, state)
     except CancellationDrainError:
         raise
     except Exception as exc:
@@ -477,11 +484,15 @@ async def agent_v2(
             {"error": crash_error},
             error=crash_error,
         )
-        state.current_phase = Phase.FAILED
-        state.pending_human_input = False
-        state.human_input_request = {}
-        state.failure_reason = crash_error
-        payload = agent_payload_from_state(state, len(state.tool_calls))
+        crash_state = latest_graph_state.model_copy(deep=True)
+        crash_state.current_phase = Phase.FAILED
+        crash_state.pending_human_input = False
+        crash_state.human_input_request = {}
+        crash_state.failure_reason = crash_error
+        payload = agent_payload_from_state(
+            crash_state,
+            len(crash_state.tool_calls),
+        )
         payload.update(
             {
                 "done": True,
@@ -493,8 +504,12 @@ async def agent_v2(
             }
         )
         if save_final_run:
-            _best_effort_save_run(state)
-        _save_trace(tracer, f"examples/traces/trace_{tracer.trace_id}.json", state)
+            _best_effort_save_run(crash_state)
+        _save_trace(
+            tracer,
+            f"examples/traces/trace_{tracer.trace_id}.json",
+            crash_state,
+        )
         return payload
 
     elapsed = _time.monotonic() - t_start

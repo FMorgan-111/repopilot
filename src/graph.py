@@ -6,6 +6,9 @@ import asyncio
 import logging
 import sys
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 from .async_safety import CancellationDrainError, wait_for_phase
@@ -13,8 +16,10 @@ from .state import AgentState, NodeFn, Phase, _as_state, _record_node_diagnostic
 from .timeout_diagnostics import extract_timeout_cleanup_evidence
 
 try:  # pragma: no cover - exercised only when langgraph is installed.
+    from langchain_core.callbacks import BaseCallbackHandler
     from langgraph.graph import END, StateGraph
 except ImportError:  # pragma: no cover - fallback is covered by tests.
+    BaseCallbackHandler = object  # type: ignore[assignment,misc]
     END = "__end__"
     StateGraph = None
 
@@ -36,6 +41,44 @@ PHASE_TIMEOUTS: dict[str, float] = {
 }
 
 logger = logging.getLogger("repopilot.graph")
+
+_GraphStateObserver = Callable[[AgentState], None]
+_graph_state_observer: ContextVar[_GraphStateObserver | None] = ContextVar(
+    "repopilot_graph_state_observer",
+    default=None,
+)
+
+
+@contextmanager
+def capture_graph_states(observer: _GraphStateObserver) -> Iterator[None]:
+    """Observe live LangGraph node states without sharing them across runs."""
+    token = _graph_state_observer.set(observer)
+    try:
+        yield
+    finally:
+        _graph_state_observer.reset(token)
+
+
+class _GraphStateCaptureCallback(BaseCallbackHandler):  # type: ignore[misc]
+    """Keep a live reference so mutations remain visible when a node raises."""
+
+    def __init__(self, observer: _GraphStateObserver) -> None:
+        self._observer = observer
+
+    def _capture(self, value: Any) -> None:
+        if isinstance(value, AgentState):
+            self._observer(value)
+
+    def on_chain_start(
+        self,
+        _serialized: dict[str, Any] | None,
+        inputs: Any,
+        **_kwargs: Any,
+    ) -> None:
+        self._capture(inputs)
+
+    def on_chain_end(self, outputs: Any, **_kwargs: Any) -> None:
+        self._capture(outputs)
 
 _RECOMMENDED_PHASES: dict[str, Phase] = {
     "collect_more_context": Phase.LOCATE,
@@ -330,5 +373,17 @@ def _record_route_decision(
 
 
 async def run_graph(graph: Any, state: AgentState) -> AgentState:
-    result = await graph.ainvoke(state)
-    return _as_state(result)
+    observer = _graph_state_observer.get()
+    if observer is not None:
+        observer(state)
+    if observer is not None and not isinstance(graph, FallbackCompiledGraph):
+        result = await graph.ainvoke(
+            state,
+            config={"callbacks": [_GraphStateCaptureCallback(observer)]},
+        )
+    else:
+        result = await graph.ainvoke(state)
+    final_state = _as_state(result)
+    if observer is not None:
+        observer(final_state)
+    return final_state
