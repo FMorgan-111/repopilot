@@ -173,6 +173,8 @@ def _wrap_node(name: str, fn: Any, *, record_route_decision: bool = False) -> An
             if record_route_decision:
                 route_from_state(s)
             return s
+        except CancellationDrainError:
+            raise
         except Exception as exc:
             elapsed = _time.monotonic() - t0
             print(f"[{_time.strftime('%H:%M:%S')}] {name:24s} ERROR {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
@@ -454,6 +456,8 @@ async def agent_v2(
 
     try:
         final_state = await run_graph(graph, state)
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         elapsed = _time.monotonic() - t_start
         print(f"[agent_v2] Graph crashed after {elapsed:.1f}s: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)

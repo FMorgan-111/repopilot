@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 import src.nodes.execute as execute_node
+import src.nodes.commit as commit_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
 from src.async_safety import CancellationDrainError
@@ -670,6 +671,7 @@ async def test_fallback_graph_preserves_redacted_pr_cleanup_timeout_cause(
     assert "OSError" in final_state.failure_reason
     assert diagnostic["status"] == "timeout"
     assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
     assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
     assert diagnostic["cleanup_error_type"] == "OSError"
     assert diagnostic["cleanup_pr_number"] == 27
@@ -714,6 +716,7 @@ async def test_wrapped_node_preserves_redacted_pr_cleanup_timeout_cause(
     assert "RuntimeError" in final_state.failure_reason
     assert diagnostic["status"] == "timeout"
     assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
     assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
     assert diagnostic["cleanup_error_type"] == "RuntimeError"
     assert diagnostic["cleanup_pr_number"] == 31
@@ -758,6 +761,7 @@ async def test_built_fallback_graph_preserves_pr_cleanup_timeout_cause(
     diagnostic = final_state.node_diagnostics[-1]
     assert final_state.current_phase == new_agent.Phase.FAILURE
     assert diagnostic["status"] == "timeout"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
     assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
     assert diagnostic["cleanup_error_type"] == "OSError"
     assert diagnostic["cleanup_pr_number"] == 37
@@ -776,6 +780,103 @@ async def test_built_fallback_graph_preserves_pr_cleanup_timeout_cause(
     assert len(progress) == 2
     assert "START" in progress[0]
     assert "TIMEOUT" in progress[1]
+
+
+async def test_fallback_graph_reraises_direct_drain_error_by_identity():
+    sentinel = CancellationDrainError(
+        "fallback graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    compiled = graph.FallbackCompiledGraph(
+        {"plan_fix": fail_with_drain}, "plan_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await compiled.ainvoke(state)
+
+    assert caught.value is sentinel
+
+
+async def test_wrapped_node_reraises_direct_drain_error_by_identity():
+    sentinel = CancellationDrainError(
+        "wrapped node",
+        asyncio.CancelledError("external cancel"),
+        RuntimeError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    wrapped = new_agent._wrap_node("commit_fix", fail_with_drain)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await wrapped(state)
+
+    assert caught.value is sentinel
+
+
+async def test_real_wrapped_commit_timeout_retains_cleanup_evidence(
+    monkeypatch,
+):
+    binding = object()
+
+    async def pushed(_state, actual_binding):
+        assert actual_binding is binding
+        return {
+            "head_sha": "d" * 40,
+            "commit_chain": ["d" * 40],
+            "repository_identity": {"full_name": "acme/widget"},
+            "files": [],
+        }
+
+    async def create_pr_fails_on_cancel(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            cleanup_error = OSError("close failed after commit timeout")
+            raise PRCancellationCleanupError(
+                73, cancellation, cleanup_error
+            ) from cleanup_error
+
+    monkeypatch.setattr(
+        commit_node, "validate_terminal_coverage_binding", lambda _state: binding
+    )
+    monkeypatch.setattr(commit_node, "push_files", pushed)
+    monkeypatch.setattr(commit_node, "create_pr", create_pr_fails_on_cancel)
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    wrapped = new_agent._wrap_node("commit_fix", new_agent.commit_fix)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-real-commit-timeout",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "PR cancellation cleanup failed for pull request 73" in (
+        final_state.failure_reason
+    )
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_error"] == "close failed after commit timeout"
+    assert diagnostic["cleanup_pr_number"] == 73
 
 
 async def test_fallback_graph_does_not_persist_direct_timeout_message():
@@ -875,6 +976,25 @@ async def test_agent_v2_crash_payload_exposes_human_input_defaults(monkeypatch):
     assert payload["final_phase"] == "CRASHED"
     assert payload["human_input_request"] == {}
     assert saved_traces[0]["state"].issue_url == "https://github.com/acme/widget/issues/7"
+
+
+async def test_agent_v2_reraises_graph_drain_error_by_identity(monkeypatch):
+    sentinel = CancellationDrainError(
+        "agent graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("graph drain failed"),
+    )
+
+    async def fail_with_drain(_graph, _state):
+        raise sentinel
+
+    monkeypatch.setattr(new_agent, "run_graph", fail_with_drain)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+
+    assert caught.value is sentinel
 
 
 async def test_agent_v2_saves_waiting_for_user_run(monkeypatch, tmp_path):

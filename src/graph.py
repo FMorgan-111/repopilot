@@ -8,7 +8,7 @@ import sys
 import time
 from typing import Any
 
-from .async_safety import wait_for_phase
+from .async_safety import CancellationDrainError, wait_for_phase
 from .state import AgentState, NodeFn, Phase, _as_state, _record_node_diagnostic
 from .timeout_diagnostics import extract_timeout_cleanup_evidence
 
@@ -107,6 +107,8 @@ class FallbackCompiledGraph:
                     f"{timeout}s limit exceeded"
                 )
                 return working
+            except CancellationDrainError:
+                raise
             except Exception as exc:
                 elapsed = time.monotonic() - t0
                 working.failure_reason = (

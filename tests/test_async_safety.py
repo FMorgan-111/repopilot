@@ -9,6 +9,15 @@ from src.async_safety import (
     drain_task,
     wait_for_phase,
 )
+from src.nodes.commit import (
+    PRCancellationCleanupError,
+    PRCancellationTransactionError,
+)
+from src import timeout_diagnostics
+from src.timeout_diagnostics import (
+    TimeoutCleanupEvidence,
+    extract_timeout_cleanup_evidence,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -259,3 +268,176 @@ async def test_cancellation_drain_error_preserves_objects_by_identity():
     assert error.operation == "store write"
     assert error.cancellation is cancellation
     assert error.cleanup_error is cleanup_error
+
+
+async def test_generic_oci_drain_evidence_has_exact_safe_interface():
+    cancellation = asyncio.CancelledError("do not inspect cancellation args")
+    cleanup_error = OSError(" socket   cleanup\nfailed ")
+    drain = CancellationDrainError(
+        " OCI   container\ncleanup ", cancellation, cleanup_error
+    )
+
+    evidence = extract_timeout_cleanup_evidence(drain)
+
+    assert evidence == TimeoutCleanupEvidence(
+        failure_kind="generic_drain",
+        cause_type="CancellationDrainError",
+        cleanup_error_type="OSError",
+        cleanup_error="socket cleanup failed",
+        operation="OCI container cleanup",
+    )
+    assert list(TimeoutCleanupEvidence.__dataclass_fields__) == [
+        "failure_kind",
+        "cause_type",
+        "cleanup_error_type",
+        "cleanup_error",
+        "operation",
+        "pr_number",
+    ]
+    assert evidence.diagnostic_details() == {
+        "timeout_cleanup_kind": "generic_drain",
+        "timeout_cause_type": "CancellationDrainError",
+        "cleanup_error_type": "OSError",
+        "cleanup_error": "socket cleanup failed",
+        "cleanup_operation": "OCI container cleanup",
+    }
+    assert evidence.summary().startswith(
+        "Cancellation cleanup failed during OCI container cleanup"
+    )
+
+
+async def test_pr_transaction_evidence_uses_transaction_error():
+    cancellation = asyncio.CancelledError("cancel transaction")
+    transaction_error = ValueError(" transaction   failed ")
+    drain = PRCancellationTransactionError(
+        19, cancellation, transaction_error
+    )
+    drain.cleanup_error = AssertionError("must not be reported as cleanup")
+
+    evidence = extract_timeout_cleanup_evidence(drain)
+
+    assert evidence == TimeoutCleanupEvidence(
+        failure_kind="pr_transaction",
+        cause_type="PRCancellationTransactionError",
+        cleanup_error_type="ValueError",
+        cleanup_error="transaction failed",
+        pr_number=19,
+    )
+    assert evidence.diagnostic_details() == {
+        "timeout_cleanup_kind": "pr_transaction",
+        "timeout_cause_type": "PRCancellationTransactionError",
+        "cleanup_error_type": "ValueError",
+        "cleanup_error": "transaction failed",
+        "cleanup_pr_number": 19,
+    }
+    assert evidence.summary().startswith(
+        "PR cancellation transaction failed for pull request 19"
+    )
+    assert "cleanup failed" not in evidence.summary()
+
+
+async def test_breadth_first_search_prefers_first_pr_drain_over_generic():
+    cancellation = asyncio.CancelledError("cancel")
+    deep_pr = PRCancellationCleanupError(
+        42, cancellation, OSError("deep cleanup")
+    )
+    generic = CancellationDrainError(
+        "generic cleanup", cancellation, deep_pr
+    )
+    shallow_pr = PRCancellationCleanupError(
+        41, cancellation, RuntimeError("shallow cleanup")
+    )
+    root = asyncio.TimeoutError()
+    root.__cause__ = generic
+    root.__context__ = shallow_pr
+
+    evidence = extract_timeout_cleanup_evidence(root)
+
+    assert evidence is not None
+    assert evidence.failure_kind == "pr_cleanup"
+    assert evidence.pr_number == 41
+    assert evidence.cleanup_error == "shallow cleanup"
+
+
+async def test_timeout_evidence_identity_seen_does_not_spend_depth_on_diamond_cycle():
+    cancellation = asyncio.CancelledError("cancel")
+    expected = PRCancellationCleanupError(
+        53, cancellation, OSError("bounded cleanup")
+    )
+    root = RuntimeError("root")
+    left = RuntimeError("left")
+    right = RuntimeError("right")
+    shared = RuntimeError("shared")
+    left_context = RuntimeError("left context")
+    right_context = RuntimeError("right context")
+    cycle = RuntimeError("cycle")
+    root.__cause__, root.__context__ = left, right
+    left.__cause__, left.__context__ = shared, left_context
+    right.__cause__, right.__context__ = shared, right_context
+    shared.__cause__, shared.__context__ = cycle, expected
+    cycle.__cause__ = root
+
+    evidence = extract_timeout_cleanup_evidence(root)
+
+    assert evidence is not None
+    assert evidence.pr_number == 53
+
+
+async def test_timeout_evidence_never_visits_beyond_maximum_depth():
+    cancellation = asyncio.CancelledError("cancel")
+    hidden = PRCancellationCleanupError(
+        59, cancellation, OSError("too deep")
+    )
+    chain = [
+        RuntimeError(f"level {index}")
+        for index in range(timeout_diagnostics._MAX_CAUSE_DEPTH)
+    ]
+    for current, following in zip(chain, chain[1:]):
+        current.__cause__ = following
+    chain[-1].__cause__ = hidden
+
+    assert extract_timeout_cleanup_evidence(chain[0]) is None
+
+
+@pytest.mark.parametrize("pr_number", [True, 0, -1])
+async def test_pr_cleanup_evidence_rejects_non_positive_strict_int(pr_number):
+    drain = PRCancellationCleanupError(
+        pr_number,
+        asyncio.CancelledError("cancel"),
+        OSError("cleanup failed"),
+    )
+
+    evidence = extract_timeout_cleanup_evidence(drain)
+
+    assert evidence is not None
+    assert evidence.pr_number is None
+    assert "cleanup_pr_number" not in evidence.diagnostic_details()
+    assert evidence.summary().startswith(
+        "PR cancellation cleanup failed for an unknown pull request"
+    )
+
+
+async def test_generic_evidence_redacts_and_bounds_all_rendered_text():
+    secret = "sk-timeout-evidence-secret-123456789"
+    long_error_type = type("X" * 500 + "Error", (RuntimeError,), {})
+    cleanup_error = long_error_type(
+        f" Authorization: Bearer {secret} " + " failure" * 100
+    )
+    cancellation = asyncio.CancelledError(f"cancellation token={secret}")
+    drain = CancellationDrainError(
+        f" OCI cleanup token={secret} " + " operation" * 100,
+        cancellation,
+        cleanup_error,
+    )
+
+    evidence = extract_timeout_cleanup_evidence(drain)
+
+    assert evidence is not None
+    assert len(evidence.operation) <= timeout_diagnostics._MAX_OPERATION
+    assert len(evidence.cleanup_error) <= timeout_diagnostics._MAX_ERROR_SUMMARY
+    assert len(evidence.summary()) <= timeout_diagnostics._MAX_EVIDENCE_SUMMARY
+    rendered = str(evidence.diagnostic_details()) + evidence.summary()
+    assert secret not in rendered
+    assert "[REDACTED]" in rendered
+    assert "  " not in evidence.operation
+    assert "\n" not in evidence.cleanup_error
