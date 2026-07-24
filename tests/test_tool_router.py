@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from src.async_safety import CancellationDrainError
 from src.evidence import EvidenceStore
 from src.safe_subprocess import BoundedProcessResult
 from src.state import (
@@ -245,6 +246,44 @@ async def test_targeted_test_uses_fixed_argv_without_shell(tmp_path, monkeypatch
     assert captured["root"] != root_repo
     assert captured["sandbox"].workspace == captured["root"]
     assert "one passed" in state.evidence[-1].content
+
+
+async def test_targeted_test_reraises_cancellation_drain_without_tool_error(
+    tmp_path,
+    monkeypatch,
+):
+    root, commit = _repo(tmp_path)
+    state = _state(root, commit)
+    cancellation = asyncio.CancelledError("cancel targeted test")
+    cleanup_error = RuntimeError("targeted test cleanup failed")
+    sentinel = CancellationDrainError(
+        "targeted test",
+        cancellation,
+        cleanup_error,
+    )
+
+    async def cancelled_oci(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(
+        "src.tool_router.run_oci_process_async",
+        cancelled_oci,
+        raising=False,
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await route_tool_intent(
+            state,
+            _intent(
+                "run_targeted_test",
+                command="pytest tests/test_widget.py::test_render -q",
+            ),
+            calls_this_round=0,
+        )
+
+    assert raised.value is sentinel
+    assert state.tool_history == []
+    assert state.evidence == []
 
 
 async def test_targeted_test_route_fails_closed_when_oci_is_unconfigured(tmp_path):

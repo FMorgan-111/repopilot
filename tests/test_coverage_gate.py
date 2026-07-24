@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from src.async_safety import CancellationDrainError
 from src.coverage_gate import (
     CoverageCandidate,
     collect_changed_targets,
@@ -20,6 +21,7 @@ from src.state import (
     AgentState,
     GeneratedTestApproval,
     SnapshotManifestEntry,
+    TestRunFingerprint as RunFingerprint,
     ToolPatchApproval,
     ToolSandboxConfig,
     tool_manifest_fingerprint,
@@ -171,6 +173,44 @@ async def test_differential_coverage_never_runs_repository_code_on_host(
     assert len({str(path) for path in workspaces}) == 4
     assert sentinel not in decision.model_dump_json()
     assert sentinel not in state.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("recovery", "expected_calls"),
+    [("fixed", 1), ("base", 3)],
+)
+@pytest.mark.asyncio
+async def test_differential_coverage_reraises_cancellation_drain(
+    differential_repo,
+    monkeypatch,
+    recovery,
+    expected_calls,
+):
+    _root, _base_ref, state, candidate = differential_repo
+    cancellation = asyncio.CancelledError(f"cancel {recovery} run")
+    cleanup_error = RuntimeError(f"{recovery} cleanup failed")
+    sentinel = CancellationDrainError(
+        f"coverage {recovery}",
+        cancellation,
+        cleanup_error,
+    )
+    calls = 0
+
+    async def run(_state, _candidate, *, apply_approved_changes):
+        nonlocal calls
+        calls += 1
+        if recovery == "fixed" or not apply_approved_changes:
+            raise sentinel
+        return RunFingerprint(exit_code=0, outcome="pass", summary="pass")
+
+    monkeypatch.setattr("src.coverage_gate._run_isolated_candidate", run)
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await validate_differential_coverage(state, candidate)
+
+    assert raised.value is sentinel
+    assert calls == expected_calls
+    assert state.coverage_proof is None
 
 
 @pytest.mark.asyncio

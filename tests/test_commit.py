@@ -300,6 +300,45 @@ def _attach_proof(state: AgentState) -> None:
 
 
 @pytest.mark.asyncio
+async def test_commit_fix_reraises_create_pr_cancellation_cleanup_error(
+    tmp_path,
+    monkeypatch,
+):
+    state = _state(tmp_path)
+    _attach_proof(state)
+    cancellation = asyncio.CancelledError("cancel commit")
+    cleanup_error = RuntimeError("PR cleanup failed")
+    sentinel = commit_node.PRCancellationCleanupError(
+        12,
+        cancellation,
+        cleanup_error,
+    )
+
+    async def pushed(_state, _binding):
+        return {
+            "head_sha": "d" * 40,
+            "commit_chain": ["d" * 40],
+            "repository_identity": _repo_identity(state),
+            "files": [],
+        }
+
+    async def cancelled(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(commit_node, "push_files", pushed)
+    monkeypatch.setattr(commit_node, "create_pr", cancelled)
+
+    with pytest.raises(commit_node.PRCancellationCleanupError) as raised:
+        await commit_node.commit_fix(state)
+
+    assert raised.value is sentinel
+    assert raised.value.cancellation is cancellation
+    assert raised.value.cleanup_error is cleanup_error
+    assert state.failure_reason == ""
+    assert all(call.tool_name != "commit_fix" for call in state.tool_calls)
+
+
+@pytest.mark.asyncio
 async def test_push_files_uses_manifest_targets_and_base_blob_sha(
     tmp_path,
     monkeypatch,

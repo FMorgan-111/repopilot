@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from src import tool_policy
+from src.async_safety import CancellationDrainError
 from src.nodes import execute as execute_node
 from src.patch_gate import validate_patch_batch
 from src.safe_subprocess import BoundedProcessResult, minimal_subprocess_env
@@ -100,6 +101,68 @@ def _approved_state(tmp_path: Path, *, command: str) -> AgentState:
     assert validate_patch_batch(state, plan, batch).accepted
     assert state.tool_patch_approval is not None
     return state
+
+
+async def test_execute_reraises_cancellation_drain_from_clone_recovery(
+    monkeypatch,
+):
+    cancellation = asyncio.CancelledError("cancel clone")
+    cleanup_error = RuntimeError("clone cleanup failed")
+    sentinel = CancellationDrainError("clone", cancellation, cleanup_error)
+
+    async def cancelled_clone(_state):
+        raise sentinel
+
+    monkeypatch.setattr(
+        execute_node,
+        "repository_execution_mode",
+        lambda _state: "unsafe_host",
+    )
+    monkeypatch.setattr(execute_node, "git_clone", cancelled_clone)
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        patch_content="diff --git a/a.py b/a.py\n",
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await execute_node.execute_fix(state)
+
+    assert raised.value is sentinel
+    assert state.fix_attempts == []
+
+
+async def test_execute_reraises_cancellation_drain_from_outer_recovery(
+    tmp_path,
+    monkeypatch,
+):
+    cancellation = asyncio.CancelledError("cancel patch")
+    cleanup_error = RuntimeError("patch cleanup failed")
+    sentinel = CancellationDrainError("patch apply", cancellation, cleanup_error)
+
+    async def cancelled_patch(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(
+        execute_node,
+        "repository_execution_mode",
+        lambda _state: "unsafe_host",
+    )
+    monkeypatch.setattr(
+        execute_node,
+        "apply_patch_with_repair",
+        cancelled_patch,
+    )
+    state = AgentState(
+        issue_url="https://github.com/acme/widget/issues/1",
+        repo_path=str(tmp_path),
+        patch_content="diff --git a/a.py b/a.py\n",
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await execute_node.execute_fix(state)
+
+    assert raised.value is sentinel
+    assert state.fix_attempts == []
 
 
 @pytest.mark.parametrize("unsafe_value", [None, "", "0", "true", "01", "1 "])

@@ -406,6 +406,8 @@ async def run_test_generation_attempts(
             break
         snapshot: dict[str, bytes | None] = {}
         applied = False
+        pending_drain: CancellationDrainError | None = None
+        rollback_error: BaseException | None = None
         try:
             batch = await request_test_batch(state, reason)
             if _is_budget_exceeded(state):
@@ -476,8 +478,8 @@ async def run_test_generation_attempts(
                     state.coverage_failure_reason = ""
                     return decision
                 reason = decision.reason
-        except CancellationDrainError:
-            raise
+        except CancellationDrainError as error:
+            pending_drain = error
         except _TestGenerationPreflightError:
             reason = _TEST_GENERATION_PREFLIGHT_REASON
             last = _failed(reason)
@@ -499,7 +501,8 @@ async def run_test_generation_attempts(
             if applied and not last.verified:
                 try:
                     _restore_test_files(root, snapshot)
-                except (OSError, RuntimeError):
+                except (OSError, RuntimeError) as error:
+                    rollback_error = error
                     reason = "generated_test_rollback_failed"
                     last = _failed(reason)
                     _restore_production_state(state, production)
@@ -507,9 +510,15 @@ async def run_test_generation_attempts(
                     state.coverage_failure_reason = reason
                     state.coverage_proof = None
                     state.pr_url = None
-                    return last
+                    if pending_drain is None:
+                        return last
             if not last.verified:
                 _restore_production_state(state, production)
+
+        if pending_drain is not None:
+            if rollback_error is not None:
+                raise pending_drain from rollback_error
+            raise pending_drain
 
         if state.test_generation_attempts == 1 and state.active_provider == "primary":
             if escalation_is_configured():

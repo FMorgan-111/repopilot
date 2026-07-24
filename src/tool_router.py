@@ -13,6 +13,7 @@ from typing import Iterator, Literal, Sequence
 
 from pydantic import BaseModel
 
+from .async_safety import CancellationDrainError
 from .evidence import EvidenceCapacityError, EvidenceStore
 from .local_search import (
     find_local_references,
@@ -821,6 +822,8 @@ async def route_tool_intent(
             evidence_id=added.evidence.evidence_id,
             made_progress=added.added,
         )
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         error_class = type(exc).__name__
         state.tool_history.append(

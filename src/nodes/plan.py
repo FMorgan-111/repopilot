@@ -9,6 +9,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
+from ..async_safety import CancellationDrainError
 from ..escalation import (
     EscalationPacket,
     immediate_model_policy_reason,
@@ -1072,6 +1073,8 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     if not tool_step.handled:
                         has_explicit_frame = "decision_frame" in response
                         decision = _normalize_plan_decision(response)
+        except CancellationDrainError:
+            raise
         except Exception as exc:
             elapsed = time.monotonic() - t0
             immediate_reason = immediate_model_policy_reason(exc)

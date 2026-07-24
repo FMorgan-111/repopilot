@@ -5,6 +5,7 @@ import logging
 import pytest
 
 from src import new_agent
+from src.async_safety import CancellationDrainError
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 
@@ -63,6 +64,41 @@ async def test_plan_fix_records_plan_decision_frame(monkeypatch):
         "collect_more_context",
     ]:
         assert key in calls[0]["system"]
+
+
+async def test_plan_tool_cancellation_drain_is_not_model_error(monkeypatch):
+    cancellation = asyncio.CancelledError("cancel plan tool")
+    cleanup_error = RuntimeError("plan tool cleanup failed")
+    sentinel = CancellationDrainError("plan tool", cancellation, cleanup_error)
+
+    async def model_selects_tool(*_args, **_kwargs):
+        return {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "submit"},
+                "reason": "find the failing path",
+                "expected_evidence": "the submit implementation",
+            },
+        }
+
+    async def cancelled_tool(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(plan_node, "llm_call", model_selects_tool)
+    monkeypatch.setattr(plan_node, "route_tool_intent", cancelled_tool)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await plan_node.plan_fix(state)
+
+    assert raised.value is sentinel
+    assert not any(item.status == "error" for item in state.model_history)
 
 
 async def test_reflect_summarizes_only_after_recording_valid_frame(monkeypatch):
@@ -151,6 +187,48 @@ async def test_reflect_error_replaces_outcome_summary_exactly_once(monkeypatch):
         "replacement outcome after reflection error"
     )
     assert next_state.current_phase == new_agent.Phase.PLAN
+
+
+async def test_reflect_tool_cancellation_drain_is_not_model_error(monkeypatch):
+    cancellation = asyncio.CancelledError("cancel reflect tool")
+    cleanup_error = RuntimeError("reflect tool cleanup failed")
+    sentinel = CancellationDrainError("reflect tool", cancellation, cleanup_error)
+
+    async def model_selects_tool(*_args, **_kwargs):
+        return {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "submit"},
+                "reason": "find the failed path",
+                "expected_evidence": "the submit implementation",
+            },
+        }
+
+    async def cancelled_tool(*_args, **_kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(reflect_node, "llm_call", model_selects_tool)
+    monkeypatch.setattr(reflect_node, "route_tool_intent", cancelled_tool)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Login crash",
+        issue_body="Crashes after submit.",
+        current_phase=new_agent.Phase.REFLECT,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                test_result="failed",
+                failure_kind="assertion_failure",
+                error_log="assert submit was not called",
+            )
+        ],
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await reflect_node.reflect_on_failure(state)
+
+    assert raised.value is sentinel
+    assert not any(item.status == "error" for item in state.model_history)
 
 
 async def test_plan_fix_records_search_replace_patch_edits(monkeypatch):

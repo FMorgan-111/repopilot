@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..async_safety import CancellationDrainError
 from ..patch_match import (
     find_normalized_span,
     leading_spaces,
@@ -1390,6 +1391,8 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         if not state.repo_path:
             try:
                 state.repo_path = await git_clone(state)
+            except CancellationDrainError:
+                raise
             except Exception as exc:
                 attempt.test_result = "execution_error"
                 attempt.failure_kind = "infra_error"
@@ -1549,6 +1552,8 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
             test_result,
         )
 
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         attempt.test_result = "execution_error"
         attempt.failure_kind = (

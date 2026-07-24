@@ -395,6 +395,105 @@ async def test_rollback_failure_hard_stops_without_second_request_or_prediction_
 
 
 @pytest.mark.asyncio
+async def test_applied_test_cancellation_drain_rolls_back_before_reraise(
+    generation_state,
+    monkeypatch,
+):
+    root = Path(generation_state.repo_path)
+    original_plan = generation_state.active_repair_plan.model_copy(deep=True)
+    original_edits = [
+        edit.model_copy(deep=True) for edit in generation_state.patch_edits
+    ]
+    original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
+    original_patch = generation_state.patch_content
+    cancellation = asyncio.CancelledError("cancel generated coverage")
+    cleanup_error = RuntimeError("coverage cleanup failed")
+    sentinel = CancellationDrainError(
+        "generated coverage",
+        cancellation,
+        cleanup_error,
+    )
+
+    async def good(*_args, **_kwargs):
+        return _good_batch().model_dump()
+
+    async def cancelled(_state, _candidate):
+        raise sentinel
+
+    monkeypatch.setattr("src.test_generator.llm_call", good)
+    monkeypatch.setattr(
+        "src.test_generator.validate_differential_coverage",
+        cancelled,
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert raised.value is sentinel
+    assert raised.value.cancellation is cancellation
+    assert raised.value.cleanup_error is cleanup_error
+    assert not (root / "tests" / "test_answer.py").exists()
+    assert generation_state.active_repair_plan == original_plan
+    assert generation_state.patch_edits == original_edits
+    assert generation_state.tool_patch_approval == original_approval
+    assert generation_state.patch_content == original_patch
+    assert generation_state.coverage_failure_reason == ""
+
+
+@pytest.mark.asyncio
+async def test_applied_test_rollback_failure_chains_under_pending_drain(
+    generation_state,
+    monkeypatch,
+):
+    original_plan = generation_state.active_repair_plan.model_copy(deep=True)
+    original_edits = [
+        edit.model_copy(deep=True) for edit in generation_state.patch_edits
+    ]
+    original_approval = generation_state.tool_patch_approval.model_copy(deep=True)
+    original_patch = generation_state.patch_content
+    cancellation = asyncio.CancelledError("cancel generated coverage")
+    cleanup_error = RuntimeError("coverage cleanup failed")
+    rollback_error = RuntimeError("generated test rollback failed")
+    sentinel = CancellationDrainError(
+        "generated coverage",
+        cancellation,
+        cleanup_error,
+    )
+
+    async def good(*_args, **_kwargs):
+        return _good_batch().model_dump()
+
+    async def cancelled(_state, _candidate):
+        raise sentinel
+
+    def failed_rollback(*_args):
+        raise rollback_error
+
+    monkeypatch.setattr("src.test_generator.llm_call", good)
+    monkeypatch.setattr(
+        "src.test_generator.validate_differential_coverage",
+        cancelled,
+    )
+    monkeypatch.setattr(
+        "src.test_generator._restore_test_files",
+        failed_rollback,
+    )
+
+    with pytest.raises(CancellationDrainError) as raised:
+        await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert raised.value is sentinel
+    assert raised.value.cancellation is cancellation
+    assert raised.value.cleanup_error is cleanup_error
+    assert raised.value.__cause__ is rollback_error
+    assert generation_state.active_repair_plan == original_plan
+    assert generation_state.patch_edits == original_edits
+    assert generation_state.tool_patch_approval == original_approval
+    assert generation_state.patch_content == original_patch
+    assert generation_state.coverage_failure_reason == ""
+
+
+@pytest.mark.asyncio
 async def test_already_escalated_provider_never_downgrades(
     generation_state,
     monkeypatch,

@@ -23,6 +23,7 @@ from typing import Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .async_safety import CancellationDrainError
 from .evaluator_safety import sanitize_evaluator_text
 from .model_provider import redact_secrets
 from .repo_paths import canonical_repo_path
@@ -926,6 +927,8 @@ async def validate_differential_coverage(
             )
             for _ in range(2)
         ]
+    except CancellationDrainError:
+        raise
     except (OSError, RuntimeError, ValueError):
         return _decision(candidate, "coverage_infra")
     if any(run.outcome != "pass" for run in fixed_runs):
@@ -941,6 +944,8 @@ async def validate_differential_coverage(
             )
             for _ in range(2)
         ]
+    except CancellationDrainError:
+        raise
     except (OSError, RuntimeError, ValueError):
         return _decision(candidate, "coverage_infra", fixed_runs=fixed_runs)
 

@@ -1041,6 +1041,8 @@ async def commit_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 state.owner, state.repo, state.issue_number, success=True
             )
         )
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         _record_tool(state, "commit_fix", {}, error=str(exc))
         state.failure_reason = f"Failed to push or create PR: {exc}"
