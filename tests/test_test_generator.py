@@ -1029,6 +1029,8 @@ async def test_direct_cancellation_is_recorded_and_reraised_by_identity(
 
     async def cancelled(_system, prompt, **_kwargs):
         captured["prompt"] = prompt
+        generation_state.active_provider = "escalation"
+        generation_state.active_model = "claude-opus-4-8:stable"
         raise error
 
     monkeypatch.setattr("src.test_generator._estimate_tokens", estimate)
@@ -1044,6 +1046,8 @@ async def test_direct_cancellation_is_recorded_and_reraised_by_identity(
     assert token_estimates == [(_SYSTEM_PROMPT, captured["prompt"])]
     assert len(generation_state.model_history) == 1
     invocation = generation_state.model_history[0]
+    assert invocation.model == "gemini-3.5-flash:stable"
+    assert invocation.provider == "primary"
     assert invocation.node == "test_generation"
     assert invocation.status == "cancelled"
     assert invocation.input_tokens == expected_input
@@ -1071,6 +1075,8 @@ async def test_cancellation_drain_is_recorded_and_reraised_without_losing_eviden
 
     async def cancelled(_system, prompt, **_kwargs):
         captured["prompt"] = prompt
+        generation_state.active_provider = "escalation"
+        generation_state.active_model = "claude-opus-4-8:stable"
         raise error
 
     monkeypatch.setattr("src.test_generator.llm_call", cancelled)
@@ -1086,6 +1092,8 @@ async def test_cancellation_drain_is_recorded_and_reraised_without_losing_eviden
     assert generation_state.token_usage == expected_input
     assert len(generation_state.model_history) == 1
     invocation = generation_state.model_history[0]
+    assert invocation.model == "gemini-3.5-flash:stable"
+    assert invocation.provider == "primary"
     assert invocation.node == "test_generation"
     assert invocation.status == "cancelled"
     assert invocation.input_tokens == expected_input

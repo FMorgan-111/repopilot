@@ -7,7 +7,9 @@ from types import SimpleNamespace
 import pytest
 
 from eval import agent_v2_harness, swe_bench
-from eval.oci_contract import ResultRecord
+from eval.oci_aggregate import aggregate_artifacts
+from eval.oci_contract import OfficialResult, RuntimeRecord, write_model
+from eval.oci_runner import package_instance
 
 
 def coverage_proof():
@@ -611,6 +613,7 @@ async def test_eval_result_exposes_safe_success_first_fields(monkeypatch):
 @pytest.mark.parametrize("attempts", [1, 2])
 async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
     monkeypatch,
+    tmp_path,
     attempts,
 ):
     invocations = [
@@ -689,7 +692,81 @@ async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
 
     assert result["test_generation_attempts"] == attempts
     assert len(result["model_invocations"]) == attempts
-    assert ResultRecord.model_validate(result).test_generation_attempts == attempts
+
+    raw_row = {
+        "repo": "acme/widget",
+        "instance_id": "acme__widget-8",
+        "base_commit": "a" * 40,
+        "patch": "",
+        "test_patch": "",
+        "problem_statement": "Login crash",
+        "hints_text": "",
+        "created_at": "2026-01-01",
+        "version": "1.0",
+        "FAIL_TO_PASS": "[]",
+        "PASS_TO_PASS": "[]",
+        "environment_setup_commit": "e" * 40,
+        "difficulty": "medium",
+    }
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    runtime_path = write_model(
+        output_dir / "runtime.json",
+        RuntimeRecord(
+            mode="checkpoint_5",
+            instance_id="acme__widget-8",
+            row_sha256=swe_bench.verified_row_sha256(raw_row),
+            commit_sha="a" * 40,
+            status="ready",
+            remote_image=(
+                "swebench/sweb.eval.x86_64.acme_widget-8:latest"
+            ),
+            image_sha="sha256:" + "b" * 64,
+        ),
+    )
+    (output_dir / "result.json").write_text(
+        json.dumps([result]) + "\n",
+        encoding="utf-8",
+    )
+    swe_bench.write_predictions([result], output_dir / "prediction.jsonl")
+    write_model(
+        output_dir / "official_result.json",
+        OfficialResult(
+            instance_id="acme__widget-8",
+            status="empty_patch",
+            submitted=True,
+            completed=False,
+            resolved=False,
+        ),
+    )
+    artifacts_dir = tmp_path / "artifacts"
+    package_instance(
+        runtime_path,
+        output_dir,
+        artifacts_dir / "bundle-acme__widget-8",
+        row_loader=lambda _instance_id: raw_row,
+    )
+    repo_root = tmp_path / "repo"
+    eval_dir = repo_root / "eval"
+    eval_dir.mkdir(parents=True)
+    (eval_dir / "checkpoint_5_ids.txt").write_text(
+        "acme__widget-8\n",
+        encoding="utf-8",
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts_dir,
+        tmp_path / "combined",
+        expected_commit="a" * 40,
+        repo_root=repo_root,
+    )
+    [aggregated] = json.loads(
+        (summary_path.parent / "results.json").read_text(encoding="utf-8")
+    )
+
+    assert aggregated["test_generation_attempts"] == attempts
+    assert aggregated["model_invocations"] == invocations
 
 
 @pytest.mark.parametrize(

@@ -8,6 +8,7 @@ from eval.failure_taxonomy import (
     classify_sample,
     summarize,
 )
+from eval.safe_contracts import has_structured_model_gateway_failure
 from src import new_agent
 from src.model_policy import record_progress
 from src.state import PatchEdit
@@ -176,6 +177,32 @@ def test_structured_model_invocation_error_is_model_gateway_infra():
     }
 
     assert classify_sample(sample)["decisive"] == "model_gateway_infra"
+
+
+@pytest.mark.parametrize(
+    ("status", "is_gateway_failure"),
+    [("cancelled", False), ("error", True)],
+)
+def test_cancelled_invocation_is_not_structured_gateway_failure(
+    status,
+    is_gateway_failure,
+):
+    sample = {
+        "id": "a",
+        "success": False,
+        "model_invocations": [
+            {
+                "node": "test_generation",
+                "status": status,
+                "error_class": "APITimeoutError",
+            }
+        ],
+    }
+
+    assert has_structured_model_gateway_failure(sample) is is_gateway_failure
+    assert (
+        classify_sample(sample)["decisive"] == "model_gateway_infra"
+    ) is is_gateway_failure
 
 
 def test_safe_model_failure_code_is_model_gateway_infra():
