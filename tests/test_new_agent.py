@@ -818,6 +818,31 @@ async def test_fallback_graph_reraises_direct_drain_error_by_identity():
     assert caught.value is sentinel
 
 
+async def test_run_graph_observer_keeps_fallback_ainvoke_signature():
+    observed = []
+
+    async def finish(state):
+        state.token_usage = 19
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    compiled = graph.FallbackCompiledGraph(
+        {"handle_failure": finish},
+        "handle_failure",
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.FAILURE,
+    )
+
+    with graph.capture_graph_states(observed.append):
+        result = await graph.run_graph(compiled, state)
+
+    assert result.token_usage == 19
+    assert observed[0] is state
+    assert observed[-1] is result
+
+
 async def test_wrapped_node_reraises_direct_drain_error_by_identity():
     sentinel = CancellationDrainError(
         "wrapped node",
@@ -1069,6 +1094,77 @@ async def test_agent_v2_real_langgraph_crash_preserves_latest_state_and_run(
     emitted = json.dumps({"payload": payload, "trace": trace})
     emitted += captured.out + captured.err
     assert secret not in emitted
+
+
+async def test_run_graph_real_langgraph_reraises_drain_by_identity():
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
+
+    sentinel = CancellationDrainError(
+        "real graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    builder = new_agent.StateGraph(new_agent.AgentState)
+    builder.add_node("fail_with_drain", fail_with_drain)
+    builder.set_entry_point("fail_with_drain")
+    builder.set_finish_point("fail_with_drain")
+    compiled = builder.compile()
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7"
+    )
+
+    with graph.capture_graph_states(lambda _state: None):
+        with pytest.raises(CancellationDrainError) as caught:
+            await graph.run_graph(compiled, state)
+
+    assert caught.value is sentinel
+
+
+async def test_graph_state_observers_are_isolated_across_concurrent_crashes():
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
+
+    both_entered = asyncio.Event()
+    entered = 0
+
+    async def crash_after_overlap(state):
+        nonlocal entered
+        state.token_usage = 41 if state.issue_url.endswith("/41") else 73
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await both_entered.wait()
+        raise RuntimeError(f"crash-{state.token_usage}")
+
+    builder = new_agent.StateGraph(new_agent.AgentState)
+    builder.add_node("crash_after_overlap", crash_after_overlap)
+    builder.set_entry_point("crash_after_overlap")
+    builder.set_finish_point("crash_after_overlap")
+    compiled = builder.compile()
+
+    async def observe_one(token: int):
+        issue_url = f"https://github.com/acme/widget/issues/{token}"
+        initial = new_agent.AgentState(issue_url=issue_url)
+        observed = []
+        with graph.capture_graph_states(observed.append):
+            with pytest.raises(RuntimeError, match=f"crash-{token}"):
+                await graph.run_graph(compiled, initial)
+        return initial, observed
+
+    first, second = await asyncio.gather(observe_one(41), observe_one(73))
+
+    for token, (initial, observed) in zip((41, 73), (first, second)):
+        assert initial.token_usage == 0
+        assert {item.issue_url for item in observed} == {initial.issue_url}
+        assert any(
+            item is not initial and item.token_usage == token
+            for item in observed
+        )
 
 
 @pytest.mark.parametrize("failure_kind", ["oversized_state", "atomic_replace"])
