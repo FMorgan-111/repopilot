@@ -10,9 +10,10 @@ Use one model-facing repair protocol for both Gemini and Claude Opus:
 `PlanDecision.patch_edits`.
 
 RepoPilot starts with Gemini. After two unsuccessful Gemini repair rounds it
-switches one-way to Opus. Opus uses the remaining global retry budget. Provider
-selection changes only the active repair model. Patch-authoring prompts, tools,
-response schema, patch validation, execution, and verification remain common.
+switches one-way to Opus. The default repair budget is five full transactions:
+Gemini, Gemini, Opus, Opus, Opus. Provider selection changes only the active
+repair model. Patch-authoring prompts, tools, response schema, patch validation,
+execution, and verification remain common.
 
 The immediate objective is reliable production of a canonical, executable
 patch. Repair success takes priority over latency and model cost.
@@ -72,7 +73,14 @@ The implementation includes:
 - one-way Gemini-to-Opus switching after two failed Gemini rounds;
 - immediate Opus fallback after exhausted Gemini gateway retries or primary
   token reserve;
-- Opus use of the remaining existing global retry budget;
+- a five-transaction default repair budget by changing the canonical
+  `max_retries` default and public upper bound from 3 to 4 while preserving its
+  retries-after-initial semantics;
+- Opus use of the remaining three default repair transactions after two failed
+  Gemini transactions;
+- consistent propagation of that default through state construction, public
+  Python entry points, CLI, API, saved-run validation, compatibility endpoints,
+  and active evaluation harnesses;
 - removal of the Opus-specific production planning and correction branch;
 - provider-neutral reflection and removal of Opus-only no-progress terminals;
 - focused regression and execution-boundary tests.
@@ -83,7 +91,8 @@ The implementation does not include:
 - changing context summaries, tool selection policy, API cache, coverage
   generation, or SWE-bench scoring;
 - weakening PatchGate or OCI exact-approval checks;
-- increasing the configured global retry or token budget;
+- granting more than the approved five default repair transactions or changing
+  the token budget;
 - running paid evaluation jobs;
 - rewriting historical serialized run artifacts.
 
@@ -299,11 +308,41 @@ infrastructure limit intervenes:
 | ---: | ---: | --- |
 | 0 | 1 | Gemini |
 | 1 | 2 | Gemini, Gemini |
-| 3 (default) | 4 | Gemini, Gemini, Opus, Opus |
+| 3 (legacy default or explicit configuration) | 4 | Gemini, Gemini, Opus, Opus |
+| 4 (new default) | 5 | Gemini, Gemini, Opus, Opus, Opus |
 
 This table counts full patch-producing transactions, not bounded reasoning-tool
 calls inside one transaction. Immediate gateway fallback or primary token
 reserve may select Opus earlier without granting another transaction.
+`max_retries=4` is therefore the required default for five total transactions;
+setting it to 5 would incorrectly grant a sixth transaction.
+
+### Default and limit propagation
+
+Define one canonical default, `DEFAULT_AGENT_V2_MAX_RETRIES = 4`, and one
+canonical public upper bound, `MAX_AGENT_V2_MAX_RETRIES = 4`, beside the
+existing token-budget constant. Active code imports these values rather than
+repeating numeric defaults.
+
+The implementation updates every active default or boundary that can otherwise
+override or reject the state value:
+
+- `AgentState.max_retries`;
+- `agent_v2(...)` and the backward-compatible
+  `intelligent_analyze_issue(...)` Python entry points;
+- the CLI default and help text;
+- `AgentV2Request` default and upper bound;
+- authorized saved-run validation, so a paused run with `max_retries=4` can be
+  resumed;
+- the `/intelligent-agent` compatibility clamp;
+- `eval/agent_v2_harness.py` and `eval/harness.py` function and CLI defaults;
+- the OCI generation runner's explicit repair budget; and
+- current README/API documentation that advertises the public range.
+
+New eval runs use 4 so they exercise the same success-first production policy.
+Historical eval plans, stored results, and explicit test fixtures that request
+3 remain unchanged and reproducible; an explicit `max_retries=3` is still a
+valid four-transaction configuration.
 
 ## Model Switching
 
@@ -344,8 +383,11 @@ evaluator data or a Gemini-authored approval.
 Opus receives no additional fixed two-round cap. Each unsuccessful Opus plan,
 stop, PatchGate proposal, or verified patch consumes one existing global retry
 through the same helper. It continues while a retry remains, subject also to
-the existing token budget, phase timeout, and graph guard. This change does not
-increase `max_retries` or the token budget.
+the existing token budget, phase timeout, and graph guard. Under the new
+default, a normal all-failure run gives Opus exactly three full transactions
+after the two Gemini transactions. Explicit non-default retry configurations
+continue to follow the same shared retry contract. The token budget is
+unchanged.
 
 If Opus is not configured, the existing explicit unavailability behavior
 remains authoritative; state must not claim that escalation occurred.
@@ -501,13 +543,25 @@ unrelated escalation telemetry.
   shared retry, clear approval, and contribute to the Gemini two-round limit.
 - Switching is one-way; the first Opus patch-authoring call uses the shared
   PLAN schema and prompt even when an Opus REFLECT call occurs first.
-- Opus is limited only by the remaining existing global budgets.
+- With the new default, the exact all-failure sequence is Gemini, Gemini, Opus,
+  Opus, Opus, followed by terminal failure; no sixth model transaction occurs.
+- Opus is limited only by the remaining shared global and token budgets.
 - A counted outcome cannot increment twice across PLAN, EXECUTE, VERIFY, or
   resume.
 - Failed Opus plan and stop outcomes consume one remaining global retry rather
   than spinning inside PLAN.
-- `max_retries` values 0, 1, and 3 produce the documented normal provider
+- `max_retries` values 0, 1, 3, and 4 produce the documented normal provider
   sequences without granting hidden calls.
+- State, both public Python entry points, CLI, API, both active eval harnesses,
+  and the OCI generation runner all resolve their default to the canonical
+  value 4.
+- API validation accepts 4 and rejects 5; saved-run authorization accepts and
+  resumes a valid run configured with 4.
+- The `/intelligent-agent` compatibility route clamps `max_turns` to 4 rather
+  than silently reducing the approved default to 3.
+- A default all-failure graph run allocates five distinct monotonic
+  `repair_round_id` values and reaches terminal failure before allocating a
+  sixth.
 
 ### Reflection and auxiliary-model tests
 
@@ -543,13 +597,19 @@ The change is complete when:
    PLAN.
 4. When Opus is configured and a global retry remains, two unsuccessful Gemini
    repair rounds deterministically select Opus for the next model call.
-5. Opus uses the remaining existing global retry and token budgets without a
-   new fixed round limit.
-6. Correctable patch failures request another full `PlanDecision`; environment
+5. The default `max_retries` is 4, yielding exactly five full repair
+   transactions in the sequence Gemini, Gemini, Opus, Opus, Opus, with no
+   sixth transaction.
+6. Every active production and evaluation entry point uses the canonical
+   default 4; the public API and saved-run validator accept 4 and reject values
+   above the canonical upper bound.
+7. Opus uses the remaining shared global retry and token budgets without a new
+   provider-specific round limit.
+8. Correctable patch failures request another full `PlanDecision`; environment
    failures do not spend a model round.
-7. PLAN and VERIFY failures consume retry budget exactly once, including across
+9. PLAN and VERIFY failures consume retry budget exactly once, including across
    resume.
-8. REFLECT and auxiliary summarization cannot create a second patch protocol or
+10. REFLECT and auxiliary summarization cannot create a second patch protocol or
    an Opus-only two-round terminal.
-9. Tool and context behavior remains unchanged.
-10. Focused tests and the complete test suite pass.
+11. Tool and context behavior remains unchanged.
+12. Focused tests and the complete test suite pass.
