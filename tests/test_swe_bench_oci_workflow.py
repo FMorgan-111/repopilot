@@ -231,15 +231,21 @@ def _assert_public_dataset_cache_contract(text: str) -> None:
 
 def _assert_runner_temp_initialization_contract(text: str) -> None:
     jobs = _mapping_block(text, "jobs", 0)
-    job_envs = [
-        inline or block
-        for inline, block in re.findall(
-            r"(?ms)^    env:(?:[ \t]+([^\n]+)|\n(.*?)(?=^    \S|\Z))",
+    job_blocks = [
+        _job_block(text, job_name)
+        for job_name in re.findall(
+            r"(?m)^  ([A-Za-z_][A-Za-z0-9_-]*):",
             jobs,
         )
     ]
+    job_envs = [
+        _mapping_block(job, "env", 4)
+        for job in job_blocks
+        if re.search(r"(?m)^    env:(?:[ \t]|$)", job)
+    ]
     assert job_envs
-    assert all("${{ runner." not in job_env for job_env in job_envs), (
+    runner_expression = re.compile(r"\$\{\{\s*runner\s*(?:\.|\[)")
+    assert all(not runner_expression.search(job_env) for job_env in job_envs), (
         "runner context is unavailable in job-level env"
     )
 
@@ -346,6 +352,71 @@ def test_runner_path_contract_rejects_inline_job_level_runner_context() -> None:
         '    env: {FORBIDDEN_PATH: "${{ runner.temp }}/forbidden"}\n',
         1,
     )
+
+    with pytest.raises(AssertionError, match="job-level env"):
+        _assert_runner_temp_initialization_contract(mutation)
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    (
+        (
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ubuntu-latest\n"
+            "    env: {\n"
+            '      FORBIDDEN_PATH: "${{ runner.temp }}/forbidden",\n'
+            "    }\n",
+        ),
+        (
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            "      FORBIDDEN_PATH: ${{runner.temp}}/forbidden\n",
+        ),
+        (
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            "      FORBIDDEN_PATH: ${{ runner['temp'] }}/forbidden\n",
+        ),
+        (
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            "      FORBIDDEN_PATH: ${{ runner .temp }}/forbidden\n",
+        ),
+        (
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
+            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            "      FORBIDDEN_PATH: ${{ runner ['temp'] }}/forbidden\n",
+        ),
+        (
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ubuntu-latest\n"
+            "    env: # job environment\n"
+            '      FORBIDDEN_PATH: "${{ runner.temp }}/forbidden"\n',
+        ),
+        (
+            "  prepare:\n    runs-on: ubuntu-latest\n",
+            "  prepare2:\n"
+            "    runs-on: ubuntu-latest\n"
+            '    env: {FORBIDDEN_PATH: "${{ runner.temp }}/forbidden"}\n',
+        ),
+    ),
+    ids=(
+        "multiline-flow",
+        "compact-dot-access",
+        "bracket-access",
+        "spaced-dot-access",
+        "spaced-bracket-access",
+        "comment-bearing-block-header",
+        "digit-bearing-job-id",
+    ),
+)
+def test_runner_path_contract_rejects_additional_job_level_runner_forms(
+    original: str,
+    replacement: str,
+) -> None:
+    text = _workflow_text()
+    mutation = text.replace(original, replacement, 1)
+    assert mutation != text
 
     with pytest.raises(AssertionError, match="job-level env"):
         _assert_runner_temp_initialization_contract(mutation)
