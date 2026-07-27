@@ -21,10 +21,12 @@ from src.state import (
     AgentState,
     GeneratedTestApproval,
     SnapshotManifestEntry,
-    TestRunFingerprint as RunFingerprint,
     ToolPatchApproval,
     ToolSandboxConfig,
     tool_manifest_fingerprint,
+)
+from src.state import (
+    TestRunFingerprint as RunFingerprint,
 )
 from src.tool_policy import PYTEST_BOOTSTRAP
 

@@ -20,8 +20,8 @@ from .coverage_gate import (
     collect_changed_targets,
     validate_differential_coverage,
 )
-from .evaluator_safety import sanitize_evaluator_text
 from .escalation import record_model_invocation
+from .evaluator_safety import sanitize_evaluator_text
 from .llm import llm_call
 from .model_policy import EscalationDecision, apply_escalation
 from .model_provider import escalation_is_configured, redact_secrets

@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from src import timeout_diagnostics
 from src.async_safety import (
     CancellationDrainError,
     drain_task,
@@ -13,7 +14,6 @@ from src.nodes.commit import (
     PRCancellationCleanupError,
     PRCancellationTransactionError,
 )
-from src import timeout_diagnostics
 from src.timeout_diagnostics import (
     TimeoutCleanupEvidence,
     extract_timeout_cleanup_evidence,

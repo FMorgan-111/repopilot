@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import src.nodes.execute as execute_node
 import src.nodes.commit as commit_node
+import src.nodes.execute as execute_node
 import src.run_store as run_store
 from src import graph, http_client, new_agent
 from src.async_safety import CancellationDrainError

@@ -21,9 +21,11 @@ from src.state import (
     ToolPatchApproval,
     VerifiedEdit,
     VerifiedEditBatch,
-    TestRunFingerprint as RunFingerprint,
     _estimate_tokens,
     tool_manifest_fingerprint,
+)
+from src.state import (
+    TestRunFingerprint as RunFingerprint,
 )
 from src.test_generator import (
     _SYSTEM_PROMPT,
