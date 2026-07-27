@@ -848,7 +848,9 @@ async def test_plan_fix_fails_fast_on_final_attempt_dead_patch(monkeypatch):
     assert next_state.current_phase == new_agent.Phase.FAILURE
 
 
-async def test_two_gemini_invalid_anchors_activate_one_way_escalation(monkeypatch):
+async def test_repeated_invalid_anchors_are_diagnostic_until_primary_failure_threshold(
+    monkeypatch,
+):
     monkeypatch.setattr(model_policy, "escalation_is_configured", lambda: True)
     monkeypatch.setattr(
         model_policy,
@@ -880,10 +882,28 @@ async def test_two_gemini_invalid_anchors_activate_one_way_escalation(monkeypatc
 
     state = await plan_node.plan_fix(state)
 
+    assert state.escalated is False
+    assert state.active_provider == "primary"
+    assert state.escalation_reason == ""
+    assert state.no_progress_rounds == 2
+    assert [event.kind for event in state.no_progress_history[-2:]] == [
+        "nonexistent_search_block",
+        "nonexistent_search_block",
+    ]
+    assert model_policy.should_escalate(state).escalate is False
+
+    state.primary_failed_repair_rounds = 2
+    decision = model_policy.should_escalate(state)
+    model_policy.apply_escalation(state, decision)
+
+    assert decision.reason == "primary_repair_round_limit"
     assert state.escalated is True
     assert state.active_provider == "escalation"
-    assert state.escalation_reason == "nonexistent_search_block"
-    assert state.no_progress_rounds == 2
+    assert state.escalation_reason == "primary_repair_round_limit"
+
+    model_policy.record_progress(state)
+    assert state.active_provider == "escalation"
+    assert state.primary_failed_repair_rounds == 2
 
 
 async def test_changed_invalid_anchor_is_material_progress(monkeypatch):
@@ -1077,8 +1097,27 @@ async def test_reflect_terminal_branches_finalize_summary_exactly_once(
     assert summary_calls == 1
 
 
-async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
+async def test_reflect_duplicate_tools_are_diagnostic_until_primary_failure_threshold(
+    monkeypatch,
+):
     calls = []
+
+    def reflection_response():
+        return {
+            "kind": "reflect",
+            "root_cause": "The original target was wrong.",
+            "what_went_wrong": "The edit missed the causal symbol.",
+            "suggested_fix_approach": "Choose another symbol.",
+            "files_that_also_need_changes": [],
+            "decision_frame": {
+                "stage": "reflect",
+                "summary": "Choose another symbol.",
+                "recommended_action": "plan",
+                "risk": "medium",
+                "confidence": 0.7,
+            },
+        }
+
     responses = [
         {
             "kind": "tool",
@@ -1098,20 +1137,7 @@ async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
                 "expected_evidence": "source location",
             },
         },
-        {
-            "kind": "reflect",
-            "root_cause": "The original target was wrong.",
-            "what_went_wrong": "The edit missed the causal symbol.",
-            "suggested_fix_approach": "Choose another symbol.",
-            "files_that_also_need_changes": [],
-            "decision_frame": {
-                "stage": "reflect",
-                "summary": "Choose another symbol.",
-                "recommended_action": "plan",
-                "risk": "medium",
-                "confidence": 0.7,
-            },
-        },
+        reflection_response(),
     ]
 
     async def fake_llm_call(system, user, **kwargs):
@@ -1151,9 +1177,41 @@ async def test_reflect_duplicate_tools_switch_to_escalation_prompt(monkeypatch):
 
     result = await reflect_node.reflect_on_failure(state)
 
-    assert result.active_provider == "escalation"
-    assert calls[2][0] == reflect_node.ESCALATED_REFLECT_SYSTEM
-    assert calls[2][2]["provider"] == "escalation"
+    assert result.active_provider == "primary"
+    assert result.escalation_reason == ""
+    assert result.no_progress_rounds == 2
+    assert [event.kind for event in result.no_progress_history[-2:]] == [
+        "unchanged_context",
+        "unchanged_context",
+    ]
+    assert calls[2][0] != reflect_node.ESCALATED_REFLECT_SYSTEM
+    assert calls[2][2] == {}
+
+    threshold_calls = []
+
+    async def threshold_llm_call(system, user, **kwargs):
+        threshold_calls.append((system, user, kwargs))
+        return reflection_response()
+
+    monkeypatch.setattr(reflect_node, "llm_call", threshold_llm_call)
+    threshold_state = _base_state(
+        current_phase=new_agent.Phase.REFLECT,
+        repo_ref="a" * 40,
+        primary_failed_repair_rounds=2,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="assertion_failure",
+                error_log="AssertionError: sentinel",
+            )
+        ],
+    )
+
+    threshold_result = await reflect_node.reflect_on_failure(threshold_state)
+
+    assert threshold_result.active_provider == "escalation"
+    assert threshold_result.escalation_reason == "primary_repair_round_limit"
+    assert threshold_calls[0][0] == reflect_node.ESCALATED_REFLECT_SYSTEM
+    assert threshold_calls[0][2]["provider"] == "escalation"
 
 
 async def test_escalated_reflect_tool_reprompt_contains_only_delta_evidence(
