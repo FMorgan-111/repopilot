@@ -231,10 +231,13 @@ def _assert_public_dataset_cache_contract(text: str) -> None:
 
 def _assert_runner_temp_initialization_contract(text: str) -> None:
     jobs = _mapping_block(text, "jobs", 0)
-    job_envs = re.findall(
-        r"(?ms)^    env:\n(?P<body>.*?)(?=^    \S|\Z)",
-        jobs,
-    )
+    job_envs = [
+        inline or block
+        for inline, block in re.findall(
+            r"(?ms)^    env:(?:[ \t]+([^\n]+)|\n(.*?)(?=^    \S|\Z))",
+            jobs,
+        )
+    ]
     assert job_envs
     assert all("${{ runner." not in job_env for job_env in job_envs), (
         "runner context is unavailable in job-level env"
@@ -248,6 +251,14 @@ def _assert_runner_temp_initialization_contract(text: str) -> None:
 
     configure_index = names.index(configure_name)
     configure = dict(steps)[configure_name]
+    commands = re.findall(r"(?m)^          (.+)$", configure)
+    fail_closed_guards = [
+        ': "${RUNNER_TEMP:?RUNNER_TEMP is required}"',
+        ': "${GITHUB_ENV:?GITHUB_ENV is required}"',
+    ]
+    assert commands[:2] == fail_closed_guards, (
+        "runner path initialization must fail closed"
+    )
     writes = re.findall(
         r'(?m)^          echo "([^"]+)" >> "\$GITHUB_ENV"$',
         configure,
@@ -320,6 +331,19 @@ def test_runner_path_contract_rejects_job_level_runner_context() -> None:
         '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
         '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
         "      FORBIDDEN_PATH: ${{ runner.temp }}/forbidden\n",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="job-level env"):
+        _assert_runner_temp_initialization_contract(mutation)
+
+
+def test_runner_path_contract_rejects_inline_job_level_runner_context() -> None:
+    text = _workflow_text()
+    mutation = text.replace(
+        "    runs-on: ubuntu-latest\n",
+        '    runs-on: ubuntu-latest\n'
+        '    env: {FORBIDDEN_PATH: "${{ runner.temp }}/forbidden"}\n',
         1,
     )
 

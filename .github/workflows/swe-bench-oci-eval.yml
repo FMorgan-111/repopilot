@@ -88,6 +88,8 @@ jobs:
 
       - name: Configure temporary evaluation paths
         run: |
+          : "${RUNNER_TEMP:?RUNNER_TEMP is required}"
+          : "${GITHUB_ENV:?GITHUB_ENV is required}"
           echo "REPOPILOT_HOME=$RUNNER_TEMP/repopilot-home" >> "$GITHUB_ENV"
           echo "HF_HOME=$RUNNER_TEMP/public-hf-cache" >> "$GITHUB_ENV"
 
