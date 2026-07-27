@@ -575,6 +575,9 @@ prompt changes, or cohort changes.
   exception-class-only persistence, and package/aggregate parsing of the
   internal timeout artifact. Prove a cancelled record alone cannot support
   generated coverage.
+- Normalize prompt-construction `subprocess.SubprocessError` failures,
+  including Git `TimeoutExpired`, into the same single bounded preflight hard
+  stop before incrementing attempts, recording history, or debiting tokens.
 - Whole-stage review addendum: applied generated-test cleanup must also capture
   direct `asyncio.CancelledError`. Successful rollback re-raises the identical
   pending cancellation or drain. If rollback fails under direct cancellation,

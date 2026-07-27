@@ -781,6 +781,33 @@ async def test_preflight_failure_terminates_without_a_model_request(
 
 
 @pytest.mark.asyncio
+async def test_git_timeout_is_a_single_bounded_preflight_failure(
+    generation_state,
+    monkeypatch,
+):
+    calls = 0
+
+    def timed_out(*_args):
+        nonlocal calls
+        calls += 1
+        raise subprocess.TimeoutExpired(["git", "diff"], 60)
+
+    async def forbidden_model(*_args, **_kwargs):
+        raise AssertionError("preflight timeout must not call a model")
+
+    monkeypatch.setattr(test_generator, "collect_changed_targets", timed_out)
+    monkeypatch.setattr(test_generator, "llm_call", forbidden_model)
+
+    result = await run_test_generation_attempts(generation_state, "no_candidate")
+
+    assert calls == 1
+    assert result.reason == "test_generation_preflight_failed"
+    assert generation_state.test_generation_attempts == 0
+    assert generation_state.token_usage == 0
+    assert generation_state.model_history == []
+
+
+@pytest.mark.asyncio
 async def test_budget_before_request_restores_production_state_without_generation(
     generation_state,
     monkeypatch,

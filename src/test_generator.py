@@ -140,7 +140,12 @@ async def request_test_batch(
     """Request one structured batch without including runtime or evaluator data."""
     try:
         prompt = _generation_prompt(state, rejection_reason)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        ValueError,
+        subprocess.SubprocessError,
+    ) as exc:
         raise _TestGenerationPreflightError(
             _TEST_GENERATION_PREFLIGHT_REASON
         ) from exc

@@ -54,7 +54,8 @@ request:
 
 1. Build and bound the prompt before starting telemetry. Prompt construction
    failures are neither model invocations nor generation attempts; they stop
-   generation with a distinct bounded preflight reason.
+   generation with a distinct bounded preflight reason. This includes bounded
+   Git subprocess failures such as `TimeoutExpired`.
 2. Increment `test_generation_attempts` immediately before the model request,
    after prompt construction succeeds. This field therefore counts logical
    model-backed generation attempts rather than local preflight failures.
