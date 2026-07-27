@@ -132,6 +132,22 @@ def test_two_counted_primary_failures_escalate_before_budget_policy(monkeypatch)
     assert decision.reason == "primary_repair_round_limit"
 
 
+def test_approved_immediate_reason_precedes_primary_failure_threshold(monkeypatch):
+    enable_escalation(monkeypatch)
+    state = make_state(
+        primary_failed_repair_rounds=2,
+        token_usage=55_000,
+    )
+
+    decision = model_policy.should_escalate(
+        state,
+        immediate_reason="primary_gateway_unavailable_after_retries",
+    )
+
+    assert decision.escalate is True
+    assert decision.reason == "primary_gateway_unavailable_after_retries"
+
+
 def test_primary_gateway_unavailable_after_retries_is_immediate(monkeypatch):
     enable_escalation(monkeypatch)
 

@@ -231,6 +231,8 @@ class PatchEdit(BaseModel):
 
 
 class FixAttempt(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     patch_content: str = ""
     patch_edits: list[PatchEdit] = Field(default_factory=list)
     file_path: str = ""
@@ -238,9 +240,33 @@ class FixAttempt(BaseModel):
     failure_kind: str = ""
     error_log: str = ""
     success: bool = False
-    repair_round_id: int = Field(default=0, ge=0)
     repair_provider: Literal["primary", "escalation"] | None = None
     repair_model: str = Field(default="", max_length=200)
+    repair_round_id: int = Field(default=0, ge=0)
+
+    @field_validator("repair_provider")
+    @classmethod
+    def _prevent_orphaned_repair_provider(cls, value: Any, info: Any) -> Any:
+        if value is None and info.data.get("repair_round_id", 0) > 0:
+            raise ValueError("positive repair round requires runtime repair attribution")
+        return value
+
+    @field_validator("repair_model")
+    @classmethod
+    def _prevent_orphaned_repair_model(cls, value: str, info: Any) -> str:
+        if not value and info.data.get("repair_round_id", 0) > 0:
+            raise ValueError("positive repair round requires runtime repair attribution")
+        return value
+
+    @field_validator("repair_round_id")
+    @classmethod
+    def _require_bound_repair_author(cls, value: int, info: Any) -> int:
+        if value > 0 and (
+            info.data.get("repair_provider") is None
+            or not info.data.get("repair_model")
+        ):
+            raise ValueError("positive repair round requires runtime repair attribution")
+        return value
 
     @model_validator(mode="after")
     def _require_runtime_repair_attribution(self) -> "FixAttempt":

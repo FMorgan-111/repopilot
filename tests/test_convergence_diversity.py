@@ -12,6 +12,7 @@ from src.evidence import EvidenceStore
 from src.nodes import execute as execute_node
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
+from src.repair_rounds import validate_repair_round_state
 from src.state import PatchEdit
 
 
@@ -892,7 +893,11 @@ async def test_repeated_invalid_anchors_are_diagnostic_until_primary_failure_thr
     ]
     assert model_policy.should_escalate(state).escalate is False
 
+    state.retry_count = 2
+    state.repair_round_sequence = 2
+    state.last_counted_repair_round_id = 2
     state.primary_failed_repair_rounds = 2
+    validate_repair_round_state(state)
     decision = model_policy.should_escalate(state)
     model_policy.apply_escalation(state, decision)
 
@@ -1197,6 +1202,9 @@ async def test_reflect_duplicate_tools_are_diagnostic_until_primary_failure_thre
     threshold_state = _base_state(
         current_phase=new_agent.Phase.REFLECT,
         repo_ref="a" * 40,
+        retry_count=2,
+        repair_round_sequence=2,
+        last_counted_repair_round_id=2,
         primary_failed_repair_rounds=2,
         fix_attempts=[
             new_agent.FixAttempt(
@@ -1205,6 +1213,7 @@ async def test_reflect_duplicate_tools_are_diagnostic_until_primary_failure_thre
             )
         ],
     )
+    validate_repair_round_state(threshold_state)
 
     threshold_result = await reflect_node.reflect_on_failure(threshold_state)
 

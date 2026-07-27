@@ -246,6 +246,147 @@ def test_historical_empty_ledger_validates_with_defaults_and_migrates_retry_coun
     assert historical.repair_correction_context == ""
 
 
+def test_direct_historical_state_object_without_ledger_fields_migrates():
+    historical = AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        retry_count=2,
+        max_retries=4,
+    )
+    assert not historical.model_fields_set & {
+        "repair_round_sequence",
+        "current_repair_round_id",
+        "last_counted_repair_round_id",
+    }
+
+    validate_repair_round_state(historical)
+
+    assert historical.repair_round_sequence == 2
+    assert historical.last_counted_repair_round_id == 2
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        pytest.param(
+            {"retry_count": 5, "max_retries": 4},
+            id="retry-count-beyond-budget",
+        ),
+        pytest.param(
+            {
+                "retry_count": 0,
+                "last_counted_repair_round_id": 2,
+                "repair_round_sequence": 2,
+            },
+            id="retry-last-difference",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 3,
+            },
+            id="sequence-last-difference",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 2,
+                "current_repair_round_id": 1,
+                "current_repair_provider": "primary",
+                "current_repair_model": PRIMARY_MODEL,
+            },
+            id="current-id-mismatch",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 2,
+                "current_repair_round_id": 2,
+            },
+            id="current-missing-attribution",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 1,
+                "primary_failed_repair_rounds": 2,
+            },
+            id="primary-counter-beyond-counted",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 1,
+                "authorized_repair_round_id": 1,
+                "tool_patch_approval": gate_approval(),
+            },
+            id="authorized-missing-attribution",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "last_counted_repair_round_id": 1,
+                "repair_round_sequence": 1,
+                "authorized_repair_round_id": 1,
+                "authorized_repair_provider": "primary",
+                "authorized_repair_model": PRIMARY_MODEL,
+            },
+            id="authorized-missing-approval",
+        ),
+        pytest.param(
+            {"retry_count": 1, "repair_round_sequence": 0},
+            id="explicit-default-partial-ledger",
+        ),
+        pytest.param(
+            {"retry_count": 1, "primary_failed_repair_rounds": 1},
+            id="legacy-shape-with-primary-counter",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "authorized_repair_round_id": 1,
+                "authorized_repair_provider": "primary",
+                "authorized_repair_model": PRIMARY_MODEL,
+                "tool_patch_approval": gate_approval(),
+            },
+            id="legacy-shape-with-complete-authorization",
+        ),
+        pytest.param(
+            {
+                "retry_count": 1,
+                "authorized_repair_round_id": 2,
+                "authorized_repair_provider": "primary",
+                "authorized_repair_model": PRIMARY_MODEL,
+                "tool_patch_approval": gate_approval(),
+            },
+            id="migration-must-not-write-before-later-error",
+        ),
+        pytest.param(
+            {"retry_count": 1, "current_repair_provider": "primary"},
+            id="orphaned-current-provider",
+        ),
+        pytest.param(
+            {"retry_count": 1, "authorized_repair_model": PRIMARY_MODEL},
+            id="orphaned-authorized-model",
+        ),
+    ],
+)
+def test_invalid_ledger_relationships_fail_closed_without_mutation(updates):
+    state = make_state(**updates)
+    before = state.model_dump(mode="json")
+    before_fields_set = state.model_fields_set.copy()
+
+    with pytest.raises(ValueError):
+        validate_repair_round_state(state)
+
+    assert state.model_dump(mode="json") == before
+    assert state.model_fields_set == before_fields_set
+
+
 def test_positive_fix_attempt_attribution_requires_runtime_provider_and_model():
     assert FixAttempt().repair_provider is None
 
@@ -260,6 +401,30 @@ def test_positive_fix_attempt_attribution_requires_runtime_provider_and_model():
     assert attempt.repair_round_id == 1
     assert attempt.repair_provider == "escalation"
     assert attempt.repair_model == ESCALATION_MODEL
+
+
+def test_fix_attempt_assignment_cannot_create_orphaned_positive_attribution():
+    attempt = FixAttempt()
+    before = attempt.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="runtime repair attribution"):
+        attempt.repair_round_id = 1
+
+    assert attempt.model_dump(mode="json") == before
+
+    attempt.repair_provider = "primary"
+    attempt.repair_model = PRIMARY_MODEL
+    attempt.repair_round_id = 1
+    assert attempt.repair_round_id == 1
+    assert attempt.repair_provider == "primary"
+    assert attempt.repair_model == PRIMARY_MODEL
+    assert FixAttempt.model_validate(attempt.model_dump()) == attempt
+
+    for field, value in (("repair_provider", None), ("repair_model", "")):
+        valid = attempt.model_dump(mode="json")
+        with pytest.raises(ValidationError, match="runtime repair attribution"):
+            setattr(attempt, field, value)
+        assert attempt.model_dump(mode="json") == valid
 
 
 def test_new_failure_rejects_mismatched_bound_author_without_accounting(monkeypatch):

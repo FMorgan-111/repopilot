@@ -840,6 +840,8 @@ def test_terminal_roundtrip_with_cleared_current_id_rejects_sixth_round(
         )
 
     state.current_repair_round_id = 0
+    state.current_repair_provider = None
+    state.current_repair_model = ""
     run_store.save_run(state, root_dir=root_dir)
     loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
 

@@ -10,6 +10,21 @@ from .state import AgentState, Phase, _record_node_diagnostic
 
 RepairProvider = Literal["primary", "escalation"]
 
+_REPAIR_LEDGER_FIELDS = frozenset(
+    {
+        "primary_failed_repair_rounds",
+        "repair_round_sequence",
+        "current_repair_round_id",
+        "current_repair_provider",
+        "current_repair_model",
+        "authorized_repair_round_id",
+        "authorized_repair_provider",
+        "authorized_repair_model",
+        "last_counted_repair_round_id",
+        "repair_correction_context",
+    }
+)
+
 
 @dataclass(frozen=True)
 class RepairRetryDecision:
@@ -20,17 +35,34 @@ class RepairRetryDecision:
 
 def validate_repair_round_state(state: AgentState) -> None:
     """Reject impossible/tampered ledger relationships before routing."""
-    if (
+    if not 0 <= state.retry_count <= state.max_retries:
+        raise ValueError("repair retry count is outside its configured budget")
+    legacy_migration_candidate = (
         state.repair_round_sequence == 0
         and state.current_repair_round_id == 0
         and state.last_counted_repair_round_id == 0
         and state.retry_count > 0
-    ):
+    )
+    if legacy_migration_candidate:
+        has_explicit_ledger_field = bool(
+            state.model_fields_set & _REPAIR_LEDGER_FIELDS
+        )
+        has_nondefault_ledger_value = any(
+            (
+                state.primary_failed_repair_rounds != 0,
+                state.current_repair_provider is not None,
+                bool(state.current_repair_model),
+                state.authorized_repair_round_id != 0,
+                state.authorized_repair_provider is not None,
+                bool(state.authorized_repair_model),
+                bool(state.repair_correction_context),
+            )
+        )
+        if has_explicit_ledger_field or has_nondefault_ledger_value:
+            raise ValueError("partial repair ledger cannot be migrated")
         state.repair_round_sequence = state.retry_count
         state.last_counted_repair_round_id = state.retry_count
 
-    if not 0 <= state.retry_count <= state.max_retries:
-        raise ValueError("repair retry count is outside its configured budget")
     transaction_cap = state.max_retries + 1
     if not (
         0
@@ -52,10 +84,19 @@ def validate_repair_round_state(state: AgentState) -> None:
         raise ValueError("current repair round exceeds the transaction cap")
     if state.primary_failed_repair_rounds > state.last_counted_repair_round_id:
         raise ValueError("primary repair failures exceed counted repair rounds")
+    if state.current_repair_round_id == 0 and (
+        state.current_repair_provider is not None or state.current_repair_model
+    ):
+        raise ValueError("current repair attribution is orphaned")
     if state.current_repair_round_id > 0 and (
         state.current_repair_provider is None or not state.current_repair_model
     ):
         raise ValueError("current repair round lacks runtime author attribution")
+    if state.authorized_repair_round_id == 0 and (
+        state.authorized_repair_provider is not None
+        or state.authorized_repair_model
+    ):
+        raise ValueError("authorized repair attribution is orphaned")
     if state.authorized_repair_round_id > 0:
         if (
             state.authorized_repair_provider is None
@@ -186,6 +227,8 @@ def record_failed_repair_round(
     if retry_allowed:
         state.retry_count += 1
         state.current_repair_round_id = 0
+        state.current_repair_provider = None
+        state.current_repair_model = ""
         state.failure_reason = str(failure_reason or "")[:8_000]
         decision = should_escalate(state, immediate_reason=immediate_reason)
         apply_escalation(state, decision)
