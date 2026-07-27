@@ -66,6 +66,8 @@ APPROVED_ESCALATION_REASONS = frozenset(
     {
         "empty_completion_after_retries",
         "invalid_structured_response_after_retries",
+        "primary_gateway_unavailable_after_retries",
+        "primary_repair_round_limit",
         "primary_budget_reserve",
         "repeated_no_progress",
         "test_generation_retry",
@@ -236,6 +238,19 @@ class FixAttempt(BaseModel):
     failure_kind: str = ""
     error_log: str = ""
     success: bool = False
+    repair_round_id: int = Field(default=0, ge=0)
+    repair_provider: Literal["primary", "escalation"] | None = None
+    repair_model: str = Field(default="", max_length=200)
+
+    @model_validator(mode="after")
+    def _require_runtime_repair_attribution(self) -> "FixAttempt":
+        if self.repair_round_id > 0 and (
+            self.repair_provider is None or not self.repair_model
+        ):
+            raise ValueError(
+                "positive repair round requires runtime repair attribution"
+            )
+        return self
 
 
 def _normalize_string_list(value: Any) -> Any:
@@ -866,6 +881,16 @@ class AgentState(BaseModel):
     active_provider: Literal["primary", "escalation"] = "primary"
     escalated: bool = False
     escalation_reason: str = ""
+    primary_failed_repair_rounds: int = Field(default=0, ge=0)
+    repair_round_sequence: int = Field(default=0, ge=0)
+    current_repair_round_id: int = Field(default=0, ge=0)
+    current_repair_provider: Literal["primary", "escalation"] | None = None
+    current_repair_model: str = Field(default="", max_length=200)
+    authorized_repair_round_id: int = Field(default=0, ge=0)
+    authorized_repair_provider: Literal["primary", "escalation"] | None = None
+    authorized_repair_model: str = Field(default="", max_length=200)
+    last_counted_repair_round_id: int = Field(default=0, ge=0)
+    repair_correction_context: str = Field(default="", max_length=8_000)
     no_progress_rounds: int = 0
     last_plan_signature: str = ""
     last_context_fingerprint: str = ""

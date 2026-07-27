@@ -642,6 +642,36 @@ async def test_resume_rejects_saved_state_outside_hard_execution_limits(
     assert called is False
 
 
+async def test_future_open_round_is_rejected_before_resume(monkeypatch, api_client):
+    state = _state()
+    state.retry_count = 4
+    state.max_retries = 4
+    state.repair_round_sequence = 6
+    state.current_repair_round_id = 6
+    state.current_repair_provider = "primary"
+    state.current_repair_model = "gemini-3.5-flash:stable"
+    state.last_counted_repair_round_id = 5
+    called = False
+
+    async def forbidden_resume(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("tampered repair ledger must not resume")
+
+    monkeypatch.setattr(main, "load_run", lambda run_id: state)
+    monkeypatch.setattr(main, "resume_agent_v2", forbidden_resume)
+
+    response = await api_client.post(
+        "/agent/v2/resume",
+        headers=AUTHORIZED_HEADERS,
+        json={"run_id": "abc123def456", "human_answer": "Proceed."},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Saved run could not be loaded."}
+    assert called is False
+
+
 async def test_resume_rejects_run_id_that_does_not_match_loaded_state(
     monkeypatch, api_client
 ):

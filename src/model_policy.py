@@ -23,6 +23,7 @@ _IMMEDIATE_REASONS = frozenset(
     {
         "empty_completion_after_retries",
         "invalid_structured_response_after_retries",
+        "primary_gateway_unavailable_after_retries",
     }
 )
 
@@ -153,18 +154,16 @@ def should_escalate(
 
     if immediate_reason in _IMMEDIATE_REASONS:
         return EscalationDecision(escalate=True, reason=immediate_reason)
+    if state.primary_failed_repair_rounds >= 2:
+        return EscalationDecision(
+            escalate=True,
+            reason="primary_repair_round_limit",
+        )
     if state.token_usage >= primary_budget_limit(state):
         return EscalationDecision(
             escalate=True,
             reason="primary_budget_reserve",
         )
-    if state.no_progress_rounds >= 2:
-        reason = "repeated_no_progress"
-        if state.no_progress_history:
-            latest_kind = state.no_progress_history[-1].kind
-            if latest_kind in APPROVED_NO_PROGRESS_KINDS:
-                reason = latest_kind
-        return EscalationDecision(escalate=True, reason=reason)
     return EscalationDecision(escalate=False)
 
 
@@ -183,7 +182,6 @@ def apply_escalation(
     if state.active_provider == "escalation" or not escalation_is_configured():
         return
 
-    previous_model = state.active_model
     escalation_model = get_model_config("escalation").model
     state.active_provider = "escalation"
     state.active_model = escalation_model
@@ -192,10 +190,9 @@ def apply_escalation(
     state.node_diagnostics.append(
         {
             "event": "model_escalated",
-            "from": previous_model,
-            "to": escalation_model,
             "reason": decision.reason,
-            "round": state.no_progress_rounds,
+            "repair_round_sequence": state.repair_round_sequence,
+            "primary_failed_repair_rounds": state.primary_failed_repair_rounds,
         }
     )
 

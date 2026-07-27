@@ -21,6 +21,7 @@ from src.agent import analyze_issue
 from src.agent_loop import agent_analyze
 from src.async_safety import CancellationDrainError
 from src.new_agent import agent_v2, intelligent_analyze_issue, resume_agent_v2
+from src.repair_rounds import validate_repair_round_state
 from src.run_store import (
     ResumeConflictError,
     format_replay_markdown,
@@ -301,6 +302,14 @@ def _load_authorized_run(run_id: str) -> AgentState:
             status_code=500,
             detail="Saved run could not be loaded.",
         )
+
+    try:
+        validate_repair_round_state(state)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Saved run could not be loaded.",
+        ) from exc
 
     try:
         repository = _parse_issue_repository(state.issue_url)

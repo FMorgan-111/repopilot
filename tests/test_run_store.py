@@ -9,7 +9,20 @@ from pathlib import Path
 import pytest
 
 from src import new_agent, run_store
-from src.state import Evidence, ModelInvocation, NoProgressEvent
+from src.repair_rounds import (
+    begin_repair_round,
+    freeze_authorized_repair_round,
+    record_failed_repair_round,
+)
+from src.state import (
+    Evidence,
+    FixAttempt,
+    ModelInvocation,
+    NoProgressEvent,
+    PatchEdit,
+    Phase,
+    ToolPatchApproval,
+)
 
 
 def _claim_in_subprocess(
@@ -736,6 +749,106 @@ def test_save_and_load_preserves_model_routing_state(tmp_path):
     assert loaded.model_history == state.model_history
     assert loaded.model_history[0].error_class == "ValidationError"
     assert loaded.no_progress_history == state.no_progress_history
+
+
+def _repair_gate_approval() -> ToolPatchApproval:
+    return ToolPatchApproval(
+        base_ref="a" * 40,
+        patch_sha256="b" * 64,
+        patch_gate_fingerprint="c" * 64,
+        changed_manifest=(),
+        manifest_fingerprint="d" * 64,
+    )
+
+
+def test_same_round_failure_is_idempotent_after_run_store_roundtrip(
+    tmp_path, monkeypatch
+):
+    root_dir = tmp_path / ".repopilot"
+    monkeypatch.setattr(
+        "src.model_policy.escalation_is_configured", lambda: False
+    )
+    state = paused_state("repair-round-idempotency")
+    state.current_phase = Phase.PLAN
+    first = begin_repair_round(state)
+    record_failed_repair_round(
+        state,
+        round_id=first,
+        provider="primary",
+        model="gemini-3.5-flash:stable",
+        failure_reason="tests_failed",
+        retry_phase=Phase.REFLECT,
+    )
+    second = begin_repair_round(state)
+    state.patch_content = "diff --git a/widget.py b/widget.py"
+    state.patch_edits = [
+        PatchEdit(file_path="widget.py", search="old", replace="new")
+    ]
+    state.tool_patch_approval = _repair_gate_approval()
+    freeze_authorized_repair_round(state)
+    state.fix_attempts.append(
+        FixAttempt(
+            failure_kind="tests_failed",
+            repair_round_id=first,
+            repair_provider="primary",
+            repair_model="gemini-3.5-flash:stable",
+        )
+    )
+
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+    before = loaded.model_copy(deep=True)
+    duplicate = record_failed_repair_round(
+        loaded,
+        round_id=first,
+        provider="primary",
+        model="gemini-3.5-flash:stable",
+        failure_reason="tests_failed",
+        retry_phase=Phase.REFLECT,
+    )
+
+    assert second == 2
+    assert loaded == before
+    assert duplicate.counted is False
+    assert loaded.retry_count == 1
+    assert loaded.last_counted_repair_round_id == 1
+    assert loaded.current_repair_round_id == 2
+    assert loaded.authorized_repair_round_id == 2
+    assert loaded.fix_attempts[-1].repair_round_id == 1
+
+
+def test_terminal_roundtrip_with_cleared_current_id_rejects_sixth_round(
+    tmp_path, monkeypatch
+):
+    root_dir = tmp_path / ".repopilot"
+    monkeypatch.setattr(
+        "src.model_policy.escalation_is_configured", lambda: False
+    )
+    state = paused_state("terminal-repair-ledger")
+    state.max_retries = 4
+    state.current_phase = Phase.PLAN
+
+    for _index in range(5):
+        round_id = begin_repair_round(state)
+        record_failed_repair_round(
+            state,
+            round_id=round_id,
+            provider="primary",
+            model="gemini-3.5-flash:stable",
+            failure_reason="tests_failed",
+            retry_phase=Phase.REFLECT,
+        )
+
+    state.current_repair_round_id = 0
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+
+    with pytest.raises(ValueError, match="budget is exhausted"):
+        begin_repair_round(loaded)
+
+    assert loaded.repair_round_sequence == 5
+    assert loaded.last_counted_repair_round_id == 5
+    assert loaded.retry_count == 4
 
 
 def test_legacy_saved_state_loads_model_routing_defaults(tmp_path):
