@@ -13,6 +13,7 @@ from src.repair_rounds import (
     begin_repair_round,
     freeze_authorized_repair_round,
     record_failed_repair_round,
+    validate_repair_round_state,
 )
 from src.state import (
     Evidence,
@@ -22,6 +23,22 @@ from src.state import (
     PatchEdit,
     Phase,
     ToolPatchApproval,
+)
+
+
+TASK2_REPAIR_STATE_FIELDS = frozenset(
+    {
+        "primary_failed_repair_rounds",
+        "repair_round_sequence",
+        "current_repair_round_id",
+        "current_repair_provider",
+        "current_repair_model",
+        "authorized_repair_round_id",
+        "authorized_repair_provider",
+        "authorized_repair_model",
+        "last_counted_repair_round_id",
+        "repair_correction_context",
+    }
 )
 
 
@@ -93,6 +110,13 @@ def paused_state(trace_id: str = "abc123def456"):
             }
         ],
     )
+
+
+def rewrite_saved_run_as_legacy(path: Path) -> None:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    for field in TASK2_REPAIR_STATE_FIELDS:
+        payload.pop(field, None)
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def replay_state(trace_id: str = "abc123def456"):
@@ -526,6 +550,68 @@ def test_claim_run_for_resume_atomically_consumes_paused_request(tmp_path):
     assert claimed.current_phase == new_agent.Phase.PLAN
     assert claimed.pending_human_input is False
     assert claimed.human_input_request == {}
+
+
+@pytest.mark.parametrize("prevalidate_expected", [False, True])
+def test_claim_canonicalizes_legacy_durable_without_mutating_expected(
+    tmp_path,
+    prevalidate_expected,
+):
+    root_dir = tmp_path / ".repopilot"
+    original = paused_state(f"legacy-claim-{int(prevalidate_expected)}")
+    original.retry_count = 1
+    path = run_store.save_run(original, root_dir=root_dir)
+    rewrite_saved_run_as_legacy(path)
+    expected = run_store.load_run(original.trace_id, root_dir=root_dir)
+    assert not expected.model_fields_set & TASK2_REPAIR_STATE_FIELDS
+    if prevalidate_expected:
+        validate_repair_round_state(expected)
+        assert expected.repair_round_sequence == 1
+        assert expected.last_counted_repair_round_id == 1
+    expected_before = expected.model_copy(deep=True)
+    expected_fields_set = expected.model_fields_set.copy()
+
+    claimed = run_store.claim_run_for_resume(
+        original.trace_id,
+        expected,
+        root_dir=root_dir,
+    )
+    durable = run_store.load_run(original.trace_id, root_dir=root_dir)
+
+    assert expected == expected_before
+    assert expected.model_fields_set == expected_fields_set
+    assert claimed == durable
+    assert claimed is not expected
+    assert claimed.repair_round_sequence == 1
+    assert claimed.last_counted_repair_round_id == 1
+    assert claimed.retry_count == 1
+    assert claimed.resume_in_progress is True
+    assert claimed.current_phase == Phase.PLAN
+
+
+def test_claim_maps_partial_durable_repair_ledger_to_conflict_without_mutation(
+    tmp_path,
+):
+    root_dir = tmp_path / ".repopilot"
+    corrupt = paused_state("partial-repair-ledger-claim")
+    corrupt.retry_count = 1
+    path = run_store.save_run(corrupt, root_dir=root_dir)
+    expected = run_store.load_run(corrupt.trace_id, root_dir=root_dir)
+    expected_before = expected.model_copy(deep=True)
+    durable_before = path.read_bytes()
+
+    with pytest.raises(run_store.ResumeConflictError):
+        run_store.claim_run_for_resume(
+            corrupt.trace_id,
+            expected,
+            root_dir=root_dir,
+        )
+
+    assert expected == expected_before
+    assert path.read_bytes() == durable_before
+    durable = run_store.load_run(corrupt.trace_id, root_dir=root_dir)
+    assert durable.current_phase == Phase.WAITING_FOR_USER
+    assert durable.resume_in_progress is False
 
 
 def test_claim_run_for_resume_rejects_stale_expected_state(tmp_path):
