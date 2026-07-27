@@ -1155,6 +1155,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 output_tokens=response_tokens_estimate,
                 status="ok",
             )
+            state.token_usage += (
+                prompt_tokens_estimate + response_tokens_estimate
+            )
         _record_node_diagnostic(
             state,
             node="plan_fix",
@@ -1169,7 +1172,6 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             state.current_phase = Phase.FAILURE
             return state
         if tool_step is not None and tool_step.handled:
-            state.token_usage += _estimate_tokens(system, user, response_text)
             if tool_step.stop_reason:
                 state.failure_reason = tool_step.stop_reason
                 state.current_phase = Phase.FAILURE
@@ -1203,8 +1205,6 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             raise ValueError("PatchGate decision diverged from its frozen approval")
     state.test_command = decision.test_command
     print(f"  [plan] Plan received ({len(state.fix_plan)} chars, patch={len(state.patch_content)} chars, edits={len(state.patch_edits)})", file=sys.stderr, flush=True)
-    if not two_stage_repair:
-        state.token_usage += _estimate_tokens(system, user, response_text)
     _remember(state, "assistant", state.fix_plan[:2000])
     frame = decision.decision_frame
     frame.parent_frame_id = state.decision_frame.frame_id if state.decision_frame else None

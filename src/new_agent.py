@@ -317,7 +317,7 @@ def _final_report_and_binding(
         pr_url=state.pr_url,
         test_results=state.fix_attempts[-1].test_result if state.fix_attempts else "",
         turns_taken=turns_taken,
-        token_used=state.token_usage,
+        token_used=state.token_usage + state.summary_token_usage,
     )
     return report, live_binding
 

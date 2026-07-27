@@ -486,6 +486,7 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             output_tokens=response_tokens_estimate,
             status="ok",
         )
+        state.token_usage += prompt_tokens_estimate + response_tokens_estimate
         _record_node_diagnostic(
             state,
             node="reflect_on_failure",
@@ -502,7 +503,6 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
                 failure_reason="model_stop",
             )
         if tool_step is not None and tool_step.handled:
-            state.token_usage += _estimate_tokens(system, user, response_text)
             if tool_step.stop_reason:
                 return await _finalize_reflection(
                     state,
@@ -541,7 +541,6 @@ async def reflect_on_failure(state: AgentState | dict[str, Any]) -> AgentState:
             separators=(",", ":"),
             sort_keys=True,
         )
-        state.token_usage += _estimate_tokens(system, user, state.reflection_notes)
         _remember(state, "assistant", f"Reflection: {state.reflection_notes[:2000]}")
         frame = decision.decision_frame
         frame.parent_frame_id = state.decision_frame.frame_id if state.decision_frame else None

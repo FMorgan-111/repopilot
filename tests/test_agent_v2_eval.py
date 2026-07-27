@@ -12,6 +12,7 @@ from eval.oci_contract import OfficialResult, RuntimeRecord, write_model
 from eval.oci_runner import package_instance
 from src import new_agent
 from src.async_safety import CancellationDrainError
+from src.outcome_summary import summarize_attempt_outcome
 
 
 def coverage_proof():
@@ -759,7 +760,11 @@ async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
         "_configured_model",
         lambda: "gemini-3.5-flash:stable",
     )
-    monkeypatch.setattr(agent_v2_harness, "_current_commit_sha", lambda: "a" * 40)
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_current_commit_sha",
+        lambda: "a" * 40,
+    )
 
     result = await agent_v2_harness.evaluate_agent_v2_sample(
         swe_bench_sample(),
@@ -773,6 +778,81 @@ async def test_eval_public_payload_fallback_preserves_generation_attempt_count(
 
     assert aggregated["test_generation_attempts"] == attempts
     assert aggregated["model_invocations"] == invocations
+
+
+async def test_outcome_summary_uses_separate_budget_and_packages_full_history(
+    monkeypatch,
+    tmp_path,
+):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.FAILED,
+        token_usage=15,
+        failure_reason="Patch failed tests.",
+        coverage_status="failed",
+        coverage_failure_reason="existing_tests_failed",
+    )
+    state.model_history.append(
+        new_agent.ModelInvocation(
+            model="gemini-3.5-flash:stable",
+            provider="primary",
+            node="plan_fix",
+            elapsed_seconds=0.1,
+            input_tokens=10,
+            output_tokens=5,
+            status="ok",
+        )
+    )
+
+    async def summarize(*_args, **_kwargs):
+        return {"summary": "The previous patch did not fix the regression."}
+
+    state.attempt_outcome_summary = await summarize_attempt_outcome(
+        state,
+        llm=summarize,
+    )
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    async def fake_agent(*_args, **_kwargs):
+        return payload
+
+    async def no_seed(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "_build_eval_seed", no_seed)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "load_run",
+        lambda _run_id: (_ for _ in ()).throw(
+            OSError("durable state unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        agent_v2_harness,
+        "_configured_model",
+        lambda: "gemini-3.5-flash:stable",
+    )
+    monkeypatch.setattr(agent_v2_harness, "_current_commit_sha", lambda: "a" * 40)
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+
+    assert state.summary_token_usage > 0
+    expected_total = 15 + state.summary_token_usage
+    assert result["token_used"] == expected_total
+    assert [item["node"] for item in result["model_invocations"]] == [
+        "plan_fix",
+        "outcome_summary",
+    ]
+
+    aggregated = _package_and_aggregate_result(result, tmp_path)
+
+    assert aggregated["token_used"] == expected_total
+    assert len(aggregated["model_invocations"]) == 2
 
 
 async def test_crash_after_cancelled_generation_packages_public_telemetry(

@@ -694,7 +694,7 @@ def test_result_models_used_match_ordered_unique_invocation_history() -> None:
         _result_record_model().model_validate(payload)
 
 
-def test_result_token_used_covers_every_serialized_model_invocation() -> None:
+def test_result_token_used_covers_multiple_main_model_invocations() -> None:
     invocations = [
         _invocation_payload(input_tokens=10, output_tokens=5),
         _invocation_payload(
@@ -711,6 +711,34 @@ def test_result_token_used_covers_every_serialized_model_invocation() -> None:
                 token_used=24,
             )
         )
+
+
+def test_result_token_used_covers_outcome_summary_invocation() -> None:
+    invocations = [
+        _invocation_payload(input_tokens=10, output_tokens=5),
+        _invocation_payload(
+            node="outcome_summary",
+            input_tokens=100,
+            output_tokens=20,
+        ),
+    ]
+
+    with pytest.raises(ValidationError, match="token_used"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_invocations=invocations,
+                token_used=134,
+            )
+        )
+
+    record = _result_record_model().model_validate(
+        _result_payload(model_invocations=invocations, token_used=135)
+    )
+
+    assert [item.node for item in record.model_invocations] == [
+        "plan",
+        "outcome_summary",
+    ]
 
 
 def test_escalation_invocation_requires_escalated_flag() -> None:

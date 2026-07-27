@@ -561,7 +561,13 @@ prompt changes, or cohort changes.
   `CancellationDrainError`. Keep the canonical equality unchanged: all
   `test_generation` records, including cancelled records, must equal
   `test_generation_attempts`. Require `token_used` to cover the sum of input
-  and output tokens from every serialized invocation.
+  and output tokens from every serialized invocation. Keep
+  `state.token_usage` as the main-budget counter and `summary_token_usage` as
+  the auxiliary counter, but publish their sum as `token_used` so evaluation
+  observes complete usage without charging summaries against the repair
+  budget. For PLAN, REFLECT, repair-flow, and generation producers, increment
+  the applicable counter with the exact input-plus-output values written to
+  the invocation; do not recompute a combined or normalized-response estimate.
 - Add RED tests for direct `asyncio.CancelledError`, generic
   `CancellationDrainError`, and a real internally timed-out generation path.
   Assert one attempt, one cancelled invocation, input-only debit, no output

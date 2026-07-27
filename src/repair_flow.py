@@ -590,14 +590,18 @@ async def _call_schema(
             raise
         except Exception as exc:
             elapsed = time.monotonic() - started
+            input_tokens = _estimate_tokens(system, current_user)
+            output_tokens = (
+                _estimate_tokens(response_text) if response_text else 0
+            )
             record_model_invocation(
                 state,
                 model=model,
                 provider=provider,
                 node="plan_fix",
                 elapsed_seconds=elapsed,
-                input_tokens=_estimate_tokens(system, current_user),
-                output_tokens=_estimate_tokens(response_text) if response_text else 0,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
                 status=(
                     "invalid_response"
                     if isinstance(
@@ -608,20 +612,22 @@ async def _call_schema(
                 ),
                 error=exc,
             )
-            state.token_usage += _estimate_tokens(system, current_user, response_text)
+            state.token_usage += input_tokens + output_tokens
             raise
         elapsed = time.monotonic() - started
+        input_tokens = _estimate_tokens(system, current_user)
+        output_tokens = _estimate_tokens(response_text)
         record_model_invocation(
             state,
             model=model,
             provider=provider,
             node="plan_fix",
             elapsed_seconds=elapsed,
-            input_tokens=_estimate_tokens(system, current_user),
-            output_tokens=_estimate_tokens(response_text),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
             status="ok",
         )
-        state.token_usage += _estimate_tokens(system, current_user, response_text)
+        state.token_usage += input_tokens + output_tokens
         if tool_step is not None and tool_step.handled:
             if tool_step.stop_reason:
                 raise ReasoningStop(

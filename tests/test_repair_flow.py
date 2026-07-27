@@ -277,6 +277,10 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
         "plan_fix",
         "plan_fix",
     ]
+    assert state.token_usage == sum(
+        item.input_tokens + item.output_tokens
+        for item in state.model_history
+    )
 
 
 async def test_escalated_plan_tool_drain_propagates_without_model_telemetry_or_debit(
@@ -414,6 +418,10 @@ async def test_opus_inner_repair_tool_uses_delta_evidence_and_pre_call_policy(
     assert "old-evidence-sentinel" not in calls[1]
     assert "new-evidence-sentinel-2" in calls[3]
     assert "old-evidence-sentinel" not in calls[3]
+    assert state.token_usage == sum(
+        item.input_tokens + item.output_tokens
+        for item in state.model_history
+    )
 
 
 async def test_default_repairplan_tool_reprompt_retains_initial_source_evidence(
@@ -751,6 +759,11 @@ async def test_opus_inner_repair_stop_terminates_without_schema_retry(
         await generate_opus_repair(state, build_escalation_packet(state))
 
     assert calls == 1
+    [invocation] = state.model_history
+    assert invocation.status == "invalid_response"
+    assert state.token_usage == (
+        invocation.input_tokens + invocation.output_tokens
+    )
 
 
 async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(

@@ -56,6 +56,10 @@ async def test_plan_fix_records_plan_decision_frame(monkeypatch):
     assert next_state.decision_frame.recommended_action == "execute"
     assert next_state.decision_frame.selected_hypothesis_id == "H1"
     assert next_state.frame_history[-1] == next_state.decision_frame
+    [invocation] = next_state.model_history
+    assert next_state.token_usage == (
+        invocation.input_tokens + invocation.output_tokens
+    )
     for key in [
         "decision_frame",
         "stage",
@@ -148,6 +152,11 @@ async def test_reflect_summarizes_only_after_recording_valid_frame(monkeypatch):
     assert calls == [next_state.decision_frame.frame_id]
     assert next_state.attempt_outcome_summary == "attempt outcome"
     assert next_state.current_phase == new_agent.Phase.PLAN
+    [invocation] = next_state.model_history
+    assert invocation.node == "reflect_on_failure"
+    assert next_state.token_usage == (
+        invocation.input_tokens + invocation.output_tokens
+    )
 
 
 async def test_reflect_error_replaces_outcome_summary_exactly_once(monkeypatch):
@@ -490,6 +499,11 @@ async def test_invalid_plan_response_never_persists_response_bearing_error(monke
         "invalid_structured_response_after_retries"
     )
     assert "error" not in next_state.node_diagnostics[-1]
+    assert next_state.token_usage == sum(
+        item.input_tokens + item.output_tokens
+        for item in next_state.model_history
+        if item.node != "outcome_summary"
+    )
     for forbidden in hostile_values:
         assert forbidden not in dumped
 
@@ -536,6 +550,16 @@ async def test_provider_error_in_reflect_never_persists_provider_message(monkeyp
     assert "error" not in next_state.node_diagnostics[-1]
     assert next_state.conversation_history[-1].content == (
         "Reflection error: LLMResponseError"
+    )
+    assert next_state.token_usage == sum(
+        item.input_tokens + item.output_tokens
+        for item in next_state.model_history
+        if item.node != "outcome_summary"
+    )
+    assert next_state.summary_token_usage == sum(
+        item.input_tokens + item.output_tokens
+        for item in next_state.model_history
+        if item.node == "outcome_summary"
     )
     for forbidden in hostile_values:
         assert forbidden not in dumped

@@ -101,10 +101,15 @@ escalation-provider generation invocation must agree with the run's escalation
 fields. The OCI boundary accepts `cancelled` only for node `test_generation`,
 with positive input tokens, zero output tokens, and error class exactly
 `CancelledError` or `CancellationDrainError`; other nodes, classes, or token
-shapes are noncanonical. The result's `token_used` must be at least the sum of
-input and output tokens in every serialized model invocation. Missing, extra,
-or contradictory telemetry rejects the artifact bundle instead of merely
-removing budget credit.
+shapes are noncanonical. The public result's `token_used` must be at least the
+sum of input and output tokens in every serialized invocation. Internally,
+`state.token_usage` continues to enforce the main 100k budget while
+`summary_token_usage` remains an auxiliary counter; the public total reports
+their sum so summary calls stay visible without consuming the main repair
+budget. PLAN, REFLECT, repair-flow, and generation producers debit exactly the
+input-plus-output estimate stored in each invocation rather than recomputing a
+combined or normalized-text estimate. Missing, extra, or contradictory
+telemetry rejects the artifact bundle instead of merely removing budget credit.
 
 ### 2. Cancellation-drain propagation
 
