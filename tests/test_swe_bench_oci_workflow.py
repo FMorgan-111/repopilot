@@ -229,6 +229,42 @@ def _assert_public_dataset_cache_contract(text: str) -> None:
     ]
 
 
+def _assert_runner_temp_initialization_contract(text: str) -> None:
+    jobs = _mapping_block(text, "jobs", 0)
+    job_envs = re.findall(
+        r"(?ms)^    env:\n(?P<body>.*?)(?=^    \S|\Z)",
+        jobs,
+    )
+    assert job_envs
+    assert all("${{ runner." not in job_env for job_env in job_envs), (
+        "runner context is unavailable in job-level env"
+    )
+
+    instance = _job_block(text, "instance")
+    steps = _step_blocks(instance)
+    names = [name for name, _block in steps]
+    configure_name = "Configure temporary evaluation paths"
+    assert names.count(configure_name) == 1
+
+    configure_index = names.index(configure_name)
+    configure = dict(steps)[configure_name]
+    writes = re.findall(
+        r'(?m)^          echo "([^"]+)" >> "\$GITHUB_ENV"$',
+        configure,
+    )
+    assert writes == [
+        "REPOPILOT_HOME=$RUNNER_TEMP/repopilot-home",
+        "HF_HOME=$RUNNER_TEMP/public-hf-cache",
+    ]
+
+    for dependent_name in (
+        "Restore public SWE-bench dataset cache",
+        "Install locked dependencies",
+        "Install RepoPilot without dependency resolution",
+    ):
+        assert configure_index < names.index(dependent_name)
+
+
 def test_workflow_is_manual_only_with_fixed_modes() -> None:
     _assert_manual_workflow_contract(_workflow_text())
 
@@ -272,6 +308,23 @@ def test_workflow_concurrency_contract_rejects_job_local_lookalike() -> None:
 
 def test_workflow_cache_is_public_dataset_only() -> None:
     _assert_public_dataset_cache_contract(_workflow_text())
+
+
+def test_workflow_initializes_runner_paths_after_runner_assignment() -> None:
+    _assert_runner_temp_initialization_contract(_workflow_text())
+
+
+def test_runner_path_contract_rejects_job_level_runner_context() -> None:
+    text = _workflow_text()
+    mutation = text.replace(
+        '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
+        '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+        "      FORBIDDEN_PATH: ${{ runner.temp }}/forbidden\n",
+        1,
+    )
+
+    with pytest.raises(AssertionError, match="job-level env"):
+        _assert_runner_temp_initialization_contract(mutation)
 
 
 def test_public_dataset_cache_contract_rejects_near_matches() -> None:
