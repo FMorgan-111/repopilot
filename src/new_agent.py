@@ -37,6 +37,7 @@ from .nodes.verify import verify_fix
 from .run_store import claim_run_for_resume, load_run, save_run
 from .safe_subprocess import tool_sandbox_config_from_env
 from .state import (
+    DEFAULT_AGENT_V2_MAX_RETRIES,
     DEFAULT_AGENT_V2_TOKEN_BUDGET,
     AgentState,
     ConversationTurn,
@@ -405,7 +406,7 @@ def _best_effort_save_run(state: AgentState) -> None:
 
 async def agent_v2(
     issue_url: str,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     save_final_run: bool = False,
     skip_commit: bool = False,
@@ -638,7 +639,7 @@ def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> N
 
 async def intelligent_analyze_issue(
     issue_url: str,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
 ) -> dict:
     """Backward-compatible alias for the previous experimental endpoint."""

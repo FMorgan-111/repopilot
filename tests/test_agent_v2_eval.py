@@ -61,9 +61,21 @@ def coverage_proof():
     }
 
 
-def test_agent_v2_eval_public_defaults_are_100000():
+def test_agent_v2_eval_public_defaults_are_canonical():
     from eval import harness
 
+    assert (
+        inspect.signature(agent_v2_harness.evaluate_agent_v2_sample)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
+    assert (
+        inspect.signature(agent_v2_harness.run_agent_v2_eval)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
     assert (
         inspect.signature(agent_v2_harness.evaluate_agent_v2_sample)
         .parameters["token_budget"]
@@ -100,6 +112,7 @@ def test_agent_v2_eval_cli_uses_100000_default_budget(monkeypatch):
     agent_v2_harness.main([])
 
     assert calls[0]["token_budget"] == 100_000
+    assert calls[0]["max_retries"] == 4
 
 
 def test_legacy_eval_cli_uses_100000_agent_v2_default_budget(monkeypatch):

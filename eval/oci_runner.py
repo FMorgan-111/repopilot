@@ -44,7 +44,7 @@ from src.safe_subprocess import (
     run_bounded_process,
     run_oci_process,
 )
-from src.state import ToolSandboxConfig
+from src.state import DEFAULT_AGENT_V2_MAX_RETRIES, ToolSandboxConfig
 
 RUNTIME_PATH = "runtime.json"
 _OFFICIAL_IMAGE_RE = re.compile(
@@ -414,7 +414,7 @@ async def generate_instance(
             await agent_runner(
                 runtime.instance_id,
                 output_dir=output_dir,
-                max_retries=3,
+                max_retries=DEFAULT_AGENT_V2_MAX_RETRIES,
                 token_budget=100_000,
             )
     except CancellationDrainError:

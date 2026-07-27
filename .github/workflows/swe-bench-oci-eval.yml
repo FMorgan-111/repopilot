@@ -74,7 +74,6 @@ jobs:
       LLM_ESCALATION_BASE_URL: https://linoapi.com.cn/v1
       LLM_ESCALATION_MODEL: claude-opus-4-8:stable
       REPOPILOT_ESCALATION_ENABLED: "1"
-      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"
     steps:
       - name: Check out RepoPilot
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

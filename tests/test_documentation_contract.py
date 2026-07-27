@@ -28,7 +28,7 @@ def test_env_example_exposes_safe_primary_and_escalation_defaults():
     assert "LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1" in example
     assert "LLM_ESCALATION_API_KEY=" in example
     assert "REPOPILOT_ESCALATION_ENABLED=0" in example
-    assert "REPOPILOT_ESCALATION_AFTER_NO_PROGRESS=2" in example
+    assert "REPOPILOT_ESCALATION_AFTER_NO_PROGRESS" not in example
     assert "sk-" not in example
 
 
@@ -43,6 +43,18 @@ def test_readme_documents_runtime_only_secrets_and_eval_success_boundaries():
     assert "agent_success" in readme
     assert "Official `resolved`" in readme
     assert "coverage_proof" in readme
+
+
+def test_docs_advertise_five_transaction_retry_contract():
+    readme = _read("README.md")
+    positioning = _read("docs/PRODUCT_POSITIONING.md")
+    workflow = _read(".github/workflows/swe-bench-oci-eval.yml")
+
+    assert "max_retries` 0–4" in readme
+    assert "two failed primary Gemini rounds" in readme
+    assert "最多重试 4 次" in positioning
+    assert "REPOPILOT_ESCALATION_AFTER_NO_PROGRESS" not in readme
+    assert "REPOPILOT_ESCALATION_AFTER_NO_PROGRESS" not in workflow
 
 
 def test_contributor_guide_uses_package_metadata_instead_of_manual_dependency_fixes():

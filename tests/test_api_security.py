@@ -257,7 +257,7 @@ async def test_intelligent_agent_never_exceeds_agent_v2_retry_cap(
     assert response.status_code == 200
     assert captured == {
         "issue_url": ISSUE_URL,
-        "max_retries": 3,
+        "max_retries": 4,
         "token_budget": 100_000,
     }
 
@@ -467,7 +467,7 @@ def test_request_model_string_limits_and_extra_fields():
     [
         (main.AgentRequest, "max_turns", (1, 10), (0, 11)),
         (main.IntelligentAgentRequest, "max_turns", (1, 10), (0, 11)),
-        (main.AgentV2Request, "max_retries", (0, 3), (-1, 4)),
+        (main.AgentV2Request, "max_retries", (0, 4), (-1, 5)),
         (main.IntelligentAgentRequest, "token_budget", (1, 100_000), (0, 100_001)),
         (main.AgentV2Request, "token_budget", (1, 100_000), (0, 100_001)),
     ],
@@ -613,7 +613,7 @@ async def test_resume_rejects_unauthorized_or_inconsistent_stored_repository(
 
 @pytest.mark.parametrize(
     ("max_retries", "token_budget"),
-    [(-1, 100_000), (4, 100_000), (3, 0), (3, 100_001)],
+    [(-1, 100_000), (5, 100_000), (4, 0), (4, 100_001)],
 )
 async def test_resume_rejects_saved_state_outside_hard_execution_limits(
     monkeypatch, api_client, max_retries, token_budget

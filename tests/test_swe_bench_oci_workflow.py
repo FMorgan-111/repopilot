@@ -334,8 +334,8 @@ def test_workflow_initializes_runner_paths_after_runner_assignment() -> None:
 def test_runner_path_contract_rejects_job_level_runner_context() -> None:
     text = _workflow_text()
     mutation = text.replace(
-        '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
-        '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+        '      REPOPILOT_ESCALATION_ENABLED: "1"\n',
+        '      REPOPILOT_ESCALATION_ENABLED: "1"\n'
         "      FORBIDDEN_PATH: ${{ runner.temp }}/forbidden\n",
         1,
     )
@@ -368,23 +368,23 @@ def test_runner_path_contract_rejects_inline_job_level_runner_context() -> None:
             "    }\n",
         ),
         (
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n',
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n'
             "      FORBIDDEN_PATH: ${{runner.temp}}/forbidden\n",
         ),
         (
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n',
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n'
             "      FORBIDDEN_PATH: ${{ runner['temp'] }}/forbidden\n",
         ),
         (
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n',
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n'
             "      FORBIDDEN_PATH: ${{ runner .temp }}/forbidden\n",
         ),
         (
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n',
-            '      REPOPILOT_ESCALATION_AFTER_NO_PROGRESS: "2"\n'
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n',
+            '      REPOPILOT_ESCALATION_ENABLED: "1"\n'
             "      FORBIDDEN_PATH: ${{ runner ['temp'] }}/forbidden\n",
         ),
         (

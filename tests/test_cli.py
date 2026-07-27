@@ -84,11 +84,11 @@ def test_cli_issue_url_path_remains_supported(monkeypatch, capsys):
     assert "RepoPilot analyzing https://github.com/acme/widget/issues/42" in capsys.readouterr().out
 
 
-def test_cli_issue_uses_100000_default_budget(monkeypatch, capsys):
+def test_cli_issue_uses_agent_v2_defaults(monkeypatch, capsys):
     calls = []
 
-    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
-        calls.append(token_budget)
+    async def fake_agent_v2(issue_url, max_retries, token_budget):
+        calls.append((max_retries, token_budget))
         return {"success": True}
 
     monkeypatch.setattr(cli, "agent_v2", fake_agent_v2)
@@ -97,8 +97,18 @@ def test_cli_issue_uses_100000_default_budget(monkeypatch, capsys):
         cli.main(["https://github.com/acme/widget/issues/42", "--json"])
 
     assert exc_info.value.code == 0
-    assert calls == [100_000]
+    assert calls == [(4, 100_000)]
     assert json.loads(capsys.readouterr().out) == {"success": True}
+
+
+def test_cli_help_describes_five_transaction_default(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "default: 4" in help_text
+    assert "five transactions total" in help_text
 
 
 def test_cli_runs_json_lists_saved_runs(monkeypatch, capsys):

@@ -28,7 +28,12 @@ from src.run_store import (
     summarize_replay,
     summarize_run,
 )
-from src.state import DEFAULT_AGENT_V2_TOKEN_BUDGET, AgentState
+from src.state import (
+    DEFAULT_AGENT_V2_MAX_RETRIES,
+    DEFAULT_AGENT_V2_TOKEN_BUDGET,
+    MAX_AGENT_V2_MAX_RETRIES,
+    AgentState,
+)
 
 _OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 _REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
@@ -289,7 +294,7 @@ def _load_authorized_run(run_id: str) -> AgentState:
 
     if (
         state.trace_id != run_id
-        or not (0 <= state.max_retries <= 3)
+        or not (0 <= state.max_retries <= MAX_AGENT_V2_MAX_RETRIES)
         or not (1 <= state.token_budget <= 100_000)
     ):
         raise HTTPException(
@@ -357,7 +362,12 @@ class IntelligentAgentRequest(StrictRequestModel):
 
 class AgentV2Request(StrictRequestModel):
     issue_url: str = Field(max_length=2_048)
-    max_retries: int = Field(default=3, ge=0, le=3, strict=True)
+    max_retries: int = Field(
+        default=DEFAULT_AGENT_V2_MAX_RETRIES,
+        ge=0,
+        le=MAX_AGENT_V2_MAX_RETRIES,
+        strict=True,
+    )
     token_budget: int = Field(
         default=DEFAULT_AGENT_V2_TOKEN_BUDGET,
         ge=1,
@@ -409,7 +419,7 @@ async def intelligent_agent(req: IntelligentAgentRequest):
         try:
             result = await intelligent_analyze_issue(
                 req.issue_url,
-                max_retries=min(req.max_turns, 3),
+                max_retries=min(req.max_turns, MAX_AGENT_V2_MAX_RETRIES),
                 token_budget=req.token_budget,
             )
         except CancellationDrainError:

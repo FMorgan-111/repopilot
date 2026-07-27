@@ -25,6 +25,8 @@ from .exception_safety import normalize_exception_class
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
 
+DEFAULT_AGENT_V2_MAX_RETRIES = 4
+MAX_AGENT_V2_MAX_RETRIES = 4
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
 
 _REPAIR_SMUGGLING_RE = re.compile(
@@ -819,7 +821,7 @@ class AgentState(BaseModel):
     fix_attempts: list[FixAttempt] = Field(default_factory=list)
     conversation_history: list[ConversationTurn] = Field(default_factory=list)
     token_usage: int = 0
-    max_retries: int = 3
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET
     retry_count: int = 0
     tool_calls: list[ToolCall] = Field(default_factory=list)

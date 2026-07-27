@@ -40,6 +40,9 @@ DEFAULT_MODEL = "gemini-3.5-flash:stable"
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
+DEFAULT_AGENT_V2_MAX_RETRIES = importlib.import_module(
+    "src.state"
+).DEFAULT_AGENT_V2_MAX_RETRIES
 _safe_subprocess = importlib.import_module("src.safe_subprocess")
 minimal_subprocess_env = _safe_subprocess.minimal_subprocess_env
 run_bounded_process = _safe_subprocess.run_bounded_process
@@ -1199,7 +1202,7 @@ async def run_eval(
 
 async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     sample_id: str | None = None,
     seed_gold_files: bool = False,
@@ -1232,7 +1235,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
     parser.add_argument("--model", default=DEFAULT_MODEL)
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_AGENT_V2_MAX_RETRIES)
     parser.add_argument(
         "--token-budget",
         type=int,

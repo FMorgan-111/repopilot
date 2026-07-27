@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import inspect
 import json
 import stat
 import subprocess
@@ -14,7 +15,12 @@ import src.run_store as run_store
 from src import graph, http_client, new_agent
 from src.async_safety import CancellationDrainError
 from src.nodes.commit import PRCancellationCleanupError
-from src.state import ModelInvocation, NoProgressEvent
+from src.state import (
+    DEFAULT_AGENT_V2_MAX_RETRIES,
+    MAX_AGENT_V2_MAX_RETRIES,
+    ModelInvocation,
+    NoProgressEvent,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +30,24 @@ def _enable_explicit_legacy_host_execution(monkeypatch):
 
 def test_agent_v2_default_budget_is_100000():
     assert new_agent.agent_v2.__defaults__[1] == 100_000
+
+
+def test_five_transaction_retry_defaults_are_canonical():
+    assert DEFAULT_AGENT_V2_MAX_RETRIES == 4
+    assert MAX_AGENT_V2_MAX_RETRIES == 4
+    assert (
+        new_agent.AgentState(
+            issue_url="https://github.com/a/b/issues/1"
+        ).max_retries
+        == 4
+    )
+    assert inspect.signature(new_agent.agent_v2).parameters["max_retries"].default == 4
+    assert (
+        inspect.signature(new_agent.intelligent_analyze_issue)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
 
 
 def test_final_report_done_without_terminal_coverage_binding_is_not_applied():

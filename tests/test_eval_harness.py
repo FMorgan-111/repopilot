@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import inspect
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,6 +12,15 @@ from src.safe_subprocess import ProcessOutputLimitError, minimal_subprocess_env
 from src.tool_policy import PYTEST_BOOTSTRAP
 
 BASE_COMMIT = "a" * 40
+
+
+def test_agent_v2_eval_wrapper_uses_five_transaction_default():
+    assert (
+        inspect.signature(harness.run_agent_v2_eval)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
 
 
 def _sample(base_commit: object = BASE_COMMIT) -> dict:

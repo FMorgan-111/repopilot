@@ -78,7 +78,7 @@ export LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1
 # Inject LLM_ESCALATION_API_KEY with the runtime secret store.
 ```
 
-`REPOPILOT_ESCALATION_AFTER_NO_PROGRESS=2` is the default bounded trigger.
+Escalation has a deterministic threshold of two failed primary Gemini rounds.
 Without the flag or key, evaluation remains Gemini-only and does not incur an
 escalation call.
 
@@ -151,7 +151,8 @@ RepoPilot implements a **six-phase state machine** with a self-reflective retry 
 
 - **Token budget** — configurable per-run; agent stops gracefully when exceeded rather than burning credits
 - **Duplicate failure detection** — if the same patch produces the same error twice, the agent aborts instead of looping
-- **Max retry cap** — defaults to 3; reachable, not theoretical
+- **Max retry cap** — defaults to 4 after the initial transaction (five
+  transactions total); reachable, not theoretical
 - **Pydantic-validated structured output** — LLM responses are parsed into typed models with schema validation and an automatic retry-on-`ValidationError` fallback
 
 ---
@@ -324,7 +325,7 @@ python -u eval/agent_v2_harness.py \
   --dataset swe-bench-verified \
   --dataset-seed 17 \
   --samples 10 \
-  --max-retries 3 \
+  --max-retries 4 \
   --token-budget 100000 \
   --predictions-file eval/swe_bench_predictions.jsonl
 ```
@@ -492,7 +493,7 @@ Endpoints:
 Protected request bodies are capped at exactly 65,536 bytes, including chunked
 requests. At most two authorized repository operations execute concurrently;
 a third is rejected immediately with 429 and `Retry-After` instead of joining
-an unbounded waiter queue. Agent v2 accepts `max_retries` 0–3 and
+an unbounded waiter queue. Agent v2 accepts `max_retries` 0–4 and
 `token_budget` 1–100,000; legacy turn counts are 1–10. Run IDs use at most 64
 safe alphanumeric/underscore/hyphen characters, and resume answers are limited
 to 1–16,384 characters. Public OpenAPI, Swagger UI, and ReDoc routes are

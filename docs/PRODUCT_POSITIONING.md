@@ -117,13 +117,13 @@
 
 | | 专业程序员 | Vibe Coder |
 |------|----------|-----------|
-| 行为 | REFLECT 反思 → 重试 2 次 → 失败后标注原因，发 Issue comment | 不知道——用户没有后手 |
+| 行为 | REFLECT 反思 → 重试 4 次 → 失败后标注原因，发 Issue comment | 不知道——用户没有后手 |
 | 失败价值 | 定位到文件 + 根因推测 = 仍然有价值 | 修不好 = 完全没价值 |
 
 **RepoPilot v2 现状**：
 - REFLECT 节点会分析失败原因
 - `handle_failure` 发 Issue comment，列出定位到的文件和尝试过的 patch
-- 最多重试 3 次（`max_retries`）
+- 最多重试 4 次（`max_retries`，初次加 4 次重试共 5 个事务）
 
 面向 A：失败处理已经很好了。面向 B：失败的 agent = 废铁。
 
