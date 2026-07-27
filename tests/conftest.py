@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import json
 import sys
 from pathlib import Path
 
@@ -19,6 +20,26 @@ def _reset_llm_global():
     _reset_llm_client()
     yield
     _reset_llm_client()
+
+
+@pytest.fixture(autouse=True)
+def _pin_llm_env(monkeypatch):
+    """Pin the LLM endpoint/model to deterministic test defaults so httpx_mock's
+    hard-coded api.deepseek.com URL matches. Without this, a developer's .env
+    pointing LLM_BASE_URL at a real gateway (e.g. the Gemini proxy) makes the
+    request URL mismatch every mock and the whole http_client/llm suite goes red.
+    """
+    monkeypatch.setenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.setenv("LLM_MODEL", "deepseek-v4-pro")
+    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    # Cross-vendor keys must never affect the primary credential domain.
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("LINOAPI_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_BASE_URL", raising=False)
+    monkeypatch.delenv("LLM_ESCALATION_MODEL", raising=False)
+    monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
 
 
 class HTTPXMock:
@@ -44,12 +65,31 @@ class HTTPXMock:
             if response["url"] is not None and response["url"] != str(request.url):
                 continue
             self._responses.pop(index)
-            return httpx.Response(
-                status_code=response["status_code"],
-                json=response["json"],
-                request=request,
-            )
+            return self._make_response(request, response)
         raise AssertionError(f"No mocked response for {request.method} {request.url}")
+
+    def _make_response(self, request, response) -> httpx.Response:
+        status = response["status_code"]
+        body = response["json"]
+        # The LLM client streams (stream=True). Re-serve the mocked completion as
+        # Server-Sent Events so the streaming parser reconstructs it — keeps the
+        # existing json= mocks working without per-test changes.
+        wants_stream = False
+        try:
+            wants_stream = bool(json.loads(request.content or b"{}").get("stream"))
+        except Exception:
+            wants_stream = False
+        if wants_stream and status == 200 and isinstance(body, dict) and body.get("choices"):
+            content = body["choices"][0].get("message", {}).get("content", "")
+            sse = (
+                "data: "
+                + json.dumps({"choices": [{"delta": {"content": content}}]})
+                + "\n\ndata: [DONE]\n"
+            )
+            return httpx.Response(
+                status_code=status, content=sse.encode(), request=request
+            )
+        return httpx.Response(status_code=status, json=body, request=request)
 
 
 @pytest.fixture

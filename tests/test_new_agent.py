@@ -1,7 +1,513 @@
+import asyncio
 import functools
+import json
+import stat
+import subprocess
+import threading
+from types import SimpleNamespace
 
+import pytest
+
+import src.nodes.commit as commit_node
+import src.nodes.execute as execute_node
 import src.run_store as run_store
-from src import new_agent
+from src import graph, http_client, new_agent
+from src.async_safety import CancellationDrainError
+from src.nodes.commit import PRCancellationCleanupError
+from src.state import ModelInvocation, NoProgressEvent
+
+
+@pytest.fixture(autouse=True)
+def _enable_explicit_legacy_host_execution(monkeypatch):
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+
+
+def test_agent_v2_default_budget_is_100000():
+    assert new_agent.agent_v2.__defaults__[1] == 100_000
+
+
+def test_final_report_done_without_terminal_coverage_binding_is_not_applied():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.DONE,
+        pr_url="https://github.com/acme/widget/pull/42",
+    )
+    before = state.model_dump(mode="json")
+
+    report = new_agent.final_report_from_state(state, turns_taken=3)
+
+    assert report.fix_applied is False
+    assert state.model_dump(mode="json") == before
+
+
+def test_agent_payload_reuses_side_effect_free_terminal_validation(monkeypatch):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.DONE,
+    )
+    before = state.model_dump(mode="json")
+    validated_states = []
+
+    def fake_validate(candidate):
+        validated_states.append(candidate)
+        candidate.failure_reason = "validation mutated its input"
+        return SimpleNamespace(patch_content="")
+
+    monkeypatch.setattr(
+        new_agent, "validate_terminal_coverage_binding", fake_validate
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=3)
+
+    assert payload["fix_applied"] is True
+    assert payload["success"] is True
+    assert len(validated_states) == 1
+    assert validated_states[0] is not state
+    assert state.model_dump(mode="json") == before
+
+
+def test_agent_state_default_budget_is_100000():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7"
+    )
+
+    assert state.token_budget == 100_000
+
+
+async def test_agent_v2_initializes_primary_model_from_provider(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    class PrimaryConfig:
+        model = "configured-gemini"
+
+    monkeypatch.setattr(new_agent, "get_model_config", lambda provider: PrimaryConfig())
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+
+    assert captured["state"].active_provider == "primary"
+    assert captured["state"].active_model == "configured-gemini"
+    assert captured["state"].token_budget == 100_000
+
+
+async def test_agent_v2_preserves_explicit_budget(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    class PrimaryConfig:
+        model = "configured-gemini"
+
+    monkeypatch.setattr(new_agent, "get_model_config", lambda provider: PrimaryConfig())
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        token_budget=12_345,
+    )
+
+    assert captured["state"].token_budget == 12_345
+
+
+def test_agent_payload_includes_only_safe_model_routing_history(monkeypatch):
+    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "never-export-this-key")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        active_model="claude-opus-4-8:stable",
+        active_provider="escalation",
+        escalated=True,
+        escalation_reason="repeated_edit",
+        no_progress_rounds=2,
+        model_history=[
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="plan_fix",
+                elapsed_seconds=1.0,
+                input_tokens=100,
+                output_tokens=20,
+                status="error",
+                error_class="TimeoutError: never-export-this-key",
+            )
+        ],
+        no_progress_history=[
+            NoProgressEvent(
+                kind="repeated_edit", fingerprint="safe-sha", node="plan_fix"
+            )
+        ],
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["active_model"] == "claude-opus-4-8:stable"
+    assert payload["active_provider"] == "escalation"
+    assert payload["escalated"] is True
+    assert payload["escalation_reason"] == "repeated_edit"
+    assert payload["no_progress_rounds"] == 2
+    assert payload["model_history"][0]["error_class"] == "TimeoutError"
+    assert payload["no_progress_history"] == [
+        {"kind": "repeated_edit", "fingerprint": "safe-sha", "node": "plan_fix"}
+    ]
+    serialized = json.dumps(payload)
+    assert "never-export-this-key" not in serialized
+    assert "api_key" not in serialized
+
+
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_agent_payload_preserves_exact_test_generation_attempts(attempts):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        test_generation_attempts=attempts,
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["test_generation_attempts"] == attempts
+
+
+def test_agent_payload_rejects_hostile_routing_strings():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        escalation_reason="FAIL_TO_PASS",
+        model_history=[
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node='"quoted-sentinel"',
+                elapsed_seconds=1.0,
+                input_tokens=1,
+                output_tokens=1,
+                status="error",
+                error_class="CredentialSentinel",
+            )
+        ],
+        no_progress_history=[
+            NoProgressEvent(
+                kind="unknown_value",
+                fingerprint="safe-sha",
+                node="FAIL_TO_PASS",
+            )
+        ],
+        node_diagnostics=[
+            {
+                "event": "model_escalated",
+                "from": "gemini-3.5-flash:stable",
+                "to": "claude-opus-4-8:stable",
+                "reason": "FAIL_TO_PASS",
+                "round": 2,
+            }
+        ],
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+    serialized = json.dumps(payload)
+
+    assert payload["escalation_reason"] == ""
+    assert payload["model_history"][0]["error_class"] == ""
+    assert payload["model_history"][0]["node"] == ""
+    assert payload["no_progress_history"][0]["kind"] == ""
+    assert payload["no_progress_history"][0]["node"] == ""
+    assert payload["node_diagnostics"][0]["reason"] == ""
+    for hostile_value in (
+        "CredentialSentinel",
+        '"quoted-sentinel"',
+        "FAIL_TO_PASS",
+        "unknown_value",
+    ):
+        assert hostile_value not in serialized
+
+
+@pytest.mark.parametrize(
+    "hostile_value",
+    ["CredentialSentinel", '"quoted-sentinel"', "FAIL_TO_PASS", "unknown_value"],
+)
+def test_model_invocation_rejects_non_exception_error_class(hostile_value):
+    invocation = ModelInvocation(
+        model="gemini-3.5-flash:stable",
+        provider="primary",
+        node="plan",
+        elapsed_seconds=1.0,
+        input_tokens=1,
+        output_tokens=1,
+        status="error",
+        error_class=hostile_value,
+    )
+
+    assert invocation.error_class == ""
+    assert hostile_value not in invocation.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    "error_class",
+    ["ReadTimeout", "ConnectTimeout", "PoolTimeout", "WriteTimeout"],
+)
+def test_model_invocation_preserves_gateway_timeout_class_round_trip(
+    error_class,
+):
+    exception = type(error_class, (TimeoutError,), {})()
+    from_exception = ModelInvocation(
+        model="gemini-3.5-flash:stable",
+        provider="primary",
+        node="plan",
+        elapsed_seconds=1.0,
+        input_tokens=1,
+        output_tokens=0,
+        status="error",
+        error_class=exception,
+    )
+
+    loaded = ModelInvocation.model_validate_json(from_exception.model_dump_json())
+    from_string = ModelInvocation.model_validate(
+        {**from_exception.model_dump(), "error_class": error_class}
+    )
+
+    assert from_exception.error_class == error_class
+    assert loaded.error_class == error_class
+    assert from_string.error_class == error_class
+
+
+async def test_issue_only_seed_starts_agent_at_locate(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["start"] = compiled_graph.start
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={
+            "owner": "acme",
+            "repo": "widget",
+            "issue_number": 7,
+            "issue_title": "Login crash",
+            "issue_body": "ValueError",
+            "repo_ref": "a" * 40,
+            "repo_path": "/tmp/widget",
+        },
+    )
+
+    assert captured["start"] == "locate_code"
+    assert captured["state"].current_phase == new_agent.Phase.LOCATE
+    assert captured["state"].repo_ref == "a" * 40
+    assert captured["state"].repo_path == "/tmp/widget"
+
+
+async def test_seeded_trace_identity_is_used_by_final_agent(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(_compiled_graph, state):
+        captured["trace_id"] = state.trace_id
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *_args, **_kwargs: None)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={"trace_id": "abc123def456"},
+    )
+
+    assert captured["trace_id"] == "abc123def456"
+    assert payload["trace_id"] == "abc123def456"
+
+
+async def test_oracle_seed_with_files_starts_agent_at_plan(monkeypatch):
+    captured = {}
+
+    async def fake_run_graph(compiled_graph, state):
+        captured["start"] = compiled_graph.start
+        captured["state"] = state.model_copy(deep=True)
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        seed={
+            "owner": "acme",
+            "repo": "widget",
+            "relevant_files": [
+                {"path": "src/auth.py", "content": "def login(): pass\n"}
+            ],
+        },
+    )
+
+    assert captured["start"] == "plan_fix"
+    assert captured["state"].current_phase == new_agent.Phase.PLAN
+
+
+def test_agent_payload_rejects_unapproved_binary_git_diff(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    source = tmp_path / "value.txt"
+    source.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "value.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    source.write_text("after\n", encoding="utf-8")
+    expected = subprocess.run(
+        ["git", "-C", str(tmp_path), "diff", "--binary", "--no-ext-diff"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert expected
+    assert payload["model_patch"] == ""
+    assert payload["success"] is False
+
+
+def test_agent_payload_rejects_unapproved_untracked_files(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "new_file.py").write_text("enabled = True\n", encoding="utf-8")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert payload["model_patch"] == ""
+    assert payload["success"] is False
+
+
+def test_agent_payload_excludes_untracked_generated_archives(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"],
+        check=True,
+    )
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "commit", "-m", "base"],
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / "new_file.py").write_text("enabled = True\n", encoding="utf-8")
+    (tmp_path / "setuptools-33.1.1.zip").write_bytes(b"PK\x03\x04\x00generated")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert payload["model_patch"] == ""
+    assert "setuptools-33.1.1.zip" not in payload["model_patch"]
+
+
+def test_agent_payload_suppresses_diff_after_generated_test_rollback_failure(
+    tmp_path,
+):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    (tmp_path / "base.py").write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "base.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_leaked.py").write_text("LEAKED = True\n")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+        coverage_status="failed",
+        coverage_failure_reason="generated_test_rollback_failed",
+        failure_reason="test_generation_failed:generated_test_rollback_failed",
+    )
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+
+    assert payload["model_patch"] == ""
+    assert "test_leaked.py" not in json.dumps(payload)
+
+
+def test_agent_payload_never_exports_evaluator_only_patch_values(tmp_path):
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True
+    )
+    (tmp_path / "base.py").write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "base.py"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "base"], check=True)
+    sentinel = "RAW-GOLD-PATCH-5519"
+    (tmp_path / "base.py").write_text(f"gold_patch={sentinel}\n")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path=str(tmp_path),
+    )
+    payload = new_agent.agent_payload_from_state(state, turns_taken=0)
+    assert sentinel not in json.dumps(payload)
+    assert "gold_patch" not in payload["model_patch"].casefold()
 
 
 async def test_agent_v2_state_machine_transitions_to_done(monkeypatch):
@@ -87,26 +593,693 @@ def test_langgraph_conditional_router_uses_native_async_callable():
     )
 
 
-async def test_agent_v2_crash_payload_exposes_human_input_defaults(monkeypatch):
-    saved_traces = []
+def test_llm_phase_timeouts_cover_retry_window():
+    llm_retry_window = http_client.llm_retry_budget_seconds()
+    planner_margin = 30.0
 
-    async def crash_graph(graph, state):
-        raise RuntimeError("boom")
+    assert graph.PHASE_TIMEOUTS["understand_issue"] >= llm_retry_window
+    assert graph.PHASE_TIMEOUTS["locate_code"] >= 180.0
+    assert graph.PHASE_TIMEOUTS["plan_fix"] >= llm_retry_window + planner_margin
+    assert graph.PHASE_TIMEOUTS["execute_fix"] >= 600.0
+    assert graph.PHASE_TIMEOUTS["ensure_coverage"] >= 1200.0
+    assert graph.PHASE_TIMEOUTS["reflect_on_failure"] >= llm_retry_window + planner_margin
+    assert graph.PHASE_TIMEOUTS["commit_fix"] >= 600.0
+    assert graph.PHASE_TIMEOUTS["handle_failure"] >= 60.0
+
+
+async def test_verify_success_always_routes_to_coverage():
+    for skip_commit in (False, True):
+        state = new_agent.AgentState(
+            issue_url="https://github.com/acme/widget/issues/7",
+            current_phase=new_agent.Phase.VERIFY,
+            skip_commit=skip_commit,
+            fix_attempts=[
+                new_agent.FixAttempt(test_result="passed", success=True)
+            ],
+        )
+        result = await new_agent.verify_fix(state)
+        assert result.current_phase == new_agent.Phase.COVERAGE
+        assert graph.route_from_state(result) == "ensure_coverage"
+
+
+def test_coverage_phase_is_registered_as_a_graph_entry_point():
+    assert new_agent._entry_point_for_phase(new_agent.Phase.COVERAGE) == "ensure_coverage"
+    assert new_agent.ensure_coverage is not None
+
+
+async def test_fallback_graph_records_phase_timeout_diagnostic(monkeypatch):
+    async def slow_node(state):
+        await asyncio.sleep(1)
+        return state
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "plan_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph({"plan_fix": slow_node}, "plan_fix")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert final_state.node_diagnostics[-1]["node"] == "plan_fix"
+    assert final_state.node_diagnostics[-1]["event"] == "phase"
+    assert final_state.node_diagnostics[-1]["status"] == "timeout"
+    assert final_state.node_diagnostics[-1]["error_type"] == "TimeoutError"
+    assert final_state.node_diagnostics[-1]["phase_timeout_seconds"] == 0.01
+    assert "timeout_cause_type" not in final_state.node_diagnostics[-1]
+
+
+async def test_fallback_graph_preserves_redacted_pr_cleanup_timeout_cause(
+    monkeypatch,
+):
+    secret = "sk-" + "timeout-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                27,
+                cancellation,
+                OSError(f"close failed Authorization: Bearer {secret}"),
+            )
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph(
+        {"commit_fix": cleanup_fails_on_cancel}, "commit_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "timed out" in final_state.failure_reason
+    assert "pull request 27" in final_state.failure_reason
+    assert "OSError" in final_state.failure_reason
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_pr_number"] == 27
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+
+
+async def test_wrapped_node_preserves_redacted_pr_cleanup_timeout_cause(
+    monkeypatch,
+):
+    secret = "sk-" + "wrapped-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                31,
+                cancellation,
+                RuntimeError(f"cleanup token={secret}"),
+            )
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    wrapped = new_agent._wrap_node("commit_fix", cleanup_fails_on_cancel)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "timed out" in final_state.failure_reason
+    assert "pull request 31" in final_state.failure_reason
+    assert "RuntimeError" in final_state.failure_reason
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "RuntimeError"
+    assert diagnostic["cleanup_pr_number"] == 31
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+
+
+async def test_built_fallback_graph_preserves_pr_cleanup_timeout_cause(
+    monkeypatch, capsys,
+):
+    secret = "sk-" + "built-fallback-cleanup-secret-123456789"
+
+    async def cleanup_fails_on_cancel(_state):
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError as cancellation:
+            raise PRCancellationCleanupError(
+                37,
+                cancellation,
+                OSError(f"close failed token={secret}"),
+            )
+
+    monkeypatch.setattr(new_agent, "StateGraph", None)
+    monkeypatch.setattr(new_agent, "commit_fix", cleanup_fails_on_cancel)
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    compiled = new_agent.build_agent_graph(
+        start_phase=new_agent.Phase.COMMIT
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_pr_number"] == 37
+    assert "[REDACTED]" in diagnostic["cleanup_error"]
+    serialized = json.dumps(
+        {
+            "failure_reason": final_state.failure_reason,
+            "diagnostic": diagnostic,
+        }
+    )
+    assert secret not in serialized
+    progress = [
+        line for line in capsys.readouterr().err.splitlines()
+        if "commit_fix" in line
+    ]
+    assert len(progress) == 2
+    assert "START" in progress[0]
+    assert "TIMEOUT" in progress[1]
+
+
+async def test_fallback_graph_reraises_direct_drain_error_by_identity():
+    sentinel = CancellationDrainError(
+        "fallback graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    compiled = graph.FallbackCompiledGraph(
+        {"plan_fix": fail_with_drain}, "plan_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await compiled.ainvoke(state)
+
+    assert caught.value is sentinel
+
+
+async def test_run_graph_observer_keeps_fallback_ainvoke_signature():
+    observed = []
+
+    async def finish(state):
+        state.token_usage = 19
+        state.current_phase = new_agent.Phase.FAILED
+        return state
+
+    compiled = graph.FallbackCompiledGraph(
+        {"handle_failure": finish},
+        "handle_failure",
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.FAILURE,
+    )
+
+    with graph.capture_graph_states(observed.append):
+        result = await graph.run_graph(compiled, state)
+
+    assert result.token_usage == 19
+    assert observed[0] is state
+    assert observed[-1] is result
+
+
+async def test_wrapped_node_reraises_direct_drain_error_by_identity():
+    sentinel = CancellationDrainError(
+        "wrapped node",
+        asyncio.CancelledError("external cancel"),
+        RuntimeError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    wrapped = new_agent._wrap_node("commit_fix", fail_with_drain)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await wrapped(state)
+
+    assert caught.value is sentinel
+
+
+async def test_real_wrapped_commit_timeout_retains_cleanup_evidence(
+    monkeypatch,
+):
+    binding = object()
+
+    async def pushed(_state, actual_binding):
+        assert actual_binding is binding
+        return {
+            "head_sha": "d" * 40,
+            "commit_chain": ["d" * 40],
+            "repository_identity": {"full_name": "acme/widget"},
+            "files": [],
+        }
+
+    async def create_pr_fails_on_cancel(*_args, **_kwargs):
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError as cancellation:
+            cleanup_error = OSError("close failed after commit timeout")
+            raise PRCancellationCleanupError(
+                73, cancellation, cleanup_error
+            ) from cleanup_error
+
+    monkeypatch.setattr(
+        commit_node, "validate_terminal_coverage_binding", lambda _state: binding
+    )
+    monkeypatch.setattr(commit_node, "push_files", pushed)
+    monkeypatch.setattr(commit_node, "create_pr", create_pr_fails_on_cancel)
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "commit_fix", 0.01)
+    wrapped = new_agent._wrap_node("commit_fix", new_agent.commit_fix)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-real-commit-timeout",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert final_state.current_phase == new_agent.Phase.FAILURE
+    assert "PR cancellation cleanup failed for pull request 73" in (
+        final_state.failure_reason
+    )
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["timeout_cleanup_kind"] == "pr_cleanup"
+    assert diagnostic["timeout_cause_type"] == "PRCancellationCleanupError"
+    assert diagnostic["cleanup_error_type"] == "OSError"
+    assert diagnostic["cleanup_error"] == "close failed after commit timeout"
+    assert diagnostic["cleanup_pr_number"] == 73
+
+
+async def test_fallback_graph_does_not_persist_direct_timeout_message():
+    secret = "sk-" + "fallback-direct-timeout-secret-123456789"
+
+    async def direct_timeout(_state):
+        raise asyncio.TimeoutError(
+            f"Authorization: Bearer {secret}"
+        )
+
+    compiled = graph.FallbackCompiledGraph(
+        {"plan_fix": direct_timeout}, "plan_fix"
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["error"] == "TimeoutError"
+    assert "timeout_cause_type" not in diagnostic
+    assert secret not in json.dumps(diagnostic)
+
+
+async def test_wrapped_node_does_not_persist_direct_timeout_message():
+    secret = "sk-" + "wrapped-direct-timeout-secret-123456789"
+
+    async def direct_timeout(_state):
+        raise asyncio.TimeoutError(f"token={secret}")
+
+    wrapped = new_agent._wrap_node("commit_fix", direct_timeout)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.COMMIT,
+    )
+
+    final_state = await wrapped(state)
+
+    diagnostic = final_state.node_diagnostics[-1]
+    assert diagnostic["status"] == "timeout"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["error"] == "TimeoutError"
+    assert "timeout_cause_type" not in diagnostic
+    assert secret not in json.dumps(diagnostic)
+
+
+async def test_phase_timeout_preserves_existing_node_diagnostics(monkeypatch):
+    async def slow_node(state):
+        state.node_diagnostics.append(
+            {
+                "node": "plan_fix",
+                "event": "prompt_built",
+                "status": "success",
+                "prompt_tokens_estimate": 3456,
+                "relevant_file_count": 2,
+            }
+        )
+        await asyncio.sleep(1)
+        return state
+
+    monkeypatch.setitem(graph.PHASE_TIMEOUTS, "plan_fix", 0.01)
+    compiled = graph.FallbackCompiledGraph({"plan_fix": slow_node}, "plan_fix")
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.PLAN,
+    )
+
+    final_state = await compiled.ainvoke(state)
+
+    assert final_state.node_diagnostics[-2]["event"] == "prompt_built"
+    assert final_state.node_diagnostics[-2]["prompt_tokens_estimate"] == 3456
+    assert final_state.node_diagnostics[-1]["event"] == "phase"
+    assert final_state.node_diagnostics[-1]["status"] == "timeout"
+
+
+async def test_agent_v2_real_langgraph_crash_preserves_latest_state_and_run(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
+
+    secret = "sk-crashtelemetrysecret123"
+    run_root = tmp_path / ".repopilot"
+    trace_path = tmp_path / "trace.json"
+    real_save_trace = new_agent._save_trace
+
+    async def crash_after_telemetry(state):
+        state.token_usage = 7
+        state.test_generation_attempts = 1
+        state.model_history.append(
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="test_generation",
+                elapsed_seconds=0.25,
+                input_tokens=7,
+                output_tokens=0,
+                status="cancelled",
+                error_class="CancelledError",
+            )
+        )
+        state.coverage_status = "failed"
+        state.coverage_test_files = ["tests/test_regression.py"]
+        state.coverage_test_command = "pytest tests/test_regression.py"
+        state.coverage_failure_reason = "test_generation_failed"
+        raise RuntimeError(f"provider failed with {secret}")
+
+    def build_crashing_graph(*, start_phase):
+        del start_phase
+        builder = new_agent.StateGraph(new_agent.AgentState)
+        builder.add_node("crash_after_telemetry", crash_after_telemetry)
+        builder.set_entry_point("crash_after_telemetry")
+        return builder.compile()
 
     def save_trace(tracer, path, state=None):
-        saved_traces.append({"path": path, "trace_id": tracer.trace_id, "state": state})
+        real_save_trace(tracer, str(trace_path), state)
 
-    monkeypatch.setattr(new_agent, "run_graph", crash_graph)
+    monkeypatch.setattr(new_agent, "build_agent_graph", build_crashing_graph)
     monkeypatch.setattr(new_agent, "_save_trace", save_trace)
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state: run_store.save_run(state, root_dir=run_root),
+    )
 
-    payload = await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
 
     assert payload["done"] is True
     assert payload["success"] is False
     assert payload["waiting_for_user"] is False
     assert payload["final_phase"] == "CRASHED"
     assert payload["human_input_request"] == {}
-    assert saved_traces[0]["state"].issue_url == "https://github.com/acme/widget/issues/7"
+    assert payload["token_used"] == 7
+    assert payload["test_generation_attempts"] == 1
+    assert payload["model_history"] == [
+        {
+            "model": "gemini-3.5-flash:stable",
+            "provider": "primary",
+            "node": "test_generation",
+            "elapsed_seconds": 0.25,
+            "input_tokens": 7,
+            "output_tokens": 0,
+            "status": "cancelled",
+            "error_class": "CancelledError",
+        }
+    ]
+    assert payload["coverage_status"] == "failed"
+    assert payload["coverage_test_files"] == ["tests/test_regression.py"]
+    assert payload["coverage_test_command"] == "pytest tests/test_regression.py"
+    assert payload["coverage_failure_reason"] == "test_generation_failed"
+    assert payload["coverage_proof"] is None
+    assert payload["error"].startswith("Graph crashed: RuntimeError:")
+    assert len(payload["error"]) <= 500
+
+    saved = run_store.load_run(payload["run_id"], root_dir=run_root)
+    assert saved.current_phase == new_agent.Phase.FAILED
+    assert saved.pending_human_input is False
+    assert saved.human_input_request == {}
+    assert saved.token_usage == 7
+    assert saved.test_generation_attempts == 1
+    assert saved.model_history[0].status == "cancelled"
+    assert saved.coverage_failure_reason == "test_generation_failed"
+
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["trace_id"] == payload["trace_id"]
+    assert trace["coverage_status"] == "failed"
+    assert trace["steps"][-1]["step"] == "agent_v2_crash"
+    captured = capsys.readouterr()
+    emitted = json.dumps({"payload": payload, "trace": trace})
+    emitted += captured.out + captured.err
+    assert secret not in emitted
+
+
+async def test_run_graph_real_langgraph_reraises_drain_by_identity():
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
+
+    sentinel = CancellationDrainError(
+        "real graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("drain failed"),
+    )
+
+    async def fail_with_drain(_state):
+        raise sentinel
+
+    builder = new_agent.StateGraph(new_agent.AgentState)
+    builder.add_node("fail_with_drain", fail_with_drain)
+    builder.set_entry_point("fail_with_drain")
+    builder.set_finish_point("fail_with_drain")
+    compiled = builder.compile()
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7"
+    )
+
+    with graph.capture_graph_states(lambda _state: None):
+        with pytest.raises(CancellationDrainError) as caught:
+            await graph.run_graph(compiled, state)
+
+    assert caught.value is sentinel
+
+
+async def test_graph_state_observers_are_isolated_across_concurrent_crashes():
+    if new_agent.StateGraph is None:
+        pytest.skip("LangGraph is unavailable")
+
+    both_entered = asyncio.Event()
+    entered = 0
+
+    async def crash_after_overlap(state):
+        nonlocal entered
+        state.token_usage = 41 if state.issue_url.endswith("/41") else 73
+        entered += 1
+        if entered == 2:
+            both_entered.set()
+        await both_entered.wait()
+        raise RuntimeError(f"crash-{state.token_usage}")
+
+    builder = new_agent.StateGraph(new_agent.AgentState)
+    builder.add_node("crash_after_overlap", crash_after_overlap)
+    builder.set_entry_point("crash_after_overlap")
+    builder.set_finish_point("crash_after_overlap")
+    compiled = builder.compile()
+
+    async def observe_one(token: int):
+        issue_url = f"https://github.com/acme/widget/issues/{token}"
+        initial = new_agent.AgentState(issue_url=issue_url)
+        observed = []
+        with graph.capture_graph_states(observed.append):
+            with pytest.raises(RuntimeError, match=f"crash-{token}"):
+                await graph.run_graph(compiled, initial)
+        return initial, observed
+
+    first, second = await asyncio.gather(observe_one(41), observe_one(73))
+
+    for token, (initial, observed) in zip((41, 73), (first, second)):
+        assert initial.token_usage == 0
+        assert {item.issue_url for item in observed} == {initial.issue_url}
+        assert any(
+            item is not initial and item.token_usage == token
+            for item in observed
+        )
+
+
+@pytest.mark.parametrize("failure_kind", ["oversized_state", "atomic_replace"])
+async def test_agent_v2_crash_payload_survives_real_final_run_save_failure(
+    monkeypatch,
+    capsys,
+    tmp_path,
+    failure_kind,
+):
+    secret = "sk-savefailuresecret123456789"
+    run_root = tmp_path / ".repopilot"
+    trace_path = tmp_path / "trace.json"
+    real_save_trace = new_agent._save_trace
+
+    async def crash_graph(_graph, state):
+        state.token_usage = 7
+        state.test_generation_attempts = 1
+        state.model_history.append(
+            ModelInvocation(
+                model="gemini-3.5-flash:stable",
+                provider="primary",
+                node="test_generation",
+                elapsed_seconds=0.25,
+                input_tokens=7,
+                output_tokens=0,
+                status="cancelled",
+                error_class="CancelledError",
+            )
+        )
+        if failure_kind == "oversized_state":
+            state.issue_body = "x" * (run_store.MAX_RUN_FILE_BYTES + 1)
+        raise RuntimeError("provider failed")
+
+    def save_run(state):
+        return run_store.save_run(state, root_dir=run_root)
+
+    def save_trace(tracer, path, state=None):
+        real_save_trace(tracer, str(trace_path), state)
+
+    if failure_kind == "atomic_replace":
+
+        def fail_replace(*_args, **_kwargs):
+            raise OSError(f"injected replace failure: {secret}")
+
+        monkeypatch.setattr(run_store.os, "replace", fail_replace)
+
+    monkeypatch.setattr(new_agent, "run_graph", crash_graph)
+    monkeypatch.setattr(new_agent, "save_run", save_run)
+    monkeypatch.setattr(new_agent, "_save_trace", save_trace)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
+
+    assert payload["done"] is True
+    assert payload["success"] is False
+    assert payload["final_phase"] == "CRASHED"
+    assert payload["token_used"] == 7
+    assert payload["test_generation_attempts"] == 1
+    assert payload["model_history"][0]["status"] == "cancelled"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["trace_id"] == payload["trace_id"]
+    assert trace["steps"][-1]["step"] == "agent_v2_crash"
+    assert list((run_root / "runs").glob("*.json")) == []
+    assert list((run_root / "runs").glob("*.tmp")) == []
+    captured = capsys.readouterr()
+    emitted = json.dumps({"payload": payload, "trace": trace})
+    emitted += captured.out + captured.err
+    assert secret not in emitted
+    if failure_kind == "atomic_replace":
+        assert "[REDACTED]" in captured.err
+    else:
+        assert "ValueError: run file exceeds the size limit" in captured.err
+
+
+def test_best_effort_save_run_reraises_drain_by_identity(monkeypatch):
+    sentinel = CancellationDrainError(
+        "run persistence",
+        asyncio.CancelledError("external cancel"),
+        OSError("save drain failed"),
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="trace-7",
+    )
+
+    def fail_with_drain(_state):
+        raise sentinel
+
+    monkeypatch.setattr(new_agent, "save_run", fail_with_drain)
+
+    with pytest.raises(CancellationDrainError) as raised:
+        new_agent._best_effort_save_run(state)
+
+    assert raised.value is sentinel
+
+
+async def test_agent_v2_reraises_graph_drain_error_by_identity(monkeypatch):
+    sentinel = CancellationDrainError(
+        "agent graph",
+        asyncio.CancelledError("external cancel"),
+        OSError("graph drain failed"),
+    )
+
+    async def fail_with_drain(_graph, _state):
+        raise sentinel
+
+    monkeypatch.setattr(new_agent, "run_graph", fail_with_drain)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await new_agent.agent_v2("https://github.com/acme/widget/issues/7")
+
+    assert caught.value is sentinel
 
 
 async def test_agent_v2_saves_waiting_for_user_run(monkeypatch, tmp_path):
@@ -158,6 +1331,29 @@ async def test_agent_v2_saves_waiting_for_user_run(monkeypatch, tmp_path):
     assert (tmp_path / ".repopilot" / "runs" / f"{payload['trace_id']}.json").exists()
 
 
+async def test_agent_v2_ignores_final_run_persistence_errors(monkeypatch):
+    async def fake_run_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        state.pr_url = "https://github.com/acme/widget/pull/42"
+        return state
+
+    def failing_save_run(state):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+    monkeypatch.setattr(new_agent, "save_run", failing_save_run)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=True,
+    )
+
+    assert payload["success"] is False
+    assert payload["final_phase"] == "DONE"
+    assert payload["run_id"] == payload["trace_id"]
+
+
 async def test_agent_v2_saves_final_run_when_requested(monkeypatch, tmp_path):
     async def fake_run_graph(graph, state):
         state.current_phase = new_agent.Phase.DONE
@@ -177,7 +1373,7 @@ async def test_agent_v2_saves_final_run_when_requested(monkeypatch, tmp_path):
         save_final_run=True,
     )
 
-    assert payload["success"] is True
+    assert payload["success"] is False
     assert payload["run_id"] == payload["trace_id"]
     assert (tmp_path / ".repopilot" / "runs" / f"{payload['trace_id']}.json").exists()
 
@@ -212,17 +1408,51 @@ async def test_resume_agent_v2_rejects_non_paused_run(monkeypatch):
         current_phase=new_agent.Phase.DONE,
     )
 
-    monkeypatch.setattr(new_agent, "load_run", lambda run_id: state)
+    def reject_claim(run_id, expected_state):
+        raise run_store.ResumeConflictError
 
-    payload = await new_agent.resume_agent_v2(
-        "abc123def456",
-        "Breaking changes are not allowed.",
+    monkeypatch.setattr(new_agent, "load_run", lambda run_id: state)
+    monkeypatch.setattr(new_agent, "claim_run_for_resume", reject_claim)
+
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "abc123def456",
+            "Breaking changes are not allowed.",
+        )
+
+
+async def test_resume_agent_v2_uses_preloaded_authorized_state(monkeypatch):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="abc123def456",
+        current_phase=new_agent.Phase.DONE,
     )
 
-    assert payload["success"] is False
-    assert payload["waiting_for_user"] is False
-    assert payload["final_phase"] == "DONE"
-    assert payload["error"] == "Run abc123def456 is not waiting for user input."
+    claimed = []
+
+    def forbidden_load(run_id):
+        raise AssertionError("an API-authorized snapshot must not be loaded again")
+
+    def fake_claim(run_id, expected_state):
+        claimed.append((run_id, expected_state))
+        raise run_store.ResumeConflictError
+
+    monkeypatch.setattr(new_agent, "load_run", forbidden_load)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
+    )
+
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "abc123def456",
+            "Proceed.",
+            state=state,
+        )
+
+    assert claimed == [("abc123def456", state)]
 
 
 async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch):
@@ -259,7 +1489,30 @@ async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch)
         state.current_phase = new_agent.Phase.DONE
         return state
 
+    def fake_claim(run_id, expected_state):
+        claimed = expected_state.model_copy(deep=True)
+        claimed.resume_in_progress = True
+        claimed.current_phase = new_agent.Phase.PLAN
+        claimed.pending_human_input = False
+        claimed.human_input_request = {}
+        return claimed
+
+    saved_states = []
+
     monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **_kwargs: saved_states.append(
+            state.model_copy(deep=True)
+        ),
+    )
     monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
 
@@ -280,9 +1533,10 @@ async def test_resume_agent_v2_injects_answer_and_resumes_from_plan(monkeypatch)
             "Breaking changes are not allowed."
         ),
     )
-    assert payload["success"] is True
+    assert payload["success"] is False
     assert payload["run_id"] == "abc123def456"
     assert payload["final_phase"] == "DONE"
+    assert saved_states[0].resume_in_progress is False
 
 
 async def test_resume_agent_v2_starts_graph_at_plan(monkeypatch):
@@ -314,7 +1568,22 @@ async def test_resume_agent_v2_starts_graph_at_plan(monkeypatch):
         state.current_phase = new_agent.Phase.DONE
         return state
 
+    def fake_claim(run_id, expected_state):
+        claimed = expected_state.model_copy(deep=True)
+        claimed.resume_in_progress = True
+        claimed.current_phase = new_agent.Phase.PLAN
+        claimed.pending_human_input = False
+        claimed.human_input_request = {}
+        return claimed
+
     monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        fake_claim,
+        raising=False,
+    )
+    monkeypatch.setattr(new_agent, "save_run", lambda state, **_kwargs: None)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
     monkeypatch.setattr(new_agent, "understand_issue", understand)
     monkeypatch.setattr(new_agent, "plan_fix", plan)
@@ -359,13 +1628,33 @@ async def test_resume_agent_v2_saves_run_when_it_pauses_again(monkeypatch, tmp_p
         }
         return state
 
-    monkeypatch.setattr(new_agent, "load_run", lambda run_id: paused_state)
+    root_dir = tmp_path / ".repopilot"
+    run_store.save_run(paused_state, root_dir=root_dir)
+    monkeypatch.setattr(
+        new_agent,
+        "load_run",
+        lambda run_id: run_store.load_run(run_id, root_dir=root_dir),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
     monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
     monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         new_agent,
         "save_run",
-        lambda state: run_store.save_run(state, root_dir=tmp_path / ".repopilot"),
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
     )
 
     payload = await new_agent.resume_agent_v2(
@@ -374,7 +1663,712 @@ async def test_resume_agent_v2_saves_run_when_it_pauses_again(monkeypatch, tmp_p
     )
 
     assert payload["waiting_for_user"] is True
-    assert (tmp_path / ".repopilot" / "runs" / "abc123def456.json").exists()
+    durable = run_store.load_run("abc123def456", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.WAITING_FOR_USER
+    assert durable.resume_in_progress is False
+
+
+def _save_paused_resume_state(root_dir, run_id, question="Proceed?"):
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id=run_id,
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": question},
+    )
+    run_store.save_run(state, root_dir=root_dir)
+    return run_store.load_run(run_id, root_dir=root_dir)
+
+
+def _use_real_resume_claim(monkeypatch, root_dir):
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+
+
+async def test_simultaneous_resumes_execute_graph_exactly_once(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="same-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    expected = run_store.load_run("same-run", root_dir=root_dir)
+    graph_calls = 0
+
+    async def fake_run_graph(graph, state):
+        nonlocal graph_calls
+        graph_calls += 1
+        await asyncio.sleep(0)
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    results = await asyncio.gather(
+        new_agent.resume_agent_v2(
+            "same-run",
+            "Proceed.",
+            state=expected.model_copy(deep=True),
+        ),
+        new_agent.resume_agent_v2(
+            "same-run",
+            "Proceed.",
+            state=expected.model_copy(deep=True),
+        ),
+        return_exceptions=True,
+    )
+
+    assert graph_calls == 1
+    assert sum(isinstance(result, dict) for result in results) == 1
+    assert sum(
+        isinstance(result, run_store.ResumeConflictError) for result in results
+    ) == 1
+
+
+async def test_different_run_ids_resume_concurrently(monkeypatch, tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    for run_id in ("run-a", "run-b"):
+        run_store.save_run(
+            new_agent.AgentState(
+                issue_url=f"https://github.com/acme/widget/issues/{run_id[-1]}",
+                trace_id=run_id,
+                current_phase=new_agent.Phase.WAITING_FOR_USER,
+                pending_human_input=True,
+                human_input_request={"question": "Proceed?"},
+            ),
+            root_dir=root_dir,
+        )
+    both_started = asyncio.Event()
+    started: set[str] = set()
+
+    async def fake_run_graph(graph, state):
+        started.add(state.trace_id)
+        if len(started) == 2:
+            both_started.set()
+        await asyncio.wait_for(both_started.wait(), timeout=1)
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    results = await asyncio.gather(
+        *(
+            new_agent.resume_agent_v2(
+                run_id,
+                "Proceed.",
+                state=run_store.load_run(run_id, root_dir=root_dir),
+            )
+            for run_id in ("run-a", "run-b")
+        )
+    )
+
+    assert started == {"run-a", "run-b"}
+    assert {result["run_id"] for result in results} == {"run-a", "run-b"}
+
+
+async def test_blocked_run_lock_does_not_stall_loop_or_another_run(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    for run_id in ("run-a", "run-b"):
+        run_store.save_run(
+            new_agent.AgentState(
+                issue_url=f"https://github.com/acme/widget/issues/{run_id[-1]}",
+                trace_id=run_id,
+                current_phase=new_agent.Phase.WAITING_FOR_USER,
+                pending_human_input=True,
+                human_input_request={"question": "Proceed?"},
+            ),
+            root_dir=root_dir,
+        )
+
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    heartbeat_ran = threading.Event()
+    run_b_started = threading.Event()
+    progress_before_release = threading.Event()
+
+    def hold_run_a_lock():
+        with run_store._run_lock("run-a", root_dir):
+            lock_held.set()
+            assert release_lock.wait(timeout=3)
+
+    async def heartbeat():
+        await asyncio.sleep(0)
+        heartbeat_ran.set()
+
+    async def fake_run_graph(graph, state):
+        if state.trace_id == "run-b":
+            run_b_started.set()
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def release_after_progress_or_timeout():
+        if heartbeat_ran.wait(timeout=0.5) and run_b_started.wait(timeout=0.5):
+            progress_before_release.set()
+        release_lock.set()
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    holder = asyncio.create_task(asyncio.to_thread(hold_run_a_lock))
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    watchdog = threading.Thread(target=release_after_progress_or_timeout)
+    watchdog.start()
+
+    run_a = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "run-a",
+            "Proceed.",
+            state=run_store.load_run("run-a", root_dir=root_dir),
+        )
+    )
+    pulse = asyncio.create_task(heartbeat())
+    run_b = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "run-b",
+            "Proceed.",
+            state=run_store.load_run("run-b", root_dir=root_dir),
+        )
+    )
+
+    await asyncio.gather(run_a, pulse, run_b, holder)
+    watchdog.join(timeout=1)
+
+    assert progress_before_release.is_set()
+
+
+async def test_cancelled_resume_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="cancelled-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    graph_started = asyncio.Event()
+
+    async def fake_run_graph(graph, state):
+        graph_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", fake_run_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-run",
+            "Proceed.",
+            state=run_store.load_run("cancelled-run", root_dir=root_dir),
+        )
+    )
+    await graph_started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    durable = run_store.load_run("cancelled-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.pending_human_input is False
+    assert durable.human_input_request == {}
+    assert all(
+        turn.content != "Human answer for paused run cancelled-run:\nProceed."
+        for turn in durable.conversation_history
+    )
+
+    with pytest.raises(run_store.ResumeConflictError):
+        await new_agent.resume_agent_v2(
+            "cancelled-run",
+            "Proceed again.",
+            state=durable,
+        )
+
+
+async def test_cancelled_blocked_claim_is_drained_without_running_graph(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-claim")
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    claim_started = threading.Event()
+    claim_finished = threading.Event()
+    graph_calls = 0
+
+    def hold_claim_lock():
+        with run_store._run_lock("cancelled-claim", root_dir):
+            lock_held.set()
+            assert release_lock.wait(timeout=3)
+
+    def blocking_claim(run_id, expected_state):
+        claim_started.set()
+        try:
+            return run_store.claim_run_for_resume(
+                run_id,
+                expected_state,
+                root_dir=root_dir,
+            )
+        finally:
+            claim_finished.set()
+
+    async def forbidden_graph(graph, state):
+        nonlocal graph_calls
+        graph_calls += 1
+        return state
+
+    monkeypatch.setattr(new_agent, "claim_run_for_resume", blocking_claim)
+    monkeypatch.setattr(new_agent, "run_graph", forbidden_graph)
+
+    holder = asyncio.create_task(asyncio.to_thread(hold_claim_lock))
+    assert await asyncio.to_thread(lock_held.wait, 1)
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-claim",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(claim_started.wait, 1)
+
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_lock.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await holder
+
+    assert task.cancelled()
+    assert claim_finished.is_set()
+    assert graph_calls == 0
+    durable = run_store.load_run("cancelled-claim", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+
+
+async def test_cancelled_terminal_save_drains_committed_write(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-terminal-save")
+    save_started = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def blocking_save(state, **kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        try:
+            return run_store.save_run(state, root_dir=root_dir, **kwargs)
+        finally:
+            save_finished.set()
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", blocking_save)
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-terminal-save",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+
+    task.cancel("first cancellation")
+    await asyncio.sleep(0)
+    task.cancel("second cancellation")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert task.cancelled()
+    assert save_finished.is_set()
+    durable = run_store.load_run("cancelled-terminal-save", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.DONE
+    assert durable.resume_in_progress is False
+
+
+async def test_cancelled_repaused_save_commits_the_new_pause(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(
+        root_dir,
+        "cancelled-repaused-save",
+        question="First question?",
+    )
+    save_started = threading.Event()
+    release_save = threading.Event()
+
+    async def repaused_graph(graph, state):
+        state.current_phase = new_agent.Phase.WAITING_FOR_USER
+        state.pending_human_input = True
+        state.human_input_request = {"question": "New question?"}
+        return state
+
+    def blocking_save(state, **kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        return run_store.save_run(state, root_dir=root_dir, **kwargs)
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", blocking_save)
+    monkeypatch.setattr(new_agent, "run_graph", repaused_graph)
+    monkeypatch.setattr(new_agent, "_save_trace", lambda *args, **kwargs: None)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-repaused-save",
+            "First answer.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+    task.cancel("cancel after new pause")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelled()
+
+    durable = run_store.load_run("cancelled-repaused-save", root_dir=root_dir)
+    assert durable.current_phase == new_agent.Phase.WAITING_FOR_USER
+    assert durable.pending_human_input is True
+    assert durable.human_input_request == {"question": "New question?"}
+    assert durable.resume_in_progress is False
+
+
+async def test_cancelled_final_save_observes_worker_failure(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    expected = _save_paused_resume_state(root_dir, "cancelled-failing-save")
+    save_started = threading.Event()
+    release_save = threading.Event()
+    save_finished = threading.Event()
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    def failing_save(state, **_kwargs):
+        save_started.set()
+        assert release_save.wait(timeout=3)
+        save_finished.set()
+        raise OSError("injected worker save failure")
+
+    _use_real_resume_claim(monkeypatch, root_dir)
+    monkeypatch.setattr(new_agent, "save_run", failing_save)
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+
+    task = asyncio.create_task(
+        new_agent.resume_agent_v2(
+            "cancelled-failing-save",
+            "Proceed.",
+            state=expected,
+        )
+    )
+    assert await asyncio.to_thread(save_started.wait, 1)
+    task.cancel("cancel failing save")
+    await asyncio.sleep(0)
+    assert not task.done()
+    release_save.set()
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await task
+
+    assert caught.value.operation == "run store call"
+    assert caught.value.cancellation.args == ("cancel failing save",)
+    assert save_finished.is_set()
+    assert isinstance(caught.value.cleanup_error, OSError)
+    assert caught.value.__cause__ is caught.value.cleanup_error
+    assert str(caught.value.cleanup_error) == "injected worker save failure"
+    durable = run_store.load_run("cancelled-failing-save", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+
+
+async def test_crashed_resume_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="crashed-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+
+    async def crashing_graph(graph, state):
+        raise RuntimeError("injected graph crash")
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", crashing_graph)
+
+    with pytest.raises(RuntimeError, match="graph crash"):
+        await new_agent.resume_agent_v2(
+            "crashed-run",
+            "Proceed.",
+            state=run_store.load_run("crashed-run", root_dir=root_dir),
+        )
+
+    durable = run_store.load_run("crashed-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.conversation_history == paused.conversation_history
+
+
+async def test_resume_completion_save_failure_leaves_durable_lease_consumed(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="save-failure-run",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+
+    async def completed_graph(graph, state):
+        state.current_phase = new_agent.Phase.DONE
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+        raising=False,
+    )
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+
+    def fail_save(state, **_kwargs):
+        raise OSError("injected completion save failure")
+
+    monkeypatch.setattr(new_agent, "save_run", fail_save)
+
+    with pytest.raises(OSError, match="completion save failure"):
+        await new_agent.resume_agent_v2(
+            "save-failure-run",
+            "Proceed.",
+            state=run_store.load_run("save-failure-run", root_dir=root_dir),
+        )
+
+    durable = run_store.load_run("save-failure-run", root_dir=root_dir)
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+
+
+async def test_post_replace_completion_failure_restores_claimed_snapshot(
+    monkeypatch, tmp_path
+):
+    root_dir = tmp_path / ".repopilot"
+    paused = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        trace_id="post-replace-failure",
+        current_phase=new_agent.Phase.WAITING_FOR_USER,
+        pending_human_input=True,
+        human_input_request={"question": "Proceed?"},
+    )
+    run_store.save_run(paused, root_dir=root_dir)
+    graph_returned = False
+    failed_directory_sync = False
+
+    async def completed_graph(graph, state):
+        nonlocal graph_returned
+        state.current_phase = new_agent.Phase.DONE
+        graph_returned = True
+        return state
+
+    monkeypatch.setattr(
+        new_agent,
+        "claim_run_for_resume",
+        lambda run_id, expected_state: run_store.claim_run_for_resume(
+            run_id,
+            expected_state,
+            root_dir=root_dir,
+        ),
+    )
+    monkeypatch.setattr(
+        new_agent,
+        "save_run",
+        lambda state, **kwargs: run_store.save_run(
+            state,
+            root_dir=root_dir,
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(new_agent, "run_graph", completed_graph)
+    real_fsync = run_store.os.fsync
+
+    def fail_first_completion_directory_sync(descriptor):
+        nonlocal failed_directory_sync
+        descriptor_info = run_store.os.fstat(descriptor)
+        if (
+            graph_returned
+            and not failed_directory_sync
+            and stat.S_ISDIR(descriptor_info.st_mode)
+        ):
+            failed_directory_sync = True
+            raise OSError("injected post-replace directory sync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(
+        run_store.os,
+        "fsync",
+        fail_first_completion_directory_sync,
+    )
+
+    with pytest.raises(OSError, match="post-replace directory sync failure"):
+        await new_agent.resume_agent_v2(
+            "post-replace-failure",
+            "Proceed.",
+            state=run_store.load_run(
+                "post-replace-failure",
+                root_dir=root_dir,
+            ),
+        )
+
+    durable = run_store.load_run("post-replace-failure", root_dir=root_dir)
+    assert failed_directory_sync is True
+    assert durable.resume_in_progress is True
+    assert durable.current_phase == new_agent.Phase.PLAN
+    assert durable.pending_human_input is False
+    assert durable.human_input_request == {}
+    assert durable.conversation_history == []
 
 
 async def test_verify_fix_replans_failed_attempt_once():
@@ -397,3 +2391,660 @@ async def test_verify_fix_replans_failed_attempt_once():
 
     assert next_state.current_phase == new_agent.Phase.REFLECT
     assert next_state.retry_count == 1
+
+
+async def test_execute_fix_marks_patch_apply_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=False,
+            output="error: corrupt patch at line 3",
+            patch_content=patch_content,
+        )
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="malformed diff",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "patch_apply_failed"
+    assert next_state.fix_attempts[-1].failure_kind == "patch_apply_failed"
+    assert next_state.fix_attempts[-1].error_log == "error: corrupt patch at line 3"
+
+
+async def test_execute_fix_marks_test_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=True,
+            output="",
+            patch_content=patch_content,
+        )
+
+    async def fake_run_pytest(repo_path, command=None):
+        return {
+            "command": "pytest tests/test_auth.py -q",
+            "returncode": 1,
+            "stdout": "FAILED tests/test_auth.py",
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+        test_command="pytest tests/test_auth.py -q",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].success is False
+    assert next_state.fix_attempts[-1].failure_kind == "test_failed"
+    assert "FAILED tests/test_auth.py" in next_state.fix_attempts[-1].error_log
+
+
+async def test_execute_fix_marks_execution_error_failure_kind(monkeypatch):
+    async def fake_apply_patch(repo_path, patch_content):
+        raise RuntimeError("git apply crashed")
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "execution_error"
+    assert next_state.fix_attempts[-1].error_log == "git apply crashed"
+
+
+async def test_run_git_async_kills_process_on_timeout():
+    import time
+
+    t0 = time.monotonic()
+    # A sleep far longer than the timeout must be killed promptly, not waited
+    # out — this is what lets the phase timeout reclaim a hung clone.
+    try:
+        await execute_node._run_git_async(["sleep", "30"], timeout=0.3)
+    except asyncio.TimeoutError:
+        pass
+    else:
+        raise AssertionError("expected TimeoutError")
+    assert time.monotonic() - t0 < 5
+
+
+async def test_worktree_is_healthy_detects_empty_and_valid(monkeypatch, tmp_path):
+    # Empty/broken work tree (no HEAD, no files) → unhealthy; a real one with
+    # HEAD + files → healthy. This is the guard that stops reusing a broken
+    # clone (which made every patch fail "target file was not found").
+    work = tmp_path / "wt"
+    (work / ".git").mkdir(parents=True)
+
+    async def fake_run_git(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(0, "abc123\n", "")  # HEAD resolves
+        if "ls-files" in args:
+            return execute_node._ProcResult(0, "a.py\nb.py\n", "")  # has files
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    assert await execute_node._worktree_is_healthy(str(work)) is True
+
+    async def fake_empty(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(128, "", "fatal: Needed a single revision")
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_empty)
+    assert await execute_node._worktree_is_healthy(str(work)) is False
+
+
+async def test_worktree_is_healthy_false_when_head_ok_but_no_files(monkeypatch, tmp_path):
+    work = tmp_path / "wt2"
+    (work / ".git").mkdir(parents=True)
+
+    async def fake_no_files(args, timeout, cwd=None):
+        if "rev-parse" in args:
+            return execute_node._ProcResult(0, "abc\n", "")
+        if "ls-files" in args:
+            return execute_node._ProcResult(0, "", "")  # HEAD ok but empty checkout
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_no_files)
+    assert await execute_node._worktree_is_healthy(str(work)) is False
+
+
+async def test_git_clone_refreshes_live_cache_before_local_clone(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    trace_id = "live-cache-trace"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    work_path = execute_node._repo_work_path("acme", "widget", "", trace_id)
+    (cache_path / ".git").mkdir(parents=True)
+    (work_path / ".git").mkdir(parents=True)
+    commands = []
+    safe_url = "https://github.com/acme/widget.git"
+
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        if args[-4:] == [
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ]:
+            return execute_node._ProcResult(0, safe_url + "\n", "")
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    # Health check has its own test; here we exercise the clone path only.
+    async def _healthy(_w):
+        return True
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
+    monkeypatch.setattr(
+        execute_node, "_worktree_head", lambda _path: asyncio.sleep(0, result="b" * 40)
+    )
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        trace_id=trace_id,
+    )
+
+    repo_path = await execute_node.git_clone(state)
+
+    assert [
+        "git",
+        "-c",
+        f"url.{safe_url}.insteadOf={safe_url}",
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--prune",
+        "origin",
+    ] in commands
+    assert [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ] in commands
+    assert [
+        "git",
+        "-C",
+        str(work_path),
+        "reset",
+        "--hard",
+        "HEAD",
+    ] not in commands
+
+
+async def test_git_clone_fetches_exact_ref_into_commit_keyed_cache(
+    monkeypatch, tmp_path
+):
+    repopilot_home = tmp_path / ".repopilot"
+    repo_ref = "a" * 40
+    cache_path = repopilot_home / "repos" / f"acme-widget-{repo_ref}"
+    trace_id = "exact-cache-trace"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    work_path = execute_node._repo_work_path(
+        "acme", "widget", repo_ref, trace_id
+    )
+    commands = []
+
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        if args[:2] == ["git", "init"]:
+            (cache_path / ".git").mkdir(parents=True)
+        if args[:4] == ["git", "clone", "--local", "--no-hardlinks"]:
+            (work_path / ".git").mkdir(parents=True)
+        return execute_node._ProcResult(0, "", "")
+
+    async def healthy(_work):
+        return True
+
+    async def matching_head(_work):
+        return repo_ref
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", healthy)
+    monkeypatch.setattr(execute_node, "_worktree_head", matching_head, raising=False)
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        repo_ref=repo_ref,
+        trace_id=trace_id,
+    )
+
+    repo_path = await execute_node.git_clone(state)
+
+    assert repo_path == str(work_path)
+    assert [
+        "git",
+        "-c",
+        "url.https://github.com/acme/widget.git.insteadOf="
+        "https://github.com/acme/widget.git",
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        repo_ref,
+    ] in commands
+    assert [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ] in commands
+
+
+async def test_git_clone_populates_cache_then_clones_worktree(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
+    commands = []
+
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        if "clone" in args and args[-1] == str(cache_path):
+            (cache_path / ".git").mkdir(parents=True)
+        return execute_node._ProcResult(0, "", "")
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    async def _healthy(_w):
+        return True
+    monkeypatch.setattr(execute_node, "_worktree_is_healthy", _healthy)
+    monkeypatch.setattr(
+        execute_node, "_worktree_head", lambda _path: asyncio.sleep(0, result="b" * 40)
+    )
+    monkeypatch.setattr(
+        execute_node, "_verify_clean_worktree", lambda *_args: asyncio.sleep(0)
+    )
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        trace_id="populate-cache-trace",
+    )
+
+    repo_path = await execute_node.git_clone(state)
+
+    safe_url = "https://github.com/acme/widget.git"
+    authenticated_url = (
+        "https://x-access-token:gho_cachetoken@github.com/acme/widget.git"
+    )
+    assert commands[0] == [
+        "git",
+        "-c",
+        f"url.{authenticated_url}.insteadOf={safe_url}",
+        "clone",
+        "--depth",
+        "1",
+        "--single-branch",
+        safe_url,
+        str(cache_path),
+    ]
+    assert commands[1] == [
+        "git",
+        "clone",
+        "--local",
+        "--no-hardlinks",
+        str(cache_path),
+        repo_path,
+    ]
+    assert all("set-url" not in command for command in commands)
+
+
+async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_path):
+    repopilot_home = tmp_path / ".repopilot"
+    cache_path = repopilot_home / "repos" / "acme-widget"
+    monkeypatch.setenv("REPOPILOT_HOME", str(repopilot_home))
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_cachetoken")
+    commands = []
+
+    async def fake_run_git(args, timeout, cwd=None):
+        commands.append(args)
+        return execute_node._ProcResult(
+            128,
+            "",
+            (
+                "fatal: unable to access "
+                "'https://x-access-token:gho_cachetoken@github.com/acme/widget.git/'"
+            ),
+        )
+
+    monkeypatch.setattr(execute_node, "_run_git_async", fake_run_git)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        trace_id="failed-cache-trace",
+    )
+
+    try:
+        await execute_node.git_clone(state)
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("git_clone should fail when all cache population fails")
+
+    assert len(commands) == 3
+    assert "gho_cachetoken" not in message
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in message
+    assert not cache_path.exists()
+
+
+async def test_execute_fix_redacts_github_token_from_execution_error(monkeypatch):
+    token = "gho_secret123"
+    tokenized_url = f"https://x-access-token:{token}@github.com/acme/widget.git"
+
+    async def fake_git_clone(state):
+        raise subprocess.TimeoutExpired(
+            cmd=[
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                tokenized_url,
+                "/tmp/repopilot-acme-widget",
+            ],
+            timeout=180,
+        )
+
+    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert tokenized_url not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_marks_clone_network_failure_as_infra_error(monkeypatch):
+    async def fake_git_clone(state):
+        raise RuntimeError(
+            "fatal: unable to access 'https://github.com/acme/widget.git/': "
+            "Failed to connect to github.com port 443"
+        )
+
+    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        owner="acme",
+        repo="widget",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.VERIFY
+    assert len(next_state.fix_attempts) == 1
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert "Failed to connect to github.com port 443" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_redacts_github_token_from_patch_apply_failure(monkeypatch):
+    token = "gho_patchsecret"
+
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=False,
+            output=(
+                "fatal: unable to access "
+                f"'https://x-access-token:{token}@github.com/acme/widget.git/'"
+            ),
+            patch_content=patch_content,
+        )
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="malformed diff",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_execute_fix_redacts_github_token_from_test_output(monkeypatch):
+    token = "gho_testsecret"
+
+    async def fake_apply_patch(repo_path, patch_content):
+        return execute_node.PatchApplyResult(
+            applied=True,
+            output="",
+            patch_content=patch_content,
+        )
+
+    async def fake_run_pytest(repo_path, command=None):
+        return {
+            "command": "pytest tests/test_auth.py -q",
+            "returncode": 1,
+            "stdout": (
+                "failed cloning "
+                f"https://x-access-token:{token}@github.com/acme/widget.git"
+            ),
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
+    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        repo_path="/tmp/repopilot-test-repo",
+        patch_content="diff --git a/src/auth.py b/src/auth.py",
+        test_command="pytest tests/test_auth.py -q",
+    )
+
+    next_state = await execute_node.execute_fix(state)
+
+    assert token not in next_state.fix_attempts[-1].error_log
+    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
+        next_state.fix_attempts[-1].error_log
+    )
+
+
+async def test_verify_fix_first_patch_apply_failure_does_not_increment_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_legacy_patch_apply_failure_does_not_increment_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_second_consecutive_patch_apply_failure_consumes_retry():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: No valid patches in input",
+                success=False,
+            ),
+            new_agent.FixAttempt(
+                patch_content="still malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 1
+
+
+async def test_verify_fix_same_patch_apply_failure_twice_routes_to_failure():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=2,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+            new_agent.FixAttempt(
+                patch_content="malformed diff",
+                test_result="patch_apply_failed",
+                failure_kind="patch_apply_failed",
+                error_log="error: corrupt patch at line 3",
+                success=False,
+            ),
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.FAILURE
+    assert next_state.failure_reason == "Same patch produced the same failure twice."
+    assert next_state.retry_count == 0
+
+
+async def test_verify_fix_test_failure_still_increments_retry_count():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="diff --git a/src/auth.py b/src/auth.py",
+                file_path="src/auth.py",
+                test_result="failed",
+                failure_kind="test_failed",
+                error_log="assert False",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.retry_count == 1
+
+
+async def test_verify_fix_infra_error_routes_to_failure_without_retry():
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        max_retries=1,
+        retry_count=0,
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_content="diff --git a/src/auth.py b/src/auth.py",
+                file_path="src/auth.py",
+                test_result="execution_error",
+                failure_kind="infra_error",
+                error_log="fatal: unable to access github.com",
+                success=False,
+            )
+        ],
+    )
+
+    next_state = await new_agent.verify_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.FAILURE
+    assert next_state.retry_count == 0
+    assert next_state.failure_reason == (
+        "Infrastructure error during execution: fatal: unable to access github.com"
+    )

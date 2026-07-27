@@ -2,8 +2,6 @@
 
 import logging
 
-import pytest
-
 from src.logging_config import setup_logging
 
 

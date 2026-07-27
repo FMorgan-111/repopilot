@@ -40,13 +40,47 @@ RepoPilot is built for **professional developers** who maintain real projects wi
 pip install repopilot
 ```
 
-Set your tokens:
+Cross-repository semantic episode memory is optional:
+
+```bash
+pip install "repopilot[memory]"
+export REPOPILOT_ENABLE_EPISODES=1
+```
+
+The first enabled recall downloads the `BAAI/bge-small-en-v1.5` embedding
+model. RepoPilot prefers `sqlite-vec`; on Python builds that cannot load SQLite
+extensions (including some macOS builds), it emits a warning and uses the
+persistent NumPy cosine-search backend instead.
+
+Inject tokens through the process environment or your deployment's runtime
+secret store. Do not put real credentials in `.env.example`, source files,
+evaluation results, or shell history:
 
 ```bash
 export GITHUB_TOKEN=ghp_...
-export LLM_API_KEY=sk-...         # or DEEPSEEK_API_KEY
-export LLM_MODEL=deepseek-v4-pro  # optional, defaults to deepseek-v4-pro
+export LLM_API_KEY=sk-...
+export LLM_BASE_URL=https://linoapi.com.cn/v1
+export LLM_MODEL=gemini-3.5-flash:stable  # optional; this is the default
 ```
+
+`LLM_BASE_URL` is paired only with `LLM_API_KEY` and must use HTTPS, except
+for exact `localhost`, `127.0.0.1`, or `::1` development endpoints. The legacy
+`OPENAI_BASE_URL` name remains a deprecated alias only when `LLM_BASE_URL` is
+unset (or has the same value); conflicting values are rejected.
+
+Success-first escalation is off by default. It activates only when both the
+explicit flag and a separately injected escalation key are present:
+
+```bash
+export REPOPILOT_ESCALATION_ENABLED=1
+export LLM_ESCALATION_MODEL=claude-opus-4-8:stable
+export LLM_ESCALATION_BASE_URL=https://linoapi.com.cn/v1
+# Inject LLM_ESCALATION_API_KEY with the runtime secret store.
+```
+
+`REPOPILOT_ESCALATION_AFTER_NO_PROGRESS=2` is the default bounded trigger.
+Without the flag or key, evaluation remains Gemini-only and does not incur an
+escalation call.
 
 Run it:
 
@@ -243,9 +277,9 @@ The agent identified that CLI boolean overrides were passed as strings (not bool
 
 ```bash
 # Install dev dependencies
-pip install -e ".[dev]"
+pip install -e ".[memory,dev]"
 
-# Run the test suite (60+ tests, <2s)
+# Run the test suite
 pytest tests/ -q
 ```
 
@@ -267,22 +301,202 @@ Tests cover:
 ```bash
 git clone https://github.com/FMorgan-111/repopilot.git
 cd repopilot
-pip install -e .
+pip install -e ".[memory,dev]"
 pytest tests/ -q
 ```
 
-### Running the FastAPI server
+### Evaluation modes
+
+An ordinary Agent V2 evaluation is labeled `end_to_end`: RepoPilot must locate
+the relevant files and produce a fix. `--seed-gold-files` is labeled
+`oracle_files`: it supplies dataset-known changed files and measures planning
+and patching in isolation. Oracle-file results must not be reported as
+end-to-end success rates.
+
+### SWE-bench Verified
+
+Install the optional evaluation dependencies and run a reproducible ten-sample
+inference batch:
 
 ```bash
+pip install -e '.[eval]'
+python -u eval/agent_v2_harness.py \
+  --dataset swe-bench-verified \
+  --dataset-seed 17 \
+  --samples 10 \
+  --max-retries 3 \
+  --token-budget 100000 \
+  --predictions-file eval/swe_bench_predictions.jsonl
+```
+
+This local command is useful for inference diagnostics, but it is not the
+authoritative success-rate evaluation because it does not prove the required
+per-instance OCI boundary or run the official scorer.
+
+#### Authoritative OCI matrix evaluation
+
+The manual `SWE-bench OCI Evaluation` workflow runs exactly one official
+SWE-bench image per matrix job, pins RepoPilot tool execution to that image's
+local `sha256:` identity, and limits model concurrency to two jobs. The
+five checkpoint IDs are a subset of the fixed 50-instance baseline. The
+checkpoint must pass its infrastructure and artifact checks before starting
+that baseline, whose final score denominator is exactly 50.
+
+The dataset boundary is `SWE-bench/SWE-bench_Verified`, split `test`, at the
+immutable Hugging Face revision
+`c104f840cc67f8b6eec6f759ebc8b2693d585d4a`. RepoPilot serializes the exact
+500-row, 13-field dataset in its fixed upstream column order and requires
+content SHA-256
+`f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c`.
+Cached content is accepted only when its metadata, row schema, row count, and
+content digest all match those code-pinned values. The public workflow cache
+key is
+`swe-bench-verified-c104f840cc67f8b6eec6f759ebc8b2693d585d4a-f61cd55ceb35b61ad592f645abcbfc8ea4d294c6c9f3c8f15e83211a8e8db98c-v2`.
+
+Before the first run:
+
+1. Revoke any API key that has appeared in a terminal transcript, chat, log,
+   attachment, or commit.
+2. Merge `.github/workflows/swe-bench-oci-eval.yml` to the repository's default
+   branch, `master`, through an explicitly authorized PR. GitHub cannot
+   manually dispatch a workflow that exists only on a feature branch.
+3. Store newly rotated values as GitHub repository secrets named
+   `LLM_API_KEY` and `LLM_ESCALATION_API_KEY`. Do not pass values as workflow
+   inputs, command arguments, cache keys, or repository files.
+
+Dispatch and inspect the checkpoint:
+
+```bash
+gh workflow run swe-bench-oci-eval.yml --ref fix/release-readiness-20260717 -f mode=checkpoint_5
+gh run list --workflow=swe-bench-oci-eval.yml --limit 5
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID \
+  --name swe-bench-oci-checkpoint_5 \
+  --dir ARTIFACT_DIR/checkpoint_5
+```
+
+Only after `checkpoint_5/summary.md` confirms all five requested artifacts,
+valid hashes, matching commit identity, digest-pinned usable runtimes, and a
+terminal official status for every non-infrastructure instance, run the fixed
+50-instance baseline:
+
+```bash
+gh workflow run swe-bench-oci-eval.yml --ref fix/release-readiness-20260717 -f mode=baseline_50
+gh run list --workflow=swe-bench-oci-eval.yml --limit 5
+gh run watch RUN_ID --exit-status
+gh run download RUN_ID \
+  --name swe-bench-oci-baseline_50 \
+  --dir ARTIFACT_DIR/baseline_50
+```
+
+Each instance upload contains only `result.json`, `prediction.jsonl`,
+`official_result.json`, and `manifest.json`. The aggregate contains ordered
+`results.json`, `predictions.jsonl`, `official_results.json`, and `summary.md`.
+Raw official logs, evaluator patches, model credentials, RepoPilot home data,
+and target repositories are not uploaded. Generated evaluation outputs are
+workflow artifacts and are not committed to Git. Snapshot reads are bounded to
+8 MiB per file and 16 MiB per instance bundle. Official scoring tags the
+prepared image digest with a run-local alias, verifies that alias immediately
+before and after the harness call, and never scores through `latest`.
+
+The aggregate displays the official score first. Its secondary engineering
+score is auditable from four explicit fractions:
+
+```text
+engineering_score =
+    80 * official_resolved / requested
+  + 10 * non_infrastructure_instances / requested
+  +  5 * explicit_agreements / official_terminal_instances
+  +  5 * completed_within_budget_instances / requested
+```
+
+An agreement requires an explicit valid internal boolean verdict. Budget
+credit requires a completed official job plus complete model token and elapsed
+telemetry, at most 100,000 tokens, and at most 360 minutes.
+Missing or invalid verdict/telemetry receives no credit. `summary.md` reports every component's
+numerator and denominator and each instance's token and elapsed usage; these
+secondary metrics never replace the raw official resolved fraction.
+
+Generate a replay-safe summary from any result path:
+
+```bash
+python eval/report.py \
+  --results-file eval/success_first_10.json \
+  --summary-file eval/success_first_10_summary.md
+```
+
+Each instance is cloned and checked out at its exact 40-character
+`base_commit` before local code search, patching, and testing. The issue seed
+contains no gold patch, test patch, or evaluator-only fields.
+The primary benchmark score is the Official `resolved` status from the
+SWE-bench harness. RepoPilot's internal `agent_success` is true only when
+`coverage_status` is `existing_verified` or `generated_verified` and a
+nonempty differential `coverage_proof` is present. It contributes only to the
+explicit agreement fraction above; it is neither official benchmark
+resolution nor the engineering score by itself:
+
+```bash
+python -m swebench.harness.run_evaluation \
+  --dataset_name SWE-bench/SWE-bench_Verified \
+  --predictions_path eval/swe_bench_predictions.jsonl \
+  --max_workers 1 \
+  --run_id repopilot-gemini-10
+```
+
+Official scoring requires Docker and may download large repository images.
+If Docker or an image build is unavailable, keep the prediction JSONL and
+report scoring as infrastructure-blocked instead of counting it as a model
+failure. Likewise, `agent_success` is RepoPilot's strict internal coverage
+verdict, `resolved` is only the official harness verdict, and
+`scorer_infra`/OCI failures are not unresolved model outcomes.
+
+GitHub API responses remain fresh for 600 seconds by default. On retryable
+network, timeout, 429, 502, 503, or 504 errors, RepoPilot may serve an older
+cached response for up to 86,400 seconds total. Configure these bounds with
+`REPOPILOT_CACHE_TTL` and `REPOPILOT_CACHE_STALE_TTL`; 404 and other
+non-retryable errors never use stale data.
+
+### Running the FastAPI server
+
+Configure a separate API bearer token and an exact repository allowlist before
+starting the service. Inject the token through the deployment secret store;
+the example below uses placeholders only:
+
+```bash
+export REPOPILOT_API_TOKEN=<deployment-secret>
+export REPOPILOT_ALLOWED_REPOS=owner/repo,second-owner/second-repo
 uvicorn src.main:app --reload
 ```
+
+`REPOPILOT_ALLOWED_REPOS` is a nonempty comma-separated list of exact
+`owner/repo` names. Matching is case-insensitive. Wildcards, URLs, paths,
+whitespace, blank entries, duplicates, and malformed names make the service
+fail closed. Only `GET /health` is public; all other routes require
+`Authorization: Bearer <deployment-secret>`. Missing API configuration returns
+503, missing or invalid credentials return the same 401 response, and a
+repository outside the allowlist returns 403 before GitHub, model, clone, or
+write helpers run.
 
 Endpoints:
 
 - `GET  /health` — liveness check
 - `POST /analyze` — issue classification + file ranking (v1)
 - `POST /agent` — legacy agent loop
+- `POST /intelligent-agent` — legacy stateful agent
 - `POST /agent/v2` — current state-machine agent (recommended)
+- `POST /agent/v2/resume` — resume an authorized saved run
+- `GET  /agent/v2/runs/{run_id}` — inspect an authorized saved-run summary
+- `GET  /agent/v2/runs/{run_id}/replay?format=json|markdown` — replay an
+  authorized run
+
+Protected request bodies are capped at exactly 65,536 bytes, including chunked
+requests. At most two authorized repository operations execute concurrently;
+a third is rejected immediately with 429 and `Retry-After` instead of joining
+an unbounded waiter queue. Agent v2 accepts `max_retries` 0–3 and
+`token_budget` 1–100,000; legacy turn counts are 1–10. Run IDs use at most 64
+safe alphanumeric/underscore/hyphen characters, and resume answers are limited
+to 1–16,384 characters. Public OpenAPI, Swagger UI, and ReDoc routes are
+disabled.
 
 ---
 
@@ -293,5 +507,5 @@ MIT — see `pyproject.toml`.
 ---
 
 <p align="center">
-  <sub>Built with LangGraph, Pydantic, httpx, and DeepSeek v4-pro. Maintained by <a href="https://github.com/FMorgan-111">FMorgan-111</a>.</sub>
+  <sub>Built with LangGraph, Pydantic, httpx, and OpenAI-compatible model gateways. Maintained by <a href="https://github.com/FMorgan-111">FMorgan-111</a>.</sub>
 </p>

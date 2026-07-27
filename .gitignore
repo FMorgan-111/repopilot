@@ -2,3 +2,28 @@ __pycache__/
 *.pyc
 .env
 .venv/
+*.egg-info/
+build/
+dist/
+.worktrees/
+.superpowers/
+
+# Regenerable eval outputs (run `python eval/harness.py` to recreate)
+eval/eval_results.json
+eval/swe_bench_predictions.jsonl
+eval/eval_summary.md
+eval/baseline_*.json
+eval/baseline_*_ids.txt
+eval/checkpoint_*.txt
+eval/checkpoint_*.json
+eval/checkpoint_*_summary.md
+eval/checkpoint_*_predictions.jsonl
+eval/success_first_*.json
+eval/success_first_*_summary.md
+
+# Immutable evaluation inputs used by clean checkouts and GitHub Actions.
+!eval/baseline_10_ids.txt
+!eval/baseline_50_ids.txt
+!eval/checkpoint_5_ids.txt
+examples/traces/case_1.json
+examples/traces/trace_*.json

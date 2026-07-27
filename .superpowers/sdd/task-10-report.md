@@ -1,0 +1,205 @@
+# Task 10 Report: Integrate policy, tools, and failure semantics into PLAN/REFLECT
+
+## Status
+
+Implementation and independent review complete; all review findings are fixed.
+
+## TDD RED evidence
+
+Tests were added before production wiring in:
+
+- `tests/test_model_escalation_integration.py`
+- `tests/test_context_loop_brake.py`
+- `tests/test_convergence_diversity.py`
+- `tests/test_failure_taxonomy.py`
+
+Required RED command:
+
+```text
+.venv/bin/python -m pytest tests/test_model_escalation_integration.py tests/test_context_loop_brake.py tests/test_convergence_diversity.py tests/test_failure_taxonomy.py -q
+```
+
+Observed RED: `8 failed, 47 passed`.
+
+Expected missing behavior represented by the failures:
+
+1. Opus repair failures still returned a generic `ValueError` failure instead of enforcing two no-progress rounds and `opus_no_progress_limit`.
+2. PLAN ignored `tool_intent`, so it neither routed tools nor re-prompted with new evidence.
+3. Duplicate tools were not recorded as no-progress and the eight-request round cap was not enforced.
+4. Two repeated Gemini invalid anchors did not activate deterministic one-way escalation.
+5. REFLECT did not require a different target symbol after an unchanged assertion.
+6. VERIFY routed syntax/import failures through REFLECT rather than direct patch correction.
+7. VERIFY did not track unchanged assertion signatures or terminate the second unchanged repeat.
+
+Two self-review regression tests were also observed RED before their fixes: mixed tool/legacy-patch variants were not rejected, and a REFLECT tool-triggered escalation reused the primary prompt.
+
+The independent review first exposed a collection RED because the strict response
+classifier did not yet exist. After adding only that importable seam, the review
+regressions produced the intended behavioral RED: `10 failed, 47 passed`. Those
+failures covered assertion streak persistence through PLAN, deterministic target
+diversity, VERIFY classification order, exclusive response variants, exhausted
+Opus PatchGate rounds, and quoted/unquoted `gold_patch` filtering. A further
+cross-outcome-field regression was observed RED (`1 failed, 3 passed`) before the
+explicit outcome field allowlists were completed.
+
+## Implementation
+
+- Added `src/reasoning_loop.py` as the shared PLAN/REFLECT mechanism for discriminated tool responses, a hard eight-request reasoning-round cap, safe tool diagnostics, Opus-local no-progress limits, and re-prompting with only the immediately new evidence IDs.
+- Kept legacy PLAN/REFLECT responses without a `kind` discriminator compatible while accepting explicit `tool`, outcome, and stop variants.
+- Kept escalation deterministic and one-way: model output never changes providers directly; only `ModelPolicy` applies escalation.
+- Kept Gemini on the existing plan path. Escalated PLAN continues to use the existing `RepairPlan` to `VerifiedEditBatch` two-stage flow and PatchGate.
+- Connected invalid anchors, repeated edits, duplicate tools, evidence progress, pending edit signatures, and test-failure signatures to existing progress/no-progress state.
+- Extended the semantic plan transaction signature with the current pending patch/edit transaction so a genuinely different invalid anchor is progress.
+- Added VERIFY routing for infrastructure errors without retry consumption, syntax/import direct PLAN correction, assertion REFLECT, one required different-target-symbol round, and stable repeated-assertion termination.
+- Preserved an assertion-specific failure signature and streak across intervening PLAN progress, and made PLAN reject a required-diversity repair that reuses any prior failed target.
+- Classified infrastructure, syntax/import, and assertion failures before the generic same-patch replay brake while retaining the existing replay brake for ordinary patch failures.
+- Made explicitly tagged PLAN/REFLECT responses exclusive field allowlists; untagged historical outcomes still pass through a separate compatibility adapter.
+- Counted exhausted Opus PatchGate rounds toward the two-round `opus_no_progress_limit`, independently of issue fingerprint changes.
+- Added evaluator-payload boundaries to safe evidence normalization; mixed tool/outcome payloads are rejected. The legacy PLAN `patch` response remains at its pre-existing compatibility boundary.
+- Verified saved already-escalated state replays without provider downgrade or phase renaming.
+
+No phase was renamed and COVERAGE was not added. No network/API, clone, checkout, push, PR, scoring, or arbitrary shell tool request is used by the new tests.
+
+## Verification
+
+Required focused suite:
+
+```text
+.venv/bin/python -m pytest tests/test_model_escalation_integration.py tests/test_decision_frame.py tests/test_context_loop_brake.py tests/test_convergence_diversity.py tests/test_patch_retry.py tests/test_new_agent.py tests/test_failure_taxonomy.py -q
+```
+
+Result after review fixes: `178 passed in 1.94s`.
+
+Required Ruff command:
+
+```text
+.venv/bin/python -m ruff check src/nodes/plan.py src/nodes/reflect.py src/nodes/verify.py src/nodes/failure.py src/graph.py src/new_agent.py tests/test_model_escalation_integration.py
+```
+
+Result: `All checks passed!`.
+
+Additional Ruff over new/shared files and modified companion tests: `All checks passed!`.
+
+Full suite:
+
+```text
+.venv/bin/python -m pytest -q
+```
+
+Result: `785 passed, 2 skipped, 1 warning in 22.61s`. The warning is the existing sqlite-vec unavailable fallback to NumPy in `test_error_episodes.py`.
+
+`git diff --check`: passed.
+
+## Formal independent review follow-up
+
+The formal review found one Critical and five Important runtime gaps. Regression
+tests were added first and produced behavioral RED with no collection failure:
+`13 failed, 87 passed`. The failures covered legacy REFLECT evaluator/raw payload
+rejection, normalized reflection persistence, Opus inner tool/policy/stop handling,
+delta-only escalation evidence, symbol-level assertion diversity, stable assertion
+signatures, and exactly-once terminal reflection summaries.
+
+The follow-up implementation:
+
+- validates tagged and untagged outcomes against explicit allowlists and rejects evaluator/raw HTTP markers before any REFLECT state or trace persistence;
+- persists canonical `ReflectDecision` JSON rather than the raw model response;
+- runs every RepairPlan, VerifiedEdit, and local correction model call through the deterministic policy gate and shared bounded tool router, with stop propagation and one shared eight-call counter;
+- allows `build_escalation_packet` to select explicit evidence IDs and uses only the immediate tool delta on escalated PLAN/REFLECT and inner repair re-prompts;
+- fails assertion diversity closed for search-only edits and accepts only an explicit `node_target` distinct from prior failed assertion symbols;
+- derives stable assertion signatures from failure class, test IDs, and normalized assertion identity while discarding volatile paths, line numbers, timestamps, durations, and summary noise; and
+- routes every terminal REFLECT loop through one bounded, secret-redacted outcome-summary finalizer exactly once.
+
+Follow-up GREEN evidence:
+
+- formal-review regression set: `101 passed`;
+- expanded focused suite across the brief plus repair, escalation, and outcome-summary coverage: `240 passed`;
+- full suite: `802 passed, 2 skipped, 1 warning in 21.17s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.
+
+## Safety and compatibility review
+
+- Tool diagnostics persist action, status, bounded counters, and evidence ID only; raw arguments and model rationales are not persisted there.
+- Duplicate/rejected/error tool calls add no fabricated evidence IDs.
+- Evidence re-prompt selection is ID-based and bounded by the existing `EvidenceStore` renderer.
+- Evaluator-only payload markers are truncated before safe evidence reaches state or prompts.
+- No credential or API-key value was added to code, tests, or this report.
+- Existing public entry points, saved-state defaults, provider fields, phases, and legacy structured outcomes remain compatible.
+
+## Concerns
+
+- None known. The full suite has one pre-existing optional sqlite-vec fallback warning, unrelated to this task.
+
+## Second formal re-review follow-up
+
+The second formal re-review identified five Important invariants and one Minor
+stop-reason boundary. Tests were added first and produced behavioral RED:
+`9 failed, 95 passed`, with no collection failure. The failures covered the
+cross-retry global tool cap, untagged tool exclusivity, exact AST symbol recovery,
+budget-terminal reflection finalization, volatile object addresses, and safe
+model-stop persistence.
+
+The narrow fixes:
+
+- keep one monotonically increasing eight-tool counter across outer PLAN, Opus retries, RepairPlan, VerifiedEdit, and correction calls; the ninth request deterministically stops;
+- require untagged tool responses to contain exactly `tool_intent` and tagged tools exactly `kind` plus `tool_intent`;
+- resolve prior Python search anchors against the confined exact checkout and enclosing AST symbol, use inferred assertion classification, and fail closed when the symbol cannot be proven uniquely;
+- finalize a budget-terminal completed REFLECT attempt exactly once with the deterministic summary fallback and no auxiliary model call;
+- normalize memory addresses and UUID-shaped runtime IDs out of assertion signatures; and
+- sanitize model stop detail while persisting only fixed safe stop codes.
+
+Final evidence:
+
+- focused re-review reproduction: `104 passed`;
+- expanded relevant suite: `253 passed`;
+- full suite: `815 passed, 2 skipped, 1 warning in 22.96s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.
+
+## Third formal re-review follow-up
+
+The third review isolated two remaining contract/identity gaps. Regression tests
+were written first and produced behavioral RED: `5 failed, 1 passed`. The existing
+strict escalated tool-to-reflect production path remained green while the prompt
+contract and pre-apply resolved-symbol metadata were absent.
+
+The final fixes:
+
+- align primary and escalated REFLECT prompts with the validator's three exclusive variants: tagged tool, tagged reflect outcome, or tagged stop, with no mixed fields; and
+- add backward-compatible `PatchEdit.resolved_target_symbol` metadata, resolve it from the confined exact Python preimage in PLAN/EXECUTE before mutation, persist it through `FixAttempt`, and prefer it during assertion diversity checks while retaining a fail-closed legacy fallback.
+
+The real-repository regressions apply a search-only edit so its old anchor disappears,
+then prove the same function is rejected, a different function is accepted, and a
+method persists its dotted `Class.method` identity. Legacy serialized edits default
+the new field to an empty string.
+
+Final evidence:
+
+- focused third-review set: `6 passed`;
+- expanded decision/patch/execute/run-store suite: `303 passed`;
+- full suite: `820 passed, 2 skipped, 1 warning in 21.68s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.
+
+## Closing trust-boundary review
+
+The closing review found one remaining trust boundary: model-authored
+`resolved_target_symbol` could be mistaken for runtime-derived identity. Tests were
+added first. After correcting an initial test selector typo, the behavioral RED was
+`4 failed, 1 passed`: valid forged symbols survived PLAN/EXECUTE, and an invalid
+path-shaped value failed the whole plan instead of being discarded. The Opus
+VerifiedEdit conversion boundary already remained green.
+
+The fix removes `resolved_target_symbol` from every model-authored PLAN edit before
+schema validation. PLAN and EXECUTE then unconditionally overwrite search-edit
+metadata from the confined exact preimage, derive node-edit identity from the
+validated `node_target`, or clear metadata on failure. Persisted FixAttempt/run
+metadata remains loadable and legacy edits retain the empty default.
+
+Final evidence:
+
+- focused closing-review set: `5 passed`;
+- expanded convergence/model/execute/repair/run-store suite: `305 passed`;
+- full suite: `822 passed, 2 skipped, 1 warning in 21.54s`;
+- required and additional Ruff checks: `All checks passed!`;
+- `git diff --check`: passed.

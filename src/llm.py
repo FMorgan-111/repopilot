@@ -1,29 +1,52 @@
 import json
-import os
 import re
 import warnings
 
 from pydantic import BaseModel, ValidationError
 
 from .http_client import llm_request
+from .model_provider import ProviderName
 from .schemas import Classification, FileRanking, FixPlan
+
+
+def _repair_json_text(text: str) -> str:
+    """Best-effort fixes for JSON mistakes chat models commonly make, applied
+    only as a fallback after a strict parse fails: smart quotes used as
+    delimiters and trailing commas before a closing bracket. Deliberately does
+    NOT strip // comments — that would corrupt URLs inside string values."""
+    text = (
+        text.replace("“", '"')
+        .replace("”", '"')
+        .replace("‘", "'")
+        .replace("’", "'")
+    )
+    text = re.sub(r",(\s*[}\]])", r"\1", text)  # trailing commas
+    return text
+
+
+def _try_loads(candidate: str) -> dict | None:
+    """Parse a candidate strictly, then with a lenient repair pass."""
+    for text in (candidate, _repair_json_text(candidate)):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _extract_json(text: str) -> dict:
     """Extract JSON from LLM response — handles markdown, code fences, raw text."""
-    # Try raw parse first
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Try ```json ... ``` block
+    # Try raw parse first.
+    parsed = _try_loads(text)
+    if parsed is not None:
+        return parsed
+    # Try ```json ... ``` block.
     m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except json.JSONDecodeError:
-            pass
-    # Try first { ... } block with bracket counting (handles arbitrary nesting)
+        parsed = _try_loads(m.group(1))
+        if parsed is not None:
+            return parsed
+    # Try first { ... } block with bracket counting (handles arbitrary nesting).
     start = text.find('{')
     if start >= 0:
         depth = 0
@@ -33,23 +56,51 @@ def _extract_json(text: str) -> dict:
             elif text[i] == '}':
                 depth -= 1
                 if depth == 0:
-                    block = text[start:i+1]
-                    try:
-                        return json.loads(block)
-                    except json.JSONDecodeError:
-                        break
+                    parsed = _try_loads(text[start:i + 1])
+                    if parsed is not None:
+                        return parsed
+                    break
     raise ValueError(f"Could not parse JSON from response: {text[:200]}")
 
 
-async def llm_call(system_prompt: str, user_prompt: str, model: str = None) -> dict:
-    """Call an OpenAI-compatible chat endpoint and return parsed JSON."""
+async def llm_call(
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    *,
+    provider: ProviderName = "primary",
+    temperature: float = 0.2,
+) -> dict:
+    """Call an OpenAI-compatible chat endpoint and return parsed JSON.
+
+    On an unparseable first response, retry once with an explicit instruction to
+    emit only JSON — some models bury the JSON in prose on the first try."""
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    resp_data = await llm_request(messages, model)
+    resp_data = await llm_request(
+        messages, model, temperature, provider=provider
+    )
     content = resp_data["choices"][0]["message"]["content"]
-    return _extract_json(content)
+    try:
+        return _extract_json(content)
+    except ValueError:
+        retry_messages = messages + [
+            {"role": "assistant", "content": content[:2000]},
+            {
+                "role": "user",
+                "content": (
+                    "Your previous response was not valid JSON. Reply with ONLY "
+                    "a single valid JSON object — no prose, no code fences."
+                ),
+            },
+        ]
+        resp_data = await llm_request(
+            retry_messages, model, temperature, provider=provider
+        )
+        content = resp_data["choices"][0]["message"]["content"]
+        return _extract_json(content)
 
 
 async def classify_issue(title: str, body: str) -> dict:

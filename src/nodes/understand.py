@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..agent import parse_issue_url
+from ..llm import llm_call
 from ..state import (
     AgentState,
     Phase,
@@ -15,8 +17,6 @@ from ..state import (
     _remember,
 )
 from ..tools import read_issue
-from ..agent import parse_issue_url
-from ..llm import llm_call
 
 
 async def understand_issue(state: AgentState | dict[str, Any]) -> AgentState:
@@ -36,7 +36,7 @@ async def understand_issue(state: AgentState | dict[str, Any]) -> AgentState:
     print(f"  [understand] Parsed {owner}/{repo}#{issue_number}", file=sys.stderr, flush=True)
 
     try:
-        print(f"  [understand] Fetching issue from GitHub...", file=sys.stderr, flush=True)
+        print("  [understand] Fetching issue from GitHub...", file=sys.stderr, flush=True)
         issue = await read_issue(owner, repo, issue_number)
         _record_tool(
             state,

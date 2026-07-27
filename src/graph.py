@@ -6,29 +6,79 @@ import asyncio
 import logging
 import sys
 import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
-from .state import AgentState, NodeFn, Phase, _as_state
+from .async_safety import CancellationDrainError, wait_for_phase
+from .state import AgentState, NodeFn, Phase, _as_state, _record_node_diagnostic
+from .timeout_diagnostics import extract_timeout_cleanup_evidence
 
 try:  # pragma: no cover - exercised only when langgraph is installed.
+    from langchain_core.callbacks import BaseCallbackHandler
     from langgraph.graph import END, StateGraph
 except ImportError:  # pragma: no cover - fallback is covered by tests.
+    BaseCallbackHandler = object  # type: ignore[assignment,misc]
     END = "__end__"
     StateGraph = None
 
 # ── per-phase timeouts (seconds) ──────────────────────────────────────────
+# plan_fix / reflect_on_failure must cover the full LLM retry budget (wall-clock
+# + backoff = 320s) plus margin. Reasoning models (gpt-5.5) push single calls to
+# 100-123s, and the retry path can stack; 360s clears it. understand also makes
+# an LLM call so it must cover the retry window too.
 PHASE_TIMEOUTS: dict[str, float] = {
-    "understand_issue": 15.0,
-    "locate_code": 30.0,
-    "plan_fix": 40.0,
-    "execute_fix": 120.0,
+    "understand_issue": 360.0,
+    "locate_code": 180.0,
+    "plan_fix": 360.0,
+    "execute_fix": 600.0,
     "verify_fix": 15.0,
-    "reflect_on_failure": 35.0,
-    "commit_fix": 30.0,
-    "handle_failure": 5.0,
+    "ensure_coverage": 1200.0,
+    "reflect_on_failure": 360.0,
+    "commit_fix": 600.0,
+    "handle_failure": 60.0,
 }
 
 logger = logging.getLogger("repopilot.graph")
+
+_GraphStateObserver = Callable[[AgentState], None]
+_graph_state_observer: ContextVar[_GraphStateObserver | None] = ContextVar(
+    "repopilot_graph_state_observer",
+    default=None,
+)
+
+
+@contextmanager
+def capture_graph_states(observer: _GraphStateObserver) -> Iterator[None]:
+    """Observe live LangGraph node states without sharing them across runs."""
+    token = _graph_state_observer.set(observer)
+    try:
+        yield
+    finally:
+        _graph_state_observer.reset(token)
+
+
+class _GraphStateCaptureCallback(BaseCallbackHandler):  # type: ignore[misc]
+    """Keep a live reference so mutations remain visible when a node raises."""
+
+    def __init__(self, observer: _GraphStateObserver) -> None:
+        self._observer = observer
+
+    def _capture(self, value: Any) -> None:
+        if isinstance(value, AgentState):
+            self._observer(value)
+
+    def on_chain_start(
+        self,
+        _serialized: dict[str, Any] | None,
+        inputs: Any,
+        **_kwargs: Any,
+    ) -> None:
+        self._capture(inputs)
+
+    def on_chain_end(self, outputs: Any, **_kwargs: Any) -> None:
+        self._capture(outputs)
 
 _RECOMMENDED_PHASES: dict[str, Phase] = {
     "collect_more_context": Phase.LOCATE,
@@ -69,25 +119,54 @@ class FallbackCompiledGraph:
             t0 = time.monotonic()
             try:
                 working = _as_state(
-                    await asyncio.wait_for(node(working), timeout=timeout)
+                    await wait_for_phase(node(working), timeout=timeout)
                 )
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as exc:
                 elapsed = time.monotonic() - t0
-                working.failure_reason = (
+                failure_reason = (
                     f"Phase {current} timed out after {timeout}s (elapsed {elapsed:.1f}s)"
                 )
+                cleanup_evidence = extract_timeout_cleanup_evidence(exc)
+                if cleanup_evidence is not None:
+                    failure_reason += f"; {cleanup_evidence.summary()}"
+                working.failure_reason = failure_reason
                 working.current_phase = Phase.FAILURE
+                _record_node_diagnostic(
+                    working,
+                    node=current,
+                    event="phase",
+                    status="timeout",
+                    elapsed_seconds=elapsed,
+                    error=asyncio.TimeoutError(),
+                    phase_timeout_seconds=timeout,
+                    **(
+                        cleanup_evidence.diagnostic_details()
+                        if cleanup_evidence is not None
+                        else {}
+                    ),
+                )
                 self._progress_fn(
                     current, "TIMEOUT",
                     f"{timeout}s limit exceeded"
                 )
                 return working
+            except CancellationDrainError:
+                raise
             except Exception as exc:
                 elapsed = time.monotonic() - t0
                 working.failure_reason = (
                     f"Phase {current} crashed: {exc}"
                 )
                 working.current_phase = Phase.FAILURE
+                _record_node_diagnostic(
+                    working,
+                    node=current,
+                    event="phase",
+                    status="error",
+                    elapsed_seconds=elapsed,
+                    error=exc,
+                    phase_timeout_seconds=timeout,
+                )
                 self._progress_fn(
                     current, "ERROR",
                     f"{type(exc).__name__}: {exc}"
@@ -155,6 +234,8 @@ def _route_for_phase(phase: Phase) -> str:
         return "execute_fix"
     if phase == Phase.VERIFY:
         return "verify_fix"
+    if phase == Phase.COVERAGE:
+        return "ensure_coverage"
     if phase == Phase.COMMIT:
         return "commit_fix"
     if phase == Phase.WAITING_FOR_USER:
@@ -292,5 +373,17 @@ def _record_route_decision(
 
 
 async def run_graph(graph: Any, state: AgentState) -> AgentState:
-    result = await graph.ainvoke(state)
-    return _as_state(result)
+    observer = _graph_state_observer.get()
+    if observer is not None:
+        observer(state)
+    if observer is not None and not isinstance(graph, FallbackCompiledGraph):
+        result = await graph.ainvoke(
+            state,
+            config={"callbacks": [_GraphStateCaptureCallback(observer)]},
+        )
+    else:
+        result = await graph.ainvoke(state)
+    final_state = _as_state(result)
+    if observer is not None:
+        observer(final_state)
+    return final_state

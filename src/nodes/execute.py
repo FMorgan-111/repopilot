@@ -2,89 +2,1339 @@
 
 from __future__ import annotations
 
+import asyncio
+import fcntl
+import hashlib
 import json
 import os
+import re
 import shlex
+import shutil
+import stat
 import subprocess
-import tempfile
+import sys
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
+from ..async_safety import CancellationDrainError
+from ..patch_match import (
+    find_normalized_span,
+    leading_spaces,
+    locate_node_span,
+    reindent,
+    try_upgrade_to_node_target,
+)
+from ..patch_repair import repair_unified_diff
+from ..repair_flow import resolve_search_target_symbol
+from ..safe_subprocess import (
+    BoundedProcessResult,
+    minimal_subprocess_env,
+    run_oci_process_async,
+)
 from ..state import (
     AgentState,
     FixAttempt,
+    PatchEdit,
     Phase,
     _as_state,
     _is_budget_exceeded,
     _primary_patch_file,
+    _record_node_diagnostic,
     _record_tool,
+    tool_manifest_fingerprint,
+)
+from ..tool_policy import fixed_pytest_argv, fixed_test_argv, repository_execution_mode
+
+_TOKENIZED_GITHUB_URL_RE = re.compile(
+    r"https://x-access-token:[^@\s'\"\]]+@github[.]com/"
+)
+_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_EXACT_REF_FETCH_RETRY_DELAYS = (0.5, 1.0)
+_CACHE_LOCK_POLL_SECONDS = 0.01
+_TRANSIENT_GIT_TRANSPORT_MARKERS = (
+    "ssl_error_syscall",
+    "connection reset",
+    "could not resolve host",
+    "temporary failure in name resolution",
+    "name or service not known",
+    "early eof",
+    "remote end hung up unexpectedly",
+    "http 502",
+    "http 503",
+    "http 504",
+    "requested url returned error: 502",
+    "requested url returned error: 503",
+    "requested url returned error: 504",
+    "operation timed out",
+    "connection timed out",
+    "timed out",
 )
 
 
-async def git_clone(state: AgentState) -> str:
-    """Clone the target repository to a temporary directory.
+@dataclass(frozen=True)
+class PatchApplyResult:
+    applied: bool
+    output: str
+    patch_content: str
+    repaired: bool = False
+    repair_reasons: list[str] = field(default_factory=list)
 
-    Strategy (best → fallback):
-    1. --depth 1 --filter=blob:none --single-branch  (fastest, Git 2.19+)
-    2. --depth 1  (shallow clone, no filter)
-    3. full clone  (no flags)
-    """
-    token = os.getenv("GITHUB_TOKEN", "")
+
+@dataclass(frozen=True)
+class PatchEditApplyResult:
+    applied: bool
+    output: str
+    changed_files: list[str] = field(default_factory=list)
+
+
+def _redact_sensitive_error_text(text: str) -> str:
+    """Remove credentials from command/error text before persistence."""
+    return _TOKENIZED_GITHUB_URL_RE.sub(
+        "https://x-access-token:<redacted>@github.com/",
+        text,
+    )
+
+
+def _repopilot_home() -> Path:
+    configured = os.getenv("REPOPILOT_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".repopilot"
+
+
+def _repo_key(owner: str, repo: str, repo_ref: str = "") -> str:
+    safe_owner = owner.replace("/", "-")
+    safe_repo = repo.replace("/", "-")
+    base = f"{safe_owner}-{safe_repo}"
+    return f"{base}-{repo_ref}" if repo_ref else base
+
+
+def _repo_cache_path(owner: str, repo: str, repo_ref: str = "") -> Path:
+    return _repopilot_home() / "repos" / _repo_key(owner, repo, repo_ref)
+
+
+def _trace_scope(trace_id: str) -> str:
+    if not trace_id:
+        raise ValueError("trace_id is required for a mutable repository checkout")
+    return hashlib.sha256(trace_id.encode("utf-8")).hexdigest()
+
+
+def _repo_work_path(
+    owner: str,
+    repo: str,
+    repo_ref: str = "",
+    trace_id: str = "",
+) -> Path:
+    """Return a mutable checkout path containing only a SHA-256 trace scope."""
+    scope = _trace_scope(trace_id)
+    return (
+        _repopilot_home()
+        / "repos"
+        / f"{_repo_key(owner, repo, repo_ref)}-work-{scope}"
+    )
+
+
+@asynccontextmanager
+async def _cache_lock(cache_path: Path):
+    """Serialize all shared-cache inspection and mutation for one cache key."""
+    lock_root = cache_path.parent / ".locks"
+    lock_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_root_info = lock_root.stat()
+    if (
+        lock_root.is_symlink()
+        or not lock_root.is_dir()
+        or lock_root_info.st_uid != os.geteuid()
+        or bool(lock_root_info.st_mode & 0o022)
+    ):
+        raise RuntimeError("repository cache lock directory is unsafe")
+    lock_name = hashlib.sha256(cache_path.name.encode("utf-8")).hexdigest() + ".lock"
+    lock_path = lock_root / lock_name
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    acquired = False
+    try:
+        lock_info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(lock_info.st_mode)
+            or lock_info.st_uid != os.geteuid()
+            or lock_info.st_nlink != 1
+            or bool(lock_info.st_mode & 0o022)
+        ):
+            raise RuntimeError("repository cache lock is not a regular file")
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                await asyncio.sleep(_CACHE_LOCK_POLL_SECONDS)
+        yield
+    finally:
+        try:
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+def _checked_remove_tree(path: str | Path) -> None:
+    """Remove one known cache tree without following links or hiding failures."""
+    target = Path(path)
+    try:
+        info = target.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise RuntimeError(f"refusing to remove non-directory cache path: {target}")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError("checked cache removal requires symlink-safe rmtree")
+    try:
+        shutil.rmtree(target)
+    except OSError as exc:
+        raise RuntimeError(f"checked cache removal failed: {target}") from exc
+    try:
+        target.lstat()
+    except FileNotFoundError:
+        return
+    raise RuntimeError(f"checked cache removal did not remove path: {target}")
+
+
+def _validated_repo_ref(state: AgentState) -> str:
+    if not state.repo_ref:
+        return ""
+    if not _COMMIT_RE.fullmatch(state.repo_ref):
+        raise ValueError("repo_ref must be a 40-character hexadecimal Git commit")
+    return state.repo_ref.lower()
+
+
+def _repo_cache_event(
+    event: str, state: AgentState, **details: object
+) -> None:
+    payload = {
+        "event": event,
+        "repo": f"{state.owner}/{state.repo}",
+        "ref": state.repo_ref[:12] if state.repo_ref else "latest",
+        **details,
+    }
+    print(
+        f"[repo-cache] {json.dumps(payload, sort_keys=True)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _repo_url(state: AgentState, *, include_token: bool) -> str:
+    token = os.getenv("GITHUB_TOKEN", "") if include_token else ""
     if token:
-        repo_url = f"https://x-access-token:{token}@github.com/{state.owner}/{state.repo}.git"
-    else:
-        repo_url = f"https://github.com/{state.owner}/{state.repo}.git"
-    target = tempfile.mkdtemp(prefix=f"repopilot-{state.owner}-{state.repo}-")
+        return f"https://x-access-token:{token}@github.com/{state.owner}/{state.repo}.git"
+    return f"https://github.com/{state.owner}/{state.repo}.git"
 
-    strategies = [
-        ["git", "clone", "--depth", "1", "--filter=blob:none", "--single-branch", repo_url, target],
-        ["git", "clone", "--depth", "1", repo_url, target],
-        ["git", "clone", repo_url, target],
+
+def _git_transport_command(state: AgentState, *args: str) -> list[str]:
+    """Authenticate one Git invocation without persisting credentials."""
+    safe_url = _repo_url(state, include_token=False)
+    authenticated_url = _repo_url(state, include_token=True)
+    return [
+        "git",
+        "-c",
+        f"url.{authenticated_url}.insteadOf={safe_url}",
+        *args,
     ]
 
-    last_error = ""
-    for cmd in strategies:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if result.returncode == 0:
-            return target
-        last_error = (result.stderr or result.stdout).strip()
 
+def _remove_tree_after_failure(path: str | Path, failure: BaseException) -> None:
+    """Clean a partially mutated tree while retaining the original failure."""
+    try:
+        _checked_remove_tree(path)
+    except BaseException as cleanup_error:
+        raise cleanup_error from failure
+
+
+def _remove_git_fetch_head(cache_path: Path) -> None:
+    """Remove transport URLs Git records outside repository configuration."""
+    try:
+        (cache_path / ".git" / "FETCH_HEAD").unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise RuntimeError("failed to remove Git transport metadata") from exc
+
+
+def _clone_local_repo(cache_path: Path, target: str) -> None:  # pragma: no cover
+    # Retained for backward-compat imports; the live path is the async variant.
+    subprocess.run(
+        ["git", "clone", "--local", "--no-hardlinks", str(cache_path), target],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=True,
+        env=minimal_subprocess_env(),
+    )
+
+
+class _ProcResult:
+    __slots__ = ("returncode", "stdout", "stderr")
+
+    def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+async def _run_git_async(
+    args: list[str], timeout: float, cwd: str | None = None
+) -> _ProcResult:
+    """Run git via an async subprocess so a hung clone does NOT pin the event
+    loop. The subprocess is killed both on its own timeout and when the caller
+    is cancelled (e.g. the execute_fix phase timeout), so neither can leave a
+    git process running unbounded — the bug that made a stuck clone hang the
+    whole run."""
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=minimal_subprocess_env(),
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        proc.kill()
+        await proc.wait()
+        raise
+    return _ProcResult(
+        proc.returncode or 0,
+        stdout.decode(errors="replace"),
+        stderr.decode(errors="replace"),
+    )
+
+
+async def _clone_local_repo_async(cache_path: Path, target: str) -> None:
+    res = await _run_git_async(
+        ["git", "clone", "--local", "--no-hardlinks", str(cache_path), target],
+        timeout=180,
+    )
+    if res.returncode != 0:
+        raise subprocess.CalledProcessError(
+            res.returncode, "git clone --local", res.stdout, res.stderr
+        )
+    if not await _worktree_is_healthy(target):
+        # A "successful" clone that produced no checkout (empty/broken cache) —
+        # treat as failure so the caller discards it and re-downloads.
+        raise subprocess.CalledProcessError(
+            1, "git clone --local", "", "clone produced an empty work tree"
+        )
+
+
+async def _worktree_is_healthy(work: str) -> bool:
+    """A usable work tree resolves HEAD and has checked-out files. Guards against
+    reusing an empty/broken clone (0 files, no HEAD) — which silently made every
+    patch fail with 'target file was not found', masquerading as the model
+    picking wrong paths."""
+    if not (Path(work) / ".git").exists():
+        return False
+    head = await _run_git_async(["git", "-C", work, "rev-parse", "HEAD"], timeout=30)
+    if head.returncode != 0:
+        return False
+    listed = await _run_git_async(["git", "-C", work, "ls-files"], timeout=60)
+    return listed.returncode == 0 and bool(listed.stdout.strip())
+
+
+async def _worktree_head(work: str) -> str:
+    result = await _run_git_async(
+        ["git", "-C", work, "rev-parse", "HEAD"], timeout=30
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+async def _verify_clean_worktree(work: str, expected_head: str) -> None:
+    head = await _checked_git(
+        ["git", "-C", work, "rev-parse", "HEAD"],
+        30,
+    )
+    if head.stdout.strip().lower() != expected_head.lower():
+        raise RuntimeError("repository checkout HEAD does not match the approved ref")
+    status = await _checked_git(
+        [
+            "git",
+            "-C",
+            work,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignored=matching",
+        ],
+        60,
+    )
+    if status.stdout:
+        raise RuntimeError("repository checkout is not clean")
+
+
+async def _reset_work_tree_async(work: str, expected_head: str) -> None:
+    """Reset, clean, and verify a reused trace-scoped checkout."""
+    for args in (
+        ["git", "-C", work, "reset", "--hard", expected_head],
+        ["git", "-C", work, "clean", "-fdx"],
+    ):
+        await _checked_git(args, 120)
+    await _verify_clean_worktree(work, expected_head)
+
+
+async def _checked_git(args: list[str], timeout: float) -> _ProcResult:
+    result = await _run_git_async(args, timeout=timeout)
+    if result.returncode:
+        raise RuntimeError(
+            _redact_sensitive_error_text((result.stderr or result.stdout).strip())
+        )
+    return result
+
+
+async def _cache_origin_matches(state: AgentState, cache_path: Path) -> bool:
+    result = await _run_git_async(
+        [
+            "git",
+            "-C",
+            str(cache_path),
+            "config",
+            "--local",
+            "--get-all",
+            "remote.origin.url",
+        ],
+        timeout=30,
+    )
+    return (
+        result.returncode == 0
+        and result.stdout.splitlines() == [_repo_url(state, include_token=False)]
+    )
+
+
+def _is_transient_git_transport_error(error: BaseException) -> bool:
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    message = str(error).lower()
+    return any(marker in message for marker in _TRANSIENT_GIT_TRANSPORT_MARKERS)
+
+
+async def _fetch_exact_ref(
+    state: AgentState,
+    cache_path: Path,
+    repo_ref: str,
+    retry_delays: tuple[float, ...],
+) -> None:
+    command = _git_transport_command(
+        state,
+        "-C",
+        str(cache_path),
+        "fetch",
+        "--depth",
+        "1",
+        "origin",
+        repo_ref,
+    )
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            await _checked_git(command, 300)
+            return
+        except Exception as exc:
+            if (
+                not _is_transient_git_transport_error(exc)
+                or attempt == len(retry_delays)
+            ):
+                raise
+            await asyncio.sleep(max(0.0, retry_delays[attempt]))
+
+
+async def _refresh_live_cache(state: AgentState, cache_path: Path) -> None:
+    try:
+        await _checked_git(
+            _git_transport_command(
+                state,
+                "-C",
+                str(cache_path),
+                "fetch",
+                "--prune",
+                "origin",
+            ),
+            300,
+        )
+        await _checked_git(
+            _git_transport_command(
+                state,
+                "-C",
+                str(cache_path),
+                "remote",
+                "set-head",
+                "origin",
+                "-a",
+            ),
+            60,
+        )
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "reset",
+                "--hard",
+                "refs/remotes/origin/HEAD",
+            ],
+            60,
+        )
+        _remove_git_fetch_head(cache_path)
+    except BaseException as failure:
+        _remove_tree_after_failure(cache_path, failure)
+        raise
+
+
+async def _populate_ref_cache(
+    state: AgentState,
+    cache_path: Path,
+    repo_ref: str,
+    *,
+    retry_delays: tuple[float, ...] = _EXACT_REF_FETCH_RETRY_DELAYS,
+) -> None:
+    try:
+        await _checked_git(["git", "init", str(cache_path)], 60)
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "remote",
+                "add",
+                "origin",
+                _repo_url(state, include_token=False),
+            ],
+            60,
+        )
+        await _fetch_exact_ref(state, cache_path, repo_ref, retry_delays)
+        await _checked_git(
+            [
+                "git",
+                "-C",
+                str(cache_path),
+                "checkout",
+                "--detach",
+                "FETCH_HEAD",
+            ],
+            60,
+        )
+        _remove_git_fetch_head(cache_path)
+    except BaseException as failure:
+        _remove_tree_after_failure(cache_path, failure)
+        raise
+
+
+async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
+    safe_repo_url = _repo_url(state, include_token=False)
+    strategies = [
+        _git_transport_command(
+            state,
+            "clone",
+            "--depth",
+            "1",
+            "--single-branch",
+            safe_repo_url,
+            str(cache_path),
+        ),
+        _git_transport_command(
+            state,
+            "clone",
+            "--depth",
+            "1",
+            safe_repo_url,
+            str(cache_path),
+        ),
+        _git_transport_command(
+            state,
+            "clone",
+            safe_repo_url,
+            str(cache_path),
+        ),
+    ]
+    last_error = ""
+    for command in strategies:
+        try:
+            result = await _run_git_async(command, timeout=300)
+            if result.returncode == 0:
+                _remove_git_fetch_head(cache_path)
+                return
+        except asyncio.TimeoutError as failure:
+            last_error = "clone timed out"
+            _remove_tree_after_failure(cache_path, failure)
+            continue
+        except BaseException as failure:
+            _remove_tree_after_failure(cache_path, failure)
+            raise
+        clone_failure = RuntimeError(
+            _redact_sensitive_error_text(
+                (result.stderr or result.stdout).strip()
+            )
+        )
+        last_error = str(clone_failure)
+        _remove_tree_after_failure(cache_path, clone_failure)
     raise RuntimeError(last_error)
 
 
-async def apply_patch(repo_path: str, patch_content: str) -> tuple[bool, str]:
-    """Apply a unified diff to the local clone."""
-    result = subprocess.run(
+async def git_clone(state: AgentState) -> str:
+    """Prepare a fresh live checkout or an immutable benchmark checkout."""
+    repo_ref = _validated_repo_ref(state)
+    cache_path = _repo_cache_path(state.owner, state.repo, repo_ref)
+    work = str(
+        _repo_work_path(state.owner, state.repo, repo_ref, state.trace_id)
+    )
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    async with _cache_lock(cache_path):
+        return await _git_clone_locked(state, repo_ref, cache_path, work)
+
+
+async def _clone_and_verify_local_checkout(
+    cache_path: Path,
+    work: str,
+    repo_ref: str,
+) -> str:
+    await _clone_local_repo_async(cache_path, work)
+    expected_head = repo_ref or await _worktree_head(str(cache_path))
+    if not expected_head:
+        raise RuntimeError("repository cache HEAD could not be established")
+    await _verify_clean_worktree(work, expected_head)
+    return work
+
+
+async def _git_clone_locked(
+    state: AgentState,
+    repo_ref: str,
+    cache_path: Path,
+    work: str,
+) -> str:
+    """Inspect and mutate one shared cache only while its advisory lock is held."""
+
+    reuse_work = False
+    if repo_ref and (Path(work) / ".git").exists():
+        if (
+            await _worktree_is_healthy(work)
+            and await _worktree_head(work) == repo_ref
+        ):
+            reuse_work = True
+        else:
+            _repo_cache_event("ref_mismatch", state, target="worktree")
+            _checked_remove_tree(work)
+
+    if repo_ref and (cache_path / ".git").exists():
+        if (
+            await _worktree_is_healthy(str(cache_path))
+            and await _worktree_head(str(cache_path)) == repo_ref
+            and await _cache_origin_matches(state, cache_path)
+        ):
+            try:
+                _remove_git_fetch_head(cache_path)
+            except BaseException as failure:
+                _remove_tree_after_failure(cache_path, failure)
+                raise
+            _repo_cache_event("object_hit", state)
+        else:
+            _repo_cache_event("ref_mismatch", state, target="object_cache")
+            _checked_remove_tree(cache_path)
+
+    if repo_ref and not (cache_path / ".git").exists():
+        _repo_cache_event("remote_fetch", state)
+        await _populate_ref_cache(state, cache_path, repo_ref)
+
+    if not repo_ref:
+        if (cache_path / ".git").exists():
+            if await _cache_origin_matches(state, cache_path):
+                _repo_cache_event("object_hit", state)
+                await _refresh_live_cache(state, cache_path)
+            else:
+                _repo_cache_event("ref_mismatch", state, target="object_cache")
+                _checked_remove_tree(cache_path)
+        if not (cache_path / ".git").exists():
+            _repo_cache_event("remote_fetch", state)
+            await _populate_live_cache(state, cache_path)
+
+    if reuse_work:
+        _repo_cache_event("worktree_hit", state)
+        try:
+            await _reset_work_tree_async(work, repo_ref)
+        except BaseException as failure:
+            _remove_tree_after_failure(work, failure)
+            raise
+        return work
+
+    _checked_remove_tree(work)
+    try:
+        return await _clone_and_verify_local_checkout(cache_path, work, repo_ref)
+    except (
+        subprocess.CalledProcessError,
+        asyncio.TimeoutError,
+        RuntimeError,
+    ) as failure:
+        _remove_tree_after_failure(work, failure)
+        _repo_cache_event("rebuild", state)
+        _checked_remove_tree(cache_path)
+        if repo_ref:
+            await _populate_ref_cache(state, cache_path, repo_ref)
+        else:
+            await _populate_live_cache(state, cache_path)
+        try:
+            return await _clone_and_verify_local_checkout(
+                cache_path,
+                work,
+                repo_ref,
+            )
+        except BaseException as retry_failure:
+            _remove_tree_after_failure(work, retry_failure)
+            raise
+    except BaseException as failure:
+        _remove_tree_after_failure(work, failure)
+        raise
+
+
+def _git_apply_check(repo_path: str, patch_content: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "apply", "--check", "-"],
+        input=patch_content,
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env=minimal_subprocess_env(),
+    )
+
+
+def _git_apply(repo_path: str, patch_content: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
         ["git", "apply", "-"],
         input=patch_content,
         cwd=repo_path,
         capture_output=True,
         text=True,
         timeout=60,
+        env=minimal_subprocess_env(),
     )
-    output = "\n".join(part for part in [result.stdout, result.stderr] if part)
-    return result.returncode == 0, output
+
+
+def git_diff(repo_path: str) -> str:
+    """Return the applied work-tree patch in SWE-bench prediction form."""
+    if not repo_path:
+        return ""
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_path,
+                "diff",
+                "HEAD",
+                "--binary",
+                "--no-ext-diff",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=minimal_subprocess_env(),
+        )
+        if result.returncode != 0:
+            return ""
+        untracked = subprocess.run(
+            [
+                "git",
+                "-C",
+                repo_path,
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+            ],
+            capture_output=True,
+            timeout=30,
+            env=minimal_subprocess_env(),
+        )
+        if untracked.returncode != 0:
+            return ""
+        patches = [result.stdout]
+        generated_suffixes = {
+            ".egg",
+            ".gz",
+            ".jar",
+            ".pyc",
+            ".tar",
+            ".tgz",
+            ".whl",
+            ".zip",
+        }
+        for encoded_path in untracked.stdout.split(b"\0"):
+            if not encoded_path:
+                continue
+            relative_path = encoded_path.decode("utf-8", errors="surrogateescape")
+            path = Path(repo_path) / relative_path
+            if path.suffix.lower() in generated_suffixes or not path.is_file():
+                continue
+            if b"\0" in path.read_bytes()[:8192]:
+                continue
+            untracked_diff = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    repo_path,
+                    "diff",
+                    "--binary",
+                    "--no-ext-diff",
+                    "--no-index",
+                    "--",
+                    "/dev/null",
+                    relative_path,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                env=minimal_subprocess_env(),
+            )
+            if untracked_diff.returncode not in {0, 1}:
+                return ""
+            patches.append(untracked_diff.stdout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return "".join(patches)
+
+
+def _combined_process_output(result: subprocess.CompletedProcess) -> str:
+    return "\n".join(part for part in [result.stdout, result.stderr] if part)
+
+
+def _apply_patch_edits(
+    repo_path: str, patch_edits: list[PatchEdit]
+) -> PatchEditApplyResult:
+    """Apply exact search/replace edits after validating every edit."""
+    pending_writes: dict[Path, str] = {}
+    changed_files: list[str] = []
+    repo_root = Path(repo_path).resolve()
+
+    for index, edit in enumerate(patch_edits, start=1):
+        relative_path = Path(edit.file_path)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            return PatchEditApplyResult(
+                applied=False,
+                output=(
+                    "Search/replace edit failed: "
+                    f"edit {index} has unsafe file path {edit.file_path!r}."
+                ),
+            )
+
+        file_path = (repo_root / relative_path).resolve()
+        try:
+            file_path.relative_to(repo_root)
+        except ValueError:
+            return PatchEditApplyResult(
+                applied=False,
+                output=(
+                    "Search/replace edit failed: "
+                    f"edit {index} escapes repository root: {edit.file_path!r}."
+                ),
+            )
+
+        is_new_file = (
+            edit.exact_only
+            and not edit.search
+            and not edit.node_target
+            and edit.expected_content_sha256 == hashlib.sha256(b"").hexdigest()
+        )
+        if not file_path.exists() and not is_new_file:
+            return PatchEditApplyResult(
+                applied=False,
+                output=(
+                    "Search/replace edit failed: "
+                    f"edit {index} target file was not found: {edit.file_path}."
+                ),
+            )
+
+        content = pending_writes.get(file_path)
+        if content is None:
+            if is_new_file:
+                content = ""
+            else:
+                if file_path.is_symlink():
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=f"Exact edit failed: edit {index} target is a symlink.",
+                    )
+                raw_content = file_path.read_bytes()
+                if (
+                    edit.exact_only
+                    and hashlib.sha256(raw_content).hexdigest()
+                    != edit.expected_content_sha256
+                ):
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=(
+                            f"Exact edit failed: edit {index} target preimage changed "
+                            f"for {edit.file_path}."
+                        ),
+                    )
+                content = raw_content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+        if is_new_file:
+            updated = edit.replace
+        elif edit.node_target:
+            # AST-anchored replacement: locate the named def/class and replace
+            # its whole span. No verbatim text anchoring, no line drift.
+            span = locate_node_span(content, edit.node_target)
+            if span is None:
+                return PatchEditApplyResult(
+                    applied=False,
+                    output=(
+                        f"Node-target edit failed: edit {index} could not locate a "
+                        f"unique definition {edit.node_target!r} in {edit.file_path}."
+                    ),
+                )
+            start, end, node_indent = span
+            first = next((ln for ln in edit.replace.split("\n") if ln.strip()), "")
+            replacement = reindent(edit.replace, node_indent - leading_spaces(first))
+            if not replacement.endswith("\n"):
+                replacement += "\n"
+            updated = content[:start] + replacement + content[end:]
+        else:
+            match_count = content.count(edit.search)
+            if match_count == 1:
+                updated = content.replace(edit.search, edit.replace, 1)
+            elif match_count > 1:
+                if not edit.replace_all:
+                    return PatchEditApplyResult(
+                        applied=False,
+                        output=(
+                            "Search/replace edit failed: "
+                            f"edit {index} search block matched {match_count} times in "
+                            f"{edit.file_path}; set replace_all=true only when all matches "
+                            "should change."
+                        ),
+                    )
+                updated = content.replace(edit.search, edit.replace)
+            else:
+                # Exact search not found — the dominant Gemini failure is whitespace
+                # drift (indent / trailing space). Retry with a normalized, unique
+                # line match before giving up, reindenting the replacement to match.
+                span = (
+                    None
+                    if edit.replace_all or edit.exact_only
+                    else find_normalized_span(content, edit.search)
+                )
+                if span is None:
+                    # Last resort: if this is really a whole-function rewrite whose
+                    # search text drifted too far to match, re-anchor by AST node
+                    # (the model won't do this itself). Size-gated so it can never
+                    # truncate a partial edit. Python files only.
+                    qualname = (
+                        None
+                        if edit.replace_all
+                        or edit.exact_only
+                        or not edit.file_path.endswith(".py")
+                        else try_upgrade_to_node_target(content, edit.search, edit.replace)
+                    )
+                    node_span = (
+                        locate_node_span(content, qualname) if qualname else None
+                    )
+                    if node_span is None:
+                        # Diagnostic: why did the converter decline? (helps tune
+                        # the gate). Reports the shape of this apply-failure.
+                        if edit.file_path.endswith(".py") and not edit.replace_all:
+                            from ..patch_match import diagnose_node_upgrade
+                            print(
+                                f"  [execute] node-upgrade declined edit {index} "
+                                f"{edit.file_path}: {diagnose_node_upgrade(content, edit.search, edit.replace)}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                        return PatchEditApplyResult(
+                            applied=False,
+                            output=(
+                                "Search/replace edit failed: "
+                                f"edit {index} search block was not found in {edit.file_path}."
+                            ),
+                        )
+                    n_start, n_end, node_indent = node_span
+                    first = next(
+                        (ln for ln in edit.replace.split("\n") if ln.strip()), ""
+                    )
+                    body = reindent(edit.replace, node_indent - leading_spaces(first))
+                    if not body.endswith("\n"):
+                        body += "\n"
+                    print(
+                        f"  [execute] upgraded search->node_target {edit.file_path}:"
+                        f"{qualname} (edit {index})",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    updated = content[:n_start] + body + content[n_end:]
+                else:
+                    start, end, indent_delta = span
+                    updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
+
+        pending_writes[file_path] = updated
+        if edit.file_path not in changed_files:
+            changed_files.append(edit.file_path)
+
+    for file_path, content in pending_writes.items():
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content, encoding="utf-8")
+
+    return PatchEditApplyResult(
+        applied=True,
+        output=f"Applied {len(patch_edits)} search/replace edit(s).",
+        changed_files=changed_files,
+    )
+
+
+async def apply_patch_with_repair(
+    repo_path: str, patch_content: str
+) -> PatchApplyResult:
+    """Apply a unified diff, attempting deterministic syntax repair once."""
+    preflight = _git_apply_check(repo_path, patch_content)
+    preflight_output = _combined_process_output(preflight)
+    if preflight.returncode == 0:
+        result = _git_apply(repo_path, patch_content)
+        output = _combined_process_output(result)
+        if result.returncode != 0:
+            output = f"Patch apply failed after preflight passed:\n{output}"
+        return PatchApplyResult(
+            applied=result.returncode == 0,
+            output=_redact_sensitive_error_text(output),
+            patch_content=patch_content,
+        )
+
+    original_failure = f"Patch preflight check failed:\n{preflight_output}"
+    repair = repair_unified_diff(patch_content)
+    if not repair.changed:
+        return PatchApplyResult(
+            applied=False,
+            output=_redact_sensitive_error_text(original_failure),
+            patch_content=patch_content,
+        )
+
+    repaired_preflight = _git_apply_check(repo_path, repair.patch)
+    repaired_preflight_output = _combined_process_output(repaired_preflight)
+    if repaired_preflight.returncode != 0:
+        output = (
+            f"{original_failure}\n\n"
+            "Patch repair attempted but preflight still failed "
+            f"(reasons: {', '.join(repair.reasons)}):\n"
+            f"{repaired_preflight_output}"
+        )
+        return PatchApplyResult(
+            applied=False,
+            output=_redact_sensitive_error_text(output),
+            patch_content=repair.patch,
+            repaired=True,
+            repair_reasons=repair.reasons,
+        )
+
+    result = _git_apply(repo_path, repair.patch)
+    output = _combined_process_output(result)
+    prefix = f"Patch repaired before apply (reasons: {', '.join(repair.reasons)})."
+    if result.returncode != 0:
+        output = f"Patch apply failed after repaired preflight passed:\n{output}"
+    output = f"{prefix}\n{output}".strip()
+    return PatchApplyResult(
+        applied=result.returncode == 0,
+        output=_redact_sensitive_error_text(output),
+        patch_content=repair.patch,
+        repaired=True,
+        repair_reasons=repair.reasons,
+    )
+
+
+async def apply_patch(repo_path: str, patch_content: str) -> tuple[bool, str]:
+    """Apply a unified diff to the local clone."""
+    result = await apply_patch_with_repair(repo_path, patch_content)
+    return result.applied, result.output
+
+
+# Best-effort editable install so the cloned package and its test deps are
+# importable before pytest runs. Bounded and failure-tolerant: src/-layout repos
+# (e.g. tox) die with "No module named X" / "command not found" without it, no
+# matter how correct the patch is. We do NOT fail the attempt if install fails —
+# pytest may still run for flat-layout / stdlib-only repos.
+INSTALL_TIMEOUT_SECONDS = 240
+VENV_CREATE_TIMEOUT_SECONDS = 120
+
+
+def _venv_dir_for(repo_path: str) -> Path:
+    """Sibling venv dir for a clone — kept outside the tree so pytest can't
+    collect it, and so the clone's own files are untouched."""
+    p = Path(repo_path)
+    return p.parent / f"{p.name}-venv"
+
+
+def _venv_python_path(repo_path: str) -> Path:
+    return _venv_dir_for(repo_path) / "bin" / "python"
+
+
+def _venv_ready_marker(repo_path: str) -> Path:
+    return _venv_dir_for(repo_path) / ".repopilot-ready"
+
+
+def _venv_is_ready(repo_path: str) -> bool:
+    return _venv_python_path(repo_path).exists() and _venv_ready_marker(repo_path).exists()
+
+
+def _mark_venv_ready(repo_path: str) -> None:
+    _venv_ready_marker(repo_path).write_text("ready\n", encoding="utf-8")
+
+
+def _create_venv(repo_path: str) -> dict[str, Any]:
+    """Create an isolated venv for the clone, reusing system site-packages.
+
+    The system Python is often PEP 668 externally-managed (pip install refused),
+    and even when not, installing into it is unsafe. A venv sidesteps PEP 668
+    entirely; --system-site-packages reuses already-present deps (pytest, etc.)
+    so only the missing ones are installed. Returns a tracing record; never
+    raises — callers fall back to system python3 on failure.
+    """
+    venv_dir = _venv_dir_for(repo_path)
+    venv_python = _venv_python_path(repo_path)
+    if _venv_is_ready(repo_path):
+        return {"created": True, "python": str(venv_python), "reason": "exists"}
+    if venv_dir.exists():
+        shutil.rmtree(venv_dir, ignore_errors=True)
+    try:
+        result = subprocess.run(
+            ["python3", "-m", "venv", "--system-site-packages",
+             str(venv_dir)],
+            capture_output=True,
+            text=True,
+            timeout=VENV_CREATE_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        stdlib_reason = str(exc)[:200]
+    else:
+        if result.returncode == 0 and venv_python.exists():
+            _mark_venv_ready(repo_path)
+            return {"created": True, "python": str(venv_python), "creator": "stdlib"}
+        stdlib_reason = (result.stderr or "venv creation failed")[:200]
+
+    shutil.rmtree(venv_dir, ignore_errors=True)
+    try:
+        uv_result = subprocess.run(
+            ["uv", "venv", "--system-site-packages", str(venv_dir)],
+            capture_output=True,
+            text=True,
+            timeout=VENV_CREATE_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        uv_reason = str(exc)[:200]
+    else:
+        if uv_result.returncode == 0 and venv_python.exists():
+            _mark_venv_ready(repo_path)
+            return {
+                "created": True,
+                "python": str(venv_python),
+                "creator": "uv",
+                "stdlib_reason": stdlib_reason,
+            }
+        uv_reason = (uv_result.stderr or "uv venv creation failed")[:200]
+
+    shutil.rmtree(venv_dir, ignore_errors=True)
+    return {
+        "created": False,
+        "python": None,
+        "reason": stdlib_reason,
+        "uv_reason": uv_reason,
+    }
+
+
+def _pip_install_editable(
+    repo_path: str, python_exe: str = "python3"
+) -> dict[str, Any]:
+    """Try `pip install -e .[<extras>]`, falling back to a bare editable install.
+
+    Installs with ``python_exe`` (the clone's venv interpreter when available).
+    Returns a record for tracing. Never raises — install is best-effort.
+    """
+    has_metadata = any(
+        (Path(repo_path) / name).exists()
+        for name in ("pyproject.toml", "setup.py", "setup.cfg")
+    )
+    if not has_metadata:
+        return {"attempted": False, "reason": "no_packaging_metadata"}
+
+    candidates = [
+        [python_exe, "-m", "pip", "install", "-e", ".[test]"],
+        [python_exe, "-m", "pip", "install", "-e", ".[testing]"],
+        [python_exe, "-m", "pip", "install", "-e", ".[dev]"],
+        [python_exe, "-m", "pip", "install", "-e", "."],
+    ]
+    last: dict[str, Any] = {"attempted": True}
+    for cmd in candidates:
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=repo_path,
+                capture_output=True,
+                text=True,
+                timeout=INSTALL_TIMEOUT_SECONDS,
+                env=minimal_subprocess_env(),
+            )
+        except subprocess.TimeoutExpired:
+            return {"attempted": True, "success": False, "reason": "timeout",
+                    "command": " ".join(cmd)}
+        except Exception as exc:  # pragma: no cover - defensive
+            return {"attempted": True, "success": False, "reason": str(exc)[:200],
+                    "command": " ".join(cmd)}
+        last = {
+            "attempted": True,
+            "success": result.returncode == 0,
+            "command": " ".join(cmd),
+            "returncode": result.returncode,
+        }
+        if result.returncode == 0:
+            return last
+    return last
+
+
+def _ensure_pytest_available(python_exe: str) -> dict[str, Any]:
+    """Ensure the selected interpreter can run pytest with Scrapy's plugin args."""
+    try:
+        check = subprocess.run(
+            [python_exe, "-c", "import pytest, pytest_twisted"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=minimal_subprocess_env(),
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        check = subprocess.CompletedProcess(
+            [python_exe, "-c", "import pytest, pytest_twisted"],
+            returncode=1,
+            stdout="",
+            stderr=str(exc),
+        )
+    if check.returncode == 0:
+        return {"attempted": False, "reason": "pytest_available"}
+
+    cmd = [python_exe, "-m", "pip", "install", "pytest", "pytest-twisted"]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=INSTALL_TIMEOUT_SECONDS,
+            env=minimal_subprocess_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return {"attempted": True, "success": False, "reason": "timeout",
+                "command": " ".join(cmd)}
+    except Exception as exc:  # pragma: no cover - defensive
+        return {"attempted": True, "success": False, "reason": str(exc)[:200],
+                "command": " ".join(cmd)}
+    return {
+        "attempted": True,
+        "success": result.returncode == 0,
+        "command": " ".join(cmd),
+        "returncode": result.returncode,
+    }
 
 
 async def run_pytest(repo_path: str, command: str | None = None) -> dict[str, Any]:
-    """Run the requested test command, defaulting to pytest."""
+    """Run the requested test command, defaulting to pytest.
+
+    Uses the clone's venv interpreter when one exists (so the editable install
+    is importable), falling back to system python3 otherwise. For an explicit
+    command the venv's bin dir is prepended to PATH so bare `pytest`/`python`
+    resolve to the venv.
+    """
+    venv_python = _venv_python_path(repo_path)
+    has_venv = _venv_is_ready(repo_path)
+    py = str(venv_python) if has_venv else "python3"
+
+    env = minimal_subprocess_env(
+        {"VIRTUAL_ENV": str(_venv_dir_for(repo_path))} if has_venv else None
+    )
+
     if command:
         cmd = shlex.split(command)
+        if has_venv and cmd and cmd[0] == "pytest":
+            cmd = [py, "-m", "pytest", *cmd[1:]]
+        elif has_venv and cmd and cmd[0] in {"python", "python3"}:
+            cmd = [py, *cmd[1:]]
     else:
-        cmd = ["python3", "-m", "pytest", "-q"]
+        cmd = [py, "-m", "pytest", "-q"]
     result = subprocess.run(
         cmd,
         cwd=repo_path,
         capture_output=True,
         text=True,
         timeout=300,
+        env=env,
     )
     return {
         "command": " ".join(cmd),
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "success": result.returncode == 0,
+    }
+
+
+def _validate_oci_execution_state(state: AgentState) -> None:
+    if not _COMMIT_RE.fullmatch(state.repo_ref):
+        raise RuntimeError("OCI execution requires an exact 40-character repo_ref")
+    approval = state.tool_patch_approval
+    if approval is None or approval.base_ref.lower() != state.repo_ref.lower():
+        raise RuntimeError("OCI execution requires an exact PatchGate approval")
+    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+    if patch_sha != approval.patch_sha256:
+        raise RuntimeError("OCI execution PatchGate approval does not match the patch")
+    if (
+        tool_manifest_fingerprint(approval.changed_manifest)
+        != approval.manifest_fingerprint
+    ):
+        raise RuntimeError("OCI execution PatchGate manifest approval is invalid")
+
+
+def _oci_test_argv(state: AgentState) -> list[str]:
+    config = state.tool_sandbox_config
+    if config is None:  # pragma: no cover - guarded by execution mode
+        raise RuntimeError("OCI tool sandbox is not configured")
+    fallback = fixed_pytest_argv(config.python_executable, ["-q"])
+    if not state.test_command:
+        return fallback
+    try:
+        planner_argv = shlex.split(state.test_command, posix=True)
+        approved_argv, _normalized = fixed_test_argv(
+            Path(state.repo_path).resolve(),
+            state,
+            planner_argv,
+        )
+    except (OSError, RuntimeError, ValueError):
+        return fallback
+    return approved_argv
+
+
+async def _run_oci_pytest(state: AgentState) -> dict[str, Any]:
+    # Runtime-local import avoids execute -> tool_router -> tool_policy cycles.
+    from ..tool_router import disposable_test_snapshot
+
+    config = state.tool_sandbox_config
+    if config is None:  # pragma: no cover - guarded by execution mode
+        raise RuntimeError("OCI tool sandbox is not configured")
+    argv = _oci_test_argv(state)
+    with disposable_test_snapshot(
+        state,
+        apply_approved_changes=True,
+    ) as sandbox:
+        result: BoundedProcessResult = await run_oci_process_async(
+            argv,
+            sandbox=sandbox,
+            config=config,
+            timeout=300,
+            max_output_bytes=8_000,
+        )
+    return {
+        "command": shlex.join(argv),
         "returncode": result.returncode,
         "stdout": result.stdout,
         "stderr": result.stderr,
@@ -101,20 +1351,186 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     patch = state.patch_content
-    attempt = FixAttempt(patch_content=patch, file_path=_primary_patch_file(patch))
+    for edit in state.patch_edits:
+        if edit.node_target:
+            edit.resolved_target_symbol = edit.node_target
+        elif edit.search:
+            edit.resolved_target_symbol = (
+                resolve_search_target_symbol(
+                    state,
+                    edit.file_path,
+                    edit.search,
+                )
+                or ""
+            )
+        else:
+            edit.resolved_target_symbol = ""
+    attempt = FixAttempt(
+        patch_content=patch,
+        patch_edits=state.patch_edits,
+        file_path=(
+            state.patch_edits[0].file_path
+            if state.patch_edits
+            else _primary_patch_file(patch)
+        ),
+    )
     try:
+        execution_mode = repository_execution_mode(state)
+        if execution_mode == "oci":
+            _validate_oci_execution_state(state)
+    except Exception as exc:
+        attempt.test_result = "execution_error"
+        attempt.failure_kind = "infra_error"
+        attempt.error_log = _redact_sensitive_error_text(str(exc))
+        attempt.success = False
+        state.fix_attempts.append(attempt)
+        state.current_phase = Phase.VERIFY
+        return state
+    try:
+        cloned_during_execute = False
         if not state.repo_path:
-            state.repo_path = await git_clone(state)
-        applied, apply_output = await apply_patch(state.repo_path, patch)
-        if not applied:
-            attempt.test_result = "patch_apply_failed"
-            attempt.error_log = apply_output
-            attempt.success = False
-            state.fix_attempts.append(attempt)
-            state.current_phase = Phase.VERIFY
-            return state
+            try:
+                state.repo_path = await git_clone(state)
+            except CancellationDrainError:
+                raise
+            except Exception as exc:
+                attempt.test_result = "execution_error"
+                attempt.failure_kind = "infra_error"
+                attempt.error_log = _redact_sensitive_error_text(str(exc))
+                attempt.success = False
+                state.fix_attempts.append(attempt)
+                state.current_phase = Phase.VERIFY
+                return state
+            cloned_during_execute = True
+        if execution_mode == "oci":
+            from ..patch_gate import revalidate_approved_patch
 
-        test_result = await run_pytest(state.repo_path, state.test_command)
+            revalidate_approved_patch(state)
+        if execution_mode == "unsafe_host" and (
+            cloned_during_execute or state.repo_ref
+        ):
+            # Build an isolated venv once, right after the fresh clone, then do
+            # a best-effort editable install into it so the package and its test
+            # deps import when pytest runs. The venv sidesteps PEP 668 on
+            # externally-managed system pythons; install into venv pip, not
+            # system pip.
+            venv_record = _create_venv(state.repo_path)
+            _record_tool(
+                state, "create_venv", {"repo_path": state.repo_path}, venv_record
+            )
+            install_python = venv_record.get("python") or "python3"
+            # Skip the (minutes-long) editable install when the venv was already
+            # built for this repo on a prior sample — the reused work tree keeps
+            # the editable install valid.
+            if venv_record.get("reason") == "exists":
+                install_record = {"attempted": False, "reason": "venv_cached"}
+            else:
+                install_record = _pip_install_editable(
+                    state.repo_path, python_exe=install_python
+                )
+            _record_tool(
+                state,
+                "pip_install_editable",
+                {"repo_path": state.repo_path, "python": install_python},
+                install_record,
+            )
+            if install_python != "python3":
+                pytest_record = _ensure_pytest_available(install_python)
+                _record_tool(
+                    state,
+                    "ensure_pytest_available",
+                    {"python": install_python},
+                    pytest_record,
+                )
+        if state.patch_edits:
+            if state.tool_patch_approval is not None:
+                from ..patch_gate import apply_approved_patch
+
+                changed_files = apply_approved_patch(state)
+                edit_result = PatchEditApplyResult(
+                    applied=True,
+                    output=(
+                        f"Applied {len(state.patch_edits)} exact PatchGate edit(s) "
+                        "transactionally."
+                    ),
+                    changed_files=changed_files,
+                )
+            elif any(edit.exact_only for edit in state.patch_edits):
+                edit_result = PatchEditApplyResult(
+                    applied=False,
+                    output="Exact PatchGate edits require their frozen approval.",
+                )
+            else:
+                edit_result = _apply_patch_edits(state.repo_path, state.patch_edits)
+            _record_tool(
+                state,
+                "apply_patch_edits",
+                {"edit_count": len(state.patch_edits)},
+                {
+                    "applied": edit_result.applied,
+                    "changed_files": edit_result.changed_files,
+                    "output": edit_result.output,
+                },
+            )
+            if not edit_result.applied:
+                attempt.test_result = "patch_apply_failed"
+                attempt.failure_kind = "patch_apply_failed"
+                attempt.error_log = _redact_sensitive_error_text(edit_result.output)
+                attempt.success = False
+                state.fix_attempts.append(attempt)
+                state.current_phase = Phase.VERIFY
+                return state
+        else:
+            apply_result = await apply_patch_with_repair(state.repo_path, patch)
+            if apply_result.repaired:
+                attempt.patch_content = apply_result.patch_content
+                attempt.file_path = _primary_patch_file(apply_result.patch_content)
+                state.patch_content = apply_result.patch_content
+                _record_node_diagnostic(
+                    state,
+                    node="execute_fix",
+                    event="patch_repair",
+                    status="success" if apply_result.applied else "error",
+                    elapsed_seconds=0.0,
+                    repair_reasons=apply_result.repair_reasons,
+                    original_patch_chars=len(patch),
+                    repaired_patch_chars=len(apply_result.patch_content),
+                    output_preview=apply_result.output[:500],
+                )
+                _record_tool(
+                    state,
+                    "patch_repair",
+                    {"original_chars": len(patch)},
+                    {
+                        "changed": True,
+                        "reasons": apply_result.repair_reasons,
+                        "repaired_chars": len(apply_result.patch_content),
+                    },
+                )
+            if not apply_result.applied:
+                attempt.test_result = "patch_apply_failed"
+                attempt.failure_kind = "patch_apply_failed"
+                attempt.error_log = _redact_sensitive_error_text(apply_result.output)
+                attempt.success = False
+                state.fix_attempts.append(attempt)
+                state.current_phase = Phase.VERIFY
+                return state
+        if state.patch_edits:
+            _record_node_diagnostic(
+                state,
+                node="execute_fix",
+                event="patch_edits",
+                status="success",
+                elapsed_seconds=0.0,
+                edit_count=len(state.patch_edits),
+            )
+
+        if execution_mode == "oci":
+            test_result = await _run_oci_pytest(state)
+            test_tool_name = "run_oci_pytest"
+        else:
+            test_result = await run_pytest(state.repo_path, state.test_command)
+            test_tool_name = "run_pytest"
         attempt.test_result = json.dumps(
             {
                 "command": test_result.get("command"),
@@ -125,13 +1541,25 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         attempt.error_log = (
             (test_result.get("stdout") or "") + "\n" + (test_result.get("stderr") or "")
         )[-8000:]
+        attempt.error_log = _redact_sensitive_error_text(attempt.error_log)
         attempt.success = bool(test_result.get("success"))
+        attempt.failure_kind = "" if attempt.success else "test_failed"
         state.fix_attempts.append(attempt)
-        _record_tool(state, "run_pytest", {"repo_path": state.repo_path}, test_result)
+        _record_tool(
+            state,
+            test_tool_name,
+            {"repo_path": state.repo_path},
+            test_result,
+        )
 
+    except CancellationDrainError:
+        raise
     except Exception as exc:
         attempt.test_result = "execution_error"
-        attempt.error_log = str(exc)
+        attempt.failure_kind = (
+            "infra_error" if execution_mode == "oci" else "execution_error"
+        )
+        attempt.error_log = _redact_sensitive_error_text(str(exc))
         attempt.success = False
         state.fix_attempts.append(attempt)
 

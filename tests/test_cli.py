@@ -44,7 +44,7 @@ def test_cli_resume_json_calls_resume_agent(monkeypatch, capsys):
 def test_cli_issue_url_path_remains_supported(monkeypatch, capsys):
     calls = []
 
-    async def fake_agent_v2(issue_url, max_retries=3, token_budget=50000):
+    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
         calls.append(
             {
                 "issue_url": issue_url,
@@ -82,6 +82,23 @@ def test_cli_issue_url_path_remains_supported(monkeypatch, capsys):
         }
     ]
     assert "RepoPilot analyzing https://github.com/acme/widget/issues/42" in capsys.readouterr().out
+
+
+def test_cli_issue_uses_100000_default_budget(monkeypatch, capsys):
+    calls = []
+
+    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
+        calls.append(token_budget)
+        return {"success": True}
+
+    monkeypatch.setattr(cli, "agent_v2", fake_agent_v2)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["https://github.com/acme/widget/issues/42", "--json"])
+
+    assert exc_info.value.code == 0
+    assert calls == [100_000]
+    assert json.loads(capsys.readouterr().out) == {"success": True}
 
 
 def test_cli_runs_json_lists_saved_runs(monkeypatch, capsys):
