@@ -381,87 +381,90 @@ def authorize_plan_patch(
             [_issue("invalid_response", "The plan response must be an object.")],
         )
 
-    raw_frame = response.get("decision_frame")
-    if isinstance(raw_frame, Mapping):
-        unknown_frame_fields = {
-            key
-            for key in raw_frame
-            if key not in _DECISION_FRAME_FIELDS and not _is_trust_field(key)
-        }
-        if unknown_frame_fields:
+    patch_response = "patch_edits" in response
+    if patch_response:
+        verified, target_files, target_symbols, edit_issues = _raw_edits(
+            response["patch_edits"]
+        )
+        if edit_issues:
             return _reject(
                 state,
-                [
-                    _issue(
-                        "unknown_decision_frame_field",
-                        "The decision frame contains an unsupported field.",
-                    )
-                ],
+                edit_issues,
             )
-        clean_frame = {
-            key: value
-            for key, value in raw_frame.items()
-            if key in _DECISION_FRAME_FIELDS
-        }
+        if not verified:
+            return _reject(
+                state,
+                [_issue("missing_edits", "An execute decision requires patch_edits.")],
+            )
     else:
-        clean_frame = {}
-    raw_action = (
-        clean_frame.get("recommended_action", "stop")
-        if isinstance(raw_frame, Mapping)
-        else None
-    )
-    if not isinstance(raw_action, str) or raw_action not in {
-        "collect_more_context",
-        "plan",
-        "execute",
-        "reflect",
-        "stop",
-        "ask_user",
-    }:
-        return _reject(
-            state,
-            [
-                _issue(
-                    "invalid_recommended_action",
-                    "The plan response has an invalid recommended action.",
+        raw_frame = response.get("decision_frame")
+        if isinstance(raw_frame, Mapping):
+            unknown_frame_fields = {
+                key
+                for key in raw_frame
+                if key not in _DECISION_FRAME_FIELDS and not _is_trust_field(key)
+            }
+            if unknown_frame_fields:
+                return _reject(
+                    state,
+                    [
+                        _issue(
+                            "unknown_decision_frame_field",
+                            "The decision frame contains an unsupported field.",
+                        )
+                    ],
                 )
-            ],
+            clean_frame = {
+                key: value
+                for key, value in raw_frame.items()
+                if key in _DECISION_FRAME_FIELDS
+            }
+        else:
+            clean_frame = {}
+        raw_action = (
+            clean_frame.get("recommended_action", "stop")
+            if isinstance(raw_frame, Mapping)
+            else None
         )
-
-    envelope, envelope_issues = _safe_envelope(response, clean_frame)
-    if envelope_issues or envelope is None:
-        return _reject(state, envelope_issues)
-
-    raw_patch = response.get("patch", "")
-    if not isinstance(raw_patch, str) or raw_patch:
-        return _reject(
-            state,
-            [_issue("legacy_patch_forbidden", "The legacy patch field must be empty.")],
-        )
-    verified, target_files, target_symbols, edit_issues = _raw_edits(
-        response.get("patch_edits", [])
-    )
-    if edit_issues:
-        return _reject(state, edit_issues)
-
-    action = raw_action
-    if action != "execute":
-        if verified:
+        if not isinstance(raw_action, str) or raw_action not in {
+            "collect_more_context",
+            "plan",
+            "execute",
+            "reflect",
+            "stop",
+            "ask_user",
+        }:
             return _reject(
                 state,
                 [
                     _issue(
-                        "unexpected_edits",
-                        "A non-execute plan decision cannot carry executable edits.",
+                        "invalid_recommended_action",
+                        "The plan response has an invalid recommended action.",
                     )
                 ],
             )
-        state.repair_correction_context = ""
-        return PatchAuthorizationOutcome(
-            status="not_requested",
-            decision=envelope.model_copy(deep=True),
-        )
-    if not verified:
+        envelope, envelope_issues = _safe_envelope(response, clean_frame)
+        if envelope_issues or envelope is None:
+            return _reject(state, envelope_issues)
+
+        raw_patch = response.get("patch", "")
+        if not isinstance(raw_patch, str) or raw_patch:
+            return _reject(
+                state,
+                [
+                    _issue(
+                        "legacy_patch_forbidden",
+                        "The legacy patch field must be empty.",
+                    )
+                ],
+            )
+        action = raw_action
+        if action != "execute":
+            state.repair_correction_context = ""
+            return PatchAuthorizationOutcome(
+                status="not_requested",
+                decision=envelope.model_copy(deep=True),
+            )
         return _reject(
             state,
             [_issue("missing_edits", "An execute decision requires patch_edits.")],
@@ -504,15 +507,23 @@ def authorize_plan_patch(
         ]
         return _reject(state, converted)
 
+    summary = f"Apply {len(state.patch_edits)} validated structured edit(s)."
     canonical = PlanDecision.model_validate(
         {
-            **envelope.model_dump(mode="json"),
+            "plan": summary,
             "patch": "",
             "patch_edits": [
-                edit.model_copy(deep=True).model_dump(mode="json")
-                for edit in state.patch_edits
+                edit.model_dump(mode="json") for edit in state.patch_edits
             ],
             "files": list(target_files),
+            "test_command": "",
+            "decision_frame": DecisionFrame(
+                stage="plan",
+                summary=summary,
+                recommended_action="execute",
+                risk="unknown",
+                confidence=0.0,
+            ).model_dump(mode="json"),
         }
     )
     state.repair_correction_context = ""

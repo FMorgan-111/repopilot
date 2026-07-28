@@ -88,19 +88,12 @@ MODEL_CONTEXT_DENIED_LITERALS = (
 )
 
 PLAN_SYSTEM = (
-    "You are RepoPilot's planning node. Return exactly one JSON response variant "
-    "and do not mix variants: kind='tool' with one tool_intent, kind='plan' with "
-    "the plan fields below, or kind='stop' with an optional stop_reason. The "
-    "deterministic runtime alone chooses the active model. Plan fields are plan, "
-    "patch_edits, patch, files, test_command, and decision_frame. Leave patch as "
-    "an empty string. Each patch_edits item must identify file, provide exactly "
-    "one exact search or dotted node_target anchor, and provide nonempty replace "
-    "text. Copy search text verbatim from approved file context. decision_frame "
-    "must use stage='plan' and include summary, hypotheses, "
-    "selected_hypothesis_id, evidence, next_checks, recommended_action, risk, and "
-    "confidence. Use recommended_action='execute' only with structured edits, "
-    "'collect_more_context' for a specific missing repository fact, 'ask_user' for "
-    "a necessary human decision, and 'stop' only when no safe repair can proceed."
+    "You are RepoPilot's patch planner. Return exactly one JSON response variant. "
+    "For a code change, return only {\"patch_edits\":[{\"file_path\":\"...\","
+    "\"search\":\"...\",\"replace\":\"...\"}]}. Copy search text verbatim from "
+    "approved file context and make it match exactly once. Use kind='tool' with one "
+    "tool_intent only when one specific repository fact is missing. Use kind='stop' "
+    "with stop_reason only when no safe repair is possible."
 )
 
 # Hard cap on consecutive collect_more_context rounds before we give up.
@@ -294,9 +287,8 @@ def _is_final_attempt(state: AgentState) -> bool:
 def _final_attempt_instructions() -> str:
     return (
         " This is the FINAL planning attempt (retry budget is spent). You MUST "
-        "return concrete patch_edits now and set recommended_action='execute'. "
-        "Do NOT request more context: 'collect_more_context' is not allowed on "
-        "the final attempt."
+        "return concrete patch_edits now. Do NOT request more context on the final "
+        "attempt."
     )
 
 
@@ -396,17 +388,16 @@ def _context_pressure_instructions(state: AgentState) -> str:
     lines = [
         "Context Budget Instructions:",
         f"- You have already collected repository context {count} time(s).",
-        "- Build on your previous strongest hypothesis instead of re-deriving new "
-        "ones each round; reuse the same hypothesis ids when the claim is unchanged.",
+        "- Build on the strongest existing repair evidence instead of re-deriving "
+        "new investigations each round.",
     ]
     if is_final:
         lines.extend(
             [
-                "- This is your FINAL context round. You MUST set "
-                "recommended_action='execute' and return concrete patch_edits now, "
-                "using the best hypothesis supported by the files you already have.",
-                "- Do NOT recommend collect_more_context again — it will be rejected "
-                "and the run will fail without a patch.",
+                "- This is your FINAL context round. You MUST return concrete "
+                "patch_edits now using the best supported repair.",
+                "- Do NOT request more context again — the run will fail without a "
+                "patch.",
             ]
         )
     else:
@@ -414,9 +405,8 @@ def _context_pressure_instructions(state: AgentState) -> str:
             [
                 "- You now have substantial source context. Strongly prefer producing "
                 "patch_edits this round.",
-                "- Only recommend collect_more_context if a SPECIFIC file you have not "
-                "yet seen is essential — name it exactly in next_checks. Do not ask for "
-                "more context to keep exploring generally.",
+                "- Use kind='tool' only if one specific repository fact is still "
+                "essential. Do not keep exploring generally.",
             ]
         )
     return "\n".join(lines)
@@ -443,10 +433,8 @@ def _hypothesis_continuity_context(state: AgentState) -> str:
         anchor_frame, hypothesis = anchor
         lines.extend(
             [
-                "- Preserve "
-                f"selected_hypothesis_id='{hypothesis.id}' from plan frame "
-                f"{anchor_frame.frame_id or '(unrecorded)'} unless the apply error "
-                "proves the target file or hunk context is impossible.",
+                "- Preserve the prior repair focus unless the apply error proves the "
+                "target file or hunk context is impossible.",
                 f"- Root-cause anchor: {_truncate_prompt_text(hypothesis.claim, 500)}",
             ]
         )

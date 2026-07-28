@@ -248,7 +248,7 @@ async def test_plan_patch_apply_failure_prompt_requires_search_replace_repair(
     assert "Previous patch apply error" in prompt
     assert "preflight" in prompt.lower()
     assert "corrupt patch at line 2" in prompt
-    assert "H1" in prompt
+    assert "envpython chooses the wrong interpreter for the active env" in prompt
     assert "envpython chooses the wrong interpreter" in prompt
 
 

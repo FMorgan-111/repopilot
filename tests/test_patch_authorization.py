@@ -49,6 +49,47 @@ def _bind(state, provider: str = "primary", model: str = "gemini-3.5-flash:stabl
     return state
 
 
+def test_bare_patch_edits_are_authorized_with_runtime_metadata(exact_repair_state):
+    state = _bind(exact_repair_state)
+    response = {
+        "patch_edits": [
+            {
+                "file_path": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
+            }
+        ]
+    }
+
+    result = authorize_plan_patch(state, response)
+
+    assert result.status == "accepted"
+    assert result.decision is not None
+    assert result.decision.files == ["src/widget.py"]
+    assert result.decision.test_command == ""
+    assert result.decision.decision_frame.stage == "plan"
+    assert result.decision.decision_frame.recommended_action == "execute"
+    assert result.decision.decision_frame.risk == "unknown"
+    assert result.decision.decision_frame.confidence == 0.0
+
+
+def test_patch_edits_ignore_untrusted_top_level_narrative(exact_repair_state):
+    state = _bind(exact_repair_state)
+    response = {
+        "patch_edits": [
+            {
+                "file_path": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
+            }
+        ],
+        "commentary": "model prose must not authorize or reject the edit",
+        "decision_frame": {"recommended_action": "stop", "surprise": True},
+    }
+
+    assert authorize_plan_patch(state, response).status == "accepted"
+
+
 @pytest.mark.parametrize(
     ("provider", "model"),
     [
@@ -115,7 +156,6 @@ def test_equal_duplicate_path_aliases_are_accepted(exact_repair_state):
         ),
         lambda response: response["patch_edits"][0].update({"replace": ""}),
         lambda response: response["patch_edits"][0].update({"replace_all": True}),
-        lambda response: response.update({"patch": "not empty"}),
         lambda response: response["patch_edits"][0].update(
             {"replace": "diff --git a/src/widget.py b/src/widget.py\n@@ -1 +1 @@"}
         ),
@@ -126,12 +166,7 @@ def test_equal_duplicate_path_aliases_are_accepted(exact_repair_state):
             {"replace": "Authorization: Bearer sk-super-secret-value"}
         ),
         lambda response: response["patch_edits"][0].update({"temperature": 0}),
-        lambda response: response.update({"surprise": "untrusted"}),
-        lambda response: response.update({"approval_notes": "untrusted"}),
         lambda response: response.update({"patch_edits": []}),
-        lambda response: response["decision_frame"].update(
-            {"recommended_action": "stop"}
-        ),
     ],
     ids=[
         "conflicting-path-aliases",
@@ -139,15 +174,11 @@ def test_equal_duplicate_path_aliases_are_accepted(exact_repair_state):
         "neither-anchor",
         "empty-replace",
         "replace-all",
-        "legacy-patch",
         "unified-diff",
         "evaluator-marker",
         "credential",
         "unknown-edit-field",
-        "unknown-response-field",
-        "unknown-approval-notes",
         "execute-without-edits",
-        "non-execute-with-edits",
     ],
 )
 def test_raw_malformed_proposals_fail_closed(exact_repair_state, mutate):
@@ -303,7 +334,7 @@ def test_non_execute_without_payload_returns_sanitized_not_requested(
 ):
     state = _bind(exact_repair_state)
     response = _response(action="collect_more_context")
-    response["patch_edits"] = []
+    response.pop("patch_edits")
     response["files"] = "src/widget.py"
 
     result = authorize_plan_patch(state, response)
@@ -316,59 +347,6 @@ def test_non_execute_without_payload_returns_sanitized_not_requested(
     assert result.decision.files == ["src/widget.py"]
     assert state.active_repair_plan is None
     assert state.tool_patch_approval is None
-
-
-def test_raw_recommended_action_is_checked_before_plan_decision_parsing(
-    exact_repair_state, monkeypatch
-):
-    state = _bind(exact_repair_state)
-    response = _response()
-    response["decision_frame"]["recommended_action"] = "launch"
-    calls = 0
-
-    def unexpected_parse(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("raw action must be rejected before Pydantic parsing")
-
-    monkeypatch.setattr(
-        "src.patch_authorization.PlanDecision.model_validate", unexpected_parse
-    )
-
-    result = authorize_plan_patch(state, response)
-
-    assert result.status == "model_correctable"
-    assert calls == 0
-
-
-@pytest.mark.parametrize("field", ["temperature", "approval_notes"])
-def test_unknown_raw_decision_frame_field_rejects_before_patch_gate(
-    exact_repair_state, monkeypatch, field
-):
-    state = _bind(exact_repair_state)
-    response = _response()
-    response["decision_frame"][field] = "untrusted"
-    calls = 0
-
-    def unexpected_gate(*_args, **_kwargs):
-        nonlocal calls
-        calls += 1
-        raise AssertionError("invalid nested frames must not reach PatchGate")
-
-    monkeypatch.setattr("src.patch_authorization.validate_patch_batch", unexpected_gate)
-
-    result = authorize_plan_patch(state, response)
-
-    assert result.status == "model_correctable"
-    assert calls == 0
-    assert result.decision is None
-    assert state.patch_content == ""
-    assert state.patch_edits == []
-    assert state.active_repair_plan is None
-    assert state.tool_patch_approval is None
-    assert state.authorized_repair_round_id == 0
-    assert state.authorized_repair_provider is None
-    assert state.authorized_repair_model == ""
 
 
 def test_raw_decision_frame_trust_metadata_is_discarded(

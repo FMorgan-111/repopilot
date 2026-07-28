@@ -41,25 +41,15 @@ async def test_plan_fix_records_plan_decision_frame(exact_repair_state, monkeypa
 
     async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append({"system": system, "user": user})
-        return _exact_plan_response(
-            decision_frame={
-                "stage": "plan",
-                "summary": "Patch auth submit handling.",
-                "recommended_action": "execute",
-                "hypotheses": [
-                    {
-                        "id": "H1",
-                        "claim": "Auth submit path mishandles missing user input.",
-                        "evidence": ["Issue mentions a crash after submit."],
-                        "score": 0.84,
-                    }
-                ],
-                "selected_hypothesis_id": "H1",
-                "next_checks": ["Run the auth regression test."],
-                "risk": "medium",
-                "confidence": 0.84,
-            }
-        )
+        return {
+            "patch_edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "search": "return 'old-sentinel'",
+                    "replace": "return 'new-sentinel'",
+                }
+            ]
+        }
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     next_state = await plan_node.plan_fix(exact_repair_state)
@@ -68,20 +58,22 @@ async def test_plan_fix_records_plan_decision_frame(exact_repair_state, monkeypa
     assert next_state.decision_frame is not None
     assert next_state.decision_frame.stage == "plan"
     assert next_state.decision_frame.recommended_action == "execute"
-    assert next_state.decision_frame.selected_hypothesis_id == "H1"
+    assert next_state.decision_frame.selected_hypothesis_id is None
     assert next_state.frame_history[-1] == next_state.decision_frame
     [invocation] = next_state.model_history
     assert next_state.token_usage == (
         invocation.input_tokens + invocation.output_tokens
     )
-    for key in [
+    for field in ("patch_edits", "file_path", "search", "replace"):
+        assert field in calls[0]["system"]
+    for field in (
         "decision_frame",
-        "stage",
         "recommended_action",
-        "ask_user",
-        "collect_more_context",
-    ]:
-        assert key in calls[0]["system"]
+        "confidence",
+        "risk",
+        "test_command",
+    ):
+        assert field not in calls[0]["system"]
 
 
 async def test_plan_tool_cancellation_drain_is_not_model_error(monkeypatch):
@@ -777,7 +769,7 @@ async def test_plan_fix_after_patch_apply_failure_includes_hypothesis_anchor(
     prompt = calls[0]["user"]
     assert "Hypothesis Continuity Instructions" in prompt
     assert "the proposal failed before tests" in prompt.lower()
-    assert "H1" in prompt
+    assert "envpython chooses the wrong interpreter for the active env" in prompt
     assert "envpython chooses the wrong interpreter" in prompt
 
 
@@ -850,7 +842,7 @@ async def test_plan_fix_after_patch_apply_failure_restores_drifted_hypothesis(
     assert next_state.decision_warnings[-1]["reason"] == (
         "preserved_selected_hypothesis_after_patch_apply_failure"
     )
-    assert next_state.decision_warnings[-1]["llm_selected_hypothesis_id"] == "H2"
+    assert next_state.decision_warnings[-1]["llm_selected_hypothesis_id"] == ""
 
 
 async def test_plan_fix_collect_more_context_without_patch_routes_to_locate(

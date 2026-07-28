@@ -67,11 +67,10 @@ def plan_response(
         if action == "execute"
         else []
     )
-    return {
+    response = {
         "kind": "plan",
         "plan": "Return the new sentinel.",
         "patch": "",
-        "patch_edits": edits,
         "files": ["src/widget.py"] if edits else [],
         "test_command": test_command,
         "decision_frame": {
@@ -82,6 +81,33 @@ def plan_response(
             "confidence": 0.9,
         },
     }
+    if edits:
+        response["patch_edits"] = edits
+    return response
+
+
+async def test_bare_patch_response_enters_execute_with_runtime_decision_frame(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm(*_args, **_kwargs):
+        return {
+            "patch_edits": [
+                {
+                    "file_path": "src/widget.py",
+                    "search": "return 'old-sentinel'",
+                    "replace": "return 'new-sentinel'",
+                }
+            ]
+        }
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.EXECUTE
+    assert [edit.file_path for edit in result.patch_edits] == ["src/widget.py"]
+    assert result.decision_frame.stage == "plan"
+    assert result.decision_frame.recommended_action == "execute"
 
 
 def _gateway_503() -> httpx.HTTPStatusError:
@@ -171,8 +197,14 @@ async def test_provider_neutral_plan_action_matrix_preserves_round_and_decision_
     assert result.retry_count == expected_retry
     assert result.repair_round_sequence == 1
     assert result.current_repair_round_id == (1 if keeps_open_round else 0)
-    assert result.test_command == "pytest -q tests/test_widget.py"
-    assert result.decision_frame.summary == "Update the sentinel."
+    assert result.test_command == (
+        "" if action == "execute" else "pytest -q tests/test_widget.py"
+    )
+    assert result.decision_frame.summary == (
+        "Apply 1 validated structured edit(s)."
+        if action == "execute"
+        else "Update the sentinel."
+    )
     assert result.decision_frame.recommended_action == (
         "plan" if action == "stop" else action
     )
@@ -385,7 +417,7 @@ async def test_primary_503_fallback_rebinds_opus_in_same_round(
 
 
 @pytest.mark.parametrize("extra_field", ["tool_intent", "stop_reason"])
-async def test_plan_kind_ignores_control_field_heuristics_and_uses_adapter(
+async def test_patch_response_ignores_untrusted_control_fields(
     exact_repair_state, monkeypatch, extra_field
 ):
     response = plan_response()
@@ -406,10 +438,7 @@ async def test_plan_kind_ignores_control_field_heuristics_and_uses_adapter(
     monkeypatch.setattr(plan_node, "llm_call", fake_llm)
     result = await plan_node.plan_fix(exact_repair_state)
 
-    assert result.current_phase == Phase.PLAN
-    assert result.retry_count == 1
-    assert result.failure_reason == "patch_authorization_rejected"
-    assert result.decision_frame.recommended_action == "plan"
+    assert result.current_phase == Phase.EXECUTE
 
 
 async def test_primary_token_reserve_binds_opus_before_first_call(
