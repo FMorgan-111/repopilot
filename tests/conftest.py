@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -103,6 +104,46 @@ def httpx_mock(monkeypatch):
 
     monkeypatch.setattr(httpx, "AsyncClient", async_client_factory)
     return mock
+
+
+@pytest.fixture
+def exact_repair_state(tmp_path):
+    from src.state import AgentState, FileInfo, Phase
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True,
+    )
+    (repo / "src").mkdir()
+    source = "def widget():\n    return 'old-sentinel'\n"
+    (repo / "src" / "widget.py").write_text(source, encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Return the new sentinel",
+        issue_body="widget must return new-sentinel",
+        owner="acme",
+        repo="widget",
+        repo_path=str(repo),
+        repo_ref=ref,
+        current_phase=Phase.PLAN,
+        relevant_files=[FileInfo(path="src/widget.py", content=source)],
+        skip_commit=True,
+    )
 
 
 def pytest_pyfunc_call(pyfuncitem):

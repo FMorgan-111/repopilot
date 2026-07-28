@@ -11,18 +11,15 @@ import pytest
 import src.test_generator as test_generator
 from src.async_safety import CancellationDrainError, wait_for_phase
 from src.coverage_gate import ChangedTarget, CoverageDecision
-from src.patch_gate import validate_patch_batch
+from src.patch_gate import apply_approved_patch, validate_patch_batch
+from src.repair_rounds import begin_repair_round
 from src.state import (
     AgentState,
     CoverageProof,
-    PatchEdit,
     RepairPlan,
-    SnapshotManifestEntry,
-    ToolPatchApproval,
     VerifiedEdit,
     VerifiedEditBatch,
     _estimate_tokens,
-    tool_manifest_fingerprint,
 )
 from src.state import (
     TestRunFingerprint as RunFingerprint,
@@ -33,6 +30,7 @@ from src.test_generator import (
     request_test_batch,
     run_test_generation_attempts,
 )
+from src.test_path_policy import inspect_allowed_test_path
 from src.timeout_diagnostics import extract_timeout_cleanup_evidence
 
 
@@ -63,25 +61,6 @@ def generation_state(tmp_path: Path) -> AgentState:
     _git(root, "add", "--all")
     _git(root, "commit", "-qm", "base")
     ref = _git(root, "rev-parse", "HEAD")
-    (root / "src" / "calc.py").write_text(
-        "def answer():\n    return 2\n", encoding="utf-8"
-    )
-    patch = subprocess.run(
-        ["git", "-C", str(root), "diff", "--binary", ref, "--"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    content = (root / "src" / "calc.py").read_bytes()
-    manifest = [
-        SnapshotManifestEntry(
-            path="src/calc.py",
-            change="modified",
-            mode="100644",
-            content_sha256=hashlib.sha256(content).hexdigest(),
-            size=len(content),
-        )
-    ]
     production_plan = RepairPlan(
         root_cause="answer returned the wrong constant",
         target_files=["src/calc.py"],
@@ -89,7 +68,7 @@ def generation_state(tmp_path: Path) -> AgentState:
         required_behavior="return two",
         regression_test_strategy="run targeted tests",
     )
-    return AgentState(
+    state = AgentState(
         issue_url="https://github.com/a/b/issues/1",
         issue_title="Wrong answer",
         issue_body="answer should return two",
@@ -97,19 +76,26 @@ def generation_state(tmp_path: Path) -> AgentState:
         repo_ref=ref,
         active_provider="primary",
         active_model="gemini-3.5-flash:stable",
-        patch_content=patch,
-        patch_edits=[
-            PatchEdit(file_path="src/calc.py", search="return 1", replace="return 2")
-        ],
         active_repair_plan=production_plan,
-        tool_patch_approval=ToolPatchApproval(
-            base_ref=ref,
-            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
-            patch_gate_fingerprint="8" * 64,
-            changed_manifest=manifest,
-            manifest_fingerprint=tool_manifest_fingerprint(manifest),
-        ),
     )
+    begin_repair_round(state)
+    production_edit = VerifiedEdit(
+        file_path="src/calc.py",
+        search="return 1",
+        replace="return 2",
+        intent="Correct the production behavior.",
+    )
+    result = validate_patch_batch(
+        state,
+        production_plan,
+        VerifiedEditBatch(edits=[production_edit]),
+    )
+    assert result.accepted
+    assert state.authorized_repair_round_id == state.current_repair_round_id
+    assert state.authorized_repair_provider == "primary"
+    assert state.authorized_repair_model == "gemini-3.5-flash:stable"
+    apply_approved_patch(state)
+    return state
 
 
 def _edit(path: str, *, search: str = "", replace: str) -> VerifiedEdit:
@@ -1146,6 +1132,38 @@ def test_allowed_test_path_requires_established_safe_layout(tmp_path: Path):
     assert not is_allowed_test_path(root, "pyproject.toml")
     assert not is_allowed_test_path(root, ".github/workflows/test_ci.py")
     assert not is_allowed_test_path(root, "src/test_generated.py")
+
+
+def test_strict_test_path_admission_preserves_layout_rules(tmp_path: Path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    assert inspect_allowed_test_path(root, "tests/test_new.py") is False
+    (root / "tests").mkdir()
+    assert inspect_allowed_test_path(root, "tests/test_new.py") is True
+    assert inspect_allowed_test_path(root, "tests/helper.py") is False
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+    assert inspect_allowed_test_path(root, "linked/test_new.py") is False
+
+
+def test_bool_test_path_admission_collapses_strict_inspection_error(
+    tmp_path: Path, monkeypatch
+):
+    root = tmp_path / "repo"
+    (root / "tests").mkdir(parents=True)
+    actual_lstat = __import__("os").lstat
+
+    def fail_root_lstat(path, *args, **kwargs):
+        if Path(path) == root:
+            raise PermissionError("injected admission permission failure")
+        return actual_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr("src.test_path_policy.os.lstat", fail_root_lstat)
+
+    with pytest.raises(PermissionError, match="injected admission"):
+        inspect_allowed_test_path(root, "tests/test_new.py")
+    assert is_allowed_test_path(root, "tests/test_new.py") is False
 
 
 @pytest.mark.parametrize(

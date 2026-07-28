@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from pathlib import Path
 
 from .evaluator_safety import contains_evaluator_only
@@ -54,27 +56,52 @@ def path_has_symlink(root: Path, relative: str) -> bool:
 
 
 def is_allowed_test_path(repo_root: Path, file_path: str) -> bool:
-    """Return whether a canonical path fits an established safe test layout."""
+    """Fail-closed bool wrapper for callers that cannot classify I/O faults."""
     try:
-        root = repo_root.resolve(strict=True)
-        relative = canonical_repo_path(file_path)
-    except (OSError, ValueError):
+        return inspect_allowed_test_path(repo_root, file_path)
+    except (OSError, RuntimeError):
         return False
+
+
+def _lstat_or_none(path: Path) -> os.stat_result | None:
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def inspect_allowed_test_path(repo_root: Path, file_path: str) -> bool:
+    """Inspect test-path admission while preserving filesystem failures."""
+    try:
+        root = Path(repo_root).resolve(strict=True)
+        relative = canonical_repo_path(file_path)
+    except ValueError:
+        return False
+    root_info = os.lstat(root)
     if (
-        not root.is_dir()
+        not stat.S_ISDIR(root_info.st_mode)
         or contains_evaluator_only(relative)
         or not _TEST_NAME_RE.fullmatch(Path(relative).name)
     ):
         return False
-    if path_has_symlink(root, relative):
-        return False
-    destination = (root / relative).resolve(strict=False)
-    if not destination.is_relative_to(root):
-        return False
-    if destination.exists() and not destination.is_file():
-        return False
 
     parts = Path(relative).parts
+    current = root
+    destination_info: os.stat_result | None = None
+    for index, part in enumerate(parts):
+        current = current / part
+        info = _lstat_or_none(current)
+        if info is None:
+            break
+        if stat.S_ISLNK(info.st_mode):
+            return False
+        if index < len(parts) - 1 and not stat.S_ISDIR(info.st_mode):
+            return False
+        if index == len(parts) - 1:
+            destination_info = info
+    if destination_info is not None and not stat.S_ISREG(destination_info.st_mode):
+        return False
+
     if any(part.casefold() in _FORBIDDEN_TEST_TREE_PARTS for part in parts[:-1]):
         return False
     test_root_index = next(
@@ -87,18 +114,26 @@ def is_allowed_test_path(repo_root: Path, file_path: str) -> bool:
     )
     if test_root_index is not None:
         established = root.joinpath(*parts[: test_root_index + 1])
-        return established.is_dir() and not established.is_symlink()
+        established_info = _lstat_or_none(established)
+        return established_info is not None and stat.S_ISDIR(established_info.st_mode)
 
-    parent = destination.parent
-    if not parent.is_dir() or parent.is_symlink():
+    destination = root / relative
+    parent_info = _lstat_or_none(destination.parent)
+    if parent_info is None or not stat.S_ISDIR(parent_info.st_mode):
         return False
-    return destination.is_file() or any(
-        item != destination
-        and item.is_file()
-        and not item.is_symlink()
-        and _TEST_NAME_RE.fullmatch(item.name)
-        for item in parent.iterdir()
-    )
+    if destination_info is not None:
+        return True
+    with os.scandir(destination.parent) as entries:
+        return any(
+            entry.name != destination.name
+            and entry.is_file(follow_symlinks=False)
+            and _TEST_NAME_RE.fullmatch(entry.name)
+            for entry in entries
+        )
 
 
-__all__ = ["is_allowed_test_path", "path_has_symlink"]
+__all__ = [
+    "inspect_allowed_test_path",
+    "is_allowed_test_path",
+    "path_has_symlink",
+]

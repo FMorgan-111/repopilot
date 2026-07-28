@@ -10,6 +10,7 @@ from src.coverage_gate import CoverageCandidate, validate_differential_coverage
 from src.new_agent import agent_payload_from_state
 from src.nodes.commit import commit_fix
 from src.patch_gate import apply_approved_patch, validate_patch_batch
+from src.repair_rounds import begin_repair_round
 from src.safe_subprocess import BoundedProcessResult
 from src.state import (
     AgentState,
@@ -82,8 +83,12 @@ def _approved_state(tmp_path: Path) -> AgentState:
             python_executable="/usr/bin/python3",
         ),
     )
+    begin_repair_round(state)
     result = validate_patch_batch(state, plan, VerifiedEditBatch(edits=[edit]))
     assert result.accepted
+    assert state.authorized_repair_round_id == state.current_repair_round_id
+    assert state.authorized_repair_provider == "primary"
+    assert state.authorized_repair_model == "gemini-3.5-flash:stable"
     apply_approved_patch(state)
     return state
 

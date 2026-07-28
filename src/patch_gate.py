@@ -21,6 +21,7 @@ from .local_search import is_sensitive_repo_path
 from .model_provider import redact_secrets
 from .patch_match import closest_region, leading_spaces, locate_node_span, reindent
 from .repair_flow import RepairContextError, _read_regular_no_follow
+from .repair_rounds import freeze_authorized_repair_round, retire_patch_authorization
 from .repo_paths import canonical_repo_path
 from .state import (
     AgentState,
@@ -31,7 +32,7 @@ from .state import (
     VerifiedEditBatch,
     tool_manifest_fingerprint,
 )
-from .test_path_policy import is_allowed_test_path
+from .test_path_policy import inspect_allowed_test_path
 
 MAX_PATCH_FILE_BYTES = 512_000
 MAX_CORRECTION_CONTEXT_CHARS = 1_200
@@ -62,6 +63,12 @@ _NEW_TEXT_SUFFIXES = frozenset(
     }
 )
 
+RepairFailureClass = Literal["model_correctable", "environment"]
+
+
+class _PatchGateEnvironmentError(ValueError):
+    """The exact checkout could not be inspected reliably."""
+
 
 class PatchGateIssue(BaseModel):
     code: Literal[
@@ -78,6 +85,7 @@ class PatchGateIssue(BaseModel):
     file_path: str
     message: str
     correction_context: str = ""
+    failure_class: RepairFailureClass = "model_correctable"
 
 
 class PatchGateResult(BaseModel):
@@ -86,12 +94,12 @@ class PatchGateResult(BaseModel):
     issues: list[PatchGateIssue] = Field(default_factory=list)
 
 
-def _clear_gate_output(state: AgentState) -> None:
+def _clear_gate_output(state: AgentState, *, test_only: bool = False) -> None:
     """Retire every value transitively bound to a rejected patch batch."""
-    state.patch_content = ""
-    state.patch_edits = []
-    state.tool_patch_approval = None
-    state.generated_test_approvals = []
+    retire_patch_authorization(
+        state,
+        preserve_authorized_attribution=test_only,
+    )
 
 
 def _issue(
@@ -99,12 +107,15 @@ def _issue(
     path: str,
     message: str,
     content: str = "",
+    *,
+    failure_class: RepairFailureClass = "model_correctable",
 ) -> PatchGateIssue:
     return PatchGateIssue(
         code=code,  # type: ignore[arg-type]
         file_path=redact_secrets(path)[:500],
         message=redact_secrets(message)[:500],
         correction_context=redact_secrets(content)[:MAX_CORRECTION_CONTEXT_CHARS],
+        failure_class=failure_class,
     )
 
 
@@ -133,31 +144,62 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
 
 def _exact_root(state: AgentState) -> Path:
     if not state.repo_path or not state.repo_ref or len(state.repo_ref) != 40:
-        raise ValueError("PatchGate requires an exact base checkout")
-    root = Path(state.repo_path).resolve()
-    head = _git(root, "rev-parse", "HEAD")
-    if head.returncode or head.stdout.decode("ascii", "ignore").strip().lower() != state.repo_ref.lower():
-        raise ValueError("PatchGate checkout does not match the exact base")
+        raise _PatchGateEnvironmentError("PatchGate requires an exact base checkout")
+    try:
+        root = Path(state.repo_path).resolve()
+        head = _git(root, "rev-parse", "HEAD")
+        current = head.stdout.decode("ascii", "strict").strip().lower()
+    except (OSError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
+        raise _PatchGateEnvironmentError(
+            "PatchGate could not inspect the exact base checkout"
+        ) from exc
+    if head.returncode or current != state.repo_ref.lower():
+        raise _PatchGateEnvironmentError(
+            "PatchGate checkout does not match the exact base"
+        )
     return root
 
 
 def _tree_entry(root: Path, ref: str, path: str) -> tuple[str, bytes] | None:
-    listed = _git(root, "ls-tree", "-z", ref, "--", path)
-    if listed.returncode or not listed.stdout:
+    try:
+        listed = _git(root, "ls-tree", "-z", ref, "--", path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _PatchGateEnvironmentError(
+            "Git could not inspect the exact tree"
+        ) from exc
+    if listed.returncode:
+        raise _PatchGateEnvironmentError("Git could not inspect the exact tree")
+    if not listed.stdout:
         return None
     records = [item for item in listed.stdout.split(b"\0") if item]
     if len(records) != 1:
-        return None
+        raise _PatchGateEnvironmentError("Git returned an invalid exact tree entry")
     metadata, separator, found = records[0].partition(b"\t")
     fields = metadata.split()
-    if not separator or found.decode("utf-8", "strict") != path or len(fields) != 3:
-        return None
-    mode = fields[0].decode("ascii")
+    try:
+        found_path = found.decode("utf-8", "strict")
+    except UnicodeDecodeError as exc:
+        raise _PatchGateEnvironmentError(
+            "Git returned an undecodable exact tree entry"
+        ) from exc
+    if not separator or found_path != path or len(fields) != 3:
+        raise _PatchGateEnvironmentError("Git returned an invalid exact tree entry")
+    try:
+        mode = fields[0].decode("ascii", "strict")
+    except UnicodeDecodeError as exc:
+        raise _PatchGateEnvironmentError(
+            "Git returned an undecodable exact tree entry"
+        ) from exc
     if mode not in {"100644", "100755"} or fields[1] != b"blob":
         raise ValueError("tracked target is a symlink or special file")
-    blob = _git(root, "show", f"{ref}:{path}")
+    try:
+        blob = _git(root, "show", f"{ref}:{path}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _PatchGateEnvironmentError(
+            "Tracked target preimage is unavailable"
+        ) from exc
     if blob.returncode:
-        raise ValueError("tracked target preimage is unavailable")
+        raise _PatchGateEnvironmentError("Tracked target preimage is unavailable")
     return mode, blob.stdout
 
 
@@ -335,6 +377,7 @@ def _fingerprint(
     edits: list[PatchEdit],
     manifest: list[SnapshotManifestEntry],
     patch_sha256: str,
+    authorized_binding: tuple[int, str, str],
 ) -> str:
     payload = {
         "base_ref": state.repo_ref.lower(),
@@ -342,9 +385,42 @@ def _fingerprint(
         "ordered_exact_edits": [_approval_edit_payload(edit) for edit in edits],
         "result_manifest": [entry.model_dump(mode="json") for entry in manifest],
         "patch_sha256": patch_sha256,
+        "authorized_repair": {
+            "round_id": authorized_binding[0],
+            "provider": authorized_binding[1],
+            "model": authorized_binding[2],
+        },
     }
     encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _current_repair_binding(state: AgentState) -> tuple[int, str, str] | None:
+    if (
+        state.current_repair_round_id <= 0
+        or state.current_repair_provider is None
+        or not state.current_repair_model
+    ):
+        return None
+    return (
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+    )
+
+
+def _frozen_repair_binding(state: AgentState) -> tuple[int, str, str]:
+    values = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider or "",
+        state.authorized_repair_model,
+    )
+    if values == (0, "", ""):
+        # A test-only approval may exist without production attribution.
+        return values
+    if values[0] <= 0 or not values[1] or not values[2]:
+        raise ValueError("PatchGate authorization binding is incomplete")
+    return values
 
 
 def validate_patch_batch(
@@ -359,7 +435,7 @@ def validate_patch_batch(
     if contains_evaluator_only(plan.model_dump(mode="json")) or contains_evaluator_only(
         batch.model_dump(mode="json")
     ):
-        _clear_gate_output(state)
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(
             accepted=False,
             issues=[
@@ -372,14 +448,31 @@ def validate_patch_batch(
         )
     try:
         root = _exact_root(state)
-    except ValueError as exc:
-        _clear_gate_output(state)
-        return PatchGateResult(accepted=False, issues=[_issue("apply_failed", "", str(exc))])
-    if state.active_repair_plan is None or state.active_repair_plan != plan:
-        _clear_gate_output(state)
+    except (OSError, UnicodeError, ValueError, subprocess.SubprocessError) as exc:
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(
             accepted=False,
-            issues=[_issue("scope_violation", "", "RepairPlan is not the active exact plan.")],
+            issues=[
+                _issue(
+                    "apply_failed",
+                    "",
+                    str(exc),
+                    failure_class="environment",
+                )
+            ],
+        )
+    if state.active_repair_plan is None or state.active_repair_plan != plan:
+        _clear_gate_output(state, test_only=test_only)
+        return PatchGateResult(
+            accepted=False,
+            issues=[
+                _issue(
+                    "scope_violation",
+                    "",
+                    "RepairPlan is not the active exact plan.",
+                    failure_class="environment",
+                )
+            ],
         )
 
     before: dict[str, str | None] = {}
@@ -395,7 +488,19 @@ def validate_patch_batch(
             issues.append(_issue("scope_violation", str(raw_path), "Target path is not canonical and repository-relative."))
             continue
         if test_only:
-            if not is_allowed_test_path(root, path):
+            try:
+                allowed_test_path = inspect_allowed_test_path(root, path)
+            except (OSError, RuntimeError) as exc:
+                issues.append(
+                    _issue(
+                        "apply_failed",
+                        path,
+                        str(exc),
+                        failure_class="environment",
+                    )
+                )
+                continue
+            if not allowed_test_path:
                 issues.append(
                     _issue(
                         "scope_violation",
@@ -422,6 +527,16 @@ def validate_patch_batch(
 
         try:
             tracked = _tree_entry(root, state.repo_ref, path)
+        except _PatchGateEnvironmentError as exc:
+            issues.append(
+                _issue(
+                    "apply_failed",
+                    path,
+                    str(exc),
+                    failure_class="environment",
+                )
+            )
+            continue
         except (UnicodeDecodeError, ValueError) as exc:
             issues.append(_issue("scope_violation", path, str(exc)))
             continue
@@ -432,6 +547,16 @@ def validate_patch_batch(
                 continue
             try:
                 _safe_leaf(root, path, must_exist=False)
+            except OSError as exc:
+                issues.append(
+                    _issue(
+                        "apply_failed",
+                        path,
+                        str(exc),
+                        failure_class="environment",
+                    )
+                )
+                continue
             except ValueError as exc:
                 issues.append(_issue("scope_violation", path, str(exc)))
                 continue
@@ -474,10 +599,27 @@ def validate_patch_batch(
         try:
             _safe_leaf(root, path, must_exist=True)
             live_bytes = _read_regular_no_follow(root, path)
+        except (OSError, RepairContextError, ValueError):
+            issues.append(
+                _issue(
+                    "apply_failed",
+                    path,
+                    "Tracked target could not be inspected as stable regular text.",
+                    failure_class="environment",
+                )
+            )
+            continue
+        try:
             live_source = _decode_text(live_bytes)
             base_source = _decode_text(base_bytes)
-        except (OSError, RepairContextError, UnicodeDecodeError, ValueError):
-            issues.append(_issue("binary_artifact", path, "Tracked target is not stable UTF-8 regular text."))
+        except UnicodeDecodeError:
+            issues.append(
+                _issue(
+                    "binary_artifact",
+                    path,
+                    "Tracked target is not stable UTF-8 regular text.",
+                )
+            )
             continue
         if len(live_bytes) > MAX_PATCH_FILE_BYTES:
             issues.append(_issue("oversized_file", path, "Target file exceeds the PatchGate size limit."))
@@ -487,12 +629,28 @@ def validate_patch_batch(
             edit._expected_content_sha256
             and edit._expected_content_sha256 != expected
         ):
-            issues.append(_issue("apply_failed", path, "Target changed from the exact verified preimage.", live_source))
+            issues.append(
+                _issue(
+                    "apply_failed",
+                    path,
+                    "Target changed from the exact verified preimage.",
+                    live_source,
+                    failure_class="environment",
+                )
+            )
             continue
         edit._expected_content_sha256 = expected
         edit._exact_only = True
         if live_source != base_source:
-            issues.append(_issue("apply_failed", path, "Target text does not match the exact base.", live_source))
+            issues.append(
+                _issue(
+                    "apply_failed",
+                    path,
+                    "Target text does not match the exact base.",
+                    live_source,
+                    failure_class="environment",
+                )
+            )
             continue
         source = after.get(path, live_source)
         if edit.node_target:
@@ -547,18 +705,25 @@ def validate_patch_batch(
         )
 
     if issues:
-        _clear_gate_output(state)
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(accepted=False, issues=issues[:16])
     try:
         patch = _patch_text(before, after, modes)
-    except (OSError, UnicodeDecodeError, ValueError) as exc:
-        _clear_gate_output(state)
+    except (OSError, UnicodeDecodeError, ValueError, subprocess.SubprocessError) as exc:
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(
             accepted=False,
-            issues=[_issue("apply_failed", "", str(exc))],
+            issues=[
+                _issue(
+                    "apply_failed",
+                    "",
+                    str(exc),
+                    failure_class="environment",
+                )
+            ],
         )
     if not patch.strip() or not converted:
-        _clear_gate_output(state)
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(accepted=False, issues=[_issue("empty_patch", "", "Batch produces no substantive diff.")])
     manifest = [
         SnapshotManifestEntry(
@@ -572,18 +737,64 @@ def validate_patch_batch(
         if before[path] != after[path]
     ]
     patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
-    apply_check = subprocess.run(
-        ["git", "-C", str(root), "apply", "--check", "-"],
-        input=patch.encode("utf-8"),
-        check=False,
-        capture_output=True,
-        timeout=30,
-    )
+    try:
+        apply_check = subprocess.run(
+            ["git", "-C", str(root), "apply", "--check", "-"],
+            input=patch.encode("utf-8"),
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _clear_gate_output(state, test_only=test_only)
+        return PatchGateResult(
+            accepted=False,
+            issues=[
+                _issue(
+                    "apply_failed",
+                    "",
+                    str(exc),
+                    failure_class="environment",
+                )
+            ],
+        )
     if apply_check.returncode:
-        _clear_gate_output(state)
+        _clear_gate_output(state, test_only=test_only)
         return PatchGateResult(
             accepted=False,
             issues=[_issue("apply_failed", "", "Generated patch failed exact git apply check.")],
+        )
+    try:
+        binding = (
+            _frozen_repair_binding(state)
+            if test_only
+            else _current_repair_binding(state)
+        )
+    except ValueError as exc:
+        _clear_gate_output(state, test_only=test_only)
+        return PatchGateResult(
+            accepted=False,
+            issues=[
+                _issue(
+                    "apply_failed",
+                    "",
+                    str(exc),
+                    failure_class="environment",
+                )
+            ],
+        )
+    if binding is None:
+        _clear_gate_output(state, test_only=test_only)
+        return PatchGateResult(
+            accepted=False,
+            issues=[
+                _issue(
+                    "apply_failed",
+                    "",
+                    "PatchGate acceptance requires runtime repair attribution.",
+                    failure_class="environment",
+                )
+            ],
         )
     gate_fingerprint = _fingerprint(
         state,
@@ -591,6 +802,7 @@ def validate_patch_batch(
         converted,
         manifest,
         patch_sha256,
+        binding,
     )
     state.patch_content = patch
     state.patch_edits = converted
@@ -601,6 +813,22 @@ def validate_patch_batch(
         changed_manifest=manifest,
         manifest_fingerprint=tool_manifest_fingerprint(manifest),
     )
+    if not test_only:
+        try:
+            freeze_authorized_repair_round(state)
+        except ValueError as exc:
+            _clear_gate_output(state)
+            return PatchGateResult(
+                accepted=False,
+                issues=[
+                    _issue(
+                        "apply_failed",
+                        "",
+                        str(exc),
+                        failure_class="environment",
+                    )
+                ],
+            )
     state.patch_correction_count = 0
     return PatchGateResult(accepted=True, edits=converted)
 
@@ -705,7 +933,14 @@ def _rebuild_approved_snapshot(state: AgentState) -> _ApprovedSnapshot:
         if before[path] != after[path]
     ]
     patch_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
-    fingerprint = _fingerprint(state, plan, state.patch_edits, manifest, patch_sha256)
+    fingerprint = _fingerprint(
+        state,
+        plan,
+        state.patch_edits,
+        manifest,
+        patch_sha256,
+        _frozen_repair_binding(state),
+    )
     approval = ToolPatchApproval(
         base_ref=state.repo_ref,
         patch_sha256=patch_sha256,
@@ -1080,7 +1315,9 @@ def apply_approved_patch(state: AgentState) -> list[str]:
 __all__ = [
     "PatchGateIssue",
     "PatchGateResult",
+    "RepairFailureClass",
     "apply_approved_patch",
     "revalidate_approved_patch",
+    "retire_patch_authorization",
     "validate_patch_batch",
 ]
