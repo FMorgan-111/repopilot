@@ -123,6 +123,30 @@ def _attach_trusted_attempt(state: AgentState) -> None:
     )
 
 
+def _attach_trusted_completion(
+    state: AgentState,
+    *,
+    test_result: str,
+    success: bool,
+    failure_kind: str,
+) -> None:
+    approval = state.tool_patch_approval
+    assert approval is not None
+    state.fix_attempts.append(
+        FixAttempt(
+            patch_content=state.patch_content,
+            patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+            test_result=test_result,
+            success=success,
+            failure_kind=failure_kind,
+            patch_gate_fingerprint=approval.patch_gate_fingerprint,
+            repair_provider=state.authorized_repair_provider,
+            repair_model=state.authorized_repair_model,
+            repair_round_id=state.authorized_repair_round_id,
+        )
+    )
+
+
 def _attach_proof(state: AgentState) -> None:
     approval = state.tool_patch_approval
     assert approval is not None
@@ -229,6 +253,102 @@ def test_terminal_prediction_exports_approved_live_patch_without_proof(tmp_path:
     assert payload["success"] is False
     assert payload["patch_generated"] is True
     assert payload["tests_passed"] is True
+    assert payload["model_patch"] == state.patch_content
+
+
+def test_terminal_prediction_rejects_trusted_live_attempt_without_completion(
+    tmp_path: Path,
+):
+    state = _approved_state(tmp_path)
+    _attach_trusted_completion(
+        state,
+        test_result="",
+        success=False,
+        failure_kind="",
+    )
+    state.current_phase = Phase.DONE
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is False
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == ""
+
+
+@pytest.mark.parametrize(
+    ("returncode", "success", "failure_kind"),
+    [
+        (1, True, ""),
+        (0, False, "test_failed"),
+    ],
+)
+def test_terminal_prediction_rejects_contradictory_live_test_completion(
+    tmp_path: Path,
+    returncode: int,
+    success: bool,
+    failure_kind: str,
+):
+    state = _approved_state(tmp_path)
+    _attach_trusted_completion(
+        state,
+        test_result=json.dumps(
+            {
+                "command": "python -m pytest tests/test_maths.py -q",
+                "returncode": returncode,
+                "success": success,
+            }
+        ),
+        success=success,
+        failure_kind=failure_kind,
+    )
+    state.current_phase = Phase.DONE
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is False
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == ""
+
+
+def test_terminal_prediction_exports_live_patch_after_failed_tests(tmp_path: Path):
+    state = _approved_state(tmp_path)
+    _attach_trusted_completion(
+        state,
+        test_result=json.dumps(
+            {
+                "command": "python -m pytest tests/test_maths.py -q",
+                "returncode": 1,
+                "success": False,
+            }
+        ),
+        success=False,
+        failure_kind="test_failed",
+    )
+    state.current_phase = Phase.DONE
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is True
+    assert payload["tests_passed"] is False
+    assert payload["model_patch"] == state.patch_content
+
+
+def test_terminal_prediction_exports_live_patch_after_test_infrastructure_error(
+    tmp_path: Path,
+):
+    state = _approved_state(tmp_path)
+    _attach_trusted_completion(
+        state,
+        test_result="execution_error",
+        success=False,
+        failure_kind="infra_error",
+    )
+    state.current_phase = Phase.DONE
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is True
+    assert payload["tests_passed"] is None
     assert payload["model_patch"] == state.patch_content
 
 

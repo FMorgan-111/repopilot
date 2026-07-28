@@ -23,14 +23,15 @@ def main(argv: list[str] | None = None):
         result = _run_issue(argv)
 
     success = result.get("success", True) if isinstance(result, dict) else True
+    if isinstance(result, dict) and _generated_patch(result):
+        success = True
     sys.exit(0 if success else 1)
 
 
 def _run_issue(argv: list[str]) -> dict:
     parser = argparse.ArgumentParser(
         prog="repopilot",
-        description="AI agent that reads a GitHub Issue, searches code, "
-        "generates fix, runs tests, creates PR.",
+        description="RepoPilot returns the first validated patch for a GitHub Issue.",
     )
     parser.add_argument("issue_url", help="GitHub Issue URL")
     parser.add_argument(
@@ -188,6 +189,19 @@ def _print_human(result: dict):
         print(f"PR: {result['pr_url']}")
     if result.get("error"):
         print(f"Error: {result['error']}")
+    patch = _generated_patch(result)
+    if patch:
+        print("\nPatch:")
+        print(patch, end="" if patch.endswith("\n") else "\n")
+    tests_passed = result.get("tests_passed")
+    test_status = (
+        "passed"
+        if tests_passed is True
+        else "failed"
+        if tests_passed is False
+        else "not run"
+    )
+    print(f"Tests: {test_status}")
     print(f"Turns: {result.get('turns_taken', 0)}")
     print(f"Token used: {result.get('token_used', 0)}")
 
@@ -206,6 +220,13 @@ def _print_human(result: dict):
         for i, a in enumerate(attempts):
             status = "✅" if a.get("success") else "❌"
             print(f"  {status} Attempt {i+1}: {a.get('file_path', 'unknown')[:60]}")
+
+
+def _generated_patch(result: dict) -> str:
+    patch = result.get("model_patch")
+    if result.get("patch_generated") is True and isinstance(patch, str) and patch.strip():
+        return patch
+    return ""
 
 
 def _print_runs(runs: list[dict]) -> None:

@@ -366,20 +366,22 @@ def _trusted_attempt_for_patch(
                 continue
         except ValueError:
             continue
+        completed, _ = _attempt_test_completion(attempt)
+        if not completed:
+            continue
         return attempt
     return None
 
 
-def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
-    if not patch:
-        return None
-    attempt = _trusted_attempt_for_patch(state, patch)
-    if attempt is None or attempt.failure_kind == "infra_error":
-        return None
+def _attempt_test_completion(attempt: FixAttempt) -> tuple[bool, bool | None]:
+    if attempt.test_result == "execution_error":
+        completed = attempt.failure_kind == "infra_error" and attempt.success is False
+        return completed, None
+
     try:
         result = json.loads(attempt.test_result)
     except (TypeError, ValueError):
-        return None
+        return False, None
     if (
         not isinstance(result, dict)
         or set(result) != {"command", "returncode", "success"}
@@ -387,10 +389,28 @@ def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
         or not result["command"].strip()
         or type(result["returncode"]) is not int
         or type(result["success"]) is not bool
-        or result["success"] is not attempt.success
     ):
+        return False, None
+
+    success = result["success"]
+    expected_failure_kind = "" if success else "test_failed"
+    if (
+        success is not (result["returncode"] == 0)
+        or success is not attempt.success
+        or attempt.failure_kind != expected_failure_kind
+    ):
+        return False, None
+    return True, success
+
+
+def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
+    if not patch:
         return None
-    return attempt.success
+    attempt = _trusted_attempt_for_patch(state, patch)
+    if attempt is None:
+        return None
+    _, tests_passed = _attempt_test_completion(attempt)
+    return tests_passed
 
 
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
