@@ -1345,5 +1345,9 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         record_progress(state)
         state.assertion_diversity_required = False
         frame.recommended_action = "execute"
-        state.current_phase = Phase.EXECUTE
+        if state.patch_only:
+            state.current_phase = Phase.DONE
+            state.decision_route_checked_frame_id = frame.frame_id
+        else:
+            state.current_phase = Phase.EXECUTE
         return state

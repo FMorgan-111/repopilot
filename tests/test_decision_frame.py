@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import subprocess
 
 import pytest
 
@@ -272,6 +273,29 @@ async def test_plan_fix_records_search_replace_patch_edits(
     assert "patch_edits" in calls[0]["system"]
     assert "search" in calls[0]["system"]
     assert "replace" in calls[0]["system"]
+
+
+async def test_patch_only_plan_stops_after_preflight_without_mutating_checkout(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(*_args, **_kwargs):
+        return _exact_plan_response()
+
+    exact_repair_state.patch_only = True
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+
+    next_state = await plan_node.plan_fix(exact_repair_state)
+
+    assert next_state.current_phase == new_agent.Phase.DONE
+    assert next_state.tool_patch_approval is not None
+    assert next_state.patch_content.startswith("diff --git a/src/widget.py")
+    assert new_agent.route_from_state(next_state) == new_agent.END
+    checkout_diff = subprocess.run(
+        ["git", "-C", next_state.repo_path, "diff", "--exit-code"],
+        check=False,
+        capture_output=True,
+    )
+    assert checkout_diff.returncode == 0
 
 
 async def test_plan_fix_records_llm_diagnostic_on_timeout(monkeypatch):

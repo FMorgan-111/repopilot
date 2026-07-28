@@ -411,6 +411,7 @@ async def agent_v2(
     save_final_run: bool = False,
     skip_commit: bool = False,
     seed: dict | None = None,
+    patch_only: bool = True,
 ) -> dict:
     """Run the full RepoPilot v2 graph with progress output and trace saving.
 
@@ -432,6 +433,7 @@ async def agent_v2(
         token_budget=token_budget,
         trace_id=tracer.trace_id,
         skip_commit=skip_commit,
+        patch_only=patch_only,
         active_model=get_model_config("primary").model,
         active_provider="primary",
         tool_sandbox_config=tool_sandbox_config_from_env(),

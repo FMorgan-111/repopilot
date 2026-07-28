@@ -942,6 +942,7 @@ class AgentState(BaseModel):
     tool_sandbox_config: ToolSandboxConfig | None = None
     # Benchmark/eval mode skips COMMIT only after differential coverage proof.
     skip_commit: bool = False
+    patch_only: bool = False
     _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
 
     @model_validator(mode="before")

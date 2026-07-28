@@ -118,6 +118,7 @@ async def test_agent_v2_initializes_primary_model_from_provider(monkeypatch):
     assert captured["state"].active_provider == "primary"
     assert captured["state"].active_model == "configured-gemini"
     assert captured["state"].token_budget == 100_000
+    assert captured["state"].patch_only is True
 
 
 async def test_agent_v2_preserves_explicit_budget(monkeypatch):
