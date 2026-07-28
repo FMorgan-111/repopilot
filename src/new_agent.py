@@ -10,10 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import re
+import subprocess
 from typing import Any
 
 from .async_safety import CancellationDrainError, drain_task, wait_for_phase
-from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
+from .coverage_gate import (
+    LiveCoverageBinding,
+    validate_live_coverage_binding,
+    validate_terminal_coverage_binding,
+)
 from .evaluator_safety import safe_prediction_patch
 from .graph import (
     END,
@@ -34,6 +39,7 @@ from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
 from .nodes.verify import verify_fix
+from .patch_gate import revalidate_approved_patch
 from .run_store import claim_run_for_resume, load_run, save_run
 from .safe_subprocess import tool_sandbox_config_from_env
 from .state import (
@@ -328,9 +334,37 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
     return report
 
 
+def _validated_patch_for_report(state: AgentState) -> str:
+    preflight_state = state.model_copy(deep=True)
+    try:
+        revalidate_approved_patch(preflight_state)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        pass
+    else:
+        return safe_prediction_patch(preflight_state.patch_content)
+
+    live_state = state.model_copy(deep=True)
+    try:
+        binding = validate_live_coverage_binding(live_state)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return ""
+    return safe_prediction_patch(binding.patch_content)
+
+
+def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
+    if not patch:
+        return None
+    for attempt in reversed(state.fix_attempts):
+        if attempt.patch_content == patch and attempt.test_result:
+            return attempt.success
+    return None
+
+
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
-    report, live_binding = _final_report_and_binding(state, turns_taken)
+    report, _ = _final_report_and_binding(state, turns_taken)
     terminal_success = report.fix_applied
+    model_patch = _validated_patch_for_report(state)
+    tests_passed = _tests_passed_for_patch(state, model_patch)
     payload = report.model_dump()
     payload.update(
         {
@@ -375,9 +409,9 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 if state.coverage_proof
                 else None
             ),
-            "model_patch": safe_prediction_patch(
-                live_binding.patch_content if live_binding is not None else ""
-            ),
+            "patch_generated": bool(model_patch),
+            "tests_passed": tests_passed,
+            "model_patch": model_patch,
             "error": state.failure_reason or None,
         }
     )
@@ -503,7 +537,6 @@ async def agent_v2(
                 "fix_applied": False,
                 "waiting_for_user": False,
                 "final_phase": "CRASHED",
-                "model_patch": "",
             }
         )
         if save_final_run:

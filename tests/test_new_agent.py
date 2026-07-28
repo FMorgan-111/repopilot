@@ -91,6 +91,143 @@ def test_agent_payload_reuses_side_effect_free_terminal_validation(monkeypatch):
     assert state.model_dump(mode="json") == before
 
 
+def test_agent_payload_exports_clean_preflight_patch_before_coverage(
+    exact_repair_state,
+):
+    state = exact_repair_state
+    plan = RepairPlan(
+        root_cause="widget returns the old sentinel",
+        target_files=["src/widget.py"],
+        target_symbols=["widget"],
+        required_behavior="widget returns the new sentinel",
+        regression_test_strategy="run the focused widget test",
+    )
+    state.active_repair_plan = plan
+    begin_repair_round(state)
+    bind_repair_round_author(state)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                VerifiedEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                    intent="return the new sentinel",
+                )
+            ]
+        ),
+    ).accepted
+    state.current_phase = new_agent.Phase.DONE
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["success"] is False
+    assert payload["patch_generated"] is True
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == state.patch_content
+
+
+def test_agent_payload_marks_matching_completed_patch_attempt_as_tested(
+    exact_repair_state,
+):
+    state = exact_repair_state
+    plan = RepairPlan(
+        root_cause="widget returns the old sentinel",
+        target_files=["src/widget.py"],
+        target_symbols=["widget"],
+        required_behavior="widget returns the new sentinel",
+        regression_test_strategy="run the focused widget test",
+    )
+    state.active_repair_plan = plan
+    begin_repair_round(state)
+    bind_repair_round_author(state)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                VerifiedEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                    intent="return the new sentinel",
+                )
+            ]
+        ),
+    ).accepted
+    approval = state.tool_patch_approval
+    assert approval is not None
+    state.fix_attempts.append(
+        new_agent.FixAttempt(
+            patch_content=state.patch_content,
+            patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+            test_result="pytest completed",
+            success=True,
+            patch_gate_fingerprint=approval.patch_gate_fingerprint,
+            repair_provider=state.authorized_repair_provider,
+            repair_model=state.authorized_repair_model,
+            repair_round_id=state.authorized_repair_round_id,
+        )
+    )
+    state.current_phase = new_agent.Phase.DONE
+
+    payload = new_agent.agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["tests_passed"] is True
+
+
+async def test_agent_v2_crash_preserves_validated_preflight_patch(
+    monkeypatch,
+    exact_repair_state,
+):
+    approved_state = exact_repair_state
+    plan = RepairPlan(
+        root_cause="widget returns the old sentinel",
+        target_files=["src/widget.py"],
+        target_symbols=["widget"],
+        required_behavior="widget returns the new sentinel",
+        regression_test_strategy="run the focused widget test",
+    )
+    approved_state.active_repair_plan = plan
+    begin_repair_round(approved_state)
+    bind_repair_round_author(approved_state)
+    assert validate_patch_batch(
+        approved_state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                VerifiedEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                    intent="return the new sentinel",
+                )
+            ]
+        ),
+    ).accepted
+
+    async def crash_with_approved_patch(_graph, state):
+        state.__dict__.update(approved_state.__dict__)
+        raise RuntimeError("injected graph crash")
+
+    monkeypatch.setattr(new_agent, "build_agent_graph", lambda **_kwargs: object())
+    monkeypatch.setattr(new_agent, "run_graph", crash_with_approved_patch)
+
+    payload = await new_agent.agent_v2(
+        "https://github.com/acme/widget/issues/7",
+        save_final_run=False,
+    )
+
+    assert payload["success"] is False
+    assert payload["fix_applied"] is False
+    assert payload["final_phase"] == "CRASHED"
+    assert payload["patch_generated"] is True
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == approved_state.patch_content
+
+
 def test_agent_state_default_budget_is_100000():
     state = new_agent.AgentState(issue_url="https://github.com/acme/widget/issues/7")
 
@@ -531,6 +668,8 @@ def test_agent_payload_never_exports_evaluator_only_patch_values(tmp_path):
     )
     payload = new_agent.agent_payload_from_state(state, turns_taken=0)
     assert sentinel not in json.dumps(payload)
+    assert payload["patch_generated"] is False
+    assert payload["tests_passed"] is None
     assert "gold_patch" not in payload["model_patch"].casefold()
 
 

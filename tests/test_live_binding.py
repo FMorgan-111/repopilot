@@ -183,20 +183,32 @@ def test_terminal_prediction_uses_only_the_approved_live_patch(tmp_path: Path):
     drifted_payload = agent_payload_from_state(state, turns_taken=1)
 
     assert drifted_payload["success"] is False
+    assert drifted_payload["patch_generated"] is False
+    assert drifted_payload["tests_passed"] is None
     assert drifted_payload["model_patch"] == ""
 
 
-@pytest.mark.parametrize("terminal_phase", [Phase.DONE, Phase.COMMIT])
-def test_terminal_prediction_rejects_valid_live_approval_without_proof(
-    tmp_path: Path,
-    terminal_phase: Phase,
-):
+def test_terminal_prediction_exports_approved_live_patch_without_proof(tmp_path: Path):
     state = _approved_state(tmp_path)
-    state.current_phase = terminal_phase
+    state.current_phase = Phase.DONE
 
     payload = agent_payload_from_state(state, turns_taken=1)
 
     assert payload["success"] is False
+    assert payload["patch_generated"] is True
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == state.patch_content
+
+
+def test_terminal_prediction_rejects_tampered_approved_patch_content(tmp_path: Path):
+    state = _approved_state(tmp_path)
+    state.current_phase = Phase.DONE
+    state.patch_content += "\n# tampered after approval\n"
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is False
+    assert payload["tests_passed"] is None
     assert payload["model_patch"] == ""
 
 
@@ -228,7 +240,10 @@ def test_terminal_prediction_rejects_mismatched_or_tampered_proof(
     payload = agent_payload_from_state(state, turns_taken=1)
 
     assert payload["success"] is False
-    assert payload["model_patch"] == ""
+    expected_patch = "" if tamper == "fingerprint" else state.patch_content
+    assert payload["patch_generated"] is bool(expected_patch)
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == expected_patch
 
 
 @pytest.mark.asyncio
