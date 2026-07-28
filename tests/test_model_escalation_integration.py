@@ -25,6 +25,10 @@ from src.state import (
 from src.tool_router import ToolRouteResult
 
 
+PRIMARY_MODEL = "gemini-3.5-flash:stable"
+ESCALATION_MODEL = "claude-opus-4-8:stable"
+
+
 def _plan_response() -> dict:
     return {
         "kind": "plan",
@@ -127,23 +131,16 @@ def _accept_repair(state, repair_plan, verified_batch):
     return SimpleNamespace(accepted=True, edits=edits, issues=[])
 
 
-@pytest.mark.parametrize(
-    "invalid_response",
-    [
-        {},
-        {
-            "kind": "tool",
-            "tool_intent": {"action": "search_text", "args": "invalid"},
-        },
-    ],
-    ids=["empty", "invalid"],
-)
-async def test_configured_invalid_primary_counts_then_next_full_plan_uses_opus(
-    exact_repair_state, monkeypatch, invalid_response
+async def test_two_invalid_primary_plans_then_full_plan_uses_opus(
+    exact_repair_state, monkeypatch
 ):
     _enable_escalation(monkeypatch)
     calls = []
-    responses = [invalid_response, _plan_response()]
+    invalid_response = {
+        "kind": "tool",
+        "tool_intent": {"action": "search_text", "args": "invalid"},
+    }
+    responses = [invalid_response, invalid_response, _plan_response()]
 
     async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append((system, user, model, provider))
@@ -155,20 +152,26 @@ async def test_configured_invalid_primary_counts_then_next_full_plan_uses_opus(
     assert first.current_phase == new_agent.Phase.PLAN
     assert first.retry_count == 1
     assert first.primary_failed_repair_rounds == 1
-    assert first.escalated is True
+    assert first.escalated is False
     assert first.current_repair_round_id == 0
 
     second = await plan_node.plan_fix(first)
 
-    assert second.current_phase == new_agent.Phase.EXECUTE
-    assert [call[3] for call in calls] == ["primary", "escalation"]
-    assert [call[2] for call in calls] == [
-        "gemini-3.5-flash:stable",
-        "claude-opus-4-8:stable",
+    assert second.current_phase == new_agent.Phase.PLAN
+    assert second.primary_failed_repair_rounds == 2
+    assert second.escalated is True
+
+    third = await plan_node.plan_fix(second)
+
+    assert third.current_phase == new_agent.Phase.EXECUTE
+    assert [(provider, model) for _, _, model, provider in calls] == [
+        ("primary", PRIMARY_MODEL),
+        ("primary", PRIMARY_MODEL),
+        ("escalation", ESCALATION_MODEL),
     ]
     assert all(call[0] == plan_node.PLAN_SYSTEM for call in calls)
-    assert second.repair_round_sequence == 2
-    assert second.authorized_repair_provider == "escalation"
+    assert third.repair_round_sequence == 3
+    assert third.authorized_repair_provider == "escalation"
 
 
 async def test_escalated_plan_prompt_bounds_and_redacts_adversarial_context(

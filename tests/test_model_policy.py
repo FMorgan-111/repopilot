@@ -48,15 +48,16 @@ def enable_escalation(monkeypatch):
         "invalid_structured_response_after_retries",
     ],
 )
-def test_approved_immediate_failures_escalate(monkeypatch, reason):
+def test_semantic_failures_wait_for_the_primary_failure_threshold(monkeypatch, reason):
     enable_escalation(monkeypatch)
+    state = make_state(primary_failed_repair_rounds=1)
 
     decision = model_policy.should_escalate(
-        make_state(), immediate_reason=reason
+        state, immediate_reason=reason
     )
 
-    assert decision.escalate is True
-    assert decision.reason == reason
+    assert decision.escalate is False
+    assert decision.reason == ""
 
 
 def test_unapproved_immediate_failure_does_not_escalate(monkeypatch):

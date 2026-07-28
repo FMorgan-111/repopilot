@@ -19,13 +19,7 @@ from .state import (
     sanitize_escalation_reason,
 )
 
-_IMMEDIATE_REASONS = frozenset(
-    {
-        "empty_completion_after_retries",
-        "invalid_structured_response_after_retries",
-        "primary_gateway_unavailable_after_retries",
-    }
-)
+_IMMEDIATE_REASONS = frozenset({"primary_gateway_unavailable_after_retries"})
 
 # These names cover the six policy signals in the design while retaining short
 # names for callers that already classified a plan, context, edit, or test event.
