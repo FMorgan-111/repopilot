@@ -466,6 +466,31 @@ def test_absent_tracked_path_is_model_correctable(tmp_path):
     assert result.issues[0].failure_class == "model_correctable"
 
 
+def test_untracked_existing_regular_file_is_environment_drift(tmp_path):
+    root, ref = _repo(tmp_path, {"a.py": "value = 1\n"})
+    (root / "src").mkdir()
+    (root / "src" / "new.py").write_text("untracked = True\n", encoding="utf-8")
+    plan = _plan("src/new.py")
+    state = _state(root, ref, plan)
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("src/new.py", replace="created = True\n")]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+    assert state.patch_content == ""
+    assert state.patch_edits == []
+    assert state.active_repair_plan is None
+    assert state.tool_patch_approval is None
+    assert state.authorized_repair_round_id == 0
+
+
 @pytest.mark.parametrize("failing_git_command", ["ls-tree", "show"])
 def test_git_tree_or_blob_failure_is_environment(
     tmp_path, monkeypatch, failing_git_command

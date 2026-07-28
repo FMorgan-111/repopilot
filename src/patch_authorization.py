@@ -14,7 +14,7 @@ from .model_provider import redact_secrets
 from .patch_gate import RepairFailureClass, validate_patch_batch
 from .repair_rounds import retire_patch_authorization
 from .schemas import PlanDecision
-from .state import AgentState, RepairPlan, VerifiedEdit, VerifiedEditBatch
+from .state import AgentState, DecisionFrame, RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 PatchAuthorizationStatus = Literal[
     "not_requested",
@@ -75,6 +75,7 @@ _EDIT_FIELDS = frozenset(
         "replace_all",
     }
 )
+_DECISION_FRAME_FIELDS = frozenset(DecisionFrame.model_fields)
 _TRUST_FIELDS = frozenset(
     {
         "provider",
@@ -182,6 +183,7 @@ def _contains_forbidden_content(value: object) -> bool:
 
 def _safe_envelope(
     response: Mapping[str, Any],
+    decision_frame: Mapping[str, Any],
 ) -> tuple[PlanDecision | None, list[PatchAuthorizationIssue]]:
     unknown = {
         key
@@ -206,6 +208,7 @@ def _safe_envelope(
         for key, value in response.items()
         if key in _RESPONSE_FIELDS and key != "kind"
     }
+    clean["decision_frame"] = dict(decision_frame)
     clean["patch"] = ""
     clean["patch_edits"] = []
     if _contains_forbidden_content(
@@ -379,8 +382,31 @@ def authorize_plan_patch(
         )
 
     raw_frame = response.get("decision_frame")
+    if isinstance(raw_frame, Mapping):
+        unknown_frame_fields = {
+            key
+            for key in raw_frame
+            if key not in _DECISION_FRAME_FIELDS and not _is_trust_field(key)
+        }
+        if unknown_frame_fields:
+            return _reject(
+                state,
+                [
+                    _issue(
+                        "unknown_decision_frame_field",
+                        "The decision frame contains an unsupported field.",
+                    )
+                ],
+            )
+        clean_frame = {
+            key: value
+            for key, value in raw_frame.items()
+            if key in _DECISION_FRAME_FIELDS
+        }
+    else:
+        clean_frame = {}
     raw_action = (
-        raw_frame.get("recommended_action", "stop")
+        clean_frame.get("recommended_action", "stop")
         if isinstance(raw_frame, Mapping)
         else None
     )
@@ -402,7 +428,7 @@ def authorize_plan_patch(
             ],
         )
 
-    envelope, envelope_issues = _safe_envelope(response)
+    envelope, envelope_issues = _safe_envelope(response, clean_frame)
     if envelope_issues or envelope is None:
         return _reject(state, envelope_issues)
 

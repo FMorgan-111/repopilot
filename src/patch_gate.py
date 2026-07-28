@@ -225,7 +225,9 @@ def _safe_leaf(root: Path, path: str, *, must_exist: bool) -> Path:
             if must_exist and not stat.S_ISREG(info.st_mode):
                 raise ValueError("target is not a regular file")
             if not must_exist:
-                raise ValueError("intentional new target already exists")
+                raise _PatchGateEnvironmentError(
+                    "intentional new target already exists"
+                )
     return current
 
 
@@ -547,6 +549,16 @@ def validate_patch_batch(
                 continue
             try:
                 _safe_leaf(root, path, must_exist=False)
+            except _PatchGateEnvironmentError as exc:
+                issues.append(
+                    _issue(
+                        "apply_failed",
+                        path,
+                        str(exc),
+                        failure_class="environment",
+                    )
+                )
+                continue
             except OSError as exc:
                 issues.append(
                     _issue(
