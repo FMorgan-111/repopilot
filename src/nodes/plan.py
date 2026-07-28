@@ -26,6 +26,7 @@ from ..model_policy import (
 )
 from ..model_provider import escalation_is_configured
 from ..outcome_summary import (
+    MAX_OUTCOME_SUMMARY_CHARS,
     OUTCOME_SUMMARY_SECTION,
     sanitize_outcome_summary,
 )
@@ -77,6 +78,8 @@ PLAN_MAX_FILES = 3
 PLAN_FAILURE_LOG_LIMIT = 1000
 PLAN_FAILURE_RESULT_LIMIT = 500
 PLAN_PREVIOUS_FAILURES_TOTAL_LIMIT = 6_000
+PLAN_FAILED_EDITS_CONTEXT_LIMIT = 4_000
+PLAN_NEW_EVIDENCE_CONTEXT_LIMIT = 12_000
 MODEL_CONTEXT_DENIED_LITERALS = (
     "unified diff",
     "replace_all",
@@ -205,7 +208,11 @@ def _prior_failed_edits_context(state: AgentState) -> str:
             f"- file: {edit.file_path}\n"
             f"  search (verbatim):\n{_truncate_prompt_text(edit.search, 300)}"
         )
-    return "\n".join(lines)
+    return sanitize_model_context(
+        "\n".join(lines),
+        PLAN_FAILED_EDITS_CONTEXT_LIMIT,
+        denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
+    )
 
 
 def _prior_assertion_symbols(state: AgentState) -> tuple[set[str], bool]:
@@ -516,7 +523,11 @@ def build_plan_user_prompt(
     recall_context: str = "",
 ) -> str:
     """Build the provider-neutral prompt with one bounded summary section."""
-    summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
+    summary = sanitize_model_context(
+        sanitize_outcome_summary(state, state.attempt_outcome_summary),
+        MAX_OUTCOME_SUMMARY_CHARS,
+        denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
+    )
     include_legacy_attempt_context = not summary
     previous_failure_entries: list[str] = []
     if include_legacy_attempt_context:
@@ -911,7 +922,13 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
 
         user = build_plan_user_prompt(state, recall_context=recall_context)
         if evidence_ids:
-            user = prompt_with_new_evidence(user, state, evidence_ids)
+            user = prompt_with_new_evidence(
+                user,
+                state,
+                evidence_ids,
+                denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
+                max_evidence_chars=PLAN_NEW_EVIDENCE_CONTEXT_LIMIT,
+            )
         prompt_tokens = _estimate_tokens(PLAN_SYSTEM, user)
         response_text = ""
         t0 = time.monotonic()
@@ -1095,6 +1112,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     node="plan_fix",
                     calls_this_round=calls_this_round,
                     router=route_tool_intent,
+                    allow_provider_local_no_progress_stop=False,
                 )
             except (CancellationDrainError, asyncio.CancelledError):
                 raise

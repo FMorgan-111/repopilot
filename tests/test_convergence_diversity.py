@@ -101,6 +101,65 @@ def test_prior_failed_edits_context_ignores_successful_attempts():
     assert plan_node._prior_failed_edits_context(_base_state(fix_attempts=[ok])) == ""
 
 
+def test_prior_failed_edits_context_sanitizes_the_complete_rendered_block():
+    state = _base_state(
+        fix_attempts=[
+            new_agent.FixAttempt(
+                patch_edits=[
+                    PatchEdit(
+                        file_path="src/safe-diversity-sentinel.py",
+                        search="safe-search-sentinel",
+                        replace="safe replacement",
+                    ),
+                    PatchEdit(
+                        file_path="src/sk-AAAAAAAAAAAAAAAA.py",
+                        search="secret-shaped-search-sentinel",
+                        replace="safe replacement",
+                    ),
+                    PatchEdit(
+                        file_path="src/RePaIrPlAn.py",
+                        search="VeRiFiEdEdItBaTcH forbidden-diversity-sentinel",
+                        replace="safe replacement",
+                    ),
+                ],
+                success=False,
+            )
+        ]
+    )
+
+    context = plan_node._prior_failed_edits_context(state)
+    folded = context.casefold()
+
+    assert "safe-diversity-sentinel" in context
+    assert "safe-search-sentinel" in context
+    for forbidden in (
+        "sk-aaaaaaaa",
+        "repairplan",
+        "verifiededitbatch",
+        "forbidden-diversity-sentinel",
+    ):
+        assert forbidden not in folded
+
+
+def test_prior_failed_edits_context_has_an_independent_total_bound():
+    edits = [
+        PatchEdit(
+            file_path=f"src/safe-diversity-{index}.py",
+            search=f"safe-search-{index}-" + "x" * 400,
+            replace="safe replacement",
+        )
+        for index in range(40)
+    ]
+    state = _base_state(
+        fix_attempts=[new_agent.FixAttempt(patch_edits=edits, success=False)]
+    )
+
+    context = plan_node._prior_failed_edits_context(state)
+
+    assert "safe-diversity-0.py" in context
+    assert len(context) <= 4_000
+
+
 def test_is_final_attempt():
     assert (
         plan_node._is_final_attempt(_base_state(retry_count=3, max_retries=3)) is True

@@ -9,11 +9,11 @@ from src.evidence import EvidenceStore
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 from src.reasoning_loop import (
+    NEW_EVIDENCE_SECTION,
     response_tool_intent,
     validate_reasoning_response,
 )
 from src.state import (
-    Evidence,
     FileInfo,
     PatchEdit,
     RepairPlan,
@@ -215,6 +215,28 @@ async def test_escalated_plan_prompt_bounds_and_redacts_adversarial_context(
     assert len(prompt) < 20_000
 
 
+@pytest.mark.parametrize("denied_term", ["RePaIrPlAn", "VeRiFiEdEdItBaTcH"])
+def test_plan_prompt_resanitizes_the_rolling_summary_for_protocol_terms(
+    denied_term,
+):
+    state = _state(
+        attempt_outcome_summary=(
+            "safe-summary-sentinel\n"
+            "sk-AAAAAAAAAAAAAAAA\n"
+            f"{denied_term} forbidden-summary-sentinel"
+        )
+    )
+
+    prompt = plan_node.build_plan_user_prompt(state)
+    folded = prompt.casefold()
+
+    assert "safe-summary-sentinel" in prompt
+    assert "completed attempts (rolling summary)" in folded
+    assert denied_term.casefold() not in folded
+    assert "forbidden-summary-sentinel" not in prompt
+    assert "sk-aaaaaaaa" not in folded
+
+
 async def test_escalated_tool_reprompt_keeps_baseline_source_and_fresh_evidence(
     exact_repair_state, monkeypatch
 ):
@@ -241,20 +263,23 @@ async def test_escalated_tool_reprompt_keeps_baseline_source_and_fresh_evidence(
         return responses.pop(0)
 
     async def fake_route(state, intent, **_kwargs):
-        state.evidence.append(
-            Evidence(
-                evidence_id="ev_fresh_plan_tool",
-                tool=intent.action,
-                summary="fresh symbol evidence",
-                content="fresh-tool-evidence-sentinel",
-                fingerprint="fresh-tool-fingerprint",
-            )
+        added = EvidenceStore(state).add(
+            tool=intent.action,
+            summary="fresh-safe-evidence-summary",
+            content=(
+                "fresh-tool-evidence-sentinel\n"
+                "sk-BBBBBBBBBBBBBBBB\n"
+                "VeRiFiEdEdItBaTcH forbidden-tool-evidence-sentinel\n" + "x" * 20_000
+            ),
+            file_path="src/widget.py",
+            symbol="widget",
         )
+        assert added.evidence is not None
         return ToolRouteResult(
             action=intent.action,
             status="ok",
             args_fingerprint="fresh-tool-args",
-            evidence_id="ev_fresh_plan_tool",
+            evidence_id=added.evidence.evidence_id,
             made_progress=True,
         )
 
@@ -266,8 +291,116 @@ async def test_escalated_tool_reprompt_keeps_baseline_source_and_fresh_evidence(
     assert len(calls) == 2
     assert "def widget():" in calls[1][1]
     assert "fresh-tool-evidence-sentinel" in calls[1][1]
+    fresh_section = calls[1][1].split(NEW_EVIDENCE_SECTION, 1)[1]
+    assert len(fresh_section) <= 12_500
+    for forbidden in (
+        "sk-bbbbbbbb",
+        "verifiededitbatch",
+        "forbidden-tool-evidence-sentinel",
+    ):
+        assert forbidden not in fresh_section.casefold()
     assert all(call[0] == plan_node.PLAN_SYSTEM for call in calls)
     assert all(call[3] == "escalation" for call in calls)
+
+
+async def test_escalated_plan_two_no_progress_tools_stay_in_the_open_round(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.active_provider = "escalation"
+    exact_repair_state.active_model = "claude-opus-4-8:stable"
+    exact_repair_state.escalated = True
+    exact_repair_state.escalation_reason = "primary_repair_round_limit"
+    tool_response = {
+        "kind": "tool",
+        "tool_intent": {
+            "action": "search_text",
+            "args": {"text": "missing-two-tool-sentinel"},
+            "reason": "Check the same missing symbol.",
+            "expected_evidence": "A source location.",
+        },
+    }
+    responses = [tool_response, tool_response, _plan_response()]
+    routed = []
+
+    async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
+        return responses.pop(0)
+
+    async def no_progress_route(state, intent, *, calls_this_round):
+        routed.append((intent.action, calls_this_round))
+        return ToolRouteResult(
+            action=intent.action,
+            status="duplicate",
+            args_fingerprint=f"duplicate-{calls_this_round}",
+            made_progress=False,
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    monkeypatch.setattr(plan_node, "route_tool_intent", no_progress_route)
+
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert routed == [("search_text", 0), ("search_text", 1)]
+    assert result.repair_round_sequence == 1
+    assert result.current_repair_round_id == 1
+    assert result.authorized_repair_round_id == 1
+    assert result.retry_count == 0
+    assert result.last_counted_repair_round_id == 0
+    assert result.primary_failed_repair_rounds == 0
+    assert result.opus_no_progress_rounds.get("plan_fix", 0) == 0
+    assert not any(
+        item.get("event") == "opus_no_progress" for item in result.node_diagnostics
+    )
+
+
+async def test_escalated_plan_no_progress_stream_stops_only_at_shared_tool_cap(
+    monkeypatch,
+):
+    state = _state(
+        active_provider="escalation",
+        active_model="claude-opus-4-8:stable",
+        escalated=True,
+        escalation_reason="primary_repair_round_limit",
+    )
+    routed = []
+
+    async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
+        return {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "search_text",
+                "args": {"text": "missing-eight-tool-sentinel"},
+                "reason": "Check the missing symbol.",
+                "expected_evidence": "A source location.",
+            },
+        }
+
+    async def no_progress_route(current, intent, *, calls_this_round):
+        routed.append(calls_this_round)
+        return ToolRouteResult(
+            action=intent.action,
+            status="duplicate",
+            args_fingerprint=f"duplicate-{calls_this_round}",
+            made_progress=False,
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    monkeypatch.setattr(plan_node, "route_tool_intent", no_progress_route)
+
+    result = await plan_node.plan_fix(state)
+
+    assert routed == list(range(8))
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.failure_reason == "tool_round_limit"
+    assert result.repair_round_sequence == 1
+    assert result.current_repair_round_id == 1
+    assert result.retry_count == 0
+    assert result.last_counted_repair_round_id == 0
+    assert result.primary_failed_repair_rounds == 0
+    assert result.opus_no_progress_rounds.get("plan_fix", 0) == 0
+    assert not any(
+        item.get("event") == "opus_no_progress" for item in result.node_diagnostics
+    )
 
 
 async def test_graph_replays_an_already_escalated_saved_state(tmp_path, monkeypatch):

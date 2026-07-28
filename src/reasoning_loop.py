@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +21,7 @@ from .tool_policy import ToolIntent
 from .tool_router import ToolRouteResult
 
 MAX_TOOL_REQUESTS_PER_ROUND = 8
+DEFAULT_NEW_EVIDENCE_CONTEXT_LIMIT = 24_000
 NEW_EVIDENCE_SECTION = "NEW APPROVED EVIDENCE FROM THE PREVIOUS TOOL REQUEST"
 _OUTCOME_FIELDS = {
     "plan": frozenset(
@@ -120,11 +121,15 @@ def validate_reasoning_response(
             return "tool"
         if response.get("stop_reason"):
             if set(response) != {"stop_reason"}:
-                raise ValidationError("structured response mixed stop and outcome variants")
+                raise ValidationError(
+                    "structured response mixed stop and outcome variants"
+                )
             return "stop"
         unexpected = set(response) - set(legacy_fields)
         if unexpected:
-            raise ValidationError("structured response has non-allowlisted legacy fields")
+            raise ValidationError(
+                "structured response has non-allowlisted legacy fields"
+            )
         return outcome_kind
 
     if explicit_kind not in {"tool", "stop", outcome_kind}:
@@ -183,10 +188,21 @@ def prompt_with_new_evidence(
     base_prompt: str,
     state: AgentState,
     evidence_ids: tuple[str, ...],
+    *,
+    denied_literals: Iterable[str] = (),
+    max_evidence_chars: int = DEFAULT_NEW_EVIDENCE_CONTEXT_LIMIT,
 ) -> str:
     """Render only IDs produced by the immediately preceding tool request."""
-    selected = EvidenceStore(state).select(list(evidence_ids))
-    rendered = EvidenceStore.render_for_prompt(selected)
+    store = EvidenceStore(state)
+    selected = store.select(
+        list(evidence_ids),
+        max_total_chars=max_evidence_chars,
+    )
+    rendered = sanitize_summary_text(
+        store.render_for_prompt(selected),
+        max_evidence_chars,
+        denied_literals=denied_literals,
+    )
     ids = ", ".join(item.evidence_id for item in selected)
     return (
         f"{base_prompt}\n\n{NEW_EVIDENCE_SECTION}\n"
@@ -228,6 +244,7 @@ async def route_reasoning_tool(
     node: str,
     calls_this_round: int,
     router: Callable[..., Awaitable[ToolRouteResult]],
+    allow_provider_local_no_progress_stop: bool = True,
 ) -> ToolStep:
     """Authorize one model-selected tool and update deterministic progress state."""
     intent = response_tool_intent(response)
@@ -269,7 +286,7 @@ async def route_reasoning_tool(
         separators=(",", ":"),
         sort_keys=True,
     )
-    if state.active_provider == "escalation":
+    if state.active_provider == "escalation" and allow_provider_local_no_progress_stop:
         if record_opus_no_progress(state, node=node, fingerprint=fingerprint):
             return ToolStep(handled=True, stop_reason="opus_no_progress_limit")
     else:
@@ -279,7 +296,8 @@ async def route_reasoning_tool(
             node=node,
             fingerprint=fingerprint,
         )
-        apply_escalation(state, should_escalate(state))
+        if state.active_provider != "escalation":
+            apply_escalation(state, should_escalate(state))
     if result.control_action == "finish_investigation":
         return ToolStep(handled=True, stop_reason="model_stop")
     return ToolStep(handled=True)
