@@ -217,6 +217,8 @@ def _completed_output(
         "issue_url": "https://github.com/owner/repo/issues/1",
         "issue_title": "A regression",
         "model_patch": patch,
+        "patch_generated": bool(patch),
+        "tests_passed": None,
         "success": internal_success,
         "official_resolved": None,
         "waiting_for_user": False,
@@ -673,6 +675,35 @@ def test_aggregate_preserves_tracked_order_and_writes_separate_metrics(
         in summary
     )
     assert summary.index("| Official score |") < summary.index("| Engineering score |")
+
+
+def test_aggregate_accepts_patch_only_unresolved_result(tmp_path: Path) -> None:
+    instance_id = "owner__repo-1"
+    repo_root = _repo_root(tmp_path, [instance_id])
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    _package(
+        artifacts,
+        instance_id,
+        agent_success=False,
+        model_patch="diff --git a/a.py b/a.py\n",
+    )
+
+    summary_path = aggregate_artifacts(
+        "checkpoint_5",
+        artifacts,
+        tmp_path / "combined",
+        expected_commit=COMMIT_SHA,
+        repo_root=repo_root,
+    )
+
+    [result] = json.loads(
+        (summary_path.parent / "results.json").read_text(encoding="utf-8")
+    )
+    assert result["model_patch"] == "diff --git a/a.py b/a.py\n"
+    assert result["patch_generated"] is True
+    assert result["tests_passed"] is None
+    assert result["agent_success"] is False
 
 
 def test_aggregate_keeps_scorer_infrastructure_in_requested_denominator(
@@ -1483,6 +1514,7 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
                 agent_success=True,
                 final_phase="DONE",
                 model_patch="diff --git a/a.py b/a.py\n",
+                patch_generated=True,
                 model_invocations=[_invocation(node="test_generation")],
                 coverage_status="generated_verified",
                 coverage_proof=_coverage_proof(),

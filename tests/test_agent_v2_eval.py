@@ -458,6 +458,44 @@ async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
     assert result["evaluation_mode"] == "end_to_end"
 
 
+async def test_swe_bench_eval_preserves_patch_first_prediction(
+    monkeypatch, tmp_path
+):
+    model_patch = "diff --git a/a.py b/a.py\n"
+
+    async def fake_clone(_state):
+        return "/tmp/exact-work"
+
+    async def fake_agent(_issue_url, **_kwargs):
+        return {
+            "success": False,
+            "patch_generated": True,
+            "tests_passed": None,
+            "final_phase": "DONE",
+            "trace_id": "trace",
+            "run_id": "trace",
+            "model_patch": model_patch,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "git_clone", fake_clone, raising=False)
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+    predictions_path = tmp_path / "prediction.jsonl"
+    swe_bench.write_predictions([result], predictions_path)
+    prediction = json.loads(predictions_path.read_text(encoding="utf-8"))
+
+    assert result["model_patch"] == model_patch
+    assert result["patch_generated"] is True
+    assert result["tests_passed"] is None
+    assert result["agent_success"] is False
+    assert prediction["model_patch"] == model_patch
+
+
 async def test_swe_bench_preclone_and_agent_share_one_trace_identity(monkeypatch):
     captured = {}
 

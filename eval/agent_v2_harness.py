@@ -635,6 +635,9 @@ async def evaluate_agent_v2_sample(
             safe_fields["coverage_status"], safe_fields["coverage_proof"]
         )
     )
+    model_patch = _safe_model_patch(payload.get("model_patch", ""))
+    raw_tests_passed = payload.get("tests_passed")
+    tests_passed = raw_tests_passed if type(raw_tests_passed) is bool else None
 
     result = {
         "id": _safe_text(sample["id"], 500),
@@ -649,6 +652,8 @@ async def evaluate_agent_v2_sample(
         "issue_title": _safe_text(issue["title"]),
         "success": terminal_success,
         "agent_success": terminal_success,
+        "patch_generated": bool(model_patch),
+        "tests_passed": tests_passed,
         # Filled only by an official scorer import; never inferred internally.
         "official_resolved": None,
         "waiting_for_user": payload.get("waiting_for_user") is True,
@@ -684,7 +689,7 @@ async def evaluate_agent_v2_sample(
             {
                 "instance_id": sample["instance_id"],
                 "base_commit": sample["base_commit"],
-                "model_patch": _safe_model_patch(payload.get("model_patch", "")),
+                "model_patch": model_patch,
             }
         )
     return result
@@ -726,6 +731,8 @@ def safe_failed_sample_result(
         "issue_title": _safe_text(issue.get("title")),
         "success": False,
         "agent_success": False,
+        "patch_generated": False,
+        "tests_passed": None,
         "official_resolved": None,
         "waiting_for_user": False,
         "final_phase": "FAILED",
