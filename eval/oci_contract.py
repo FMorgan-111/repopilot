@@ -430,6 +430,8 @@ class ResultRecord(BaseModel):
             )
         if self.patch_generated is not bool(self.model_patch):
             raise ValueError("patch_generated must match model_patch presence")
+        if not self.model_patch and self.tests_passed is not None:
+            raise ValueError("tests_passed requires model_patch")
         if self.model_patch and not self.model_invocations:
             raise ValueError("model_patch requires model invocation history")
         if self.model_patch and not any(

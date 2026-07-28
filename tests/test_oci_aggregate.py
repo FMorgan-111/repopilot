@@ -1585,6 +1585,7 @@ def test_nonready_runtime_rejects_terminal_patch_or_invocations(
         ("result", "attempt_outcome_summary", "attempted"),
         ("result", "base_commit", "d" * 40),
         ("result", "model_patch", "diff --git a/a.py b/a.py\n"),
+        ("result", "tests_passed", True),
         ("result", "coverage_status", "pending"),
         ("result", "coverage_test_files", ["tests/test_auth.py"]),
         ("result", "coverage_test_command", "pytest tests/test_auth.py"),

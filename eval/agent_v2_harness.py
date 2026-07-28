@@ -637,7 +637,11 @@ async def evaluate_agent_v2_sample(
     )
     model_patch = _safe_model_patch(payload.get("model_patch", ""))
     raw_tests_passed = payload.get("tests_passed")
-    tests_passed = raw_tests_passed if type(raw_tests_passed) is bool else None
+    tests_passed = (
+        raw_tests_passed
+        if model_patch and type(raw_tests_passed) is bool
+        else None
+    )
 
     result = {
         "id": _safe_text(sample["id"], 500),

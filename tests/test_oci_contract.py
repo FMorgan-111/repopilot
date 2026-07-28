@@ -387,6 +387,7 @@ def test_result_record_accepts_complete_producer_schema() -> None:
 
     assert record.instance_id == INSTANCE_ID
     assert record.model_invocations[0].provider == "primary"
+    assert record.tests_passed is None
 
 
 @pytest.mark.parametrize("scope", ["result", "invocation"])
@@ -1004,6 +1005,14 @@ def test_patch_generated_must_match_model_patch_presence(
                 model_patch=model_patch,
                 patch_generated=patch_generated,
             )
+        )
+
+
+@pytest.mark.parametrize("tests_passed", [True, False])
+def test_tests_passed_requires_model_patch(tests_passed: bool) -> None:
+    with pytest.raises(ValidationError, match="tests_passed|model_patch"):
+        _result_record_model().model_validate(
+            _result_payload(tests_passed=tests_passed)
         )
 
 
