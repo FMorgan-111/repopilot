@@ -198,16 +198,21 @@ def prompt_with_new_evidence(
         list(evidence_ids),
         max_total_chars=max_evidence_chars,
     )
-    rendered = sanitize_summary_text(
-        store.render_for_prompt(selected),
-        max_evidence_chars,
-        denied_literals=denied_literals,
-    )
+    rendered = store.render_for_prompt(selected)
     ids = ", ".join(item.evidence_id for item in selected)
-    return (
-        f"{base_prompt}\n\n{NEW_EVIDENCE_SECTION}\n"
+    suffix_body = (
+        f"{NEW_EVIDENCE_SECTION}\n"
         f"Evidence IDs: {ids or '(none)'}\n{rendered or '(no new evidence)'}"
     )
+    separator = "\n\n"
+    safe_suffix_body = sanitize_summary_text(
+        suffix_body,
+        max(0, max_evidence_chars - len(separator)),
+        denied_literals=denied_literals,
+    )
+    if not safe_suffix_body:
+        return base_prompt
+    return f"{base_prompt}{separator}{safe_suffix_body}"
 
 
 def record_opus_no_progress(

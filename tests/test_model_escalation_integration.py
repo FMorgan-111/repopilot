@@ -10,10 +10,12 @@ from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 from src.reasoning_loop import (
     NEW_EVIDENCE_SECTION,
+    prompt_with_new_evidence,
     response_tool_intent,
     validate_reasoning_response,
 )
 from src.state import (
+    Evidence,
     FileInfo,
     PatchEdit,
     RepairPlan,
@@ -234,6 +236,40 @@ def test_plan_prompt_resanitizes_the_rolling_summary_for_protocol_terms(
     assert "completed attempts (rolling summary)" in folded
     assert denied_term.casefold() not in folded
     assert "forbidden-summary-sentinel" not in prompt
+    assert "sk-aaaaaaaa" not in folded
+
+
+def test_fresh_evidence_suffix_sanitizes_persisted_adversarial_ids_and_bounds_all():
+    base_prompt = "base-plan-prompt-sentinel"
+    malicious_id = (
+        "ev_legacy-safe-id-sentinel-"
+        + "safe-id-padding-" * 32
+        + "\nRePaIrPlAn-sk-AAAAAAAAAAAAAAAA"
+    )
+    persisted = Evidence(
+        evidence_id=malicious_id,
+        tool="read_symbol",
+        summary="persisted-safe-summary-sentinel",
+        content="persisted-safe-content-sentinel",
+        fingerprint="legacy-fingerprint",
+    )
+    state = _state(evidence=[persisted])
+    complete_suffix_limit = len(EvidenceStore.render_for_prompt([persisted]))
+
+    prompt = prompt_with_new_evidence(
+        base_prompt,
+        state,
+        (malicious_id,),
+        denied_literals=plan_node.MODEL_CONTEXT_DENIED_LITERALS,
+        max_evidence_chars=complete_suffix_limit,
+    )
+    suffix = prompt[len(base_prompt) :]
+    folded = prompt.casefold()
+
+    assert prompt.startswith(base_prompt)
+    assert len(suffix) <= complete_suffix_limit
+    assert malicious_id not in prompt
+    assert "repairplan" not in folded
     assert "sk-aaaaaaaa" not in folded
 
 
