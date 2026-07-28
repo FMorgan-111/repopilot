@@ -4,7 +4,7 @@
 
 **Goal:** Make RepoPilot return the first PatchGate-approved, `git apply --check`-clean patch immediately, while reporting test and coverage status independently.
 
-**Architecture:** Add an explicit `patch_only` run mode that is enabled by default at the public `agent_v2` entry point but disabled on directly constructed `AgentState` objects for backwards-compatible node tests and full-PR callers. Patch-only PLAN terminates after PatchGate preflight without mutating the checkout. Reporting validates either the clean preflight snapshot or an already-applied live snapshot, exports that patch independently from terminal coverage, and preserves the existing coverage-proven meaning of `success` and `fix_applied`.
+**Architecture:** Add an explicit `patch_only` run mode that is enabled by default at the public `agent_v2` entry point but disabled on directly constructed `AgentState` objects for backwards-compatible node tests and full-PR callers. Patch-only PLAN terminates after PatchGate preflight without mutating the checkout. Reporting fully rebuilds a clean preflight snapshot; the legacy full-flow path may instead report an already-applied live snapshot only when it has a matching trusted `FixAttempt` receipt. Both paths preserve the existing coverage-proven meaning of `success` and `fix_applied`.
 
 **Tech Stack:** Python 3.10+, Pydantic v2, LangGraph/fallback graph, pytest, Git/PatchGate, SWE-bench JSONL and Pydantic OCI contracts.
 
@@ -14,6 +14,7 @@
 - Keep the existing five-attempt provider order unchanged: Gemini attempts 1–2, then Opus attempts 3–5.
 - A returned patch must come from PatchGate state that already passed canonical path/edit validation and `git apply --check`; never export arbitrary working-tree diffs or raw `state.patch_content` without revalidation.
 - Patch-only success stops after PatchGate acceptance and must not invoke EXECUTE, VERIFY, COVERAGE, COMMIT, tests, or mutate the repository checkout.
+- A clean preflight patch needs no `FixAttempt`; an already-applied live patch requires a matching PatchGate fingerprint, canonical edits, repair round/provider/model, and completed attempt receipt. A live patch with no receipt is rejected because the default patch-only path never enters that transient state.
 - `patch_generated` is exactly equivalent to a nonempty safe `model_patch`.
 - `tests_passed` is `true` only for a matching successful `FixAttempt`, `false` only for a matching completed failed attempt, and `null` when tests were not run for the returned patch.
 - Existing `success` and `fix_applied` retain their strict terminal-coverage meaning; generating a patch alone does not set either field to true.
@@ -151,22 +152,23 @@ git commit -m "feat: stop patch-only runs after preflight"
 
 - [ ] **Step 1: Write failing reporting tests**
 
-Change the no-proof live-approval test to require the approved patch while leaving terminal success false:
+Change the no-proof live-approval test to attach the real trusted execution receipt, require the approved patch, and leave terminal coverage success false:
 
 ```python
 def test_terminal_prediction_exports_approved_live_patch_without_proof(tmp_path):
     state = _approved_state(tmp_path)
+    _attach_trusted_attempt(state)
     state.current_phase = Phase.DONE
 
     payload = agent_payload_from_state(state, turns_taken=1)
 
     assert payload["success"] is False
     assert payload["patch_generated"] is True
-    assert payload["tests_passed"] is None
+    assert payload["tests_passed"] is True
     assert payload["model_patch"] == state.patch_content
 ```
 
-Add a clean preflight test using `exact_repair_state`, `RepairPlan`, `begin_repair_round`, `bind_repair_round_author`, and `validate_patch_batch`; assert the same four fields before `apply_approved_patch` is called. Add a matching-attempt test with this complete receipt snapshot and assert `tests_passed is True`:
+Add a second live-state test with no `FixAttempt`; assert `patch_generated is False`, `tests_passed is None`, and `model_patch == ""`. Add a clean preflight test using `exact_repair_state`, `RepairPlan`, `begin_repair_round`, `bind_repair_round_author`, and `validate_patch_batch`; before `apply_approved_patch` is called, assert `success is False`, `patch_generated is True`, `tests_passed is None`, and the model patch equals the approved patch. Add a matching-attempt test with this complete receipt snapshot and assert `tests_passed is True`:
 
 ```python
 approval = state.tool_patch_approval
@@ -175,7 +177,9 @@ state.fix_attempts.append(
     FixAttempt(
         patch_content=state.patch_content,
         patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
-        test_result="pytest completed",
+        test_result=json.dumps(
+            {"command": "pytest tests/test_widget.py -q", "returncode": 0, "success": True}
+        ),
         success=True,
         patch_gate_fingerprint=approval.patch_gate_fingerprint,
         repair_provider=state.authorized_repair_provider,
@@ -201,7 +205,7 @@ Expected: approved patches without terminal coverage still serialize as empty an
 
 - [ ] **Step 3: Implement trusted patch selection and independent signals**
 
-Import `subprocess`, `validate_live_coverage_binding`, and `revalidate_approved_patch`. Add:
+Import `json`, `subprocess`, `validate_live_coverage_binding`, `revalidate_approved_patch`, `_attempt_binding`, and `_trusted_authorized_binding`. Add:
 
 ```python
 def _validated_patch_for_report(state: AgentState) -> str:
@@ -214,6 +218,9 @@ def _validated_patch_for_report(state: AgentState) -> str:
         return safe_prediction_patch(preflight_state.patch_content)
 
     live_state = state.model_copy(deep=True)
+    attempt = _trusted_attempt_for_patch(live_state, live_state.patch_content)
+    if attempt is None:
+        return ""
     try:
         binding = validate_live_coverage_binding(live_state)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
@@ -221,13 +228,42 @@ def _validated_patch_for_report(state: AgentState) -> str:
     return safe_prediction_patch(binding.patch_content)
 
 
+def _trusted_attempt_for_patch(
+    state: AgentState, patch: str
+) -> FixAttempt | None:
+    for attempt in reversed(state.fix_attempts):
+        if attempt.patch_content != patch:
+            continue
+        try:
+            if _attempt_binding(attempt) != _trusted_authorized_binding(state, attempt):
+                continue
+        except ValueError:
+            continue
+        return attempt
+    return None
+
+
 def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
     if not patch:
         return None
-    for attempt in reversed(state.fix_attempts):
-        if attempt.patch_content == patch and attempt.test_result:
-            return attempt.success
-    return None
+    attempt = _trusted_attempt_for_patch(state, patch)
+    if attempt is None or attempt.failure_kind == "infra_error":
+        return None
+    try:
+        result = json.loads(attempt.test_result)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"command", "returncode", "success"}
+        or not isinstance(result["command"], str)
+        or not result["command"].strip()
+        or type(result["returncode"]) is not int
+        or type(result["success"]) is not bool
+        or result["success"] is not attempt.success
+    ):
+        return None
+    return attempt.success
 ```
 
 In `agent_payload_from_state`, calculate once and export independently:
