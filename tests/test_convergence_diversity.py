@@ -13,7 +13,7 @@ from src.nodes import execute as execute_node
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 from src.patch_authorization import authorize_plan_patch
-from src.repair_rounds import begin_repair_round
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.repair_rounds import validate_repair_round_state
 from src.state import PatchEdit
 
@@ -589,6 +589,7 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
         repo_ref=ref,
     )
     begin_repair_round(state)
+    bind_repair_round_author(state)
     raw = json.loads(
         _execute_response(
             "module.py",
@@ -788,6 +789,7 @@ async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monke
         repo_ref=ref,
     )
     begin_repair_round(state)
+    bind_repair_round_author(state)
     raw = json.loads(
         _execute_response(
             "module.py",

@@ -8,49 +8,125 @@ import re
 from typing import Any
 
 from ..model_policy import record_no_progress, record_progress
+from ..repair_rounds import (
+    record_failed_repair_round,
+    validate_repair_round_state,
+)
 from ..state import (
     AgentState,
     FixAttempt,
     Phase,
     _as_state,
-    _is_budget_exceeded,
     _record_node_diagnostic,
-    _same_failure_seen_twice,
+    tool_manifest_fingerprint,
 )
 
 
-def _consecutive_failure_count(attempts: list[FixAttempt], failure_kind: str) -> int:
-    count = 0
-    for attempt in reversed(attempts):
-        if _failure_kind(attempt) != failure_kind:
-            break
-        count += 1
-    return count
-
-
-def _is_patch_preflight_failure(attempt: FixAttempt) -> bool:
-    return (
-        _failure_kind(attempt) == "patch_apply_failed"
-        and "patch preflight check failed" in attempt.error_log.lower()
+def _trusted_authorized_binding(
+    state: AgentState,
+    latest: FixAttempt,
+) -> tuple[int, str, str]:
+    """Validate the persisted, fingerprint-bound author for this exact patch."""
+    approval = state.tool_patch_approval
+    plan = state.active_repair_plan
+    binding = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider or "",
+        state.authorized_repair_model,
     )
+    if (
+        approval is None
+        or plan is None
+        or binding[0] <= 0
+        or not binding[1]
+        or not binding[2]
+        or not state.patch_content
+        or not state.patch_edits
+    ):
+        raise ValueError("trusted PatchGate authorization is unavailable")
+    if approval.base_ref.lower() != state.repo_ref.lower():
+        raise ValueError("PatchGate authorization base does not match state")
+    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+    if patch_sha != approval.patch_sha256:
+        raise ValueError("PatchGate authorization patch digest changed")
+    if (
+        tool_manifest_fingerprint(approval.changed_manifest)
+        != approval.manifest_fingerprint
+    ):
+        raise ValueError("PatchGate authorization manifest changed")
+    if latest.patch_content != state.patch_content:
+        raise ValueError("FixAttempt patch does not match frozen authorization")
 
+    from ..patch_gate import _approval_edit_payload, _fingerprint
 
-def _is_patch_repair_failure(attempt: FixAttempt) -> bool:
-    if _is_patch_preflight_failure(attempt):
-        return True
-    return (
-        _failure_kind(attempt) == "patch_apply_failed"
-        and "search/replace edit failed" in attempt.error_log.lower()
+    attempt_edits = [_approval_edit_payload(edit) for edit in latest.patch_edits]
+    state_edits = [_approval_edit_payload(edit) for edit in state.patch_edits]
+    if not attempt_edits or attempt_edits != state_edits:
+        raise ValueError("FixAttempt edits do not match frozen authorization")
+    expected_fingerprint = _fingerprint(
+        state,
+        plan,
+        state.patch_edits,
+        list(approval.changed_manifest),
+        approval.patch_sha256,
+        binding,
     )
+    if expected_fingerprint != approval.patch_gate_fingerprint:
+        raise ValueError("PatchGate authorization fingerprint changed")
+    return binding
 
 
-def _consecutive_patch_repair_failure_count(attempts: list[FixAttempt]) -> int:
-    count = 0
-    for attempt in reversed(attempts):
-        if not _is_patch_repair_failure(attempt):
-            break
-        count += 1
-    return count
+def _prepare_failure_attribution(
+    state: AgentState,
+    latest: FixAttempt,
+) -> tuple[int, str, str]:
+    binding = _trusted_authorized_binding(state, latest)
+    attempt_binding = (
+        latest.repair_round_id,
+        latest.repair_provider or "",
+        latest.repair_model,
+    )
+    if latest.repair_round_id == 0:
+        if attempt_binding != (0, "", ""):
+            raise ValueError("historical FixAttempt attribution is partial")
+        latest.repair_provider = binding[1]
+        latest.repair_model = binding[2]
+        latest.repair_round_id = binding[0]
+    elif attempt_binding != binding:
+        raise ValueError("FixAttempt attribution does not match authorization")
+
+    if binding[0] > state.last_counted_repair_round_id:
+        if state.current_repair_round_id == 0:
+            orphaned_author = (
+                state.current_repair_provider or "",
+                state.current_repair_model,
+            )
+            if orphaned_author not in {
+                ("", ""),
+                (binding[1], binding[2]),
+            }:
+                raise ValueError(
+                    "orphaned current repair author does not match authorization"
+                )
+            state.current_repair_round_id = binding[0]
+            state.current_repair_provider = binding[1]
+            state.current_repair_model = binding[2]
+        elif (
+            state.current_repair_round_id,
+            state.current_repair_provider or "",
+            state.current_repair_model,
+        ) != binding:
+            raise ValueError("open repair ledger does not match FixAttempt")
+        validate_repair_round_state(state)
+    return binding
+
+
+def _route_state_integrity_failure(state: AgentState, exc: Exception) -> AgentState:
+    state.failure_reason = (
+        f"Infrastructure state-integrity error during verification: {str(exc)[:500]}"
+    )
+    state.current_phase = Phase.FAILURE
+    return state
 
 
 def _failure_kind(attempt: FixAttempt) -> str:
@@ -82,7 +158,9 @@ def _test_failure_class(attempt: FixAttempt) -> str:
     return failure_kind or "test_failed"
 
 
-def _failure_signature_payload(attempt: FixAttempt, failure_class: str) -> dict[str, str]:
+def _failure_signature_payload(
+    attempt: FixAttempt, failure_class: str
+) -> dict[str, str]:
     error_log = attempt.error_log.replace("\\", "/")
     test_ids = sorted(
         set(
@@ -233,67 +311,33 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         state.current_phase = Phase.FAILURE
         return state
 
-    if _same_failure_seen_twice(state) and failure_class not in {
-        "syntax_error",
-        "import_error",
-        "assertion_failure",
-    }:
-        state.failure_reason = "Same patch produced the same failure twice."
-        state.current_phase = Phase.FAILURE
-        return state
+    try:
+        round_id, provider, model = _prepare_failure_attribution(state, latest)
+    except (TypeError, ValueError) as exc:
+        return _route_state_integrity_failure(state, exc)
 
-    if _failure_kind(latest) == "patch_apply_failed":
-        if _is_patch_repair_failure(latest):
-            consecutive_repair_failures = _consecutive_patch_repair_failure_count(
-                state.fix_attempts
+    retry_phase = (
+        Phase.PLAN
+        if failure_class in {"syntax_error", "import_error"}
+        else Phase.REFLECT
+    )
+    if round_id <= state.last_counted_repair_round_id:
+        try:
+            record_failed_repair_round(
+                state,
+                round_id=round_id,
+                provider=provider,
+                model=model,
+                failure_reason=failure_class,
+                retry_phase=retry_phase,
             )
-            repair_budget = state.max_retries + 1
-            if consecutive_repair_failures <= repair_budget:
-                if _is_budget_exceeded(state):
-                    state.failure_reason = "Token budget exceeded during verification."
-                    state.current_phase = Phase.FAILURE
-                    return state
-                state.current_phase = Phase.REFLECT
-                return state
-            state.failure_reason = (
-                "Patch repair budget exhausted after "
-                f"{consecutive_repair_failures} failures."
-            )
-            state.current_phase = Phase.FAILURE
-            return state
-
-        consecutive_patch_apply_failures = _consecutive_failure_count(
-            state.fix_attempts,
-            "patch_apply_failed",
-        )
-        if consecutive_patch_apply_failures == 1:
-            state.current_phase = Phase.REFLECT
-            return state
-        if state.retry_count >= state.max_retries:
-            state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-            state.current_phase = Phase.FAILURE
-            return state
-        if _is_budget_exceeded(state):
-            state.failure_reason = "Token budget exceeded during verification."
-            state.current_phase = Phase.FAILURE
-            return state
-        state.retry_count += 1
-        state.current_phase = Phase.REFLECT
+        except (TypeError, ValueError) as exc:
+            return _route_state_integrity_failure(state, exc)
         return state
 
     repeated_failure = _record_test_failure_progress(state, latest, failure_class)
 
     if failure_class in {"syntax_error", "import_error"}:
-        if state.retry_count >= state.max_retries:
-            state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-            state.current_phase = Phase.FAILURE
-            return state
-        if _is_budget_exceeded(state):
-            state.failure_reason = "Token budget exceeded during verification."
-            state.current_phase = Phase.FAILURE
-            return state
-        state.retry_count += 1
-        state.current_phase = Phase.PLAN
         _record_node_diagnostic(
             state,
             node="verify_fix",
@@ -302,21 +346,8 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
             elapsed_seconds=0.0,
             failure_class=failure_class,
         )
-        return state
 
     if failure_class == "assertion_failure" and repeated_failure:
-        if state.assertion_no_progress_rounds >= 2:
-            state.failure_reason = "repeated_assertion_no_progress"
-            state.current_phase = Phase.FAILURE
-            _record_node_diagnostic(
-                state,
-                node="verify_fix",
-                event="assertion_no_progress_limit",
-                status="error",
-                elapsed_seconds=0.0,
-                round=state.no_progress_rounds,
-            )
-            return state
         state.assertion_diversity_required = True
         _record_node_diagnostic(
             state,
@@ -327,16 +358,15 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
             round=state.no_progress_rounds,
         )
 
-    if state.retry_count >= state.max_retries:
-        state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-        state.current_phase = Phase.FAILURE
-        return state
-
-    if _is_budget_exceeded(state):
-        state.failure_reason = "Token budget exceeded during verification."
-        state.current_phase = Phase.FAILURE
-        return state
-
-    state.retry_count += 1
-    state.current_phase = Phase.REFLECT
+    try:
+        record_failed_repair_round(
+            state,
+            round_id=round_id,
+            provider=provider,
+            model=model,
+            failure_reason=failure_class,
+            retry_phase=retry_phase,
+        )
+    except (TypeError, ValueError) as exc:
+        return _route_state_integrity_failure(state, exc)
     return state

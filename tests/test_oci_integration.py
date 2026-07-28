@@ -12,6 +12,7 @@ import pytest
 
 from src.nodes import execute as execute_node
 from src.patch_gate import validate_patch_batch
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.safe_subprocess import ProcessTimeoutError, SandboxPaths, run_oci_process
 from src.state import (
     AgentState,
@@ -184,7 +185,10 @@ def test_real_docker_boundary_and_cleanup(tmp_path, monkeypatch):
             )
         ]
     )
+    begin_repair_round(state)
+    bind_repair_round_author(state)
     assert validate_patch_batch(state, plan, batch).accepted
+    assert state.authorized_repair_round_id > 0
     for key in secret_keys:
         monkeypatch.setenv(key, f"host-{key.lower()}-sentinel")
     assert not setup_sentinel.exists()

@@ -2,7 +2,7 @@ import subprocess
 
 import src.new_agent as new_agent
 from src.nodes import plan as plan_node
-from src.repair_rounds import begin_repair_round
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -65,6 +65,7 @@ async def test_primary_plan_replacement_atomically_retires_old_gate_approval(
     from src.patch_gate import validate_patch_batch
 
     begin_repair_round(state)
+    bind_repair_round_author(state)
     assert validate_patch_batch(state, repair_plan, _verified("return 1")).accepted
     assert state.tool_patch_approval is not None
     old_fingerprint = state.tool_patch_approval.patch_gate_fingerprint
@@ -109,7 +110,7 @@ async def test_primary_plan_replacement_atomically_retires_old_gate_approval(
     assert result.authorized_repair_model == "gemini-3.5-flash:stable"
 
 
-async def test_patch_apply_failure_routes_to_failure_when_budget_exhausted():
+async def test_unattributed_patch_failure_is_integrity_failure_when_budget_exhausted():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         max_retries=1,
@@ -137,10 +138,10 @@ async def test_patch_apply_failure_routes_to_failure_when_budget_exhausted():
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
     assert next_state.retry_count == 1
-    assert next_state.failure_reason == "Maximum retries reached: 1."
+    assert "state-integrity" in next_state.failure_reason.lower()
 
 
-async def test_consecutive_preflight_failures_do_not_consume_semantic_retry():
+async def test_unattributed_preflight_failures_do_not_consume_semantic_retry():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         max_retries=1,
@@ -166,11 +167,12 @@ async def test_consecutive_preflight_failures_do_not_consume_semantic_retry():
 
     next_state = await new_agent.verify_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.current_phase == new_agent.Phase.FAILURE
     assert next_state.retry_count == 0
+    assert "state-integrity" in next_state.failure_reason.lower()
 
 
-async def test_consecutive_search_replace_failures_do_not_consume_semantic_retry():
+async def test_unattributed_search_replace_failures_do_not_consume_retry():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         max_retries=1,
@@ -214,11 +216,12 @@ async def test_consecutive_search_replace_failures_do_not_consume_semantic_retry
 
     next_state = await new_agent.verify_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.REFLECT
+    assert next_state.current_phase == new_agent.Phase.FAILURE
     assert next_state.retry_count == 0
+    assert "state-integrity" in next_state.failure_reason.lower()
 
 
-async def test_preflight_repair_failures_are_bounded_without_semantic_retry():
+async def test_unattributed_preflight_history_is_state_integrity_failure():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         max_retries=1,
@@ -253,12 +256,10 @@ async def test_preflight_repair_failures_are_bounded_without_semantic_retry():
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
     assert next_state.retry_count == 0
-    assert next_state.failure_reason == (
-        "Patch repair budget exhausted after 3 failures."
-    )
+    assert "state-integrity" in next_state.failure_reason.lower()
 
 
-async def test_search_replace_repair_failures_are_bounded_without_semantic_retry():
+async def test_unattributed_search_replace_history_is_state_integrity_failure():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         max_retries=1,
@@ -289,6 +290,4 @@ async def test_search_replace_repair_failures_are_bounded_without_semantic_retry
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
     assert next_state.retry_count == 0
-    assert next_state.failure_reason == (
-        "Patch repair budget exhausted after 3 failures."
-    )
+    assert "state-integrity" in next_state.failure_reason.lower()

@@ -43,7 +43,6 @@ from ..state import (
     _primary_patch_file,
     _record_node_diagnostic,
     _record_tool,
-    tool_manifest_fingerprint,
 )
 from ..tool_policy import fixed_pytest_argv, fixed_test_argv, repository_execution_mode
 
@@ -130,9 +129,7 @@ def _repo_work_path(
     """Return a mutable checkout path containing only a SHA-256 trace scope."""
     scope = _trace_scope(trace_id)
     return (
-        _repopilot_home()
-        / "repos"
-        / f"{_repo_key(owner, repo, repo_ref)}-work-{scope}"
+        _repopilot_home() / "repos" / f"{_repo_key(owner, repo, repo_ref)}-work-{scope}"
     )
 
 
@@ -210,9 +207,7 @@ def _validated_repo_ref(state: AgentState) -> str:
     return state.repo_ref.lower()
 
 
-def _repo_cache_event(
-    event: str, state: AgentState, **details: object
-) -> None:
+def _repo_cache_event(event: str, state: AgentState, **details: object) -> None:
     payload = {
         "event": event,
         "repo": f"{state.owner}/{state.repo}",
@@ -229,7 +224,9 @@ def _repo_cache_event(
 def _repo_url(state: AgentState, *, include_token: bool) -> str:
     token = os.getenv("GITHUB_TOKEN", "") if include_token else ""
     if token:
-        return f"https://x-access-token:{token}@github.com/{state.owner}/{state.repo}.git"
+        return (
+            f"https://x-access-token:{token}@github.com/{state.owner}/{state.repo}.git"
+        )
     return f"https://github.com/{state.owner}/{state.repo}.git"
 
 
@@ -344,9 +341,7 @@ async def _worktree_is_healthy(work: str) -> bool:
 
 
 async def _worktree_head(work: str) -> str:
-    result = await _run_git_async(
-        ["git", "-C", work, "rev-parse", "HEAD"], timeout=30
-    )
+    result = await _run_git_async(["git", "-C", work, "rev-parse", "HEAD"], timeout=30)
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
@@ -405,10 +400,9 @@ async def _cache_origin_matches(state: AgentState, cache_path: Path) -> bool:
         ],
         timeout=30,
     )
-    return (
-        result.returncode == 0
-        and result.stdout.splitlines() == [_repo_url(state, include_token=False)]
-    )
+    return result.returncode == 0 and result.stdout.splitlines() == [
+        _repo_url(state, include_token=False)
+    ]
 
 
 def _is_transient_git_transport_error(error: BaseException) -> bool:
@@ -439,9 +433,8 @@ async def _fetch_exact_ref(
             await _checked_git(command, 300)
             return
         except Exception as exc:
-            if (
-                not _is_transient_git_transport_error(exc)
-                or attempt == len(retry_delays)
+            if not _is_transient_git_transport_error(exc) or attempt == len(
+                retry_delays
             ):
                 raise
             await asyncio.sleep(max(0.0, retry_delays[attempt]))
@@ -570,9 +563,7 @@ async def _populate_live_cache(state: AgentState, cache_path: Path) -> None:
             _remove_tree_after_failure(cache_path, failure)
             raise
         clone_failure = RuntimeError(
-            _redact_sensitive_error_text(
-                (result.stderr or result.stdout).strip()
-            )
+            _redact_sensitive_error_text((result.stderr or result.stdout).strip())
         )
         last_error = str(clone_failure)
         _remove_tree_after_failure(cache_path, clone_failure)
@@ -583,9 +574,7 @@ async def git_clone(state: AgentState) -> str:
     """Prepare a fresh live checkout or an immutable benchmark checkout."""
     repo_ref = _validated_repo_ref(state)
     cache_path = _repo_cache_path(state.owner, state.repo, repo_ref)
-    work = str(
-        _repo_work_path(state.owner, state.repo, repo_ref, state.trace_id)
-    )
+    work = str(_repo_work_path(state.owner, state.repo, repo_ref, state.trace_id))
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     async with _cache_lock(cache_path):
         return await _git_clone_locked(state, repo_ref, cache_path, work)
@@ -614,10 +603,7 @@ async def _git_clone_locked(
 
     reuse_work = False
     if repo_ref and (Path(work) / ".git").exists():
-        if (
-            await _worktree_is_healthy(work)
-            and await _worktree_head(work) == repo_ref
-        ):
+        if await _worktree_is_healthy(work) and await _worktree_head(work) == repo_ref:
             reuse_work = True
         else:
             _repo_cache_event("ref_mismatch", state, target="worktree")
@@ -874,7 +860,11 @@ def _apply_patch_edits(
                             f"for {edit.file_path}."
                         ),
                     )
-                content = raw_content.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+                content = (
+                    raw_content.decode("utf-8")
+                    .replace("\r\n", "\n")
+                    .replace("\r", "\n")
+                )
 
         if is_new_file:
             updated = edit.replace
@@ -931,7 +921,9 @@ def _apply_patch_edits(
                         if edit.replace_all
                         or edit.exact_only
                         or not edit.file_path.endswith(".py")
-                        else try_upgrade_to_node_target(content, edit.search, edit.replace)
+                        else try_upgrade_to_node_target(
+                            content, edit.search, edit.replace
+                        )
                     )
                     node_span = (
                         locate_node_span(content, qualname) if qualname else None
@@ -941,6 +933,7 @@ def _apply_patch_edits(
                         # the gate). Reports the shape of this apply-failure.
                         if edit.file_path.endswith(".py") and not edit.replace_all:
                             from ..patch_match import diagnose_node_upgrade
+
                             print(
                                 f"  [execute] node-upgrade declined edit {index} "
                                 f"{edit.file_path}: {diagnose_node_upgrade(content, edit.search, edit.replace)}",
@@ -970,7 +963,11 @@ def _apply_patch_edits(
                     updated = content[:n_start] + body + content[n_end:]
                 else:
                     start, end, indent_delta = span
-                    updated = content[:start] + reindent(edit.replace, indent_delta) + content[end:]
+                    updated = (
+                        content[:start]
+                        + reindent(edit.replace, indent_delta)
+                        + content[end:]
+                    )
 
         pending_writes[file_path] = updated
         if edit.file_path not in changed_files:
@@ -1076,7 +1073,9 @@ def _venv_ready_marker(repo_path: str) -> Path:
 
 
 def _venv_is_ready(repo_path: str) -> bool:
-    return _venv_python_path(repo_path).exists() and _venv_ready_marker(repo_path).exists()
+    return (
+        _venv_python_path(repo_path).exists() and _venv_ready_marker(repo_path).exists()
+    )
 
 
 def _mark_venv_ready(repo_path: str) -> None:
@@ -1100,8 +1099,7 @@ def _create_venv(repo_path: str) -> dict[str, Any]:
         shutil.rmtree(venv_dir, ignore_errors=True)
     try:
         result = subprocess.run(
-            ["python3", "-m", "venv", "--system-site-packages",
-             str(venv_dir)],
+            ["python3", "-m", "venv", "--system-site-packages", str(venv_dir)],
             capture_output=True,
             text=True,
             timeout=VENV_CREATE_TIMEOUT_SECONDS,
@@ -1179,11 +1177,19 @@ def _pip_install_editable(
                 env=minimal_subprocess_env(),
             )
         except subprocess.TimeoutExpired:
-            return {"attempted": True, "success": False, "reason": "timeout",
-                    "command": " ".join(cmd)}
+            return {
+                "attempted": True,
+                "success": False,
+                "reason": "timeout",
+                "command": " ".join(cmd),
+            }
         except Exception as exc:  # pragma: no cover - defensive
-            return {"attempted": True, "success": False, "reason": str(exc)[:200],
-                    "command": " ".join(cmd)}
+            return {
+                "attempted": True,
+                "success": False,
+                "reason": str(exc)[:200],
+                "command": " ".join(cmd),
+            }
         last = {
             "attempted": True,
             "success": result.returncode == 0,
@@ -1225,11 +1231,19 @@ def _ensure_pytest_available(python_exe: str) -> dict[str, Any]:
             env=minimal_subprocess_env(),
         )
     except subprocess.TimeoutExpired:
-        return {"attempted": True, "success": False, "reason": "timeout",
-                "command": " ".join(cmd)}
+        return {
+            "attempted": True,
+            "success": False,
+            "reason": "timeout",
+            "command": " ".join(cmd),
+        }
     except Exception as exc:  # pragma: no cover - defensive
-        return {"attempted": True, "success": False, "reason": str(exc)[:200],
-                "command": " ".join(cmd)}
+        return {
+            "attempted": True,
+            "success": False,
+            "reason": str(exc)[:200],
+            "command": " ".join(cmd),
+        }
     return {
         "attempted": True,
         "success": result.returncode == 0,
@@ -1279,20 +1293,72 @@ async def run_pytest(repo_path: str, command: str | None = None) -> dict[str, An
     }
 
 
-def _validate_oci_execution_state(state: AgentState) -> None:
+def _validate_execution_state(state: AgentState) -> None:
+    """Require one complete, frozen PatchGate transaction in every mode."""
     if not _COMMIT_RE.fullmatch(state.repo_ref):
-        raise RuntimeError("OCI execution requires an exact 40-character repo_ref")
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires an exact "
+            "40-character repo_ref"
+        )
     approval = state.tool_patch_approval
     if approval is None or approval.base_ref.lower() != state.repo_ref.lower():
-        raise RuntimeError("OCI execution requires an exact PatchGate approval")
-    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
-    if patch_sha != approval.patch_sha256:
-        raise RuntimeError("OCI execution PatchGate approval does not match the patch")
-    if (
-        tool_manifest_fingerprint(approval.changed_manifest)
-        != approval.manifest_fingerprint
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires an exact PatchGate approval"
+        )
+    if not state.repo_path:
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires an exact repository"
+        )
+    if state.active_repair_plan is None:
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires an active RepairPlan"
+        )
+    if not state.patch_content:
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires a canonical patch"
+        )
+    if not state.patch_edits or any(
+        not edit.exact_only or not edit.expected_content_sha256
+        for edit in state.patch_edits
     ):
-        raise RuntimeError("OCI execution PatchGate manifest approval is invalid")
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires ordered exact edits"
+        )
+    if (
+        state.authorized_repair_round_id <= 0
+        or state.authorized_repair_provider is None
+        or not state.authorized_repair_model
+    ):
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires frozen repair attribution"
+        )
+    from ..patch_gate import revalidate_approved_patch
+
+    revalidate_approved_patch(state)
+
+
+def _fix_attempt_from_state(state: AgentState) -> FixAttempt:
+    """Snapshot mutation data without sharing mutable canonical edit objects."""
+    edits = [edit.model_copy(deep=True) for edit in state.patch_edits]
+    attribution: dict[str, Any] = {}
+    if (
+        state.authorized_repair_round_id > 0
+        and state.authorized_repair_provider is not None
+        and state.authorized_repair_model
+    ):
+        attribution = {
+            "repair_provider": state.authorized_repair_provider,
+            "repair_model": state.authorized_repair_model,
+            "repair_round_id": state.authorized_repair_round_id,
+        }
+    return FixAttempt(
+        patch_content=state.patch_content,
+        patch_edits=edits,
+        file_path=(
+            edits[0].file_path if edits else _primary_patch_file(state.patch_content)
+        ),
+        **attribution,
+    )
 
 
 def _oci_test_argv(state: AgentState) -> list[str]:
@@ -1350,34 +1416,10 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         state.current_phase = Phase.FAILURE
         return state
 
-    patch = state.patch_content
-    for edit in state.patch_edits:
-        if edit.node_target:
-            edit.resolved_target_symbol = edit.node_target
-        elif edit.search:
-            edit.resolved_target_symbol = (
-                resolve_search_target_symbol(
-                    state,
-                    edit.file_path,
-                    edit.search,
-                )
-                or ""
-            )
-        else:
-            edit.resolved_target_symbol = ""
-    attempt = FixAttempt(
-        patch_content=patch,
-        patch_edits=state.patch_edits,
-        file_path=(
-            state.patch_edits[0].file_path
-            if state.patch_edits
-            else _primary_patch_file(patch)
-        ),
-    )
+    attempt = _fix_attempt_from_state(state)
     try:
         execution_mode = repository_execution_mode(state)
-        if execution_mode == "oci":
-            _validate_oci_execution_state(state)
+        _validate_execution_state(state)
     except Exception as exc:
         attempt.test_result = "execution_error"
         attempt.failure_kind = "infra_error"
@@ -1386,29 +1428,26 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         state.fix_attempts.append(attempt)
         state.current_phase = Phase.VERIFY
         return state
-    try:
-        cloned_during_execute = False
-        if not state.repo_path:
-            try:
-                state.repo_path = await git_clone(state)
-            except CancellationDrainError:
-                raise
-            except Exception as exc:
-                attempt.test_result = "execution_error"
-                attempt.failure_kind = "infra_error"
-                attempt.error_log = _redact_sensitive_error_text(str(exc))
-                attempt.success = False
-                state.fix_attempts.append(attempt)
-                state.current_phase = Phase.VERIFY
-                return state
-            cloned_during_execute = True
-        if execution_mode == "oci":
-            from ..patch_gate import revalidate_approved_patch
 
-            revalidate_approved_patch(state)
-        if execution_mode == "unsafe_host" and (
-            cloned_during_execute or state.repo_ref
-        ):
+    # Re-snapshot only after the common invariant proves this is the exact
+    # frozen authorization that will be executed.
+    attempt = _fix_attempt_from_state(state)
+    try:
+        for edit in attempt.patch_edits:
+            if edit.node_target:
+                edit.resolved_target_symbol = edit.node_target
+            elif edit.search:
+                edit.resolved_target_symbol = (
+                    resolve_search_target_symbol(
+                        state,
+                        edit.file_path,
+                        edit.search,
+                    )
+                    or ""
+                )
+            else:
+                edit.resolved_target_symbol = ""
+        if execution_mode == "unsafe_host":
             # Build an isolated venv once, right after the fresh clone, then do
             # a best-effort editable install into it so the package and its test
             # deps import when pytest runs. The venv sidesteps PEP 668 on
@@ -1442,88 +1481,30 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
                     {"python": install_python},
                     pytest_record,
                 )
-        if state.patch_edits:
-            if state.tool_patch_approval is not None:
-                from ..patch_gate import apply_approved_patch
+        from ..patch_gate import apply_approved_patch
 
-                changed_files = apply_approved_patch(state)
-                edit_result = PatchEditApplyResult(
-                    applied=True,
-                    output=(
-                        f"Applied {len(state.patch_edits)} exact PatchGate edit(s) "
-                        "transactionally."
-                    ),
-                    changed_files=changed_files,
-                )
-            elif any(edit.exact_only for edit in state.patch_edits):
-                edit_result = PatchEditApplyResult(
-                    applied=False,
-                    output="Exact PatchGate edits require their frozen approval.",
-                )
-            else:
-                edit_result = _apply_patch_edits(state.repo_path, state.patch_edits)
-            _record_tool(
-                state,
-                "apply_patch_edits",
-                {"edit_count": len(state.patch_edits)},
-                {
-                    "applied": edit_result.applied,
-                    "changed_files": edit_result.changed_files,
-                    "output": edit_result.output,
-                },
-            )
-            if not edit_result.applied:
-                attempt.test_result = "patch_apply_failed"
-                attempt.failure_kind = "patch_apply_failed"
-                attempt.error_log = _redact_sensitive_error_text(edit_result.output)
-                attempt.success = False
-                state.fix_attempts.append(attempt)
-                state.current_phase = Phase.VERIFY
-                return state
-        else:
-            apply_result = await apply_patch_with_repair(state.repo_path, patch)
-            if apply_result.repaired:
-                attempt.patch_content = apply_result.patch_content
-                attempt.file_path = _primary_patch_file(apply_result.patch_content)
-                state.patch_content = apply_result.patch_content
-                _record_node_diagnostic(
-                    state,
-                    node="execute_fix",
-                    event="patch_repair",
-                    status="success" if apply_result.applied else "error",
-                    elapsed_seconds=0.0,
-                    repair_reasons=apply_result.repair_reasons,
-                    original_patch_chars=len(patch),
-                    repaired_patch_chars=len(apply_result.patch_content),
-                    output_preview=apply_result.output[:500],
-                )
-                _record_tool(
-                    state,
-                    "patch_repair",
-                    {"original_chars": len(patch)},
-                    {
-                        "changed": True,
-                        "reasons": apply_result.repair_reasons,
-                        "repaired_chars": len(apply_result.patch_content),
-                    },
-                )
-            if not apply_result.applied:
-                attempt.test_result = "patch_apply_failed"
-                attempt.failure_kind = "patch_apply_failed"
-                attempt.error_log = _redact_sensitive_error_text(apply_result.output)
-                attempt.success = False
-                state.fix_attempts.append(attempt)
-                state.current_phase = Phase.VERIFY
-                return state
-        if state.patch_edits:
-            _record_node_diagnostic(
-                state,
-                node="execute_fix",
-                event="patch_edits",
-                status="success",
-                elapsed_seconds=0.0,
-                edit_count=len(state.patch_edits),
-            )
+        changed_files = apply_approved_patch(state)
+        apply_output = (
+            f"Applied {len(state.patch_edits)} exact PatchGate edit(s) transactionally."
+        )
+        _record_tool(
+            state,
+            "apply_patch_edits",
+            {"edit_count": len(state.patch_edits)},
+            {
+                "applied": True,
+                "changed_files": changed_files,
+                "output": apply_output,
+            },
+        )
+        _record_node_diagnostic(
+            state,
+            node="execute_fix",
+            event="patch_edits",
+            status="success",
+            elapsed_seconds=0.0,
+            edit_count=len(state.patch_edits),
+        )
 
         if execution_mode == "oci":
             test_result = await _run_oci_pytest(state)
@@ -1556,9 +1537,7 @@ async def execute_fix(state: AgentState | dict[str, Any]) -> AgentState:
         raise
     except Exception as exc:
         attempt.test_result = "execution_error"
-        attempt.failure_kind = (
-            "infra_error" if execution_mode == "oci" else "execution_error"
-        )
+        attempt.failure_kind = "infra_error"
         attempt.error_log = _redact_sensitive_error_text(str(exc))
         attempt.success = False
         state.fix_attempts.append(attempt)
