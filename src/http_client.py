@@ -137,12 +137,15 @@ def is_retryable_github_error(exc: BaseException) -> bool:
 _is_retryable_github = is_retryable_github_error
 
 
-def _is_retryable_llm(exc: BaseException) -> bool:
+def is_retryable_llm_error(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.NetworkError, httpx.TimeoutException)):
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         return exc.response.status_code in RETRYABLE_LLM_STATUS
     return False
+
+
+_is_retryable_llm = is_retryable_llm_error
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +188,6 @@ async def _github_request_with_retry(method: str, url: str, **kwargs) -> httpx.R
 # ---------------------------------------------------------------------------
 # LLM request
 # ---------------------------------------------------------------------------
-
 def _get_llm_base_url() -> str:
     return get_model_config("primary").base_url
 

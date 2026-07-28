@@ -17,7 +17,7 @@ from pydantic import (
 )
 
 from .evidence import EvidenceStore
-from .http_client import LLMResponseError
+from .http_client import LLMResponseError, is_retryable_llm_error
 from .model_provider import redact_secrets
 from .state import (
     AgentState,
@@ -26,6 +26,7 @@ from .state import (
     ModelInvocation,
     _issue_search_terms,
 )
+from .summary_safety import sanitize_model_context
 
 ISSUE_TITLE_LIMIT = 500
 ISSUE_BODY_LIMIT = 4_000
@@ -68,26 +69,12 @@ def _safe_text(
     *,
     denied_literals: Iterable[str] = (),
 ) -> str:
-    """Redact and stop at the first forbidden boundary, then apply a hard cap."""
-    text = redact_secrets(str(value or ""))
-    boundary_offsets = [
-        marker.start()
-        for marker in (
-            _EVALUATOR_FIELD_RE.search(text),
-            _RAW_HTTP_MARKER_RE.search(text),
-        )
-        if marker is not None
-    ]
-    denied = tuple(item for item in denied_literals if item)
-    boundary_offsets.extend(
-        offset
-        for literal in denied
-        if (offset := text.find(literal)) >= 0
+    """Compatibility wrapper around the public model-context sanitizer."""
+    return sanitize_model_context(
+        value,
+        limit,
+        denied_literals=denied_literals,
     )
-    if boundary_offsets:
-        text = text[: min(boundary_offsets)]
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
-    return normalized[: max(0, limit)]
 
 
 def relevance_window(content: str, terms: Sequence[str], limit: int) -> str:
@@ -713,7 +700,12 @@ def render_escalation_packet(packet: EscalationPacket) -> str:
 
 def immediate_model_policy_reason(exc: BaseException) -> str:
     """Classify only retry-exhausted response failures approved by ModelPolicy."""
-    if isinstance(exc, LLMResponseError) and "empty chat completion" in str(exc).lower():
+    if is_retryable_llm_error(exc):
+        return "primary_gateway_unavailable_after_retries"
+    if (
+        isinstance(exc, LLMResponseError)
+        and "empty chat completion" in str(exc).lower()
+    ):
         return "empty_completion_after_retries"
     if isinstance(exc, (ValidationError, ValueError)):
         return "invalid_structured_response_after_retries"

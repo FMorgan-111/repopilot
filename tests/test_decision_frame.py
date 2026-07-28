@@ -10,45 +10,58 @@ from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 
 
-async def test_plan_fix_records_plan_decision_frame(monkeypatch):
+def _exact_plan_response(*, decision_frame=None):
+    return {
+        "kind": "plan",
+        "plan": "Return the new sentinel.",
+        "patch": "",
+        "patch_edits": [
+            {
+                "file": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
+            }
+        ],
+        "files": ["src/widget.py"],
+        "test_command": "pytest tests/test_widget.py -q",
+        "decision_frame": decision_frame
+        or {
+            "stage": "plan",
+            "summary": "Update the sentinel.",
+            "recommended_action": "execute",
+            "risk": "low",
+            "confidence": 0.9,
+        },
+    }
+
+
+async def test_plan_fix_records_plan_decision_frame(exact_repair_state, monkeypatch):
     calls = []
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append({"system": system, "user": user})
-        return json.dumps(
-            {
-                "plan": "Patch auth submit handling.",
-                "patch": "diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n",
-                "files": ["src/auth.py"],
-                "test_command": "pytest tests/test_auth.py -q",
-                "decision_frame": {
-                    "stage": "plan",
-                    "summary": "Patch auth submit handling.",
-                    "recommended_action": "execute",
-                    "hypotheses": [
-                        {
-                            "id": "H1",
-                            "claim": "Auth submit path mishandles missing user input.",
-                            "evidence": ["Issue mentions a crash after submit."],
-                            "score": 0.84,
-                        }
-                    ],
-                    "selected_hypothesis_id": "H1",
-                    "next_checks": ["Run the auth regression test."],
-                    "risk": "medium",
-                    "confidence": 0.84,
-                },
+        return _exact_plan_response(
+            decision_frame={
+                "stage": "plan",
+                "summary": "Patch auth submit handling.",
+                "recommended_action": "execute",
+                "hypotheses": [
+                    {
+                        "id": "H1",
+                        "claim": "Auth submit path mishandles missing user input.",
+                        "evidence": ["Issue mentions a crash after submit."],
+                        "score": 0.84,
+                    }
+                ],
+                "selected_hypothesis_id": "H1",
+                "next_checks": ["Run the auth regression test."],
+                "risk": "medium",
+                "confidence": 0.84,
             }
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-    )
-
-    next_state = await plan_node.plan_fix(state)
+    next_state = await plan_node.plan_fix(exact_repair_state)
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
     assert next_state.decision_frame is not None
@@ -106,7 +119,7 @@ async def test_plan_tool_cancellation_drain_is_not_model_error(monkeypatch):
 
 
 async def test_reflect_summarizes_only_after_recording_valid_frame(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return {
             "root_cause": "The guard ran after submit.",
             "what_went_wrong": "The unsafe call still executed.",
@@ -163,7 +176,7 @@ async def test_reflect_error_replaces_outcome_summary_exactly_once(monkeypatch):
     monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
     monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         raise RuntimeError("reflection provider unavailable")
 
     calls = []
@@ -240,54 +253,29 @@ async def test_reflect_tool_cancellation_drain_is_not_model_error(monkeypatch):
     assert not any(item.status == "error" for item in state.model_history)
 
 
-async def test_plan_fix_records_search_replace_patch_edits(monkeypatch):
+async def test_plan_fix_records_search_replace_patch_edits(
+    exact_repair_state, monkeypatch
+):
     calls = []
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append({"system": system, "user": user})
-        return json.dumps(
-            {
-                "plan": "Patch auth submit handling with a search/replace edit.",
-                "patch": "",
-                "patch_edits": [
-                    {
-                        "file": "src/auth.py",
-                        "search": "if retry_count > max_retries:\n    return FAILURE\n",
-                        "replace": "if retry_count >= max_retries:\n    return FAILURE\n",
-                    }
-                ],
-                "files": ["src/auth.py"],
-                "test_command": "pytest tests/test_auth.py -q",
-                "decision_frame": {
-                    "stage": "plan",
-                    "summary": "Patch auth submit handling.",
-                    "recommended_action": "execute",
-                    "risk": "medium",
-                    "confidence": 0.84,
-                },
-            }
-        )
+        return _exact_plan_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-    )
-
-    next_state = await plan_node.plan_fix(state)
+    next_state = await plan_node.plan_fix(exact_repair_state)
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert next_state.patch_content == ""
-    assert next_state.patch_edits[0].file_path == "src/auth.py"
-    assert next_state.patch_edits[0].search.startswith("if retry_count >")
+    assert next_state.patch_content.startswith("diff --git a/src/widget.py")
+    assert next_state.patch_edits[0].file_path == "src/widget.py"
+    assert next_state.patch_edits[0].search == "return 'old-sentinel'"
     assert "patch_edits" in calls[0]["system"]
     assert "search" in calls[0]["system"]
     assert "replace" in calls[0]["system"]
 
 
 async def test_plan_fix_records_llm_diagnostic_on_timeout(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         raise asyncio.TimeoutError()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
@@ -301,41 +289,24 @@ async def test_plan_fix_records_llm_diagnostic_on_timeout(monkeypatch):
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert "TimeoutError" in next_state.failure_reason
-    assert next_state.node_diagnostics[-1]["node"] == "plan_fix"
-    assert next_state.node_diagnostics[-1]["event"] == "llm_call"
-    assert next_state.node_diagnostics[-1]["status"] == "error"
-    assert next_state.node_diagnostics[-1]["error_type"] == "TimeoutError"
-    assert next_state.node_diagnostics[-1]["prompt_tokens_estimate"] > 0
+    assert next_state.failure_reason == "The planning model call failed."
+    diagnostic = next(
+        item for item in next_state.node_diagnostics if item.get("event") == "llm_call"
+    )
+    assert diagnostic["node"] == "plan_fix"
+    assert diagnostic["status"] == "error"
+    assert diagnostic["error_type"] == "TimeoutError"
+    assert diagnostic["prompt_tokens_estimate"] > 0
 
 
-async def test_plan_fix_records_successful_llm_diagnostic(monkeypatch):
-    async def fake_llm_call(system, user):
-        return json.dumps(
-            {
-                "plan": "Patch auth submit handling.",
-                "patch": "diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n",
-                "files": ["src/auth.py"],
-                "test_command": "pytest tests/test_auth.py -q",
-                "decision_frame": {
-                    "stage": "plan",
-                    "summary": "Patch auth submit handling.",
-                    "recommended_action": "execute",
-                    "risk": "medium",
-                    "confidence": 0.84,
-                },
-            }
-        )
+async def test_plan_fix_records_successful_llm_diagnostic(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _exact_plan_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-        current_phase=new_agent.Phase.PLAN,
-    )
-
-    next_state = await plan_node.plan_fix(state)
+    next_state = await plan_node.plan_fix(exact_repair_state)
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
     assert next_state.node_diagnostics[-1]["node"] == "plan_fix"
@@ -345,22 +316,13 @@ async def test_plan_fix_records_successful_llm_diagnostic(monkeypatch):
     assert next_state.node_diagnostics[-1]["response_tokens_estimate"] > 0
 
 
-async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
-    tmp_path, monkeypatch,
+async def test_invalid_structured_plan_counts_one_failed_transaction(
+    exact_repair_state, monkeypatch
 ):
-    import subprocess
+    calls = []
 
-    primary_calls = []
-    escalation_calls = []
-
-    monkeypatch.setenv("REPOPILOT_ESCALATION_ENABLED", "1")
-    monkeypatch.setenv("LLM_ESCALATION_API_KEY", "escalation-test-sentinel")
-    monkeypatch.setenv("LLM_ESCALATION_MODEL", "claude-opus-4-8:stable")
-
-    async def fake_llm_call(
-        system, user, model=None, *, provider="primary", temperature=0.2
-    ):
-        primary_calls.append((system, user, model, provider))
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append((system, user, model, provider))
         return {
             "plan": "invalid frame stage",
             "decision_frame": {
@@ -369,97 +331,18 @@ async def test_invalid_structured_plan_escalates_and_retries_in_same_node(
             },
         }
 
-    async def fake_escalation_call(
-        system, user, model=None, *, provider="primary", temperature=0.2
-    ):
-        escalation_calls.append((system, user, model, provider))
-        if len(escalation_calls) == 1:
-            return {
-                "root_cause": "The missing-user branch still calls submit.",
-                "target_files": ["src/auth.py"],
-                "target_symbols": ["submit_if_present"],
-                "required_behavior": "Return before submit for a missing user.",
-                "regression_test_strategy": "Run the focused auth test.",
-                "rejected_approaches": [],
-            }
-        return {
-            "edits": [
-                {
-                    "file_path": "src/auth.py",
-                    "node_target": "submit_if_present",
-                    "search": "",
-                    "replace": (
-                        "def submit_if_present(user):\n"
-                        "    if user is None:\n"
-                        "        return\n"
-                        "    submit(user)\n"
-                    ),
-                    "intent": "Guard the missing user.",
-                }
-            ]
-        }
-
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    monkeypatch.setattr("src.repair_flow.llm_call", fake_escalation_call)
-    repo = tmp_path / "repo"
-    (repo / "src").mkdir(parents=True)
-    (repo / "src" / "auth.py").write_text(
-        "def submit(user):\n    return user\n\n"
-        "def submit_if_present(user):\n"
-        "    if user is None:\n"
-        "        submit(user)\n",
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "add", "src/auth.py"], check=True)
-    subprocess.run(
-        [
-            "git", "-C", str(repo), "-c", "user.name=RepoPilot Tests",
-            "-c", "user.email=tests@example.invalid", "commit", "-qm", "base",
-        ],
-        check=True,
-    )
-    ref = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-        owner="acme",
-        repo="widget",
-        repo_path=str(repo),
-        repo_ref=ref,
-        current_phase=new_agent.Phase.PLAN,
-    )
 
-    next_state = await plan_node.plan_fix(state)
+    next_state = await plan_node.plan_fix(exact_repair_state)
 
-    assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert [call[3] for call in primary_calls] == ["primary"]
-    assert [call[3] for call in escalation_calls] == ["escalation", "escalation"]
-    assert escalation_calls[0][2] == "claude-opus-4-8:stable"
-    assert next_state.escalated is True
-    assert next_state.escalation_reason == (
-        "invalid_structured_response_after_retries"
-    )
-    assert [item.status for item in next_state.model_history[-3:]] == [
-        "invalid_response",
-        "ok",
-        "ok",
-    ]
-    assert [item.provider for item in next_state.model_history[-3:]] == [
-        "primary",
-        "escalation",
-        "escalation",
-    ]
-    assert any(
-        item.get("event") == "model_escalated"
-        for item in next_state.node_diagnostics
-    )
+    assert len(calls) == 1
+    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.retry_count == 1
+    assert next_state.primary_failed_repair_rounds == 1
+    assert next_state.last_counted_repair_round_id == 1
+    assert next_state.current_repair_round_id == 0
+    assert next_state.model_history[-1].status == "ok"
+    assert next_state.node_diagnostics[-1]["event"] == "repair_round_failed"
 
 
 async def test_invalid_plan_response_never_persists_response_bearing_error(monkeypatch):
@@ -471,7 +354,7 @@ async def test_invalid_plan_response_never_persists_response_bearing_error(monke
     monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
     monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return {
             "plan": " | ".join(hostile_values),
             "decision_frame": {
@@ -486,19 +369,18 @@ async def test_invalid_plan_response_never_persists_response_bearing_error(monke
         issue_title="Login crash",
         issue_body="Crashes after submit.",
         current_phase=new_agent.Phase.PLAN,
+        max_retries=0,
     )
 
     next_state = await plan_node.plan_fix(state)
     dumped = next_state.model_dump_json()
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert next_state.failure_reason == "Failed to generate fix plan: ValidationError"
-    assert next_state.model_history[-1].error_class == "ValidationError"
-    assert next_state.node_diagnostics[-1]["error_type"] == "ValidationError"
-    assert next_state.node_diagnostics[-1]["policy_reason"] == (
-        "invalid_structured_response_after_retries"
-    )
-    assert "error" not in next_state.node_diagnostics[-1]
+    assert next_state.failure_reason == "Maximum retries reached: 0."
+    assert next_state.model_history[-1].status == "ok"
+    assert next_state.model_history[-1].error_class == ""
+    assert next_state.node_diagnostics[-1]["event"] == "repair_round_failed"
+    assert next_state.node_diagnostics[-1]["provider"] == "primary"
     assert next_state.token_usage == sum(
         item.input_tokens + item.output_tokens
         for item in next_state.model_history
@@ -574,7 +456,7 @@ async def test_invalid_reflect_response_never_persists_response_values(monkeypat
     monkeypatch.delenv("REPOPILOT_ESCALATION_ENABLED", raising=False)
     monkeypatch.delenv("LLM_ESCALATION_API_KEY", raising=False)
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         hostile = " | ".join(hostile_values)
         return {
             "root_cause": hostile,
@@ -614,7 +496,7 @@ async def test_invalid_reflect_response_never_persists_response_values(monkeypat
 
 
 async def test_plan_fix_records_prompt_built_diagnostic(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "plan": "Patch auth submit handling.",
@@ -652,7 +534,7 @@ async def test_plan_fix_records_prompt_built_diagnostic(monkeypatch):
 async def test_plan_fix_prompt_uses_compact_file_context(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return json.dumps(
             {
@@ -706,7 +588,7 @@ async def test_plan_fix_prompt_uses_compact_file_context(monkeypatch):
 async def test_plan_fix_prompt_includes_function_bodies_not_just_imports(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return json.dumps(
             {
@@ -754,10 +636,8 @@ async def test_plan_fix_prompt_includes_function_bodies_not_just_imports(monkeyp
     assert "the line the fix targets" in captured["user"]
 
 
-
-
 async def test_plan_fix_no_patch_execute_recommendation_routes_to_failure(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "plan": "Patch is required but missing.",
@@ -786,112 +666,43 @@ async def test_plan_fix_no_patch_execute_recommendation_routes_to_failure(monkey
     planned_state = await plan_node.plan_fix(state)
     route = new_agent.route_from_state(planned_state)
 
-    assert planned_state.current_phase == new_agent.Phase.FAILURE
-    assert planned_state.failure_reason == "Planner did not produce a patch."
-    assert planned_state.decision_frame.recommended_action == "stop"
-    assert route == "handle_failure"
-
-
-async def test_plan_fix_records_frame_health_warning_for_legacy_output(monkeypatch):
-    async def fake_llm_call(system, user):
-        return json.dumps(
-            {
-                "plan": "Patch auth submit handling.",
-                "patch": "diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n",
-                "files": ["src/auth.py"],
-                "test_command": "pytest tests/test_auth.py -q",
-            }
-        )
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-        current_phase=new_agent.Phase.PLAN,
-    )
-
-    next_state = await plan_node.plan_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert next_state.decision_frame.stage == "plan"
-    assert next_state.decision_warnings[-1] == {
-        "warning_type": "frame_health",
-        "node": "plan_fix",
-        "frame_id": "df_0001",
-        "expected_stage": "plan",
-        "actual_stage": "plan",
-        "reason": "missing_explicit_decision_frame",
-    }
-
-
-async def test_plan_fix_accepts_legacy_single_file_string(monkeypatch):
-    async def fake_llm_call(system, user):
-        return json.dumps(
-            {
-                "plan": "Patch auth submit handling.",
-                "patch": "diff --git a/src/auth.py b/src/auth.py\n--- a/src/auth.py\n+++ b/src/auth.py\n",
-                "files": "src/auth.py",
-                "test_command": "pytest tests/test_auth.py -q",
-            }
-        )
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="Crashes after submit.",
-        current_phase=new_agent.Phase.PLAN,
-    )
-
-    next_state = await plan_node.plan_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert json.loads(next_state.decision_frame.trace_notes)["files"] == [
-        "src/auth.py"
-    ]
+    assert planned_state.current_phase == new_agent.Phase.PLAN
+    assert planned_state.failure_reason == "patch_authorization_rejected"
+    assert planned_state.retry_count == 1
+    assert planned_state.decision_frame.recommended_action == "plan"
+    assert route == "plan_fix"
 
 
 async def test_plan_fix_after_patch_apply_failure_includes_hypothesis_anchor(
+    exact_repair_state,
     monkeypatch,
 ):
     calls = []
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append({"system": system, "user": user})
-        return json.dumps(
-            {
-                "plan": "Regenerate the envpython patch with valid hunk context.",
-                "patch": "diff --git a/src/envpython.py b/src/envpython.py\n",
-                "files": ["src/envpython.py"],
-                "test_command": "pytest tests/test_envpython.py -q",
-                "decision_frame": {
-                    "stage": "plan",
-                    "summary": "Repair the envpython patch.",
-                    "recommended_action": "execute",
-                    "hypotheses": [
-                        {
-                            "id": "H1",
-                            "claim": "envpython chooses the wrong interpreter.",
-                            "evidence": ["Previous plan selected envpython."],
-                            "score": 0.82,
-                        }
-                    ],
-                    "selected_hypothesis_id": "H1",
-                    "risk": "medium",
-                    "confidence": 0.82,
-                },
+        return _exact_plan_response(
+            decision_frame={
+                "stage": "plan",
+                "summary": "Repair the envpython patch.",
+                "recommended_action": "execute",
+                "hypotheses": [
+                    {
+                        "id": "H1",
+                        "claim": "envpython chooses the wrong interpreter.",
+                        "evidence": ["Previous plan selected envpython."],
+                        "score": 0.82,
+                    }
+                ],
+                "selected_hypothesis_id": "H1",
+                "risk": "medium",
+                "confidence": 0.82,
             }
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/tox-dev/tox/issues/3075",
-        issue_title="envpython picks the wrong environment",
-        issue_body="The envpython helper resolves python from the wrong env.",
-        current_phase=new_agent.Phase.PLAN,
-        reflection_notes='{"suggested_fix_approach": "Repair the malformed diff."}',
-    )
+    state = exact_repair_state
+    state.reflection_notes = '{"suggested_fix_approach": "Repair the malformed edit."}'
     previous_plan = new_agent.DecisionFrame(
         stage="plan",
         summary="Patch envpython environment resolution.",
@@ -941,48 +752,38 @@ async def test_plan_fix_after_patch_apply_failure_includes_hypothesis_anchor(
 
     prompt = calls[0]["user"]
     assert "Hypothesis Continuity Instructions" in prompt
-    assert "the patch failed before tests ran" in prompt.lower()
+    assert "the proposal failed before tests" in prompt.lower()
     assert "H1" in prompt
     assert "envpython chooses the wrong interpreter" in prompt
 
 
 async def test_plan_fix_after_patch_apply_failure_restores_drifted_hypothesis(
+    exact_repair_state,
     monkeypatch,
 ):
-    async def fake_llm_call(system, user):
-        return json.dumps(
-            {
-                "plan": "Patch the envpython file with valid diff syntax.",
-                "patch": "diff --git a/src/envpython.py b/src/envpython.py\n",
-                "files": ["src/envpython.py"],
-                "test_command": "pytest tests/test_envpython.py -q",
-                "decision_frame": {
-                    "stage": "plan",
-                    "summary": "Patch env hashing instead.",
-                    "recommended_action": "execute",
-                    "hypotheses": [
-                        {
-                            "id": "H2",
-                            "claim": "The env uniqueness hash is unstable.",
-                            "evidence": ["Unrelated alternate hypothesis."],
-                            "score": 0.7,
-                        }
-                    ],
-                    "selected_hypothesis_id": "H2",
-                    "risk": "medium",
-                    "confidence": 0.7,
-                },
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _exact_plan_response(
+            decision_frame={
+                "stage": "plan",
+                "summary": "Patch env hashing instead.",
+                "recommended_action": "execute",
+                "hypotheses": [
+                    {
+                        "id": "H2",
+                        "claim": "The env uniqueness hash is unstable.",
+                        "evidence": ["Unrelated alternate hypothesis."],
+                        "score": 0.7,
+                    }
+                ],
+                "selected_hypothesis_id": "H2",
+                "risk": "medium",
+                "confidence": 0.7,
             }
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/tox-dev/tox/issues/3075",
-        issue_title="envpython picks the wrong environment",
-        issue_body="The envpython helper resolves python from the wrong env.",
-        current_phase=new_agent.Phase.PLAN,
-        reflection_notes='{"what_went_wrong": "The unified diff was malformed."}',
-    )
+    state = exact_repair_state
+    state.reflection_notes = '{"what_went_wrong": "The structured edit was malformed."}'
     previous_plan = new_agent.DecisionFrame(
         stage="plan",
         summary="Patch envpython environment resolution.",
@@ -1028,8 +829,10 @@ async def test_plan_fix_after_patch_apply_failure_restores_drifted_hypothesis(
     assert next_state.decision_warnings[-1]["llm_selected_hypothesis_id"] == "H2"
 
 
-async def test_plan_fix_collect_more_context_without_patch_routes_to_locate(monkeypatch):
-    async def fake_llm_call(system, user):
+async def test_plan_fix_collect_more_context_without_patch_routes_to_locate(
+    monkeypatch,
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "plan": "Need to inspect routing middleware before patching.",
@@ -1059,15 +862,14 @@ async def test_plan_fix_collect_more_context_without_patch_routes_to_locate(monk
     route = new_agent.route_from_state(planned_state)
 
     assert route == "locate_code"
-    assert planned_state.current_phase == new_agent.Phase.PLAN
+    assert planned_state.current_phase == new_agent.Phase.LOCATE
     assert planned_state.failure_reason == ""
     assert planned_state.decision_frame.recommended_action == "collect_more_context"
-    assert planned_state.decision_warnings[0]["expected_phase"] == "LOCATE"
-    assert planned_state.decision_warnings[0]["actual_phase"] == "PLAN"
+    assert planned_state.decision_warnings == []
 
 
-async def test_plan_fix_ask_user_preserves_plan_phase_for_router(monkeypatch):
-    async def fake_llm_call(system, user):
+async def test_plan_fix_ask_user_enters_waiting_phase_for_router(monkeypatch):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "plan": "Need product confirmation before patching.",
@@ -1101,15 +903,13 @@ async def test_plan_fix_ask_user_preserves_plan_phase_for_router(monkeypatch):
     assert route == new_agent.END
     assert planned_state.current_phase == new_agent.Phase.WAITING_FOR_USER
     assert planned_state.failure_reason == ""
-    assert planned_state.decision_warnings[0]["recommended_action"] == "ask_user"
-    assert planned_state.decision_warnings[0]["expected_phase"] == "WAITING_FOR_USER"
-    assert planned_state.decision_warnings[0]["actual_phase"] == "PLAN"
+    assert planned_state.decision_warnings == []
 
 
 async def test_reflect_on_failure_records_reflect_decision_frame(monkeypatch):
     calls = []
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append({"system": system, "user": user})
         return json.dumps(
             {
@@ -1174,7 +974,9 @@ async def test_reflect_on_patch_apply_failure_preserves_selected_hypothesis_cont
 ):
     calls = []
 
-    async def fake_llm_request(messages, model=None, temperature=0.2, *, provider="primary"):
+    async def fake_llm_request(
+        messages, model=None, temperature=0.2, *, provider="primary"
+    ):
         calls.append({"messages": messages, "model": model})
         return {
             "choices": [
@@ -1269,13 +1071,11 @@ async def test_reflect_on_patch_apply_failure_preserves_selected_hypothesis_cont
     prompt_lower = prompt.lower()
     assert "failed to apply" in prompt_lower or "patch apply" in prompt_lower
     assert (
-        ("keep" in prompt_lower and "root-cause hypothesis" in prompt_lower)
-        or "selected hypothesis" in prompt_lower
-    )
+        "keep" in prompt_lower and "root-cause hypothesis" in prompt_lower
+    ) or "selected hypothesis" in prompt_lower
     assert "unified diff" in prompt_lower
-    assert (
-        "formatting" in prompt_lower
-        and ("context repair" in prompt_lower or "hunk context" in prompt_lower)
+    assert "formatting" in prompt_lower and (
+        "context repair" in prompt_lower or "hunk context" in prompt_lower
     )
     assert "the patch failed before tests ran" in prompt_lower
     assert "envpython chooses the wrong interpreter" in prompt
@@ -1283,7 +1083,7 @@ async def test_reflect_on_patch_apply_failure_preserves_selected_hypothesis_cont
 
 
 async def test_reflect_records_frame_health_warning_for_legacy_output(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "root_cause": "The patch changed the wrong branch.",
@@ -1324,7 +1124,7 @@ async def test_reflect_records_frame_health_warning_for_legacy_output(monkeypatc
 
 
 async def test_reflect_accepts_legacy_single_file_string(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "root_cause": "The patch changed the wrong branch.",
@@ -1782,7 +1582,9 @@ def test_route_from_state_uses_summary_as_human_input_question_when_no_next_chec
     route = new_agent.route_from_state(state)
 
     assert route == new_agent.END
-    assert state.human_input_request["question"] == "Need deployment environment details."
+    assert (
+        state.human_input_request["question"] == "Need deployment environment details."
+    )
 
 
 def test_route_from_state_uses_summary_as_human_input_question_when_first_check_blank():
@@ -1803,7 +1605,9 @@ def test_route_from_state_uses_summary_as_human_input_question_when_first_check_
     route = new_agent.route_from_state(state)
 
     assert route == new_agent.END
-    assert state.human_input_request["question"] == "Need deployment environment details."
+    assert (
+        state.human_input_request["question"] == "Need deployment environment details."
+    )
 
 
 def test_route_from_state_falls_back_for_unsupported_recommended_action(caplog):

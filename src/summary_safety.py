@@ -51,3 +51,20 @@ def sanitize_summary_text(
         text = text[: min(boundary_offsets)]
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     return normalized[: max(0, limit)]
+
+
+def sanitize_model_context(
+    value: object,
+    limit: int,
+    *,
+    denied_literals: Iterable[str] = (),
+) -> str:
+    """Expose the shared bounded/redacted boundary for model-facing context."""
+    return sanitize_summary_text(
+        value,
+        limit,
+        denied_literals=denied_literals,
+    )
+
+
+__all__ = ["sanitize_model_context", "sanitize_summary_text"]

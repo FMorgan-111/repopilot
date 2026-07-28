@@ -36,18 +36,24 @@ class FakeEmbedder:
 def _seeded_store():
     store = ErrorEpisodeStore(db_path=":memory:", embedder=FakeEmbedder())
     store.record(
-        owner="django", repo="django", issue_url="u1",
+        owner="django",
+        repo="django",
+        issue_url="u1",
         issue_title="request middleware crashes on missing header",
         issue_body="KeyError raised when header missing in middleware",
         error_log='Traceback\n  File "m.py", line 10, in process\n    x=h["k"]\nKeyError: k',
-        patch="guard the header lookup", success=True,
+        patch="guard the header lookup",
+        success=True,
     )
     store.record(
-        owner="pallets", repo="flask", issue_url="u2",
+        owner="pallets",
+        repo="flask",
+        issue_url="u2",
         issue_title="json serialization of set fails",
         issue_body="TypeError serializing a set to json",
         error_log="TypeError: set is not JSON serializable",
-        patch="add set encoder", success=False,
+        patch="add set encoder",
+        success=False,
     )
     return store
 
@@ -58,20 +64,38 @@ def _base_state(**kw):
         issue_title="crash in request middleware on missing header",
         issue_body="KeyError when a header is missing in the request middleware",
         current_phase=new_agent.Phase.PLAN,
-        owner="acme", repo="widget",
+        owner="acme",
+        repo="widget",
         **kw,
     )
 
 
-def _execute_response(file_path="a.py", search="a", replace="b"):
+def _exact_plan_state(exact_repair_state):
+    exact_repair_state.issue_title = "crash in request middleware on missing header"
+    exact_repair_state.issue_body = (
+        "KeyError when a header is missing in the request middleware"
+    )
+    return exact_repair_state
+
+
+def _execute_response(
+    file_path="src/widget.py",
+    search="return 'old-sentinel'",
+    replace="return 'new-sentinel'",
+):
     return json.dumps(
         {
-            "plan": "fix", "patch": "",
+            "plan": "fix",
+            "patch": "",
             "patch_edits": [{"file": file_path, "search": search, "replace": replace}],
-            "files": [file_path], "test_command": "pytest",
+            "files": [file_path],
+            "test_command": "pytest",
             "decision_frame": {
-                "stage": "plan", "summary": "fix",
-                "recommended_action": "execute", "risk": "low", "confidence": 0.7,
+                "stage": "plan",
+                "summary": "fix",
+                "recommended_action": "execute",
+                "risk": "low",
+                "confidence": 0.7,
             },
         }
     )
@@ -79,14 +103,15 @@ def _execute_response(file_path="a.py", search="a", replace="b"):
 
 # ---- keyframe ---------------------------------------------------------------
 
+
 def test_extract_keyframe_captures_exception_and_frames():
     log = (
-        'Traceback (most recent call last):\n'
+        "Traceback (most recent call last):\n"
         '  File "/repo/app/router.py", line 42, in handle\n'
-        '    return self.dispatch(req)\n'
+        "    return self.dispatch(req)\n"
         '  File "/repo/app/core.py", line 88, in dispatch\n'
-        '    return route[key]\n'
-        'KeyError: \'missing\'\n'
+        "    return route[key]\n"
+        "KeyError: 'missing'\n"
     )
     kf = extract_keyframe(log)
     assert "KeyError" in kf
@@ -101,6 +126,7 @@ def test_extract_keyframe_empty_and_fallback():
 
 
 # ---- vector index -----------------------------------------------------------
+
 
 def test_sqlite_vec_index_cosine_knn():
     try:
@@ -169,6 +195,7 @@ def test_episode_store_exposes_selected_backend():
 
 # ---- episode store ----------------------------------------------------------
 
+
 def test_recall_surfaces_cross_repo_episode():
     store = _seeded_store()
     res = store.recall(
@@ -189,65 +216,69 @@ def test_recall_excludes_self_issue():
         k=3,
         exclude_issue_url="u2",
     )
-    assert all(r.issue_url != "u2" for r in res) if hasattr(res[0], "issue_url") else True
+    assert (
+        all(r.issue_url != "u2" for r in res) if hasattr(res[0], "issue_url") else True
+    )
     assert all(r.patch != "add set encoder" for r in res)
 
 
 # ---- PLAN recall injection --------------------------------------------------
 
-async def test_plan_prompt_includes_recalled_episodes(monkeypatch):
+
+async def test_plan_prompt_includes_recalled_episodes(exact_repair_state, monkeypatch):
     store = _seeded_store()
     monkeypatch.setattr(eps, "get_episode_store", lambda: store)
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _execute_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    await plan_node.plan_fix(_base_state())
+    await plan_node.plan_fix(_exact_plan_state(exact_repair_state))
 
     assert "RELATED PAST FIX EPISODES" in captured["user"]
     assert "✅ SUCCESS" in captured["user"]
     assert "django/django" in captured["user"]
 
 
-async def test_plan_recall_is_best_effort_on_error(monkeypatch):
+async def test_plan_recall_is_best_effort_on_error(exact_repair_state, monkeypatch):
     def boom():
         raise RuntimeError("store down")
 
     monkeypatch.setattr(eps, "get_episode_store", boom)
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _execute_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    next_state = await plan_node.plan_fix(_base_state())
+    next_state = await plan_node.plan_fix(_exact_plan_state(exact_repair_state))
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
     assert "RELATED PAST FIX EPISODES" not in captured["user"]
 
 
-async def test_plan_recall_disabled_by_default(monkeypatch):
+async def test_plan_recall_disabled_by_default(exact_repair_state, monkeypatch):
     # Episodes are opt-in; without REPOPILOT_ENABLE_EPISODES the store is off.
     monkeypatch.delenv("REPOPILOT_ENABLE_EPISODES", raising=False)
     eps.reset_episode_store()
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _execute_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    await plan_node.plan_fix(_base_state())
+    await plan_node.plan_fix(_exact_plan_state(exact_repair_state))
 
     assert eps.get_episode_store() is None
     assert "RELATED PAST FIX EPISODES" not in captured["user"]
 
 
 # ---- VERIFY records episodes ------------------------------------------------
+
 
 async def test_verify_records_episode(monkeypatch):
     store = ErrorEpisodeStore(db_path=":memory:", embedder=FakeEmbedder())

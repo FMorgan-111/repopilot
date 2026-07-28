@@ -32,20 +32,21 @@ from src.state import (
 
 def _valid_plan_response() -> dict:
     return {
-        "plan": "Guard the missing user before submit.",
+        "kind": "plan",
+        "plan": "Return the new sentinel.",
         "patch": "",
         "patch_edits": [
             {
-                "file": "src/auth.py",
-                "search": "if user is None:\n    submit(user)\n",
-                "replace": "if user is None:\n    return\n",
+                "file": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
             }
         ],
-        "files": ["src/auth.py"],
-        "test_command": "pytest tests/test_auth.py -q",
+        "files": ["src/widget.py"],
+        "test_command": "pytest tests/test_widget.py -q",
         "decision_frame": {
             "stage": "plan",
-            "summary": "Guard missing users.",
+            "summary": "Update the sentinel.",
             "recommended_action": "execute",
             "risk": "low",
             "confidence": 0.9,
@@ -122,8 +123,7 @@ def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
     state.issue_body = (
         "Keep this required behavior.\n"
         f"Authorization: Bearer {secret}\n"
-        "gold_patch: evaluator-gold-sentinel\n"
-        + "body-overflow-sentinel" * 1_000
+        "gold_patch: evaluator-gold-sentinel\n" + "body-overflow-sentinel" * 1_000
     )
     state.evidence = [
         Evidence(
@@ -160,7 +160,8 @@ def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
                 "AssertionError: safe failure\n"
                 f"api_key={secret}\n"
                 "test_patch: evaluator-test-patch-sentinel\n"
-                + "test-overflow-sentinel" * 1_000
+                + "test-overflow-sentinel"
+                * 1_000
             ),
         ),
         FixAttempt(
@@ -170,8 +171,7 @@ def test_escalation_packet_is_an_allowlist_boundary_with_independent_bounds():
             error_log=(
                 "Search block missing safely\n"
                 "HTTP response payload: raw-http-error-sentinel\n"
-                "tests/test_generated_secret_name.py\n"
-                + "p" * 10_000
+                "tests/test_generated_secret_name.py\n" + "p" * 10_000
             ),
         ),
     ]
@@ -376,9 +376,7 @@ def test_standalone_raw_http_marker_truncates_evidence_and_test_error():
 
     assert packet.evidence[0].summary == "Safe summary inline"
     assert packet.evidence[0].content.endswith("debug prefix")
-    assert packet.test_error_summaries == (
-        "AssertionError: safe failure inline",
-    )
+    assert packet.test_error_summaries == ("AssertionError: safe failure inline",)
     for forbidden in (
         "evidence-http-sentinel",
         "evidence-content-sentinel",
@@ -422,10 +420,13 @@ def test_direct_packet_construction_bounds_fields_and_is_deeply_immutable():
     assert len(packet.base_commit) <= 500
     assert len(packet.required_behavior) <= 2_500
     assert len(packet.evidence) <= 12
-    assert sum(
-        len(json.dumps(item.model_dump(), ensure_ascii=False))
-        for item in packet.evidence
-    ) <= 24_000
+    assert (
+        sum(
+            len(json.dumps(item.model_dump(), ensure_ascii=False))
+            for item in packet.evidence
+        )
+        <= 24_000
+    )
     assert all(len(item.content) <= 6_000 for item in packet.evidence)
     assert all(len(item.summary) <= 500 for item in packet.evidence)
     for values in (
@@ -495,20 +496,23 @@ def test_render_reconstructs_and_rebounds_a_bypassed_mutation():
     assert "mutated-continuation-sentinel" not in rendered
 
 
-async def test_primary_plan_keeps_current_bounded_prompt_and_default_call(monkeypatch):
+async def test_primary_plan_keeps_current_bounded_prompt_and_default_call(
+    exact_repair_state, monkeypatch
+):
     captured = {}
 
-    async def fake_llm_call(system, user):
-        captured.update(system=system, user=user)
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        captured.update(
+            system=system,
+            user=user,
+            model=model,
+            provider=provider,
+        )
         return _valid_plan_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="Login crash",
-        issue_body="x" * 8_000,
-        current_phase=Phase.PLAN,
-    )
+    state = exact_repair_state
+    state.issue_body = "x" * 8_000
 
     result = await plan_node.plan_fix(state)
 
@@ -516,126 +520,66 @@ async def test_primary_plan_keeps_current_bounded_prompt_and_default_call(monkey
     assert "Issue URL:" in captured["user"]
     assert "Relevant files:" in captured["user"]
     assert "x" * (plan_node.PLAN_ISSUE_BODY_LIMIT + 1) not in captured["user"]
+    assert captured["system"] == plan_node.PLAN_SYSTEM
+    assert captured["provider"] == "primary"
+    assert captured["model"] == "gemini-3.5-flash:stable"
     assert result.model_history[-1].provider == "primary"
     assert result.model_history[-1].model == "gemini-3.5-flash:stable"
     assert result.model_history[-1].status == "ok"
 
 
-async def test_escalated_plan_uses_packet_plus_summary_for_first_stage_only(
-    tmp_path, monkeypatch
+async def test_escalated_plan_uses_the_common_prompt_and_single_call(
+    exact_repair_state, monkeypatch
 ):
-    import subprocess
-
     calls = []
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append(
             {
                 "system": system,
                 "user": user,
                 "model": model,
                 "provider": provider,
-                "temperature": temperature,
             }
         )
-        if len(calls) == 1:
-            return {
-                "root_cause": "The missing-user branch still submits.",
-                "target_files": ["src/auth.py"],
-                "target_symbols": ["submit_if_present"],
-                "required_behavior": "Return before submit for missing users.",
-                "regression_test_strategy": "Run the focused auth test.",
-                "rejected_approaches": [],
-            }
-        return {
-            "edits": [
-                {
-                    "file_path": "src/auth.py",
-                    "node_target": "submit_if_present",
-                    "search": "",
-                    "replace": (
-                        "def submit_if_present(user):\n"
-                        "    if user is None:\n"
-                        "        return\n"
-                        "    submit(user)\n"
-                    ),
-                    "intent": "Guard missing users.",
-                }
-            ]
-        }
+        return _valid_plan_response()
 
-    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
-    state = _escalated_state()
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = exact_repair_state
+    state.active_provider = "escalation"
+    state.active_model = "claude-opus-4-8:stable"
+    state.escalated = True
+    state.escalation_reason = "primary_repair_round_limit"
     state.attempt_outcome_summary = "safe rolling outcome"
-    repo = tmp_path / "repo"
-    (repo / "src").mkdir(parents=True)
-    (repo / "src" / "auth.py").write_text(
-        "def submit(user):\n    return user\n\n"
-        "def submit_if_present(user):\n"
-        "    if user is None:\n"
-        "        submit(user)\n",
-        encoding="utf-8",
-    )
-    subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "add", "src/auth.py"], check=True)
-    subprocess.run(
-        [
-            "git", "-C", str(repo), "-c", "user.name=RepoPilot Tests",
-            "-c", "user.email=tests@example.invalid", "commit", "-qm", "base",
-        ],
-        check=True,
-    )
-    state.repo_path = str(repo)
-    state.repo_ref = subprocess.run(
-        ["git", "-C", str(repo), "rev-parse", "HEAD"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    state.relevant_files = []
     state.conversation_history = [
         ConversationTurn(role="user", content="unrelated-conversation-sentinel")
     ]
-    state.tool_calls = [
-        ToolCall(tool_name="raw", result="raw-http-payload-sentinel")
-    ]
-    expected_packet = render_escalation_packet(build_escalation_packet(state))
-    expected_first_prompt = (
-        f"{expected_packet}\n\n{OUTCOME_SUMMARY_SECTION}\n"
-        "safe rolling outcome"
-    )
+    state.tool_calls = [ToolCall(tool_name="raw", result="raw-http-payload-sentinel")]
 
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == Phase.EXECUTE
-    assert [call["provider"] for call in calls] == ["escalation", "escalation"]
-    assert all(call["model"] == "claude-opus-4-8:stable" for call in calls)
-    assert calls[0]["user"] == expected_first_prompt
-    assert calls[0]["user"].count(OUTCOME_SUMMARY_SECTION) == 1
-    assert "patch" not in calls[0]["system"].lower()
-    assert "edit" not in calls[0]["system"].lower()
-    assert "target_evidence" in calls[1]["user"]
-    assert OUTCOME_SUMMARY_SECTION not in calls[1]["user"]
-    assert "safe rolling outcome" not in calls[1]["user"]
-    assert "Issue URL:" not in calls[0]["user"]
-    assert "Relevant files:" not in calls[0]["user"]
-    assert "unrelated-conversation-sentinel" not in calls[0]["user"]
-    assert "raw-http-payload-sentinel" not in calls[0]["user"]
-    assert [item.provider for item in result.model_history[-2:]] == [
-        "escalation",
-        "escalation",
-    ]
-    assert all(
-        item.model == "claude-opus-4-8:stable"
-        and item.node == "plan_fix"
-        for item in result.model_history[-2:]
-    )
+    assert len(calls) == 1
+    [call] = calls
+    assert call["system"] == plan_node.PLAN_SYSTEM
+    assert call["provider"] == "escalation"
+    assert call["model"] == "claude-opus-4-8:stable"
+    assert "Issue URL:" in call["user"]
+    assert "Relevant files:" in call["user"]
+    assert call["user"].count(OUTCOME_SUMMARY_SECTION) == 1
+    assert "safe rolling outcome" in call["user"]
+    assert "unrelated-conversation-sentinel" not in call["user"]
+    assert "raw-http-payload-sentinel" not in call["user"]
+    assert result.model_history[-1].provider == "escalation"
+    assert result.model_history[-1].model == "claude-opus-4-8:stable"
 
 
 async def test_escalated_reflect_uses_packet_and_active_escalation_model(monkeypatch):
     calls = []
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
         calls.append((system, user, model, provider))
         return _valid_reflect_response()
 

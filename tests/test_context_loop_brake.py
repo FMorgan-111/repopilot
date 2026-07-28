@@ -56,9 +56,7 @@ def _execute_response(file_path, search, replace):
         {
             "kind": "plan",
             "plan": "Update the sentinel.",
-            "patch_edits": [
-                {"file": file_path, "search": search, "replace": replace}
-            ],
+            "patch_edits": [{"file": file_path, "search": search, "replace": replace}],
             "files": [file_path],
             "test_command": "pytest tests/test_widget.py -q",
             "decision_frame": {
@@ -75,7 +73,7 @@ def _execute_response(file_path, search, replace):
 async def test_plan_fix_collect_more_context_under_cap_still_routes_to_locate(
     monkeypatch,
 ):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
@@ -88,14 +86,17 @@ async def test_plan_fix_collect_more_context_under_cap_still_routes_to_locate(
 
     next_state = await plan_node.plan_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.current_phase == new_agent.Phase.LOCATE
     assert next_state.context_collection_count == 1
     assert next_state.failure_reason == ""
     assert next_state.decision_frame.recommended_action == "collect_more_context"
+    assert next_state.repair_round_sequence == 1
+    assert next_state.current_repair_round_id == 1
+    assert next_state.retry_count == 0
 
 
 async def test_plan_fix_forces_stop_after_context_collection_cap(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
@@ -106,19 +107,21 @@ async def test_plan_fix_forces_stop_after_context_collection_cap(monkeypatch):
         current_phase=new_agent.Phase.PLAN,
     )
 
-    # First MAX rounds keep routing to PLAN (so the router sends LOCATE).
+    # Context collection stays inside one open repair transaction.
     for round_num in range(1, plan_node.MAX_CONTEXT_COLLECTION_ROUNDS + 1):
         state = await plan_node.plan_fix(state)
-        assert state.current_phase == new_agent.Phase.PLAN
+        assert state.current_phase == new_agent.Phase.LOCATE
         assert state.context_collection_count == round_num
+        assert state.current_repair_round_id == 1
 
     # The next collect_more_context exceeds the cap and is forced to stop.
     state = await plan_node.plan_fix(state)
 
     assert state.current_phase == new_agent.Phase.FAILURE
     assert state.decision_frame.recommended_action == "stop"
-    assert "after" in state.failure_reason
-    assert str(plan_node.MAX_CONTEXT_COLLECTION_ROUNDS) in state.failure_reason
+    assert state.failure_reason == (
+        "Context collection made no progress within its bounded cap."
+    )
     # Router must send a forced-stop frame to handle_failure, not back to LOCATE.
     assert new_agent.route_from_state(state) == "handle_failure"
 
@@ -219,7 +222,10 @@ async def test_locate_code_carries_forward_files_when_new_paths_fail(monkeypatch
 
     async def fake_read_file(owner, repo, path):
         if path == "src/tox/tox_env/api.py":
-            return {"content": "class ToxEnv:\n    def env_dir(self): ...\n", "sha": "r"}
+            return {
+                "content": "class ToxEnv:\n    def env_dir(self): ...\n",
+                "sha": "r",
+            }
         # Any other path (e.g. a planner-hallucinated one) fails to read.
         raise RuntimeError(f"404 not found: {path}")
 
@@ -270,6 +276,7 @@ async def test_locate_code_excludes_docs_so_source_reaches_planner(monkeypatch):
     accumulated they filled every PLAN_MAX_FILES slot, starving the planner of
     code. A patch_edits + pytest agent fixes source, so docs are excluded.
     """
+
     async def fake_search_code(query, owner, repo):
         return [
             {"path": "docs/reference/config.rst", "sha": "sha-doc"},
@@ -306,7 +313,7 @@ async def test_locate_code_excludes_docs_so_source_reaches_planner(monkeypatch):
 async def test_plan_prompt_has_no_context_pressure_on_first_round(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _collect_more_context_response()
 
@@ -326,7 +333,7 @@ async def test_plan_prompt_has_no_context_pressure_on_first_round(monkeypatch):
 async def test_plan_prompt_adds_soft_pressure_mid_collection(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _collect_more_context_response()
 
@@ -353,7 +360,7 @@ async def test_plan_prompt_adds_soft_pressure_mid_collection(monkeypatch):
 async def test_plan_prompt_forces_commit_on_final_round(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         captured["user"] = user
         return _collect_more_context_response()
 
@@ -373,7 +380,9 @@ async def test_plan_prompt_forces_commit_on_final_round(monkeypatch):
     assert "patch_edits now" in captured["user"]
 
 
-async def test_plan_tool_request_reprompts_with_only_new_evidence(monkeypatch):
+async def test_plan_tool_request_reprompts_with_only_new_evidence(
+    exact_repair_state, monkeypatch
+):
     calls = []
     responses = [
         {
@@ -440,28 +449,16 @@ async def test_plan_tool_request_reprompts_with_only_new_evidence(monkeypatch):
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     monkeypatch.setattr(plan_node, "route_tool_intent", fake_route, raising=False)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="sentinel",
-        issue_body="update sentinel",
-        current_phase=new_agent.Phase.PLAN,
-        repo_ref="a" * 40,
-        relevant_files=[
-            new_agent.FileInfo(
-                path="src/widget.py",
-                content="def widget():\n    return 'old-sentinel'\n",
-            )
-        ],
-        evidence=[
-            Evidence(
-                evidence_id="ev_old_sentinel",
-                tool="read_range",
-                summary="old evidence",
-                content="must not be reinjected",
-                fingerprint="old-fingerprint",
-            )
-        ],
-    )
+    state = exact_repair_state
+    state.evidence = [
+        Evidence(
+            evidence_id="ev_old_sentinel",
+            tool="read_range",
+            summary="old evidence",
+            content="must not be reinjected",
+            fingerprint="old-fingerprint",
+        )
+    ]
 
     result = await plan_node.plan_fix(state)
 
@@ -472,7 +469,9 @@ async def test_plan_tool_request_reprompts_with_only_new_evidence(monkeypatch):
     assert "ev_old_sentinel" not in calls[1]
 
 
-async def test_duplicate_tool_request_counts_no_progress_before_plan(monkeypatch):
+async def test_duplicate_tool_request_counts_no_progress_before_plan(
+    exact_repair_state, monkeypatch
+):
     responses = [
         {
             "kind": "tool",
@@ -503,14 +502,7 @@ async def test_duplicate_tool_request_counts_no_progress_before_plan(monkeypatch
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     monkeypatch.setattr(plan_node, "route_tool_intent", duplicate_route, raising=False)
-    state = _base_state(
-        relevant_files=[
-            new_agent.FileInfo(
-                path="src/widget.py",
-                content="def widget():\n    return 'old-sentinel'\n",
-            )
-        ]
-    )
+    state = exact_repair_state
 
     result = await plan_node.plan_fix(state)
 
