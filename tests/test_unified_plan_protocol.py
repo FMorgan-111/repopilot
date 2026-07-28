@@ -5,6 +5,7 @@ import httpx
 import pytest
 
 from src import model_policy
+from src import repair_flow
 from src.nodes import plan as plan_node
 from src.patch_authorization import (
     PatchAuthorizationIssue,
@@ -380,6 +381,35 @@ async def test_primary_503_fallback_rebinds_opus_in_same_round(
     assert result.authorized_repair_provider == "escalation"
     assert result.authorized_repair_model == ESCALATION_MODEL
     assert result.escalation_reason == "primary_gateway_unavailable_after_retries"
+    assert [item.status for item in result.model_history] == ["error", "ok"]
+
+
+@pytest.mark.parametrize("extra_field", ["tool_intent", "stop_reason"])
+async def test_plan_kind_ignores_control_field_heuristics_and_uses_adapter(
+    exact_repair_state, monkeypatch, extra_field
+):
+    response = plan_response()
+    response[extra_field] = (
+        {
+            "action": "search_text",
+            "args": {"text": "sentinel"},
+            "reason": "mixed payload",
+            "expected_evidence": "source",
+        }
+        if extra_field == "tool_intent"
+        else "mixed stop"
+    )
+
+    async def fake_llm(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.PLAN
+    assert result.retry_count == 1
+    assert result.failure_reason == "patch_authorization_rejected"
+    assert result.decision_frame.recommended_action == "plan"
 
 
 async def test_primary_token_reserve_binds_opus_before_first_call(
@@ -561,6 +591,201 @@ async def test_correction_context_is_preserved_for_tools_then_replaced_or_cleare
     assert original in prompts[2]
     assert result.repair_correction_context == ""
     assert result.current_phase == Phase.EXECUTE
+
+
+async def test_second_patch_rejection_replaces_correction_instead_of_appending(
+    exact_repair_state, monkeypatch
+):
+    responses = [plan_response(), plan_response()]
+    outcomes = [
+        PatchAuthorizationOutcome(
+            status="model_correctable",
+            issues=(
+                PatchAuthorizationIssue(
+                    code="search_missing",
+                    message="FIRST correction sentinel",
+                    correction_context="FIRST bounded window",
+                    failure_class="model_correctable",
+                ),
+            ),
+        ),
+        PatchAuthorizationOutcome(
+            status="model_correctable",
+            issues=(
+                PatchAuthorizationIssue(
+                    code="search_missing",
+                    message="SECOND correction sentinel",
+                    correction_context="SECOND bounded window",
+                    failure_class="model_correctable",
+                ),
+            ),
+        ),
+    ]
+
+    async def fake_llm(*_args, **_kwargs):
+        return responses.pop(0)
+
+    def reject(*_args, **_kwargs):
+        return outcomes.pop(0)
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    monkeypatch.setattr(plan_node, "authorize_plan_patch", reject)
+
+    first = await plan_node.plan_fix(exact_repair_state)
+    first_correction = first.repair_correction_context
+    second = await plan_node.plan_fix(first)
+
+    assert "FIRST" in first_correction
+    assert "SECOND" in second.repair_correction_context
+    assert "FIRST" not in second.repair_correction_context
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_phase"),
+    [
+        ("collect_more_context", Phase.LOCATE),
+        ("ask_user", Phase.WAITING_FOR_USER),
+    ],
+)
+async def test_nonexecute_decision_preserves_seeded_correction_suffix(
+    exact_repair_state, monkeypatch, action, expected_phase
+):
+    exact_repair_state.repair_correction_context = "seeded correction sentinel"
+
+    async def fake_llm(*_args, **_kwargs):
+        return plan_response(action=action)
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == expected_phase
+    assert result.repair_correction_context == "seeded correction sentinel"
+    assert result.retry_count == 0
+    assert result.current_repair_round_id == 1
+
+
+async def test_accepted_plan_clears_seeded_correction_suffix(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.repair_correction_context = "obsolete correction sentinel"
+
+    async def fake_llm(*_args, **_kwargs):
+        return plan_response()
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.EXECUTE
+    assert result.repair_correction_context == ""
+
+
+@pytest.mark.parametrize(
+    "denied_term",
+    ["UnIfIeD DiFf", "RePlAcE_AlL", "rEpAiRpLaN", "VeRiFiEdEdItBaTcH"],
+)
+def test_previous_failure_context_redacts_each_mixed_case_denied_term(denied_term):
+    state = plan_node.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Safe issue",
+        issue_body="Safe body",
+        fix_attempts=[
+            FixAttempt(
+                test_result=(
+                    "safe-result-sentinel "
+                    "sk-AAAAAAAAAAAAAAAA "
+                    f"{denied_term} forbidden-result-sentinel"
+                ),
+                error_log="safe-error-sentinel",
+                success=False,
+            )
+        ],
+    )
+
+    prompt = plan_node.build_plan_user_prompt(state)
+    folded = prompt.casefold()
+
+    assert "safe-result-sentinel" in prompt
+    assert "safe-error-sentinel" in prompt
+    assert denied_term.casefold() not in folded
+    assert "forbidden-result-sentinel" not in prompt
+    assert "sk-aaaaaaaa" not in folded
+
+
+def test_previous_failure_context_has_individual_and_total_bounds():
+    state = plan_node.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        issue_title="Safe issue",
+        issue_body="Safe body",
+        fix_attempts=[
+            FixAttempt(
+                test_result=f"result-{index}-sentinel " + "r" * 4_000,
+                error_log=f"error-{index}-sentinel " + "e" * 4_000,
+                success=False,
+            )
+            for index in range(40)
+        ],
+    )
+
+    prompt = plan_node.build_plan_user_prompt(state)
+
+    assert "result-0-sentinel" in prompt
+    assert "error-0-sentinel" in prompt
+    assert len(prompt) <= plan_node.PLAN_PREVIOUS_FAILURES_TOTAL_LIMIT + 5_000
+
+
+@pytest.mark.parametrize("failure_mode", ["checkout_drift", "read_io"])
+async def test_post_gate_symbol_resolution_environment_failure_spends_no_retry(
+    exact_repair_state, monkeypatch, failure_mode
+):
+    exact_repair_state.assertion_diversity_required = True
+    exact_repair_state.fix_attempts = [
+        FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'wrong-sentinel'",
+                )
+            ],
+            failure_kind="assertion_failure",
+            error_log="AssertionError: wrong sentinel",
+            success=False,
+        )
+    ]
+    response = plan_response()
+    response["patch_edits"][0]["node_target"] = "widget"
+    response["patch_edits"][0].pop("search")
+    real_authorize = plan_node.authorize_plan_patch
+
+    def authorize_then_break_environment(state, raw):
+        outcome = real_authorize(state, raw)
+        assert outcome.status == "accepted"
+        if failure_mode == "checkout_drift":
+            state.repo_ref = "f" * 40
+        else:
+            monkeypatch.setattr(
+                repair_flow,
+                "_read_regular_no_follow",
+                lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("read failed")),
+            )
+        return outcome
+
+    async def fake_llm(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    monkeypatch.setattr(
+        plan_node, "authorize_plan_patch", authorize_then_break_environment
+    )
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.FAILURE
+    assert result.retry_count == 0
+    assert result.primary_failed_repair_rounds == 0
+    assert result.last_counted_repair_round_id == 0
+    assert result.patch_edits == []
+    assert result.tool_patch_approval is None
+    assert result.repair_correction_context == ""
 
 
 @pytest.mark.parametrize("provider", ["primary", "escalation"])

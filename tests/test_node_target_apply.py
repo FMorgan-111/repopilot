@@ -7,7 +7,7 @@ from src.nodes.execute import _apply_patch_edits
 from src.patch_match import locate_node_span
 from src.state import PatchEdit
 
-SRC = '''\
+SRC = """\
 import os
 
 
@@ -22,7 +22,7 @@ class C:
     @property
     def p(self):
         return self._p
-'''
+"""
 
 
 def _write(tmp_path, name, text):
@@ -32,6 +32,7 @@ def _write(tmp_path, name, text):
 
 
 # ---- locate_node_span -------------------------------------------------------
+
 
 def test_locate_top_level_function():
     span = locate_node_span(SRC, "top")
@@ -76,12 +77,16 @@ def test_locate_ambiguous_returns_none():
 
 # ---- execute node-target apply ---------------------------------------------
 
+
 def test_node_target_replaces_whole_function(tmp_path):
     _write(tmp_path, "a.py", SRC)
     result = _apply_patch_edits(
         str(tmp_path),
-        [PatchEdit(file_path="a.py", node_target="top",
-                   replace="def top():\n    return 42")],
+        [
+            PatchEdit(
+                file_path="a.py", node_target="top", replace="def top():\n    return 42"
+            )
+        ],
     )
     assert result.applied, result.output
     text = (tmp_path / "a.py").read_text()
@@ -96,8 +101,13 @@ def test_node_target_reindents_method_replacement(tmp_path):
     # Model supplies the method at column 0; executor reindents to 4.
     result = _apply_patch_edits(
         str(tmp_path),
-        [PatchEdit(file_path="a.py", node_target="C.m",
-                   replace="def m(self, x):\n    return x + 100")],
+        [
+            PatchEdit(
+                file_path="a.py",
+                node_target="C.m",
+                replace="def m(self, x):\n    return x + 100",
+            )
+        ],
     )
     assert result.applied, result.output
     text = (tmp_path / "a.py").read_text()
@@ -127,23 +137,38 @@ def test_patch_edit_both_anchors_prefers_search():
     assert edit.node_target == ""
 
 
-def test_normalize_plan_decision_drops_malformed_edit():
-    from src.nodes.plan import _normalize_plan_decision
+def test_patch_authorization_rejects_whole_batch_with_malformed_edit(
+    exact_repair_state,
+):
+    from src.patch_authorization import authorize_plan_patch
+    from src.repair_rounds import begin_repair_round
 
-    resp = {
-        "plan": "p",
+    begin_repair_round(exact_repair_state)
+    response = {
+        "kind": "plan",
+        "plan": "Update the sentinel.",
         "patch": "",
         "patch_edits": [
-            {"file": "a.py", "search": "x", "replace": "y"},  # valid
-            {"file": "b.py"},  # malformed: no anchor → dropped, not a crash
+            {
+                "file": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
+            },
+            {"file": "src/other.py"},
         ],
-        "files": ["a.py"],
+        "files": ["src/widget.py"],
         "test_command": "pytest",
         "decision_frame": {
-            "stage": "plan", "summary": "p",
-            "recommended_action": "execute", "risk": "low", "confidence": 0.7,
+            "stage": "plan",
+            "summary": "Update the sentinel.",
+            "recommended_action": "execute",
+            "risk": "low",
+            "confidence": 0.7,
         },
     }
-    decision = _normalize_plan_decision(resp)
-    assert len(decision.patch_edits) == 1
-    assert decision.patch_edits[0].file_path == "a.py"
+
+    outcome = authorize_plan_patch(exact_repair_state, response)
+
+    assert outcome.status == "model_correctable"
+    assert exact_repair_state.patch_edits == []
+    assert exact_repair_state.tool_patch_approval is None

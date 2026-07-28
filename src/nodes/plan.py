@@ -41,7 +41,7 @@ from ..reasoning_loop import (
     route_reasoning_tool,
     validate_reasoning_response,
 )
-from ..repair_flow import resolve_search_target_symbol
+from ..repair_flow import RepairContextError, resolve_search_target_symbol_strict
 from ..repair_rounds import (
     begin_repair_round,
     bind_repair_round_author,
@@ -75,6 +75,8 @@ PLAN_ISSUE_BODY_LIMIT = 2500
 PLAN_FILE_CONTENT_LIMIT = 6000
 PLAN_MAX_FILES = 3
 PLAN_FAILURE_LOG_LIMIT = 1000
+PLAN_FAILURE_RESULT_LIMIT = 500
+PLAN_PREVIOUS_FAILURES_TOTAL_LIMIT = 6_000
 MODEL_CONTEXT_DENIED_LITERALS = (
     "unified diff",
     "replace_all",
@@ -219,7 +221,7 @@ def _prior_assertion_symbols(state: AgentState) -> tuple[set[str], bool]:
             if edit.node_target:
                 symbols.add(edit.node_target)
                 continue
-            symbol = resolve_search_target_symbol(
+            symbol = resolve_search_target_symbol_strict(
                 state,
                 edit.file_path,
                 edit.search,
@@ -516,14 +518,26 @@ def build_plan_user_prompt(
     """Build the provider-neutral prompt with one bounded summary section."""
     summary = sanitize_outcome_summary(state, state.attempt_outcome_summary)
     include_legacy_attempt_context = not summary
-    previous_failures = (
-        "\n\n".join(
-            f"Attempt {idx + 1}: {attempt.test_result}\n"
-            f"{_truncate_prompt_text(attempt.error_log, PLAN_FAILURE_LOG_LIMIT)}"
-            for idx, attempt in enumerate(state.fix_attempts)
-        )
-        if include_legacy_attempt_context
-        else ""
+    previous_failure_entries: list[str] = []
+    if include_legacy_attempt_context:
+        for idx, attempt in enumerate(state.fix_attempts):
+            safe_result = sanitize_model_context(
+                attempt.test_result,
+                PLAN_FAILURE_RESULT_LIMIT,
+                denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
+            )
+            safe_error = sanitize_model_context(
+                attempt.error_log,
+                PLAN_FAILURE_LOG_LIMIT,
+                denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
+            )
+            previous_failure_entries.append(
+                f"Attempt {idx + 1}: {safe_result}\n{safe_error}"
+            )
+    previous_failures = sanitize_model_context(
+        "\n\n".join(previous_failure_entries),
+        PLAN_PREVIOUS_FAILURES_TOTAL_LIMIT,
+        denied_literals=MODEL_CONTEXT_DENIED_LITERALS,
     )
     reflection_context = ""
     if include_legacy_attempt_context and state.reflection_notes:
@@ -926,6 +940,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
         except Exception as exc:
             elapsed = time.monotonic() - t0
             response_tokens = _estimate_tokens(response_text)
+            retryable_transport = is_retryable_llm_error(exc)
             immediate_reason = immediate_model_policy_reason(exc)
             _record_plan_invocation(
                 state,
@@ -934,10 +949,16 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 elapsed_seconds=elapsed,
                 prompt_tokens=prompt_tokens,
                 response_tokens=response_tokens,
-                status="invalid_response" if immediate_reason else "error",
+                status=(
+                    "error"
+                    if retryable_transport
+                    else "invalid_response"
+                    if immediate_reason
+                    else "error"
+                ),
                 error=exc,
             )
-            if is_retryable_llm_error(exc):
+            if retryable_transport:
                 if invoked_provider == "primary":
                     previous_provider = state.active_provider
                     apply_escalation(
@@ -1023,11 +1044,7 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
             )
 
         raw_kind = str(response.get("kind") or "").strip().lower()
-        is_control_variant = (
-            raw_kind in {"tool", "stop"}
-            or response.get("tool_intent") is not None
-            or response.get("stop_reason") is not None
-        )
+        is_control_variant = raw_kind in {"tool", "stop"}
         response_kind = "plan"
         if is_control_variant:
             try:
@@ -1243,16 +1260,37 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 frame=frame,
             )
 
-        prior_assertion_symbols, unresolved_assertion_target = _prior_assertion_symbols(
-            state
-        )
+        try:
+            prior_assertion_symbols, unresolved_assertion_target = (
+                _prior_assertion_symbols(state)
+            )
+            current_assertion_symbols: set[str] = set()
+            unresolved_current_target = False
+            for edit in state.patch_edits:
+                symbol = edit.resolved_target_symbol or edit.node_target
+                if not symbol and edit.search:
+                    symbol = resolve_search_target_symbol_strict(
+                        state,
+                        edit.file_path,
+                        edit.search,
+                    )
+                if symbol:
+                    current_assertion_symbols.add(symbol)
+                else:
+                    unresolved_current_target = True
+        except (OSError, RepairContextError):
+            return _route_plan_environment_failure(
+                state,
+                reason=(
+                    "PatchGate authorization could not be checked against the "
+                    "exact repository state."
+                ),
+                event="assertion_target_resolution",
+            )
         assertion_target_not_diversified = state.assertion_diversity_required and (
             unresolved_assertion_target
-            or any(
-                not edit.resolved_target_symbol
-                or edit.resolved_target_symbol in prior_assertion_symbols
-                for edit in state.patch_edits
-            )
+            or unresolved_current_target
+            or bool(current_assertion_symbols & prior_assertion_symbols)
         )
         if assertion_target_not_diversified:
             record_no_progress(

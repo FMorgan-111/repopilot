@@ -12,6 +12,8 @@ from src.evidence import EvidenceStore
 from src.nodes import execute as execute_node
 from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
+from src.patch_authorization import authorize_plan_patch
+from src.repair_rounds import begin_repair_round
 from src.repair_rounds import validate_repair_round_state
 from src.state import PatchEdit
 
@@ -21,8 +23,9 @@ def _enable_explicit_legacy_host_execution(monkeypatch):
     monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
 
 
-def _failed_attempt(file_path="app/router.py", search="def handle():",
-                    replace="def handle(x):"):
+def _failed_attempt(
+    file_path="app/router.py", search="def handle():", replace="def handle(x):"
+):
     return new_agent.FixAttempt(
         patch_edits=[PatchEdit(file_path=file_path, search=search, replace=replace)],
         test_result="failed",
@@ -80,6 +83,7 @@ def _collect_more_context_response(summary="Need more context."):
 
 # ---- pure helpers -----------------------------------------------------------
 
+
 def test_prior_failed_edits_context_empty_without_failures():
     assert plan_node._prior_failed_edits_context(_base_state()) == ""
 
@@ -97,67 +101,95 @@ def test_prior_failed_edits_context_ignores_successful_attempts():
     assert plan_node._prior_failed_edits_context(_base_state(fix_attempts=[ok])) == ""
 
 
-def test_planned_edits_repeat_failure_detects_repeat():
-    state = _base_state(fix_attempts=[_failed_attempt()])
-    state.patch_edits = [
-        PatchEdit(file_path="app/router.py", search="def handle():", replace="X")
-    ]
-    assert plan_node._planned_edits_repeat_failure(state) is True
-
-
-def test_planned_edits_repeat_failure_false_when_diversified():
-    state = _base_state(fix_attempts=[_failed_attempt()])
-    state.patch_edits = [
-        PatchEdit(file_path="app/other.py", search="def other():", replace="Y")
-    ]
-    assert plan_node._planned_edits_repeat_failure(state) is False
-
-
 def test_is_final_attempt():
-    assert plan_node._is_final_attempt(_base_state(retry_count=3, max_retries=3)) is True
-    assert plan_node._is_final_attempt(_base_state(retry_count=2, max_retries=3)) is False
+    assert (
+        plan_node._is_final_attempt(_base_state(retry_count=3, max_retries=3)) is True
+    )
+    assert (
+        plan_node._is_final_attempt(_base_state(retry_count=2, max_retries=3)) is False
+    )
 
 
 # ---- solution 1: diversification -------------------------------------------
 
-async def test_plan_fix_records_warning_when_patch_repeats_failure(monkeypatch):
-    # Same failed anchor but a DIFFERENT replace: not identical, not
-    # unappliable, so it still executes — with a diversification warning.
-    async def fake_llm_call(system, user):
-        return _execute_response("app/router.py", "def handle():", "def handle(y):")
+
+async def test_identical_failed_patch_replay_uses_shared_retry_and_retires_approval(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=1, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
+    state = exact_repair_state
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                )
+            ],
+            test_result="failed",
+            success=False,
+        )
+    ]
 
     next_state = await plan_node.plan_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.EXECUTE
+    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.retry_count == 1
+    assert next_state.primary_failed_repair_rounds == 1
+    assert next_state.decision_frame.recommended_action == "plan"
+    assert next_state.patch_edits == []
+    assert next_state.tool_patch_approval is None
     assert any(
-        w.get("warning") == "repeated_failed_patch"
-        for w in next_state.decision_warnings
+        w.get("warning") == "blocked_dead_patch" for w in next_state.decision_warnings
     )
 
 
-async def test_plan_fix_no_warning_when_patch_diversified(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _execute_response("app/other.py", "def other():", "def other(x):")
+async def test_materially_changed_proposal_receives_fresh_exact_approval(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=1, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
+    state = exact_repair_state
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'wrong-sentinel'",
+                )
+            ],
+            test_result="failed",
+            success=False,
+        )
+    ]
 
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.EXECUTE
-    assert not any(
-        w.get("warning") == "repeated_failed_patch"
-        for w in next_state.decision_warnings
-    )
+    assert next_state.tool_patch_approval is not None
+    assert next_state.patch_edits[0].exact_only is True
+    assert next_state.authorized_repair_provider == "primary"
 
 
-async def test_assertion_diversity_rejects_same_target_symbol(monkeypatch):
-    async def fake_llm_call(system, user):
+async def test_assertion_diversity_rejects_same_target_symbol(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "kind": "plan",
@@ -165,9 +197,9 @@ async def test_assertion_diversity_rejects_same_target_symbol(monkeypatch):
                 "patch": "",
                 "patch_edits": [
                     {
-                        "file": "app/router.py",
-                        "node_target": "handle",
-                        "replace": "def handle():\n    return 'new'\n",
+                        "file": "src/widget.py",
+                        "node_target": "widget",
+                        "replace": "def widget():\n    return 'new-sentinel'\n",
                     }
                 ],
                 "files": ["app/router.py"],
@@ -183,69 +215,77 @@ async def test_assertion_diversity_rejects_same_target_symbol(monkeypatch):
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(
-        assertion_diversity_required=True,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_edits=[
-                    PatchEdit(
-                        file_path="app/router.py",
-                        node_target="handle",
-                        replace="def handle():\n    return 'wrong'\n",
-                    )
-                ],
-                failure_kind="assertion_failure",
-                error_log="AssertionError: expected new",
-            )
-        ],
-    )
+    state = exact_repair_state
+    state.assertion_diversity_required = True
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    node_target="widget",
+                    replace="def widget():\n    return 'wrong'\n",
+                )
+            ],
+            failure_kind="assertion_failure",
+            error_log="AssertionError: expected new",
+        )
+    ]
 
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == new_agent.Phase.PLAN
     assert not result.patch_edits
+    assert result.retry_count == 1
+    assert result.primary_failed_repair_rounds == 1
+    assert result.tool_patch_approval is None
+    assert result.decision_frame.recommended_action == "plan"
     assert any(
         warning.get("warning") == "assertion_target_not_diversified"
         for warning in result.decision_warnings
     )
 
 
-async def test_assertion_diversity_rejects_different_search_in_same_unknown_symbol(
+async def test_assertion_diversity_rejects_different_search_in_same_resolved_symbol(
+    exact_repair_state,
     monkeypatch,
 ):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return _execute_response(
-            "app/router.py",
-            "    second_line()",
-            "    replacement_line()",
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(
-        assertion_diversity_required=True,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_edits=[
-                    PatchEdit(
-                        file_path="app/router.py",
-                        search="    first_line()",
-                        replace="    wrong_line()",
-                    )
-                ],
-                failure_kind="assertion_failure",
-                error_log="AssertionError: expected new",
-            )
-        ],
-    )
+    state = exact_repair_state
+    state.assertion_diversity_required = True
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="def widget():",
+                    replace="def widget():\n    return 'wrong'",
+                )
+            ],
+            failure_kind="assertion_failure",
+            error_log="AssertionError: expected new",
+        )
+    ]
 
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == new_agent.Phase.PLAN
     assert not result.patch_edits
+    assert result.retry_count == 1
+    assert result.primary_failed_repair_rounds == 1
+    assert result.decision_frame.recommended_action == "plan"
 
 
-async def test_assertion_diversity_accepts_distinct_explicit_node_target(monkeypatch):
-    async def fake_llm_call(system, user):
+async def test_assertion_diversity_accepts_distinct_explicit_node_target(
+    tmp_path, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "kind": "plan",
@@ -271,7 +311,39 @@ async def test_assertion_diversity_accepts_distinct_explicit_node_target(monkeyp
         )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "app").mkdir()
+    (repo / "app" / "router.py").write_text(
+        "def handle():\n    return 'wrong'\n\ndef other_helper():\n    return 'old'\n",
+        encoding="utf-8",
+    )
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "add", "--all"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     state = _base_state(
+        repo_path=str(repo),
+        repo_ref=ref,
         assertion_diversity_required=True,
         fix_attempts=[
             new_agent.FixAttempt(
@@ -292,6 +364,7 @@ async def test_assertion_diversity_accepts_distinct_explicit_node_target(monkeyp
 
     assert result.current_phase == new_agent.Phase.EXECUTE
     assert result.patch_edits[0].node_target == "other_helper"
+    assert result.tool_patch_approval is not None
     assert result.assertion_diversity_required is False
 
 
@@ -325,8 +398,16 @@ async def test_assertion_diversity_resolves_prior_search_to_exact_ast_symbol(
     subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
     subprocess.run(
         [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
         ],
         check=True,
     )
@@ -337,7 +418,7 @@ async def test_assertion_diversity_resolves_prior_search_to_exact_ast_symbol(
         text=True,
     ).stdout.strip()
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "kind": "plan",
@@ -347,10 +428,7 @@ async def test_assertion_diversity_resolves_prior_search_to_exact_ast_symbol(
                     {
                         "file": "module.py",
                         "node_target": candidate_symbol,
-                        "replace": (
-                            f"def {candidate_symbol}():\n"
-                            "    return 'new'\n"
-                        ),
+                        "replace": (f"def {candidate_symbol}():\n    return 'new'\n"),
                     }
                 ],
                 "files": ["module.py"],
@@ -405,19 +483,23 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
     repo = tmp_path / "repo"
     repo.mkdir()
     source = (
-        "def f():\n"
-        "    old_value = 1\n"
-        "    return old_value\n\n"
-        "def g():\n"
-        "    return 2\n"
+        "def f():\n    old_value = 1\n    return old_value\n\ndef g():\n    return 2\n"
     )
     (repo / "module.py").write_text(source, encoding="utf-8")
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
     subprocess.run(
         [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
         ],
         check=True,
     )
@@ -444,28 +526,30 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
         lambda _repo: {"python": "python3", "reason": "exists", "success": True},
     )
     state = _base_state(
-        current_phase=new_agent.Phase.EXECUTE,
         repo_path=str(repo),
         repo_ref=ref,
-        patch_edits=[
-            PatchEdit(
-                file_path="module.py",
-                search="    old_value = 1\n",
-                replace="    new_value = 3\n",
-                resolved_target_symbol="g",
-            )
-        ],
-        test_command="pytest",
     )
+    begin_repair_round(state)
+    raw = json.loads(
+        _execute_response(
+            "module.py",
+            "    old_value = 1\n",
+            "    new_value = 3\n",
+        )
+    )
+    raw["patch_edits"][0]["resolved_target_symbol"] = "g"
+    assert authorize_plan_patch(state, raw).status == "accepted"
+    state.current_phase = new_agent.Phase.EXECUTE
 
     state = await execute_node.execute_fix(state)
 
     assert "old_value = 1" not in (repo / "module.py").read_text(encoding="utf-8")
     assert state.fix_attempts[-1].patch_edits[0].resolved_target_symbol == "f"
+    (repo / "module.py").write_text(source, encoding="utf-8")
     state.assertion_diversity_required = True
     state.current_phase = new_agent.Phase.PLAN
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "kind": "plan",
@@ -493,7 +577,7 @@ async def test_applied_search_edit_persists_preimage_symbol_for_diversity(
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     result = await plan_node.plan_fix(state)
 
-    assert result.current_phase == expected_phase
+    assert result.current_phase == expected_phase, result.failure_reason
 
 
 @pytest.mark.parametrize(
@@ -513,8 +597,16 @@ async def test_plan_discards_model_authored_resolved_symbol_and_recomputes_exact
     subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
     subprocess.run(
         [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
         ],
         check=True,
     )
@@ -525,7 +617,7 @@ async def test_plan_discards_model_authored_resolved_symbol_and_recomputes_exact
         text=True,
     ).stdout.strip()
 
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return json.dumps(
             {
                 "kind": "plan",
@@ -557,8 +649,30 @@ async def test_plan_discards_model_authored_resolved_symbol_and_recomputes_exact
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == new_agent.Phase.EXECUTE
-    assert result.patch_edits[0].resolved_target_symbol == "f"
+    assert result.patch_edits[0].resolved_target_symbol == ""
     assert "forged-identity-trace-sentinel" not in result.model_dump_json()
+
+    async def passed_test(*_args, **_kwargs):
+        return {
+            "command": "pytest",
+            "returncode": 0,
+            "stdout": "passed",
+            "stderr": "",
+            "success": True,
+        }
+
+    monkeypatch.setattr(
+        execute_node,
+        "run_pytest",
+        passed_test,
+    )
+    monkeypatch.setattr(
+        execute_node,
+        "_create_venv",
+        lambda _repo: {"python": "python3", "reason": "exists", "success": True},
+    )
+    executed = await execute_node.execute_fix(result)
+    assert executed.fix_attempts[-1].patch_edits[0].resolved_target_symbol == "f"
 
 
 async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monkeypatch):
@@ -575,8 +689,16 @@ async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monke
     subprocess.run(["git", "-C", str(repo), "add", "module.py"], check=True)
     subprocess.run(
         [
-            "git", "-C", str(repo), "-c", "user.name=Test",
-            "-c", "user.email=test@example.invalid", "commit", "-qm", "base",
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
         ],
         check=True,
     )
@@ -589,8 +711,11 @@ async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monke
 
     async def failed_test(*args, **kwargs):
         return {
-            "command": "pytest", "returncode": 1,
-            "stdout": "AssertionError: expected new", "stderr": "", "success": False,
+            "command": "pytest",
+            "returncode": 1,
+            "stdout": "AssertionError: expected new",
+            "stderr": "",
+            "success": False,
         }
 
     monkeypatch.setattr(execute_node, "run_pytest", failed_test)
@@ -600,18 +725,19 @@ async def test_applied_search_edit_persists_dotted_method_symbol(tmp_path, monke
         lambda _repo: {"python": "python3", "reason": "exists", "success": True},
     )
     state = _base_state(
-        current_phase=new_agent.Phase.EXECUTE,
         repo_path=str(repo),
         repo_ref=ref,
-        patch_edits=[
-            PatchEdit(
-                file_path="module.py",
-                search="        old_value = 1\n",
-                replace="        new_value = 3\n",
-            )
-        ],
-        test_command="pytest",
     )
+    begin_repair_round(state)
+    raw = json.loads(
+        _execute_response(
+            "module.py",
+            "        old_value = 1\n",
+            "        new_value = 3\n",
+        )
+    )
+    assert authorize_plan_patch(state, raw).status == "accepted"
+    state.current_phase = new_agent.Phase.EXECUTE
 
     result = await execute_node.execute_fix(state)
 
@@ -633,24 +759,27 @@ def test_legacy_patch_edit_defaults_resolved_symbol_for_saved_state_compatibilit
 async def test_plan_prompt_includes_failed_edits(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
-        captured["user"] = user
-        return _execute_response("app/other.py", "def other():", "Y")
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        captured.update(system=system, user=user, model=model, provider=provider)
+        return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=1, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
+    state = _base_state(retry_count=1, max_retries=3, fix_attempts=[_failed_attempt()])
 
     await plan_node.plan_fix(state)
 
     assert "ALREADY-TRIED EDITS" in captured["user"]
     assert "app/router.py" in captured["user"]
+    assert captured["system"] == plan_node.PLAN_SYSTEM
+    assert captured["model"] == "gemini-3.5-flash:stable"
+    assert captured["provider"] == "primary"
 
 
 # ---- solution 2: final-attempt force execute -------------------------------
 
+
 async def test_plan_fix_final_attempt_blocks_collect_more_context(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
@@ -659,13 +788,15 @@ async def test_plan_fix_final_attempt_blocks_collect_more_context(monkeypatch):
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert "Final attempt" in next_state.failure_reason
-    # must NOT have looped as a context round
+    assert next_state.failure_reason == (
+        "Context collection made no progress within its bounded cap."
+    )
+    assert next_state.retry_count == 3
     assert next_state.context_collection_count == 0
 
 
 async def test_plan_fix_non_final_collect_more_context_still_loops(monkeypatch):
-    async def fake_llm_call(system, user):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
@@ -673,64 +804,79 @@ async def test_plan_fix_non_final_collect_more_context_still_loops(monkeypatch):
 
     next_state = await plan_node.plan_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.current_phase == new_agent.Phase.LOCATE
     assert next_state.context_collection_count == 1
+    assert next_state.retry_count == 0
+    assert next_state.current_repair_round_id == 1
 
 
 async def test_plan_prompt_includes_final_attempt_instruction(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
-        captured["system"] = system
-        return _execute_response("app/x.py", "a", "b")
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        captured.update(system=system, user=user, model=model, provider=provider)
+        return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     state = _base_state(retry_count=3, max_retries=3)
 
     await plan_node.plan_fix(state)
 
-    assert "FINAL planning attempt" in captured["system"]
+    assert captured["system"] == plan_node.PLAN_SYSTEM
+    assert "FINAL planning attempt" in captured["user"]
+    assert captured["model"] == "gemini-3.5-flash:stable"
+    assert captured["provider"] == "primary"
 
 
 async def test_plan_first_plan_forbids_collect_more_context(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
-        captured["system"] = system
-        return _execute_response("app/x.py", "a", "b")
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        captured.update(system=system, user=user, model=model, provider=provider)
+        return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     # First plan: no prior attempts, no context collected.
     await plan_node.plan_fix(_base_state())
 
-    assert "at least one patch_edit" in captured["system"]
-    assert "FIRST plan" in captured["system"]
-    assert "do NOT recommend collect_more_context" in captured["system"]
+    assert captured["system"] == plan_node.PLAN_SYSTEM
+    assert "at least one patch_edit" in captured["user"]
+    assert "FIRST plan" in captured["user"]
+    assert "do NOT recommend collect_more_context" in captured["user"]
+    assert captured["model"] == "gemini-3.5-flash:stable"
+    assert captured["provider"] == "primary"
 
 
 async def test_plan_non_first_plan_still_requires_patch_but_allows_context(monkeypatch):
     captured = {}
 
-    async def fake_llm_call(system, user):
-        captured["system"] = system
-        return _execute_response("app/x.py", "a", "b")
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        captured.update(system=system, user=user, model=model, provider=provider)
+        return _collect_more_context_response()
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     # A later plan (context already collected once) still demands a patch but
     # does not carry the first-plan collect_more_context ban.
     await plan_node.plan_fix(_base_state(context_collection_count=1))
 
-    assert "at least one patch_edit" in captured["system"]
-    assert "FIRST plan" not in captured["system"]
+    assert captured["system"] == plan_node.PLAN_SYSTEM
+    assert "at least one patch_edit" in captured["user"]
+    assert "FIRST plan" not in captured["user"]
+    assert captured["model"] == "gemini-3.5-flash:stable"
+    assert captured["provider"] == "primary"
 
 
 # ---- reflect wiring ---------------------------------------------------------
 
-async def test_reflect_prompt_includes_failed_edits(monkeypatch):
-    captured = {}
 
-    async def fake_llm_call(system, user):
-        captured["user"] = user
+async def test_reflect_prompt_includes_failed_edits(monkeypatch):
+    calls = []
+
+    async def fake_summary(*_args, **_kwargs):
+        return "safe reflection summary"
+
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append(user)
         return json.dumps(
             {
                 "root_cause": "wrong file",
@@ -748,19 +894,25 @@ async def test_reflect_prompt_includes_failed_edits(monkeypatch):
         )
 
     monkeypatch.setattr(reflect_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=1, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
+    monkeypatch.setattr(
+        reflect_node,
+        "summarize_attempt_outcome",
+        fake_summary,
+    )
+    state = _base_state(retry_count=1, max_retries=3, fix_attempts=[_failed_attempt()])
 
     await reflect_node.reflect_on_failure(state)
 
-    assert "ALREADY-TRIED EDITS" in captured["user"]
-    assert "DIFFERENT edit" in captured["user"]
+    assert "ALREADY-TRIED EDITS" in calls[0]
+    assert "DIFFERENT edit" in calls[0]
 
 
 # ---- solution 1b: hard-block dead patches (do not execute known re-fails) ----
 
-def _unappliable_attempt(file_path="app/router.py", search="def handle():",
-                         replace="def handle(x):"):
+
+def _unappliable_attempt(
+    file_path="app/router.py", search="def handle():", replace="def handle(x):"
+):
     return new_agent.FixAttempt(
         patch_edits=[PatchEdit(file_path=file_path, search=search, replace=replace)],
         test_result="patch_apply_failed",
@@ -772,8 +924,9 @@ def _unappliable_attempt(file_path="app/router.py", search="def handle():",
 def test_dead_plan_reason_identical_patch():
     state = _base_state(fix_attempts=[_failed_attempt()])
     state.patch_edits = [
-        PatchEdit(file_path="app/router.py", search="def handle():",
-                  replace="def handle(x):")
+        PatchEdit(
+            file_path="app/router.py", search="def handle():", replace="def handle(x):"
+        )
     ]
     assert plan_node._dead_plan_reason(state) == "identical_to_failed_patch"
 
@@ -783,8 +936,9 @@ def test_dead_plan_reason_reuses_unappliable_anchor_even_with_new_replace():
     # anchor will still fail to apply, so it is dead.
     state = _base_state(fix_attempts=[_unappliable_attempt()])
     state.patch_edits = [
-        PatchEdit(file_path="app/router.py", search="def handle():",
-                  replace="def handle(z):")
+        PatchEdit(
+            file_path="app/router.py", search="def handle():", replace="def handle(z):"
+        )
     ]
     assert plan_node._dead_plan_reason(state) == "reuses_unappliable_anchor"
 
@@ -797,121 +951,188 @@ def test_dead_plan_reason_none_when_diversified():
     assert plan_node._dead_plan_reason(state) is None
 
 
-async def test_plan_fix_blocks_identical_patch_and_routes_to_reflect(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _execute_response("app/router.py", "def handle():", "def handle(x):")
+async def test_plan_fix_blocks_identical_patch_with_shared_global_retry(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=1, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
+    state = exact_repair_state
+    state.retry_count = 1
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                )
+            ],
+            test_result="failed",
+            success=False,
+        )
+    ]
 
     next_state = await plan_node.plan_fix(state)
 
-    assert next_state.current_phase == new_agent.Phase.REFLECT
-    # Router keys off recommended_action — must be rerouted too, else the empty
-    # patch leaks to EXECUTE.
-    assert next_state.decision_frame.recommended_action == "reflect"
-    assert new_agent.route_from_state(next_state) == "reflect_on_failure"
+    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.retry_count == 2
+    assert next_state.decision_frame.recommended_action == "plan"
+    assert new_agent.route_from_state(next_state) == "plan_fix"
     assert next_state.patch_edits == []
-    assert next_state.repeated_patch_block_count == 1
+    assert next_state.tool_patch_approval is None
     assert any(
-        w.get("warning") == "blocked_dead_patch"
-        for w in next_state.decision_warnings
+        w.get("warning") == "blocked_dead_patch" for w in next_state.decision_warnings
     )
 
 
-async def test_plan_fix_fails_fast_when_block_budget_exhausted(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _execute_response("app/router.py", "def handle():", "def handle(x):")
+async def test_legacy_block_counter_cannot_terminate_before_global_budget(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        )
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    # Already blocked once (at MAX); a second dead plan must fail, not loop.
-    state = _base_state(retry_count=1, max_retries=3,
-                        repeated_patch_block_count=plan_node.MAX_REPEATED_PATCH_BLOCKS,
-                        fix_attempts=[_failed_attempt()])
+    state = exact_repair_state
+    state.retry_count = 1
+    state.repeated_patch_block_count = 99
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                )
+            ],
+            test_result="failed",
+            success=False,
+        )
+    ]
+
+    next_state = await plan_node.plan_fix(state)
+
+    assert next_state.current_phase == new_agent.Phase.PLAN
+    assert next_state.retry_count == 2
+    assert next_state.failure_reason == "identical_to_failed_patch"
+
+
+async def test_final_global_attempt_dead_patch_exhausts_shared_budget(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        return _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
+    state = exact_repair_state
+    state.retry_count = state.max_retries
+    state.fix_attempts = [
+        new_agent.FixAttempt(
+            patch_edits=[
+                PatchEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                )
+            ],
+            test_result="failed",
+            success=False,
+        )
+    ]
 
     next_state = await plan_node.plan_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert "already failed" in next_state.failure_reason
+    assert next_state.failure_reason == (
+        f"Maximum retries reached: {state.max_retries}."
+    )
 
 
-async def test_plan_fix_fails_fast_on_final_attempt_dead_patch(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _execute_response("app/router.py", "def handle():", "def handle(x):")
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(retry_count=3, max_retries=3,
-                        fix_attempts=[_failed_attempt()])
-
-    next_state = await plan_node.plan_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.FAILURE
-
-
-async def test_repeated_invalid_anchors_are_diagnostic_until_primary_failure_threshold(
-    monkeypatch,
+async def test_two_invalid_primary_anchors_switch_next_full_plan_to_opus(
+    exact_repair_state, monkeypatch
 ):
     monkeypatch.setattr(model_policy, "escalation_is_configured", lambda: True)
     monkeypatch.setattr(
         model_policy,
         "get_model_config",
-        lambda provider: SimpleNamespace(model="claude-opus-4-8:stable"),
+        lambda provider: SimpleNamespace(
+            model=(
+                "claude-opus-4-8:stable"
+                if provider == "escalation"
+                else "gemini-3.5-flash:stable"
+            )
+        ),
     )
-
-    async def fake_llm_call(system, user, **kwargs):
-        return _execute_response(
+    responses = [
+        _execute_response(
             "src/widget.py",
             "return 'missing-sentinel'",
             "return 'new-sentinel'",
             summary="Use the missing anchor.",
-        )
+        ),
+        _execute_response(
+            "src/widget.py",
+            "return 'missing-sentinel'",
+            "return 'new-sentinel'",
+            summary="Use the missing anchor again.",
+        ),
+        _execute_response(
+            "src/widget.py",
+            "return 'old-sentinel'",
+            "return 'new-sentinel'",
+            summary="Use the exact anchor.",
+        ),
+    ]
+    calls = []
+
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append((system, user, model, provider))
+        return responses.pop(0)
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(
-        relevant_files=[
-            new_agent.FileInfo(
-                path="src/widget.py",
-                content="def widget():\n    return 'old-sentinel'\n",
-            )
-        ]
-    )
+    state = exact_repair_state
 
     state = await plan_node.plan_fix(state)
-    assert state.escalated is False
     assert state.current_phase == new_agent.Phase.PLAN
+    assert state.retry_count == 1
+    assert state.primary_failed_repair_rounds == 1
+    assert state.escalated is False
 
     state = await plan_node.plan_fix(state)
-
-    assert state.escalated is False
-    assert state.active_provider == "primary"
-    assert state.escalation_reason == ""
-    assert state.no_progress_rounds == 2
-    assert [event.kind for event in state.no_progress_history[-2:]] == [
-        "nonexistent_search_block",
-        "nonexistent_search_block",
-    ]
-    assert model_policy.should_escalate(state).escalate is False
-
-    state.retry_count = 2
-    state.repair_round_sequence = 2
-    state.last_counted_repair_round_id = 2
-    state.primary_failed_repair_rounds = 2
-    validate_repair_round_state(state)
-    decision = model_policy.should_escalate(state)
-    model_policy.apply_escalation(state, decision)
-
-    assert decision.reason == "primary_repair_round_limit"
+    assert state.current_phase == new_agent.Phase.PLAN
+    assert state.retry_count == 2
+    assert state.primary_failed_repair_rounds == 2
     assert state.escalated is True
     assert state.active_provider == "escalation"
     assert state.escalation_reason == "primary_repair_round_limit"
+    assert state.patch_edits == []
+    assert state.tool_patch_approval is None
 
-    model_policy.record_progress(state)
-    assert state.active_provider == "escalation"
-    assert state.primary_failed_repair_rounds == 2
+    state = await plan_node.plan_fix(state)
+
+    assert state.current_phase == new_agent.Phase.EXECUTE
+    assert [call[3] for call in calls] == ["primary", "primary", "escalation"]
+    assert all(call[0] == plan_node.PLAN_SYSTEM for call in calls)
+    assert state.authorized_repair_provider == "escalation"
 
 
-async def test_changed_invalid_anchor_is_material_progress(monkeypatch):
+async def test_changed_invalid_anchor_still_uses_one_shared_retry_per_round(
+    exact_repair_state, monkeypatch
+):
+    monkeypatch.setattr(model_policy, "escalation_is_configured", lambda: False)
     responses = [
         _execute_response(
             "src/widget.py",
@@ -931,19 +1152,18 @@ async def test_changed_invalid_anchor_is_material_progress(monkeypatch):
         return responses.pop(0)
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _base_state(
-        relevant_files=[
-            new_agent.FileInfo(
-                path="src/widget.py",
-                content="def widget():\n    return 'old-sentinel'\n",
-            )
-        ]
-    )
+    state = exact_repair_state
 
     state = await plan_node.plan_fix(state)
     state = await plan_node.plan_fix(state)
 
-    assert state.no_progress_rounds == 1
+    assert state.current_phase == new_agent.Phase.PLAN
+    assert state.retry_count == 2
+    assert state.primary_failed_repair_rounds == 2
+    assert state.repair_round_sequence == 2
+    assert state.last_counted_repair_round_id == 2
+    assert state.patch_edits == []
+    assert state.tool_patch_approval is None
     assert state.escalated is False
 
 
@@ -1048,9 +1268,11 @@ async def test_reflect_terminal_branches_finalize_summary_exactly_once(
         return f"summary for {terminal}"
 
     if terminal == "model_stop":
+
         async def fake_llm_call(*args, **kwargs):
             return {"kind": "stop", "stop_reason": "done"}
     elif terminal == "tool_stop":
+
         async def fake_llm_call(*args, **kwargs):
             return {
                 "kind": "tool",
@@ -1072,6 +1294,7 @@ async def test_reflect_terminal_branches_finalize_summary_exactly_once(
 
         monkeypatch.setattr(reflect_node, "route_tool_intent", stop_router)
     else:
+
         async def fake_llm_call(*args, **kwargs):
             raise ValueError("invalid escalated reflection")
 
@@ -1304,6 +1527,5 @@ async def test_escalated_reflect_tool_reprompt_contains_only_delta_evidence(
     assert "new-reflect-evidence-sentinel" in calls[1][1]
     assert "old-reflect-evidence-sentinel" not in calls[1][1]
     assert not any(
-        item.get("event") == "opus_no_progress"
-        for item in result.node_diagnostics
+        item.get("event") == "opus_no_progress" for item in result.node_diagnostics
     )

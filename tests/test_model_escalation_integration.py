@@ -13,12 +13,38 @@ from src.reasoning_loop import (
     validate_reasoning_response,
 )
 from src.state import (
+    Evidence,
     FileInfo,
     PatchEdit,
     RepairPlan,
     VerifiedEdit,
     VerifiedEditBatch,
 )
+from src.tool_router import ToolRouteResult
+
+
+def _plan_response() -> dict:
+    return {
+        "kind": "plan",
+        "plan": "Return the new sentinel.",
+        "patch": "",
+        "patch_edits": [
+            {
+                "file": "src/widget.py",
+                "search": "return 'old-sentinel'",
+                "replace": "return 'new-sentinel'",
+            }
+        ],
+        "files": ["src/widget.py"],
+        "test_command": "pytest tests/test_widget.py -q",
+        "decision_frame": {
+            "stage": "plan",
+            "summary": "Update the sentinel.",
+            "recommended_action": "execute",
+            "risk": "low",
+            "confidence": 0.9,
+        },
+    }
 
 
 def _state(**updates):
@@ -97,6 +123,151 @@ def _accept_repair(state, repair_plan, verified_batch):
     ]
     state.patch_edits = edits
     return SimpleNamespace(accepted=True, edits=edits, issues=[])
+
+
+@pytest.mark.parametrize(
+    "invalid_response",
+    [
+        {},
+        {
+            "kind": "tool",
+            "tool_intent": {"action": "search_text", "args": "invalid"},
+        },
+    ],
+    ids=["empty", "invalid"],
+)
+async def test_configured_invalid_primary_counts_then_next_full_plan_uses_opus(
+    exact_repair_state, monkeypatch, invalid_response
+):
+    _enable_escalation(monkeypatch)
+    calls = []
+    responses = [invalid_response, _plan_response()]
+
+    async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append((system, user, model, provider))
+        return responses.pop(0)
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    first = await plan_node.plan_fix(exact_repair_state)
+
+    assert first.current_phase == new_agent.Phase.PLAN
+    assert first.retry_count == 1
+    assert first.primary_failed_repair_rounds == 1
+    assert first.escalated is True
+    assert first.current_repair_round_id == 0
+
+    second = await plan_node.plan_fix(first)
+
+    assert second.current_phase == new_agent.Phase.EXECUTE
+    assert [call[3] for call in calls] == ["primary", "escalation"]
+    assert [call[2] for call in calls] == [
+        "gemini-3.5-flash:stable",
+        "claude-opus-4-8:stable",
+    ]
+    assert all(call[0] == plan_node.PLAN_SYSTEM for call in calls)
+    assert second.repair_round_sequence == 2
+    assert second.authorized_repair_provider == "escalation"
+
+
+async def test_escalated_plan_prompt_bounds_and_redacts_adversarial_context(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.active_provider = "escalation"
+    exact_repair_state.active_model = "claude-opus-4-8:stable"
+    exact_repair_state.escalated = True
+    exact_repair_state.escalation_reason = "primary_repair_round_limit"
+    exact_repair_state.relevant_files = [
+        FileInfo(
+            path="src/widget.py",
+            content=(
+                "distinct-safe-source-sentinel\n"
+                "sk-BBBBBBBBBBBBBBBB\n"
+                "RePaIrPlAn forbidden-source-sentinel\n" + "x" * 20_000
+            ),
+        )
+    ]
+    exact_repair_state.repair_correction_context = (
+        "distinct-safe-correction-sentinel\n"
+        "VeRiFiEdEdItBaTcH forbidden-correction-sentinel\n" + "c" * 6_000
+    )
+    calls = []
+
+    async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append((system, user, model, provider))
+        return _plan_response()
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    [call] = calls
+    prompt = call[1]
+    assert "distinct-safe-source-sentinel" in prompt
+    assert "distinct-safe-correction-sentinel" in prompt
+    for forbidden in (
+        "sk-bbbbbbbb",
+        "repairplan",
+        "verifiededitbatch",
+        "forbidden-source-sentinel",
+        "forbidden-correction-sentinel",
+    ):
+        assert forbidden not in prompt.casefold()
+    assert len(prompt) < 20_000
+
+
+async def test_escalated_tool_reprompt_keeps_baseline_source_and_fresh_evidence(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.active_provider = "escalation"
+    exact_repair_state.active_model = "claude-opus-4-8:stable"
+    exact_repair_state.escalated = True
+    exact_repair_state.escalation_reason = "primary_repair_round_limit"
+    calls = []
+    responses = [
+        {
+            "kind": "tool",
+            "tool_intent": {
+                "action": "read_symbol",
+                "args": {"path": "src/widget.py", "symbol": "widget"},
+                "reason": "Confirm the exact body.",
+                "expected_evidence": "Current widget source.",
+            },
+        },
+        _plan_response(),
+    ]
+
+    async def fake_llm(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append((system, user, model, provider))
+        return responses.pop(0)
+
+    async def fake_route(state, intent, **_kwargs):
+        state.evidence.append(
+            Evidence(
+                evidence_id="ev_fresh_plan_tool",
+                tool=intent.action,
+                summary="fresh symbol evidence",
+                content="fresh-tool-evidence-sentinel",
+                fingerprint="fresh-tool-fingerprint",
+            )
+        )
+        return ToolRouteResult(
+            action=intent.action,
+            status="ok",
+            args_fingerprint="fresh-tool-args",
+            evidence_id="ev_fresh_plan_tool",
+            made_progress=True,
+        )
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    monkeypatch.setattr(plan_node, "route_tool_intent", fake_route)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == new_agent.Phase.EXECUTE
+    assert len(calls) == 2
+    assert "def widget():" in calls[1][1]
+    assert "fresh-tool-evidence-sentinel" in calls[1][1]
+    assert all(call[0] == plan_node.PLAN_SYSTEM for call in calls)
+    assert all(call[3] == "escalation" for call in calls)
 
 
 async def test_graph_replays_an_already_escalated_saved_state(tmp_path, monkeypatch):

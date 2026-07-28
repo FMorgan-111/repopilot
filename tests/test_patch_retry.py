@@ -2,6 +2,7 @@ import subprocess
 
 import src.new_agent as new_agent
 from src.nodes import plan as plan_node
+from src.repair_rounds import begin_repair_round
 from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -63,8 +64,14 @@ async def test_primary_plan_replacement_atomically_retires_old_gate_approval(
     state.active_repair_plan = repair_plan
     from src.patch_gate import validate_patch_batch
 
+    begin_repair_round(state)
     assert validate_patch_batch(state, repair_plan, _verified("return 1")).accepted
     assert state.tool_patch_approval is not None
+    old_fingerprint = state.tool_patch_approval.patch_gate_fingerprint
+    old_round_id = state.authorized_repair_round_id
+    state.current_repair_round_id = 0
+    state.current_repair_provider = None
+    state.current_repair_model = ""
     state.active_provider = "primary"
     state.active_model = "gemini-3.5-flash:stable"
 
@@ -92,9 +99,14 @@ async def test_primary_plan_replacement_atomically_retires_old_gate_approval(
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == new_agent.Phase.EXECUTE
-    assert result.tool_patch_approval is None
-    assert result.active_repair_plan is None
-    assert result.patch_edits and not result.patch_edits[0].exact_only
+    assert result.tool_patch_approval is not None
+    assert result.tool_patch_approval.patch_gate_fingerprint != old_fingerprint
+    assert result.active_repair_plan is not None
+    assert result.patch_edits[0].replace == "return 3"
+    assert result.patch_edits[0].exact_only is True
+    assert result.authorized_repair_round_id == old_round_id + 1
+    assert result.authorized_repair_provider == "primary"
+    assert result.authorized_repair_model == "gemini-3.5-flash:stable"
 
 
 async def test_patch_apply_failure_routes_to_failure_when_budget_exhausted():

@@ -266,7 +266,9 @@ def _target_snapshot(root: Path, relative: str) -> _TargetSnapshot:
         )
     _assert_intentional_new_target(root, path)
     if Path(path).suffix.lower() not in _TEXT_SOURCE_SUFFIXES:
-        raise RepairContextError("target file is missing or not an intentional new text file")
+        raise RepairContextError(
+            "target file is missing or not an intentional new text file"
+        )
     return _TargetSnapshot(
         file_path=path,
         content=None,
@@ -295,7 +297,9 @@ def _python_symbol_spans(source: str, requested: str) -> list[tuple[int, int]]:
                     start_line = child.lineno
                     decorators = getattr(child, "decorator_list", ())
                     if decorators:
-                        start_line = min(start_line, *(item.lineno for item in decorators))
+                        start_line = min(
+                            start_line, *(item.lineno for item in decorators)
+                        )
                     end_line = child.end_lineno or child.lineno
                     spans.append((offsets[start_line - 1], offsets[end_line]))
                 walk(child, names)
@@ -381,7 +385,11 @@ def _build_target_context_with_snapshots(
                 f"target symbol {symbol!r} is missing or not unique in RepairPlan files"
             )
         relative, source, span = matches[0]
-        content = _definition_window(source, span) if span else _fallback_window(source, symbol)
+        content = (
+            _definition_window(source, span)
+            if span
+            else _fallback_window(source, symbol)
+        )
         pending.append(
             {
                 "tool": "repair_context",
@@ -412,8 +420,7 @@ def _build_target_context_with_snapshots(
         )
 
     if any(
-        _EVALUATOR_FIELD_RE.search(str(item.get("content") or ""))
-        for item in pending
+        _EVALUATOR_FIELD_RE.search(str(item.get("content") or "")) for item in pending
     ):
         raise RepairContextError("target context contains an evaluator-only field")
 
@@ -472,16 +479,33 @@ def resolve_search_target_symbol(
     file_path: str,
     search: str,
 ) -> str | None:
-    """Resolve one unique Python search anchor to its exact enclosing symbol."""
+    """Best-effort compatibility wrapper used by legacy EXECUTE paths."""
+    try:
+        return resolve_search_target_symbol_strict(state, file_path, search)
+    except (OSError, RepairContextError):
+        return None
+
+
+def resolve_search_target_symbol_strict(
+    state: AgentState,
+    file_path: str,
+    search: str,
+) -> str | None:
+    """Resolve a symbol while preserving exact-checkout environment failures."""
     if not search or not file_path.endswith(".py"):
         return None
     try:
         source = read_exact_checkout_text(state, file_path)
-        if source.count(search) != 1:
-            return None
-        line = source.count("\n", 0, source.index(search)) + 1
+    except RepairContextError:
+        raise
+    except OSError as exc:
+        raise RepairContextError("exact checkout target read failed") from exc
+    if source.count(search) != 1:
+        return None
+    line = source.count("\n", 0, source.index(search)) + 1
+    try:
         tree = ast.parse(source)
-    except (OSError, SyntaxError, ValueError):
+    except SyntaxError:
         return None
 
     candidates: list[tuple[int, str]] = []
@@ -591,9 +615,7 @@ async def _call_schema(
         except Exception as exc:
             elapsed = time.monotonic() - started
             input_tokens = _estimate_tokens(system, current_user)
-            output_tokens = (
-                _estimate_tokens(response_text) if response_text else 0
-            )
+            output_tokens = _estimate_tokens(response_text) if response_text else 0
             record_model_invocation(
                 state,
                 model=model,
@@ -606,7 +628,12 @@ async def _call_schema(
                     "invalid_response"
                     if isinstance(
                         exc,
-                        (ValidationError, RepairContextError, ReasoningStop, ValueError),
+                        (
+                            ValidationError,
+                            RepairContextError,
+                            ReasoningStop,
+                            ValueError,
+                        ),
                     )
                     else "error"
                 ),
@@ -670,9 +697,16 @@ def _validate_batch(
             or current.content_sha256 != expected.content_sha256
         ):
             raise RepairContextError("target file changed from its exact preimage")
-        if _UNIFIED_DIFF_RE.search(edit.search) or _UNIFIED_DIFF_RE.search(edit.replace):
-            raise RepairContextError("unified diff content is not a verified edit anchor")
-        if redact_secrets(edit.search) != edit.search or redact_secrets(edit.replace) != edit.replace:
+        if _UNIFIED_DIFF_RE.search(edit.search) or _UNIFIED_DIFF_RE.search(
+            edit.replace
+        ):
+            raise RepairContextError(
+                "unified diff content is not a verified edit anchor"
+            )
+        if (
+            redact_secrets(edit.search) != edit.search
+            or redact_secrets(edit.replace) != edit.replace
+        ):
             raise RepairContextError("verified edit contains credential-shaped text")
         anchor = (edit.file_path, edit.node_target or "", edit.search)
         if anchor in anchors:
@@ -682,7 +716,9 @@ def _validate_batch(
         edit._exact_only = True
         if current.is_new:
             if edit.node_target or edit.search:
-                raise RepairContextError("intentional new text file cannot use an existing anchor")
+                raise RepairContextError(
+                    "intentional new text file cannot use an existing anchor"
+                )
             continue
         source = current.content
         if source is None:  # defensive narrowing; existing targets always have content
@@ -690,30 +726,48 @@ def _validate_batch(
         file_evidence = evidence_by_file.get(edit.file_path, [])
         if edit.node_target:
             if edit.node_target not in plan.target_symbols:
-                raise RepairContextError("verified edit node is outside RepairPlan symbols")
+                raise RepairContextError(
+                    "verified edit node is outside RepairPlan symbols"
+                )
             if locate_node_span(source, edit.node_target) is None:
-                raise RepairContextError("verified edit node target is missing or ambiguous")
+                raise RepairContextError(
+                    "verified edit node target is missing or ambiguous"
+                )
             if not any(item.symbol == edit.node_target for item in file_evidence):
-                raise RepairContextError("verified edit node lacks exact target evidence")
+                raise RepairContextError(
+                    "verified edit node lacks exact target evidence"
+                )
             try:
                 replacement = ast.parse(textwrap.dedent(edit.replace))
             except SyntaxError as exc:
-                raise RepairContextError("node replacement is not valid Python") from exc
+                raise RepairContextError(
+                    "node replacement is not valid Python"
+                ) from exc
             if len(replacement.body) != 1 or not isinstance(
                 replacement.body[0],
                 (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef),
             ):
-                raise RepairContextError("node replacement must be one complete definition")
+                raise RepairContextError(
+                    "node replacement must be one complete definition"
+                )
             definition = replacement.body[0]
             if definition.name != edit.node_target.rsplit(".", 1)[-1]:
-                raise RepairContextError("node replacement does not preserve its target symbol")
+                raise RepairContextError(
+                    "node replacement does not preserve its target symbol"
+                )
         else:
             if not edit.search:
-                raise RepairContextError("existing-file verified edit requires an exact anchor")
+                raise RepairContextError(
+                    "existing-file verified edit requires an exact anchor"
+                )
             if source.count(edit.search) != 1:
-                raise RepairContextError("verified edit search anchor is missing or not unique")
+                raise RepairContextError(
+                    "verified edit search anchor is missing or not unique"
+                )
             if not any(edit.search in item.content for item in file_evidence):
-                raise RepairContextError("verified edit search anchor was not in target evidence")
+                raise RepairContextError(
+                    "verified edit search anchor was not in target evidence"
+                )
 
 
 def verified_edits_to_patch_edits(
@@ -726,7 +780,9 @@ def verified_edits_to_patch_edits(
     edits: list[PatchEdit] = []
     for edit in batch.edits:
         if not edit._exact_only or not edit._expected_content_sha256:
-            raise RepairContextError("verified edit is missing its exact preimage binding")
+            raise RepairContextError(
+                "verified edit is missing its exact preimage binding"
+            )
         current = _target_snapshot(root, edit.file_path)
         if current.content_sha256 != edit._expected_content_sha256:
             raise RepairContextError("target file changed from its exact preimage")
@@ -856,7 +912,9 @@ async def generate_opus_repair(
     reasoning_tool_counter = tool_counter if tool_counter is not None else [0]
     state._reasoning_tool_counter = reasoning_tool_counter
 
-    def validate_plan(candidate: RepairPlan) -> tuple[
+    def validate_plan(
+        candidate: RepairPlan,
+    ) -> tuple[
         RepairPlan,
         list[Evidence],
         dict[str, _TargetSnapshot],
@@ -899,7 +957,9 @@ async def generate_opus_repair(
             for item in evidence
         ],
     }
-    user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    user = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     if len(user) > REPAIR_PROMPT_LIMIT:
         raise RepairContextError("verified edit prompt exceeds strict context budget")
     should_validate_edits = validate_edits
@@ -963,7 +1023,9 @@ async def request_verified_edit_correction(
                     if str(getattr(issue, "file_path", ""))
                     else ""
                 ),
-                "message": _safe_generated_text(str(getattr(issue, "message", "")))[:500],
+                "message": _safe_generated_text(str(getattr(issue, "message", "")))[
+                    :500
+                ],
                 "real_code_window": _safe_generated_text(
                     str(getattr(issue, "correction_context", ""))
                 )[:1_200],
@@ -983,9 +1045,13 @@ async def request_verified_edit_correction(
             for edit in previous_batch.edits
         ],
     }
-    user = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    user = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    )
     if len(user) > 40_000:
-        raise RepairContextError("verified edit correction exceeds strict context budget")
+        raise RepairContextError(
+            "verified edit correction exceeds strict context budget"
+        )
     return await _call_schema(
         state,
         system=VERIFIED_EDIT_CORRECTION_SYSTEM,
@@ -1008,8 +1074,6 @@ async def request_verified_edit_correction(
             sort_keys=True,
         ),
         tool_counter=(
-            tool_counter
-            if tool_counter is not None
-            else state._reasoning_tool_counter
+            tool_counter if tool_counter is not None else state._reasoning_tool_counter
         ),
     )

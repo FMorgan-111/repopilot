@@ -5,7 +5,9 @@ from src.nodes import plan as plan_node
 from src.nodes import reflect as reflect_node
 
 
-async def test_reflect_patch_apply_failure_prompt_prefers_search_replace_repair(monkeypatch):
+async def test_reflect_patch_apply_failure_prompt_prefers_search_replace_repair(
+    monkeypatch,
+):
     calls = []
 
     async def fake_llm_call(system, user):
@@ -151,11 +153,15 @@ async def test_reflect_search_replace_failure_prompt_includes_failed_edits(monke
     assert "new envpython lookup" in prompt
 
 
-async def test_plan_patch_apply_failure_prompt_requires_search_replace_repair(monkeypatch):
+async def test_plan_patch_apply_failure_prompt_requires_search_replace_repair(
+    monkeypatch,
+):
     calls = []
 
-    async def fake_llm_call(system, user):
-        calls.append({"system": system, "user": user})
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append(
+            {"system": system, "user": user, "model": model, "provider": provider}
+        )
         return json.dumps(
             {
                 "plan": "Repair the envpython patch before changing semantics.",
@@ -229,8 +235,11 @@ async def test_plan_patch_apply_failure_prompt_requires_search_replace_repair(mo
     prompt = calls[0]["user"]
     assert "Hypothesis Continuity Instructions" in prompt
     assert "tests did not run" in prompt.lower()
-    assert "exact patch_edits repair" in prompt.lower()
-    assert "repair the previous patch's file paths and search blocks before changing semantics" in prompt.lower()
+    assert "complete structured-edit decision" in prompt.lower()
+    assert "repair the previous target paths and exact anchors" in prompt.lower()
+    assert calls[0]["system"] == plan_node.PLAN_SYSTEM
+    assert calls[0]["model"] == "gemini-3.5-flash:stable"
+    assert calls[0]["provider"] == "primary"
     assert "patch_edits" in calls[0]["system"]
     assert "search" in calls[0]["system"]
     assert "replace" in calls[0]["system"]
@@ -246,18 +255,22 @@ async def test_plan_patch_apply_failure_prompt_requires_search_replace_repair(mo
 async def test_plan_fix_includes_human_answer_context(monkeypatch):
     calls = []
 
-    async def fake_llm_call(system, user):
-        calls.append({"system": system, "user": user})
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
+        calls.append(
+            {"system": system, "user": user, "model": model, "provider": provider}
+        )
         return json.dumps(
             {
+                "kind": "plan",
                 "plan": "Use the human answer to refine the patch.",
-                "patch": "diff --git a/src/envpython.py b/src/envpython.py\n",
-                "files": ["src/envpython.py"],
-                "test_command": "pytest tests/test_envpython.py -q",
+                "patch": "",
+                "patch_edits": [],
+                "files": [],
+                "test_command": "",
                 "decision_frame": {
                     "stage": "plan",
                     "summary": "Use the human answer to refine the patch.",
-                    "recommended_action": "execute",
+                    "recommended_action": "collect_more_context",
                     "risk": "medium",
                     "confidence": 0.8,
                 },
@@ -286,6 +299,9 @@ async def test_plan_fix_includes_human_answer_context(monkeypatch):
     prompt = calls[0]["user"]
     assert "Human answer since resume" in prompt
     assert "Breaking changes are allowed." in prompt
+    assert calls[0]["system"] == plan_node.PLAN_SYSTEM
+    assert calls[0]["model"] == "gemini-3.5-flash:stable"
+    assert calls[0]["provider"] == "primary"
 
 
 async def test_reflect_on_failure_includes_human_answer_context(monkeypatch):
@@ -347,7 +363,9 @@ async def test_reflect_on_failure_includes_human_answer_context(monkeypatch):
     assert "Breaking changes are allowed." in prompt
 
 
-async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkeypatch):
+async def test_escalated_plan_uses_common_structured_edit_protocol(
+    tmp_path, monkeypatch
+):
     import subprocess
 
     repo = tmp_path / "repo"
@@ -380,30 +398,31 @@ async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkey
     ).stdout.strip()
     calls = []
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append((system, user, model, provider))
-        if len(calls) == 1:
-            return {
-                "root_cause": "compute omits the offset",
-                "target_files": ["widget.py"],
-                "target_symbols": ["compute"],
-                "required_behavior": "Apply the offset.",
-                "regression_test_strategy": "Run the focused test.",
-                "rejected_approaches": [],
-            }
         return {
-            "edits": [
+            "kind": "plan",
+            "plan": "Apply the offset.",
+            "patch": "",
+            "patch_edits": [
                 {
-                    "file_path": "widget.py",
+                    "file": "widget.py",
                     "node_target": "compute",
-                    "search": "",
                     "replace": "def compute(value):\n    return value + 1\n",
-                    "intent": "Apply the offset.",
                 }
-            ]
+            ],
+            "files": ["widget.py"],
+            "test_command": "pytest -q",
+            "decision_frame": {
+                "stage": "plan",
+                "summary": "Apply the offset.",
+                "recommended_action": "execute",
+                "risk": "low",
+                "confidence": 0.9,
+            },
         }
 
-    monkeypatch.setattr("src.repair_flow.llm_call", fake_llm_call)
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
         issue_title="Wrong result",
@@ -422,7 +441,9 @@ async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkey
     result = await plan_node.plan_fix(state)
 
     assert result.current_phase == new_agent.Phase.EXECUTE
-    assert len(calls) == 2
+    assert len(calls) == 1
+    assert calls[0][0] == plan_node.PLAN_SYSTEM
+    assert calls[0][2:] == ("claude-opus-4-8:stable", "escalation")
     assert result.patch_content.startswith("diff --git a/widget.py b/widget.py")
     assert result.tool_patch_approval is not None
     assert result.tool_patch_approval.base_ref == ref
@@ -434,7 +455,4 @@ async def test_escalated_plan_uses_two_stage_verified_edit_flow(tmp_path, monkey
     )
     assert result.patch_edits[0].exact_only is True
     assert len(result.patch_edits[0].expected_content_sha256) == 64
-    assert [entry.provider for entry in result.model_history[-2:]] == [
-        "escalation",
-        "escalation",
-    ]
+    assert [entry.provider for entry in result.model_history] == ["escalation"]

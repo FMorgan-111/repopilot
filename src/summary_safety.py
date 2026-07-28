@@ -11,7 +11,7 @@ _EVALUATOR_FIELD_RE = re.compile(
     r"(?i)\b(?:gold[_ -]?patch|test[_ -]?patch|FAIL_TO_PASS|PASS_TO_PASS)\b"
 )
 _PATCH_FIELD_RE = re.compile(
-    r'''(?ix)(?:\{\s*)?(?<![\w])(?:"patch"|'patch'|patch)\s*[:=]'''
+    r"""(?ix)(?:\{\s*)?(?<![\w])(?:"patch"|'patch'|patch)\s*[:=]"""
 )
 _RAW_HTTP_MARKER_RE = re.compile(
     r"(?i)(?:\braw[\s_-]+HTTP\b|HTTP/\d(?:\.\d)?\b|"
@@ -42,11 +42,12 @@ def sanitize_summary_text(
         )
         if marker is not None
     ]
-    boundary_offsets.extend(
-        offset
-        for literal in denied_literals
-        if literal and (offset := text.find(literal)) >= 0
-    )
+    for literal in denied_literals:
+        if not literal:
+            continue
+        match = re.search(re.escape(literal), text, flags=re.IGNORECASE | re.ASCII)
+        if match is not None:
+            boundary_offsets.append(match.start())
     if boundary_offsets:
         text = text[: min(boundary_offsets)]
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
