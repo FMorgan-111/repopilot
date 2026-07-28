@@ -1048,9 +1048,12 @@ async def plan_fix(state: AgentState | dict[str, Any]) -> AgentState:
                 immediate_reason=immediate_model_policy_reason(invalid),
             )
 
-        raw_kind = str(response.get("kind") or "").strip().lower()
-        is_control_variant = raw_kind in {"tool", "stop"}
         response_kind = "plan"
+        if "patch_edits" not in response:
+            raw_kind = str(response.get("kind") or "").strip().lower()
+            is_control_variant = raw_kind in {"tool", "stop"}
+        else:
+            is_control_variant = False
         if is_control_variant:
             try:
                 response_kind = validate_reasoning_response(

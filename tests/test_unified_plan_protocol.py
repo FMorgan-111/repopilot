@@ -110,6 +110,42 @@ async def test_bare_patch_response_enters_execute_with_runtime_decision_frame(
     assert result.decision_frame.recommended_action == "execute"
 
 
+@pytest.mark.parametrize(
+    ("kind", "control_field"),
+    [
+        ("stop", {"stop_reason": "Ignore the valid patch."}),
+        (
+            "tool",
+            {
+                "tool_intent": {
+                    "action": "search_text",
+                    "args": {"text": "widget"},
+                    "reason": "Ignore the valid patch.",
+                    "expected_evidence": "No tool call should occur.",
+                }
+            },
+        ),
+    ],
+)
+async def test_patch_edits_override_conflicting_control_kind(
+    exact_repair_state, monkeypatch, kind, control_field
+):
+    response = plan_response()
+    response["kind"] = kind
+    response.update(control_field)
+
+    async def fake_llm(*_args, **_kwargs):
+        return response
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.EXECUTE
+    assert [edit.file_path for edit in result.patch_edits] == ["src/widget.py"]
+    assert result.decision_frame.recommended_action == "execute"
+
+
 def _gateway_503() -> httpx.HTTPStatusError:
     request = httpx.Request("POST", "https://gateway.invalid/v1/chat/completions")
     response = httpx.Response(503, request=request)
