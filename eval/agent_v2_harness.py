@@ -38,6 +38,9 @@ CoverageProof = importlib.import_module("src.state").CoverageProof
 DEFAULT_AGENT_V2_TOKEN_BUDGET = importlib.import_module(
     "src.state"
 ).DEFAULT_AGENT_V2_TOKEN_BUDGET
+DEFAULT_AGENT_V2_MAX_RETRIES = importlib.import_module(
+    "src.state"
+).DEFAULT_AGENT_V2_MAX_RETRIES
 _execute = importlib.import_module("src.nodes.execute")
 git_clone = _execute.git_clone
 is_transient_git_transport_error = _execute._is_transient_git_transport_error
@@ -587,7 +590,7 @@ async def _build_eval_seed(
 async def evaluate_agent_v2_sample(
     sample: dict[str, Any],
     idx: int,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     seed_gold_files: bool = False,
 ) -> dict[str, Any]:
@@ -632,6 +635,13 @@ async def evaluate_agent_v2_sample(
             safe_fields["coverage_status"], safe_fields["coverage_proof"]
         )
     )
+    model_patch = _safe_model_patch(payload.get("model_patch", ""))
+    raw_tests_passed = payload.get("tests_passed")
+    tests_passed = (
+        raw_tests_passed
+        if model_patch and type(raw_tests_passed) is bool
+        else None
+    )
 
     result = {
         "id": _safe_text(sample["id"], 500),
@@ -646,6 +656,8 @@ async def evaluate_agent_v2_sample(
         "issue_title": _safe_text(issue["title"]),
         "success": terminal_success,
         "agent_success": terminal_success,
+        "patch_generated": bool(model_patch),
+        "tests_passed": tests_passed,
         # Filled only by an official scorer import; never inferred internally.
         "official_resolved": None,
         "waiting_for_user": payload.get("waiting_for_user") is True,
@@ -681,7 +693,7 @@ async def evaluate_agent_v2_sample(
             {
                 "instance_id": sample["instance_id"],
                 "base_commit": sample["base_commit"],
-                "model_patch": _safe_model_patch(payload.get("model_patch", "")),
+                "model_patch": model_patch,
             }
         )
     return result
@@ -723,6 +735,8 @@ def safe_failed_sample_result(
         "issue_title": _safe_text(issue.get("title")),
         "success": False,
         "agent_success": False,
+        "patch_generated": False,
+        "tests_passed": None,
         "official_resolved": None,
         "waiting_for_user": False,
         "final_phase": "FAILED",
@@ -764,7 +778,7 @@ async def run_exact_verified_instance(
     instance_id: str,
     *,
     output_dir: Path,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = 100_000,
 ) -> dict[str, Any]:
     """Run exactly one official Verified row and persist one safe checkpoint."""
@@ -794,7 +808,7 @@ async def run_exact_verified_instance(
 
 async def run_agent_v2_eval(
     n_samples: int = MAX_SAMPLES,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     results_path: Path | str = RESULTS_PATH,
     sample_id: str | None = None,
@@ -913,7 +927,7 @@ def main(argv: list[str] | None = None) -> None:
         description="Run RepoPilot's state-graph agent on eval samples.",
     )
     parser.add_argument("--samples", type=int, default=MAX_SAMPLES)
-    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--max-retries", type=int, default=DEFAULT_AGENT_V2_MAX_RETRIES)
     parser.add_argument(
         "--token-budget",
         type=int,

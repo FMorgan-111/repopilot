@@ -7,6 +7,7 @@ import src.nodes.execute as execute_node
 from src import new_agent
 from src.patch_gate import validate_patch_batch
 from src.patch_repair import repair_unified_diff
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -15,7 +16,7 @@ def _enable_explicit_legacy_host_execution(monkeypatch):
     monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
 
 
-async def test_execute_fix_prepares_environment_for_precloned_benchmark_repo(
+async def test_execute_fix_rejects_unapproved_precloned_benchmark_repo(
     monkeypatch, tmp_path
 ):
     source = tmp_path / "src" / "auth.py"
@@ -65,15 +66,14 @@ async def test_execute_fix_prepares_environment_for_precloned_benchmark_repo(
 
     result = await execute_node.execute_fix(state)
 
-    assert result.fix_attempts[-1].success is True
-    assert calls == [
-        ("venv", str(tmp_path)),
-        ("install", str(tmp_path), "/tmp/benchmark-venv/bin/python"),
-        ("pytest", "/tmp/benchmark-venv/bin/python"),
-    ]
+    assert result.fix_attempts[-1].success is False
+    assert result.fix_attempts[-1].failure_kind == "infra_error"
+    assert "PatchGate" in result.fix_attempts[-1].error_log
+    assert calls == []
+    assert source.read_text(encoding="utf-8") == "enabled = False\n"
 
 
-async def test_execute_fix_applies_search_replace_patch_edits_without_git_apply(
+async def test_execute_fix_rejects_unapproved_search_replace_edits(
     monkeypatch, tmp_path
 ):
     app_path = tmp_path / "src" / "auth.py"
@@ -108,13 +108,9 @@ async def test_execute_fix_applies_search_replace_patch_edits_without_git_apply(
         patch_edits=[
             new_agent.PatchEdit(
                 file_path="src/auth.py",
-                search=(
-                    "    if retry_count > max_retries:\n"
-                    "        return FAILURE\n"
-                ),
+                search=("    if retry_count > max_retries:\n        return FAILURE\n"),
                 replace=(
-                    "    if retry_count >= max_retries:\n"
-                    "        return FAILURE\n"
+                    "    if retry_count >= max_retries:\n        return FAILURE\n"
                 ),
             )
         ],
@@ -123,11 +119,15 @@ async def test_execute_fix_applies_search_replace_patch_edits_without_git_apply(
 
     next_state = await execute_node.execute_fix(state)
 
-    assert "if retry_count >= max_retries" in app_path.read_text(encoding="utf-8")
+    assert "if retry_count > max_retries" in app_path.read_text(encoding="utf-8")
     assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert next_state.fix_attempts[-1].success is True
+    assert next_state.fix_attempts[-1].success is False
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert "PatchGate" in next_state.fix_attempts[-1].error_log
     assert next_state.fix_attempts[-1].patch_edits[0].file_path == "src/auth.py"
-    assert any(call.tool_name == "apply_patch_edits" for call in next_state.tool_calls)
+    assert not any(
+        call.tool_name == "apply_patch_edits" for call in next_state.tool_calls
+    )
 
 
 async def test_execute_fix_search_replace_failure_does_not_modify_file(
@@ -161,10 +161,9 @@ async def test_execute_fix_search_replace_failure_does_not_modify_file(
     assert app_path.read_text(encoding="utf-8") == original
     assert next_state.current_phase == new_agent.Phase.VERIFY
     assert next_state.fix_attempts[-1].success is False
-    assert next_state.fix_attempts[-1].test_result == "patch_apply_failed"
-    assert next_state.fix_attempts[-1].failure_kind == "patch_apply_failed"
-    assert "Search/replace edit failed" in next_state.fix_attempts[-1].error_log
-    assert "search block was not found" in next_state.fix_attempts[-1].error_log
+    assert next_state.fix_attempts[-1].test_result == "execution_error"
+    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
+    assert "PatchGate" in next_state.fix_attempts[-1].error_log
 
 
 async def test_apply_patch_checks_before_applying(monkeypatch, tmp_path):
@@ -191,7 +190,7 @@ async def test_apply_patch_checks_before_applying(monkeypatch, tmp_path):
     assert [payload for _, payload in calls] == ["patch-content", "patch-content"]
 
 
-async def test_execute_fix_preflight_failure_short_circuits_and_redacts_token(
+async def test_execute_fix_rejects_raw_patch_before_preflight_or_token_exposure(
     monkeypatch, tmp_path
 ):
     token = "gho_patchsecret"
@@ -218,20 +217,18 @@ async def test_execute_fix_preflight_failure_short_circuits_and_redacts_token(
 
     next_state = await execute_node.execute_fix(state)
 
-    assert calls == [["git", "apply", "--check", "-"]]
+    assert calls == []
     assert next_state.current_phase == new_agent.Phase.VERIFY
     assert len(next_state.fix_attempts) == 1
     attempt = next_state.fix_attempts[-1]
-    assert attempt.test_result == "patch_apply_failed"
-    assert attempt.failure_kind == "patch_apply_failed"
+    assert attempt.test_result == "execution_error"
+    assert attempt.failure_kind == "infra_error"
     assert token not in attempt.error_log
     assert tokenized_url not in attempt.error_log
-    assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in (
-        attempt.error_log
-    )
+    assert "PatchGate" in attempt.error_log
 
 
-async def test_execute_fix_preflight_failure_records_distinct_stage(
+async def test_execute_fix_raw_patch_is_a_common_state_integrity_failure(
     monkeypatch, tmp_path
 ):
     def fake_run(cmd, **kwargs):
@@ -254,10 +251,9 @@ async def test_execute_fix_preflight_failure_records_distinct_stage(
     next_state = await execute_node.execute_fix(state)
 
     attempt = next_state.fix_attempts[-1]
-    assert attempt.test_result == "patch_apply_failed"
-    assert attempt.failure_kind == "patch_apply_failed"
-    assert "Patch preflight check failed" in attempt.error_log
-    assert "error: No valid patches in input" in attempt.error_log
+    assert attempt.test_result == "execution_error"
+    assert attempt.failure_kind == "infra_error"
+    assert "PatchGate" in attempt.error_log
 
 
 def test_repair_unified_diff_extracts_diff_and_recounts_hunk_lengths():
@@ -288,7 +284,7 @@ This fixes the issue.
     assert "recounted_hunk_lengths" in repaired.reasons
 
 
-async def test_execute_fix_uses_repaired_patch_when_preflight_repair_passes(
+async def test_execute_fix_does_not_repair_unapproved_model_patch(
     monkeypatch, tmp_path
 ):
     original_patch = """Here is the repaired patch:
@@ -306,7 +302,10 @@ index 1234567..abcdefg 100644
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs.get("input")))
-        if cmd == ["git", "apply", "--check", "-"] and kwargs.get("input") == original_patch:
+        if (
+            cmd == ["git", "apply", "--check", "-"]
+            and kwargs.get("input") == original_patch
+        ):
             return subprocess.CompletedProcess(
                 cmd,
                 1,
@@ -341,29 +340,16 @@ index 1234567..abcdefg 100644
     next_state = await execute_node.execute_fix(state)
 
     assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert next_state.fix_attempts[-1].success is True
-    assert next_state.fix_attempts[-1].patch_content != original_patch
-    assert next_state.patch_content == next_state.fix_attempts[-1].patch_content
-    repair_diag = next(
-        item
-        for item in next_state.node_diagnostics
-        if item["node"] == "execute_fix" and item["event"] == "patch_repair"
-    )
-    assert repair_diag["status"] == "success"
-    assert repair_diag["repair_reasons"] == [
-        "extracted_diff_block",
-        "removed_invalid_index_line",
-        "recounted_hunk_lengths",
-    ]
-    assert any(call.tool_name == "patch_repair" for call in next_state.tool_calls)
-    assert [cmd for cmd, _ in calls] == [
-        ["git", "apply", "--check", "-"],
-        ["git", "apply", "--check", "-"],
-        ["git", "apply", "-"],
-    ]
+    attempt = next_state.fix_attempts[-1]
+    assert attempt.success is False
+    assert attempt.failure_kind == "infra_error"
+    assert attempt.patch_content == original_patch
+    assert next_state.patch_content == original_patch
+    assert not any(call.tool_name == "patch_repair" for call in next_state.tool_calls)
+    assert calls == []
 
 
-async def test_execute_fix_records_repair_attempt_when_repaired_preflight_fails(
+async def test_execute_fix_never_attempts_unapproved_patch_repair(
     monkeypatch, tmp_path
 ):
     original_patch = """```diff
@@ -378,7 +364,10 @@ index 1234567..abcdefg 100644
 """
 
     def fake_run(cmd, **kwargs):
-        if cmd == ["git", "apply", "--check", "-"] and kwargs.get("input") == original_patch:
+        if (
+            cmd == ["git", "apply", "--check", "-"]
+            and kwargs.get("input") == original_patch
+        ):
             return subprocess.CompletedProcess(
                 cmd,
                 1,
@@ -405,23 +394,10 @@ index 1234567..abcdefg 100644
 
     attempt = next_state.fix_attempts[-1]
     assert attempt.success is False
-    assert attempt.failure_kind == "patch_apply_failed"
-    assert attempt.patch_content != original_patch
-    assert "Patch repair attempted but preflight still failed" in attempt.error_log
-    assert "error: corrupt patch at line 9" in attempt.error_log
-    assert "error: patch failed: src/app.py:19" in attempt.error_log
-    repair_diag = next(
-        item
-        for item in next_state.node_diagnostics
-        if item["node"] == "execute_fix" and item["event"] == "patch_repair"
-    )
-    assert repair_diag["status"] == "error"
-    assert repair_diag["repair_reasons"] == [
-        "extracted_diff_block",
-        "removed_invalid_index_line",
-        "recounted_hunk_lengths",
-    ]
-    assert any(call.tool_name == "patch_repair" for call in next_state.tool_calls)
+    assert attempt.failure_kind == "infra_error"
+    assert attempt.patch_content == original_patch
+    assert "PatchGate" in attempt.error_log
+    assert not any(call.tool_name == "patch_repair" for call in next_state.tool_calls)
 
 
 def test_apply_patch_edits_creates_gate_bound_new_text_file(tmp_path):
@@ -439,17 +415,27 @@ def test_apply_patch_edits_creates_gate_bound_new_text_file(tmp_path):
     assert (tmp_path / "tests/test_new.py").read_text(encoding="utf-8") == edit.replace
 
 
-async def test_execute_revalidates_gate_preimage_immediately_before_apply(monkeypatch, tmp_path):
+async def test_execute_revalidates_gate_preimage_immediately_before_apply(
+    monkeypatch, tmp_path
+):
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
-    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@example.invalid"],
+        check=True,
+    )
     subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
     source = "value = 1\n"
     (repo / "a.py").write_text(source, encoding="utf-8")
     subprocess.run(["git", "-C", str(repo), "add", "a.py"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
-    ref = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    ref = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
     plan = RepairPlan(
         root_cause="wrong value",
         target_files=["a.py"],
@@ -463,11 +449,22 @@ async def test_execute_revalidates_gate_preimage_immediately_before_apply(monkey
         active_repair_plan=plan,
     )
     batch = VerifiedEditBatch(
-        edits=[VerifiedEdit(file_path="a.py", search="value = 1", replace="value = 2", intent="fix")]
+        edits=[
+            VerifiedEdit(
+                file_path="a.py", search="value = 1", replace="value = 2", intent="fix"
+            )
+        ]
     )
+    begin_repair_round(state)
+    bind_repair_round_author(state)
     assert validate_patch_batch(state, plan, batch).accepted
+    assert state.authorized_repair_round_id > 0
     (repo / "a.py").write_text("value = 9\n", encoding="utf-8")
-    monkeypatch.setattr(execute_node, "_create_venv", lambda path: {"python": "python3", "reason": "exists"})
+    monkeypatch.setattr(
+        execute_node,
+        "_create_venv",
+        lambda path: {"python": "python3", "reason": "exists"},
+    )
 
     async def should_not_test(*args, **kwargs):
         raise AssertionError("tests must not run after a preimage mismatch")
@@ -476,6 +473,6 @@ async def test_execute_revalidates_gate_preimage_immediately_before_apply(monkey
 
     result = await execute_node.execute_fix(state)
 
-    assert result.fix_attempts[-1].failure_kind == "execution_error"
+    assert result.fix_attempts[-1].failure_kind == "infra_error"
     assert "preimage" in result.fix_attempts[-1].error_log.lower()
     assert (repo / "a.py").read_text(encoding="utf-8") == "value = 9\n"

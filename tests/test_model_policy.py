@@ -101,7 +101,7 @@ def test_first_no_progress_signature_starts_streak_at_one(monkeypatch):
     assert model_policy.should_escalate(state).escalate is False
 
 
-def test_two_consecutive_same_signatures_escalate(monkeypatch):
+def test_two_consecutive_same_signatures_are_diagnostic_only(monkeypatch):
     enable_escalation(monkeypatch)
     state = make_state()
     fingerprint = {"path": "a.py", "search": "x"}
@@ -114,9 +114,49 @@ def test_two_consecutive_same_signatures_escalate(monkeypatch):
     )
 
     decision = model_policy.should_escalate(state)
-    assert decision.escalate is True
-    assert decision.reason == "repeated_edit"
+    assert decision.escalate is False
+    assert decision.reason == ""
     assert state.no_progress_rounds == 2
+
+
+def test_two_counted_primary_failures_escalate_before_budget_policy(monkeypatch):
+    enable_escalation(monkeypatch)
+    state = make_state(
+        primary_failed_repair_rounds=2,
+        token_usage=55_000,
+    )
+
+    decision = model_policy.should_escalate(state)
+
+    assert decision.escalate is True
+    assert decision.reason == "primary_repair_round_limit"
+
+
+def test_approved_immediate_reason_precedes_primary_failure_threshold(monkeypatch):
+    enable_escalation(monkeypatch)
+    state = make_state(
+        primary_failed_repair_rounds=2,
+        token_usage=55_000,
+    )
+
+    decision = model_policy.should_escalate(
+        state,
+        immediate_reason="primary_gateway_unavailable_after_retries",
+    )
+
+    assert decision.escalate is True
+    assert decision.reason == "primary_gateway_unavailable_after_retries"
+
+
+def test_primary_gateway_unavailable_after_retries_is_immediate(monkeypatch):
+    enable_escalation(monkeypatch)
+
+    decision = model_policy.should_escalate(
+        make_state(), immediate_reason="primary_gateway_unavailable_after_retries"
+    )
+
+    assert decision.escalate is True
+    assert decision.reason == "primary_gateway_unavailable_after_retries"
 
 
 def test_changed_context_signature_resets_streak_without_escalating(monkeypatch):
@@ -404,9 +444,12 @@ def test_no_escalation_without_complete_configuration(monkeypatch, configured):
 
 def test_apply_escalation_is_idempotent_and_emits_safe_diagnostic(monkeypatch):
     enable_escalation(monkeypatch)
-    state = make_state(no_progress_rounds=2)
+    state = make_state(
+        primary_failed_repair_rounds=2,
+        repair_round_sequence=2,
+    )
     decision = model_policy.EscalationDecision(
-        escalate=True, reason="repeated_edit"
+        escalate=True, reason="primary_repair_round_limit"
     )
 
     model_policy.apply_escalation(state, decision)
@@ -415,14 +458,13 @@ def test_apply_escalation_is_idempotent_and_emits_safe_diagnostic(monkeypatch):
     assert state.active_provider == "escalation"
     assert state.active_model == "claude-opus-4-8:stable"
     assert state.escalated is True
-    assert state.escalation_reason == "repeated_edit"
+    assert state.escalation_reason == "primary_repair_round_limit"
     assert state.node_diagnostics == [
         {
             "event": "model_escalated",
-            "from": "gemini-3.5-flash:stable",
-            "to": "claude-opus-4-8:stable",
-            "reason": "repeated_edit",
-            "round": 2,
+            "reason": "primary_repair_round_limit",
+            "repair_round_sequence": 2,
+            "primary_failed_repair_rounds": 2,
         }
     ]
 

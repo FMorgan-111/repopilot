@@ -257,7 +257,7 @@ async def test_intelligent_agent_never_exceeds_agent_v2_retry_cap(
     assert response.status_code == 200
     assert captured == {
         "issue_url": ISSUE_URL,
-        "max_retries": 3,
+        "max_retries": 4,
         "token_budget": 100_000,
     }
 
@@ -467,7 +467,7 @@ def test_request_model_string_limits_and_extra_fields():
     [
         (main.AgentRequest, "max_turns", (1, 10), (0, 11)),
         (main.IntelligentAgentRequest, "max_turns", (1, 10), (0, 11)),
-        (main.AgentV2Request, "max_retries", (0, 3), (-1, 4)),
+        (main.AgentV2Request, "max_retries", (0, 4), (-1, 5)),
         (main.IntelligentAgentRequest, "token_budget", (1, 100_000), (0, 100_001)),
         (main.AgentV2Request, "token_budget", (1, 100_000), (0, 100_001)),
     ],
@@ -613,7 +613,7 @@ async def test_resume_rejects_unauthorized_or_inconsistent_stored_repository(
 
 @pytest.mark.parametrize(
     ("max_retries", "token_budget"),
-    [(-1, 100_000), (4, 100_000), (3, 0), (3, 100_001)],
+    [(-1, 100_000), (5, 100_000), (4, 0), (4, 100_001)],
 )
 async def test_resume_rejects_saved_state_outside_hard_execution_limits(
     monkeypatch, api_client, max_retries, token_budget
@@ -627,6 +627,36 @@ async def test_resume_rejects_saved_state_outside_hard_execution_limits(
         nonlocal called
         called = True
         raise AssertionError("invalid saved execution limits must not resume")
+
+    monkeypatch.setattr(main, "load_run", lambda run_id: state)
+    monkeypatch.setattr(main, "resume_agent_v2", forbidden_resume)
+
+    response = await api_client.post(
+        "/agent/v2/resume",
+        headers=AUTHORIZED_HEADERS,
+        json={"run_id": "abc123def456", "human_answer": "Proceed."},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Saved run could not be loaded."}
+    assert called is False
+
+
+async def test_future_open_round_is_rejected_before_resume(monkeypatch, api_client):
+    state = _state()
+    state.retry_count = 4
+    state.max_retries = 4
+    state.repair_round_sequence = 6
+    state.current_repair_round_id = 6
+    state.current_repair_provider = "primary"
+    state.current_repair_model = "gemini-3.5-flash:stable"
+    state.last_counted_repair_round_id = 5
+    called = False
+
+    async def forbidden_resume(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("tampered repair ledger must not resume")
 
     monkeypatch.setattr(main, "load_run", lambda run_id: state)
     monkeypatch.setattr(main, "resume_agent_v2", forbidden_resume)

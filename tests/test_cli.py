@@ -84,11 +84,52 @@ def test_cli_issue_url_path_remains_supported(monkeypatch, capsys):
     assert "RepoPilot analyzing https://github.com/acme/widget/issues/42" in capsys.readouterr().out
 
 
-def test_cli_issue_uses_100000_default_budget(monkeypatch, capsys):
+def test_cli_patch_only_result_prints_patch_and_exits_success(monkeypatch, capsys):
+    patch = "diff --git a/src/widget.py b/src/widget.py\n+fixed = True\n"
+
+    async def fake_agent_v2(issue_url, max_retries, token_budget):
+        return {
+            "success": False,
+            "patch_generated": True,
+            "model_patch": patch,
+            "tests_passed": None,
+            "final_phase": "DONE",
+        }
+
+    monkeypatch.setattr(cli, "agent_v2", fake_agent_v2)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["https://github.com/acme/widget/issues/42"])
+
+    assert exc_info.value.code == 0
+    output = capsys.readouterr().out
+    assert patch in output
+    assert "Tests: not run" in output
+
+
+def test_cli_unsuccessful_result_without_patch_exits_failure(monkeypatch, capsys):
+    async def fake_agent_v2(issue_url, max_retries, token_budget):
+        return {
+            "success": False,
+            "patch_generated": False,
+            "model_patch": "",
+            "tests_passed": None,
+        }
+
+    monkeypatch.setattr(cli, "agent_v2", fake_agent_v2)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["https://github.com/acme/widget/issues/42", "--json"])
+
+    assert exc_info.value.code == 1
+    assert json.loads(capsys.readouterr().out)["patch_generated"] is False
+
+
+def test_cli_issue_uses_agent_v2_defaults(monkeypatch, capsys):
     calls = []
 
-    async def fake_agent_v2(issue_url, max_retries=3, token_budget=100000):
-        calls.append(token_budget)
+    async def fake_agent_v2(issue_url, max_retries, token_budget):
+        calls.append((max_retries, token_budget))
         return {"success": True}
 
     monkeypatch.setattr(cli, "agent_v2", fake_agent_v2)
@@ -97,8 +138,19 @@ def test_cli_issue_uses_100000_default_budget(monkeypatch, capsys):
         cli.main(["https://github.com/acme/widget/issues/42", "--json"])
 
     assert exc_info.value.code == 0
-    assert calls == [100_000]
+    assert calls == [(4, 100_000)]
     assert json.loads(capsys.readouterr().out) == {"success": True}
+
+
+def test_cli_help_describes_five_transaction_default(capsys):
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--help"])
+
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    assert "returns the first validated patch" in help_text
+    assert "default: 4" in help_text
+    assert "five transactions total" in help_text
 
 
 def test_cli_runs_json_lists_saved_runs(monkeypatch, capsys):

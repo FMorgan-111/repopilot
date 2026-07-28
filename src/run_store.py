@@ -16,6 +16,7 @@ from typing import Any
 
 from .evaluator_safety import contains_evaluator_only
 from .home import repopilot_home
+from .repair_rounds import validate_repair_round_state
 from .state import AgentState, Phase
 from .summary_safety import sanitize_summary_text
 
@@ -457,22 +458,26 @@ def claim_run_for_resume(
     with _run_lock(run_id, root_dir) as (_, directory_fd):
         try:
             content, _opened = _read_run_bytes_at(run_id, directory_fd)
-        except FileNotFoundError:
+            durable = _state_from_run_bytes(content)
+            normalized_durable = durable.model_copy(deep=True)
+            normalized_expected = expected_state.model_copy(deep=True)
+            validate_repair_round_state(normalized_durable)
+            validate_repair_round_state(normalized_expected)
+        except (FileNotFoundError, ValueError):
             raise ResumeConflictError from None
-        durable = _state_from_run_bytes(content)
         if (
-            durable.trace_id != run_id
-            or expected_state.trace_id != run_id
-            or durable.model_dump(mode="json")
-            != expected_state.model_dump(mode="json")
-            or durable.current_phase != Phase.WAITING_FOR_USER
-            or not durable.pending_human_input
-            or not durable.human_input_request
-            or durable.resume_in_progress
+            normalized_durable.trace_id != run_id
+            or normalized_expected.trace_id != run_id
+            or normalized_durable.model_dump(mode="json")
+            != normalized_expected.model_dump(mode="json")
+            or normalized_durable.current_phase != Phase.WAITING_FOR_USER
+            or not normalized_durable.pending_human_input
+            or not normalized_durable.human_input_request
+            or normalized_durable.resume_in_progress
         ):
             raise ResumeConflictError
 
-        claimed = durable.model_copy(deep=True)
+        claimed = normalized_durable.model_copy(deep=True)
         claimed.resume_in_progress = True
         claimed.current_phase = Phase.PLAN
         claimed.pending_human_input = False

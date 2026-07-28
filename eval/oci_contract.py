@@ -324,6 +324,8 @@ class ResultRecord(BaseModel):
     instance_id: str
     base_commit: str
     model_patch: str
+    patch_generated: StrictBool
+    tests_passed: StrictBool | None
 
     @field_validator("commit_sha")
     @classmethod
@@ -426,8 +428,10 @@ class ResultRecord(BaseModel):
             raise ValueError(
                 "non-escalated result cannot have escalation_reason"
             )
-        if self.model_patch and not self.agent_success:
-            raise ValueError("model_patch requires agent_success")
+        if self.patch_generated is not bool(self.model_patch):
+            raise ValueError("patch_generated must match model_patch presence")
+        if not self.model_patch and self.tests_passed is not None:
+            raise ValueError("tests_passed requires model_patch")
         if self.model_patch and not self.model_invocations:
             raise ValueError("model_patch requires model invocation history")
         if self.model_patch and not any(

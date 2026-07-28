@@ -1,155 +1,86 @@
-"""PLAN-side gate that rejects hallucinated search blocks before EXECUTE and
-feeds the real file lines back so the planner can copy a valid block."""
+"""PLAN integration coverage for exact PatchGate search-anchor rejection."""
 
-import json
-
-from src import new_agent
 from src.nodes import plan as plan_node
-from src.state import AgentState, FileInfo, PatchEdit, Phase
-
-REAL = (
-    "\n".join(f"import mod{i}" for i in range(30))
-    + "\ndef compute(value):\n    return value * 2\n"
-)
+from src.state import Phase
 
 
-def _state(**kw):
-    return AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        issue_title="compute is wrong",
-        issue_body="compute returns the wrong number",
-        current_phase=Phase.PLAN,
-        relevant_files=[
-            FileInfo(path="app/mod.py", content=REAL, relevance_score=0.9, reason="r")
+def _plan_response(search: str) -> dict:
+    return {
+        "kind": "plan",
+        "plan": "Update the widget sentinel.",
+        "patch": "",
+        "patch_edits": [
+            {
+                "file": "src/widget.py",
+                "search": search,
+                "replace": "return 'new-sentinel'",
+            }
         ],
-        **kw,
-    )
+        "files": ["src/widget.py"],
+        "test_command": "pytest -q",
+        "decision_frame": {
+            "stage": "plan",
+            "summary": "Update the sentinel.",
+            "recommended_action": "execute",
+            "risk": "low",
+            "confidence": 0.8,
+        },
+    }
 
 
-def _plan_response(file_path, search, replace):
-    return json.dumps(
-        {
-            "plan": "fix it",
-            "patch": "",
-            "patch_edits": [{"file": file_path, "search": search, "replace": replace}],
-            "files": [file_path],
-            "test_command": "pytest",
-            "decision_frame": {
-                "stage": "plan",
-                "summary": "fix",
-                "recommended_action": "execute",
-                "risk": "low",
-                "confidence": 0.7,
-            },
-        }
-    )
+async def test_patchgate_search_missing_routes_to_new_full_plan_with_real_window(
+    exact_repair_state, monkeypatch
+):
+    async def fake_llm(_system, _user, model=None, *, provider="primary", **_kwargs):
+        return _plan_response("def widget(value):\n    return old")
+
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
+
+    assert result.current_phase == Phase.PLAN
+    assert result.decision_frame.recommended_action == "plan"
+    assert result.retry_count == 1
+    assert result.primary_failed_repair_rounds == 1
+    assert result.last_counted_repair_round_id == 1
+    assert result.tool_patch_approval is None
+    assert result.patch_edits == []
+    assert "search_missing" in result.repair_correction_context
+    assert "old-sentinel" in result.repair_correction_context
+    assert len(result.repair_correction_context) <= 8_000
 
 
-# ---- pure predicates --------------------------------------------------------
+async def test_patchgate_search_missing_obeys_terminal_global_budget(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.max_retries = 0
 
-def test_unlocatable_edits_flags_hallucinated_search():
-    state = _state()
-    state.patch_edits = [
-        PatchEdit(file_path="app/mod.py", search="def compute(val):\n    return val*2",
-                  replace="x")
-    ]
-    missing = plan_node._unlocatable_edits(state)
-    assert len(missing) == 1
+    async def fake_llm(_system, _user, model=None, *, provider="primary", **_kwargs):
+        return _plan_response("missing final anchor")
 
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
 
-def test_unlocatable_edits_empty_when_search_present():
-    state = _state()
-    state.patch_edits = [
-        PatchEdit(file_path="app/mod.py", search="    return value * 2", replace="x")
-    ]
-    assert plan_node._unlocatable_edits(state) == []
-
-
-def test_unlocatable_edits_skips_unknown_file():
-    # File not in relevant_files → cannot validate → skipped (EXECUTE backstops).
-    state = _state()
-    state.patch_edits = [
-        PatchEdit(file_path="other/unknown.py", search="whatever", replace="x")
-    ]
-    assert plan_node._unlocatable_edits(state) == []
+    assert result.current_phase == Phase.FAILURE
+    assert result.decision_frame.recommended_action == "stop"
+    assert result.retry_count == 0
+    assert result.primary_failed_repair_rounds == 1
+    assert result.last_counted_repair_round_id == 1
+    assert result.repair_round_sequence == 1
+    assert result.tool_patch_approval is None
 
 
-def test_build_search_correction_surfaces_real_lines():
-    state = _state()
-    missing = [
-        PatchEdit(file_path="app/mod.py", search="def compute(val):\n    return val*2",
-                  replace="x")
-    ]
-    text = plan_node._build_search_correction(state, missing)
-    assert "VERBATIM" in text
-    assert "def compute(value):" in text  # the ACTUAL line, not the hallucination
-    assert "return value * 2" in text
+async def test_exact_search_acceptance_clears_obsolete_correction_context(
+    exact_repair_state, monkeypatch
+):
+    exact_repair_state.repair_correction_context = "stale-anchor-correction"
 
+    async def fake_llm(_system, _user, model=None, *, provider="primary", **_kwargs):
+        return _plan_response("return 'old-sentinel'")
 
-# ---- routing ----------------------------------------------------------------
+    monkeypatch.setattr(plan_node, "llm_call", fake_llm)
+    result = await plan_node.plan_fix(exact_repair_state)
 
-async def test_hallucinated_search_routes_to_plan_with_correction(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _plan_response("app/mod.py", "def compute(val):\n    return val*2", "y")
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _state(retry_count=0, max_retries=3)
-
-    nxt = await plan_node.plan_fix(state)
-
-    assert nxt.current_phase == Phase.PLAN
-    assert nxt.patch_edits == []
-    assert nxt.hallucinated_search_block_count == 1
-    assert "VERBATIM" in nxt.search_correction_context
-    assert any(
-        w.get("warning") == "hallucinated_search_block" for w in nxt.decision_warnings
-    )
-    # The router keys off frame.recommended_action, not current_phase — the gate
-    # must reroute the frame or the empty patch leaks to EXECUTE (the "No valid
-    # patches in input" bug). Verify the frame agrees with current_phase.
-    assert nxt.decision_frame.recommended_action == "plan"
-    assert new_agent.route_from_state(nxt) == "plan_fix"
-
-
-async def test_hallucinated_search_fails_fast_when_budget_exhausted(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _plan_response("app/mod.py", "def compute(val):\n    return val*2", "y")
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _state(retry_count=0, max_retries=3,
-                   hallucinated_search_block_count=plan_node.MAX_SEARCH_CORRECTIONS)
-
-    nxt = await plan_node.plan_fix(state)
-
-    assert nxt.current_phase == Phase.FAILURE
-    assert "do not exist" in nxt.failure_reason
-
-
-async def test_locatable_search_executes_and_clears_correction(monkeypatch):
-    async def fake_llm_call(system, user):
-        return _plan_response("app/mod.py", "    return value * 2", "    return value * 3")
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _state(retry_count=0, max_retries=3,
-                   search_correction_context="stale correction text")
-
-    nxt = await plan_node.plan_fix(state)
-
-    assert nxt.current_phase == Phase.EXECUTE
-    assert nxt.search_correction_context == ""
-
-
-async def test_correction_context_injected_into_prompt(monkeypatch):
-    captured = {}
-
-    async def fake_llm_call(system, user):
-        captured["user"] = user
-        return _plan_response("app/mod.py", "    return value * 2", "    return value * 3")
-
-    monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
-    state = _state(retry_count=0, max_retries=3,
-                   search_correction_context="COPY-THIS-VERBATIM-MARKER")
-
-    await plan_node.plan_fix(state)
-
-    assert "COPY-THIS-VERBATIM-MARKER" in captured["user"]
+    assert result.current_phase == Phase.EXECUTE
+    assert result.repair_correction_context == ""
+    assert result.tool_patch_approval is not None
+    assert result.patch_edits[0].exact_only is True

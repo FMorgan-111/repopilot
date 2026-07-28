@@ -8,49 +8,217 @@ import re
 from typing import Any
 
 from ..model_policy import record_no_progress, record_progress
+from ..repair_rounds import (
+    record_failed_repair_round,
+    validate_repair_round_state,
+)
 from ..state import (
     AgentState,
     FixAttempt,
     Phase,
     _as_state,
-    _is_budget_exceeded,
     _record_node_diagnostic,
-    _same_failure_seen_twice,
+    tool_manifest_fingerprint,
 )
 
 
-def _consecutive_failure_count(attempts: list[FixAttempt], failure_kind: str) -> int:
-    count = 0
-    for attempt in reversed(attempts):
-        if _failure_kind(attempt) != failure_kind:
-            break
-        count += 1
-    return count
-
-
-def _is_patch_preflight_failure(attempt: FixAttempt) -> bool:
-    return (
-        _failure_kind(attempt) == "patch_apply_failed"
-        and "patch preflight check failed" in attempt.error_log.lower()
+def _trusted_authorized_binding(
+    state: AgentState,
+    latest: FixAttempt,
+) -> tuple[int, str, str]:
+    """Validate the persisted, fingerprint-bound author for this exact patch."""
+    approval = state.tool_patch_approval
+    plan = state.active_repair_plan
+    binding = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider or "",
+        state.authorized_repair_model,
     )
+    if (
+        approval is None
+        or plan is None
+        or binding[0] <= 0
+        or not binding[1]
+        or not binding[2]
+        or not state.patch_content
+        or not state.patch_edits
+    ):
+        raise ValueError("trusted PatchGate authorization is unavailable")
+    if approval.base_ref.lower() != state.repo_ref.lower():
+        raise ValueError("PatchGate authorization base does not match state")
+    patch_sha = hashlib.sha256(state.patch_content.encode("utf-8")).hexdigest()
+    if patch_sha != approval.patch_sha256:
+        raise ValueError("PatchGate authorization patch digest changed")
+    if (
+        tool_manifest_fingerprint(approval.changed_manifest)
+        != approval.manifest_fingerprint
+    ):
+        raise ValueError("PatchGate authorization manifest changed")
+    if latest.patch_content != state.patch_content:
+        raise ValueError("FixAttempt patch does not match frozen authorization")
+    if latest.patch_gate_fingerprint is None:
+        raise ValueError("FixAttempt lacks an immutable PatchGate receipt")
+    if latest.patch_gate_fingerprint != approval.patch_gate_fingerprint:
+        raise ValueError("FixAttempt PatchGate receipt does not match authorization")
 
+    from ..patch_gate import _approval_edit_payload, _fingerprint
 
-def _is_patch_repair_failure(attempt: FixAttempt) -> bool:
-    if _is_patch_preflight_failure(attempt):
-        return True
-    return (
-        _failure_kind(attempt) == "patch_apply_failed"
-        and "search/replace edit failed" in attempt.error_log.lower()
+    attempt_edits = [_approval_edit_payload(edit) for edit in latest.patch_edits]
+    state_edits = [_approval_edit_payload(edit) for edit in state.patch_edits]
+    if not attempt_edits or attempt_edits != state_edits:
+        raise ValueError("FixAttempt edits do not match frozen authorization")
+    expected_fingerprint = _fingerprint(
+        state,
+        plan,
+        state.patch_edits,
+        list(approval.changed_manifest),
+        approval.patch_sha256,
+        binding,
     )
+    if expected_fingerprint != approval.patch_gate_fingerprint:
+        raise ValueError("PatchGate authorization fingerprint changed")
+    return binding
 
 
-def _consecutive_patch_repair_failure_count(attempts: list[FixAttempt]) -> int:
-    count = 0
-    for attempt in reversed(attempts):
-        if not _is_patch_repair_failure(attempt):
-            break
-        count += 1
-    return count
+def _attempt_binding(latest: FixAttempt) -> tuple[int, str, str]:
+    binding = (
+        latest.repair_round_id,
+        latest.repair_provider or "",
+        latest.repair_model,
+    )
+    if binding[0] <= 0 or not binding[1] or not binding[2]:
+        raise ValueError("FixAttempt lacks positive repair author attribution")
+    receipt = latest.patch_gate_fingerprint
+    if receipt is not None and not re.fullmatch(r"[0-9a-f]{64}", receipt):
+        raise ValueError("FixAttempt PatchGate receipt is malformed")
+    return binding
+
+
+def _validate_counted_replay(state: AgentState, latest: FixAttempt) -> None:
+    """Validate immutable attribution and the durable ledger on a candidate."""
+    round_id, _provider, _model = _attempt_binding(latest)
+    if round_id > state.last_counted_repair_round_id:
+        raise ValueError("FixAttempt is not a counted repair round")
+    candidate = state.model_copy(deep=True)
+    validate_repair_round_state(candidate)
+
+
+def _restore_open_binding(
+    state: AgentState,
+    binding: tuple[int, str, str],
+) -> None:
+    current = (
+        state.current_repair_round_id,
+        state.current_repair_provider or "",
+        state.current_repair_model,
+    )
+    if current == binding:
+        return
+    if current != (0, "", ""):
+        raise ValueError("open repair ledger does not match FixAttempt")
+    state.current_repair_round_id = binding[0]
+    state.current_repair_provider = binding[1]
+    state.current_repair_model = binding[2]
+
+
+def _prepare_positive_attribution(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    """Validate an uncounted receipt-bound attempt on an isolated candidate."""
+    candidate = state.model_copy(deep=True)
+    latest = candidate.fix_attempts[-1]
+    validate_repair_round_state(candidate)
+    attempt_binding = _attempt_binding(latest)
+    binding = _trusted_authorized_binding(candidate, latest)
+    if attempt_binding != binding:
+        raise ValueError("FixAttempt attribution does not match authorization")
+    if (
+        binding[0] <= candidate.last_counted_repair_round_id
+        or binding[0] != candidate.repair_round_sequence
+    ):
+        raise ValueError("FixAttempt does not identify the open uncounted round")
+    _restore_open_binding(candidate, binding)
+    validate_repair_round_state(candidate)
+    return candidate, binding
+
+
+def _prepare_legacy_first_round(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    """Migrate only a sole, pristine, exact first-round historical attempt."""
+    candidate = state.model_copy(deep=True)
+    latest = candidate.fix_attempts[-1]
+    attempt_binding = (
+        latest.repair_round_id,
+        latest.repair_provider or "",
+        latest.repair_model,
+    )
+    authorized = (
+        candidate.authorized_repair_round_id,
+        candidate.authorized_repair_provider or "",
+        candidate.authorized_repair_model,
+    )
+    current = (
+        candidate.current_repair_round_id,
+        candidate.current_repair_provider or "",
+        candidate.current_repair_model,
+    )
+    if (
+        len(candidate.fix_attempts) != 1
+        or candidate.current_phase != Phase.VERIFY
+        or _failure_kind(latest) == "infra_error"
+        or attempt_binding != (0, "", "")
+        or latest.patch_gate_fingerprint is not None
+        or candidate.repair_round_sequence != 1
+        or authorized[0] != 1
+        or not authorized[1]
+        or not authorized[2]
+        or candidate.last_counted_repair_round_id != 0
+        or candidate.retry_count != 0
+        or candidate.primary_failed_repair_rounds != 0
+        or current not in {authorized, (0, "", "")}
+    ):
+        raise ValueError("historical FixAttempt is not a pristine first round")
+    validate_repair_round_state(candidate)
+
+    assert candidate.tool_patch_approval is not None
+    binding = authorized
+    migrated_payload = latest.model_dump(mode="python")
+    migrated_payload.update(
+        {
+            "repair_round_id": binding[0],
+            "repair_provider": binding[1],
+            "repair_model": binding[2],
+            "patch_gate_fingerprint": (
+                candidate.tool_patch_approval.patch_gate_fingerprint
+            ),
+        }
+    )
+    migrated = FixAttempt.model_validate(migrated_payload)
+    binding = _trusted_authorized_binding(candidate, migrated)
+    if binding != authorized:
+        raise ValueError("historical authorization does not match first binding")
+    candidate.fix_attempts[-1] = migrated
+    _restore_open_binding(candidate, binding)
+    validate_repair_round_state(candidate)
+    return candidate, binding
+
+
+def _prepare_failure_attribution(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    latest = state.fix_attempts[-1]
+    if latest.repair_round_id == 0:
+        return _prepare_legacy_first_round(state)
+    return _prepare_positive_attribution(state)
+
+
+def _route_state_integrity_failure(state: AgentState, exc: Exception) -> AgentState:
+    state.failure_reason = (
+        f"Infrastructure state-integrity error during verification: {str(exc)[:500]}"
+    )
+    state.current_phase = Phase.FAILURE
+    return state
 
 
 def _failure_kind(attempt: FixAttempt) -> str:
@@ -82,7 +250,9 @@ def _test_failure_class(attempt: FixAttempt) -> str:
     return failure_kind or "test_failed"
 
 
-def _failure_signature_payload(attempt: FixAttempt, failure_class: str) -> dict[str, str]:
+def _failure_signature_payload(
+    attempt: FixAttempt, failure_class: str
+) -> dict[str, str]:
     error_log = attempt.error_log.replace("\\", "/")
     test_ids = sorted(
         set(
@@ -218,8 +388,21 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     latest = state.fix_attempts[-1]
-    await _record_episode_best_effort(state, latest)
+    if _failure_kind(latest) == "infra_error":
+        message = latest.error_log.strip() or "execution infrastructure failed"
+        state.failure_reason = f"Infrastructure error during execution: {message[:500]}"
+        state.current_phase = Phase.FAILURE
+        return state
+
     if latest.success:
+        try:
+            state, _binding = _prepare_positive_attribution(state)
+        except (TypeError, ValueError) as exc:
+            return _route_state_integrity_failure(state, exc)
+        latest = state.fix_attempts[-1]
+        if not latest.episode_recording_attempted:
+            await _record_episode_best_effort(state, latest)
+            latest.episode_recording_attempted = True
         state.last_assertion_failure_signature = ""
         state.assertion_no_progress_rounds = 0
         state.assertion_diversity_required = False
@@ -227,73 +410,34 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     failure_class = _test_failure_class(latest)
-    if _failure_kind(latest) == "infra_error":
-        message = latest.error_log.strip() or "execution infrastructure failed"
-        state.failure_reason = f"Infrastructure error during execution: {message[:500]}"
-        state.current_phase = Phase.FAILURE
+    if latest.repair_round_id > 0 and (
+        latest.repair_round_id <= state.last_counted_repair_round_id
+    ):
+        try:
+            _validate_counted_replay(state, latest)
+        except (TypeError, ValueError) as exc:
+            return _route_state_integrity_failure(state, exc)
         return state
 
-    if _same_failure_seen_twice(state) and failure_class not in {
-        "syntax_error",
-        "import_error",
-        "assertion_failure",
-    }:
-        state.failure_reason = "Same patch produced the same failure twice."
-        state.current_phase = Phase.FAILURE
-        return state
+    try:
+        state, binding = _prepare_failure_attribution(state)
+    except (TypeError, ValueError) as exc:
+        return _route_state_integrity_failure(state, exc)
+    round_id, provider, model = binding
+    latest = state.fix_attempts[-1]
 
-    if _failure_kind(latest) == "patch_apply_failed":
-        if _is_patch_repair_failure(latest):
-            consecutive_repair_failures = _consecutive_patch_repair_failure_count(
-                state.fix_attempts
-            )
-            repair_budget = state.max_retries + 1
-            if consecutive_repair_failures <= repair_budget:
-                if _is_budget_exceeded(state):
-                    state.failure_reason = "Token budget exceeded during verification."
-                    state.current_phase = Phase.FAILURE
-                    return state
-                state.current_phase = Phase.REFLECT
-                return state
-            state.failure_reason = (
-                "Patch repair budget exhausted after "
-                f"{consecutive_repair_failures} failures."
-            )
-            state.current_phase = Phase.FAILURE
-            return state
-
-        consecutive_patch_apply_failures = _consecutive_failure_count(
-            state.fix_attempts,
-            "patch_apply_failed",
-        )
-        if consecutive_patch_apply_failures == 1:
-            state.current_phase = Phase.REFLECT
-            return state
-        if state.retry_count >= state.max_retries:
-            state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-            state.current_phase = Phase.FAILURE
-            return state
-        if _is_budget_exceeded(state):
-            state.failure_reason = "Token budget exceeded during verification."
-            state.current_phase = Phase.FAILURE
-            return state
-        state.retry_count += 1
-        state.current_phase = Phase.REFLECT
-        return state
+    retry_phase = (
+        Phase.PLAN
+        if failure_class in {"syntax_error", "import_error"}
+        else Phase.REFLECT
+    )
+    if not latest.episode_recording_attempted:
+        await _record_episode_best_effort(state, latest)
+        latest.episode_recording_attempted = True
 
     repeated_failure = _record_test_failure_progress(state, latest, failure_class)
 
     if failure_class in {"syntax_error", "import_error"}:
-        if state.retry_count >= state.max_retries:
-            state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-            state.current_phase = Phase.FAILURE
-            return state
-        if _is_budget_exceeded(state):
-            state.failure_reason = "Token budget exceeded during verification."
-            state.current_phase = Phase.FAILURE
-            return state
-        state.retry_count += 1
-        state.current_phase = Phase.PLAN
         _record_node_diagnostic(
             state,
             node="verify_fix",
@@ -302,21 +446,8 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
             elapsed_seconds=0.0,
             failure_class=failure_class,
         )
-        return state
 
     if failure_class == "assertion_failure" and repeated_failure:
-        if state.assertion_no_progress_rounds >= 2:
-            state.failure_reason = "repeated_assertion_no_progress"
-            state.current_phase = Phase.FAILURE
-            _record_node_diagnostic(
-                state,
-                node="verify_fix",
-                event="assertion_no_progress_limit",
-                status="error",
-                elapsed_seconds=0.0,
-                round=state.no_progress_rounds,
-            )
-            return state
         state.assertion_diversity_required = True
         _record_node_diagnostic(
             state,
@@ -327,16 +458,15 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
             round=state.no_progress_rounds,
         )
 
-    if state.retry_count >= state.max_retries:
-        state.failure_reason = f"Maximum retries reached: {state.max_retries}."
-        state.current_phase = Phase.FAILURE
-        return state
-
-    if _is_budget_exceeded(state):
-        state.failure_reason = "Token budget exceeded during verification."
-        state.current_phase = Phase.FAILURE
-        return state
-
-    state.retry_count += 1
-    state.current_phase = Phase.REFLECT
+    try:
+        record_failed_repair_round(
+            state,
+            round_id=round_id,
+            provider=provider,
+            model=model,
+            failure_reason=failure_class,
+            retry_phase=retry_phase,
+        )
+    except (TypeError, ValueError) as exc:
+        return _route_state_integrity_failure(state, exc)
     return state

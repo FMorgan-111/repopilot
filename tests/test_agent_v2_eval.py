@@ -61,9 +61,21 @@ def coverage_proof():
     }
 
 
-def test_agent_v2_eval_public_defaults_are_100000():
+def test_agent_v2_eval_public_defaults_are_canonical():
     from eval import harness
 
+    assert (
+        inspect.signature(agent_v2_harness.evaluate_agent_v2_sample)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
+    assert (
+        inspect.signature(agent_v2_harness.run_agent_v2_eval)
+        .parameters["max_retries"]
+        .default
+        == 4
+    )
     assert (
         inspect.signature(agent_v2_harness.evaluate_agent_v2_sample)
         .parameters["token_budget"]
@@ -100,6 +112,7 @@ def test_agent_v2_eval_cli_uses_100000_default_budget(monkeypatch):
     agent_v2_harness.main([])
 
     assert calls[0]["token_budget"] == 100_000
+    assert calls[0]["max_retries"] == 4
 
 
 def test_legacy_eval_cli_uses_100000_agent_v2_default_budget(monkeypatch):
@@ -443,6 +456,80 @@ async def test_swe_bench_eval_prepares_exact_checkout_and_passes_safe_seed(
     assert result["base_commit"] == "a" * 40
     assert result["model_patch"] == "diff --git"
     assert result["evaluation_mode"] == "end_to_end"
+
+
+async def test_swe_bench_eval_preserves_patch_first_prediction(
+    monkeypatch, tmp_path
+):
+    model_patch = "diff --git a/a.py b/a.py\n"
+
+    async def fake_clone(_state):
+        return "/tmp/exact-work"
+
+    async def fake_agent(_issue_url, **_kwargs):
+        return {
+            "success": False,
+            "patch_generated": True,
+            "tests_passed": None,
+            "final_phase": "DONE",
+            "trace_id": "trace",
+            "run_id": "trace",
+            "model_patch": model_patch,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "git_clone", fake_clone, raising=False)
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+    predictions_path = tmp_path / "prediction.jsonl"
+    swe_bench.write_predictions([result], predictions_path)
+    prediction = json.loads(predictions_path.read_text(encoding="utf-8"))
+
+    assert result["model_patch"] == model_patch
+    assert result["patch_generated"] is True
+    assert result["tests_passed"] is None
+    assert result["agent_success"] is False
+    assert prediction["model_patch"] == model_patch
+
+
+async def test_swe_bench_eval_drops_test_verdict_when_patch_is_rejected(
+    monkeypatch,
+):
+    unsafe_patch = (
+        "diff --git a/a.py b/a.py\n"
+        "+token = 'sk-12345678'\n"
+    )
+
+    async def fake_clone(_state):
+        return "/tmp/exact-work"
+
+    async def fake_agent(_issue_url, **_kwargs):
+        return {
+            "success": False,
+            "patch_generated": True,
+            "tests_passed": True,
+            "final_phase": "DONE",
+            "trace_id": "trace",
+            "run_id": "trace",
+            "model_patch": unsafe_patch,
+        }
+
+    monkeypatch.setattr(agent_v2_harness, "git_clone", fake_clone, raising=False)
+    monkeypatch.setattr(agent_v2_harness, "agent_v2", fake_agent)
+    monkeypatch.setattr(agent_v2_harness, "replay_run", lambda _run_id: {})
+
+    result = await agent_v2_harness.evaluate_agent_v2_sample(
+        swe_bench_sample(),
+        idx=0,
+    )
+
+    assert result["model_patch"] == ""
+    assert result["patch_generated"] is False
+    assert result["tests_passed"] is None
 
 
 async def test_swe_bench_preclone_and_agent_share_one_trace_identity(monkeypatch):

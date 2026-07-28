@@ -180,6 +180,30 @@ async def test_post_agent_v2_uses_100000_default_budget(monkeypatch, api_client)
     assert captured["token_budget"] == 100_000
 
 
+async def test_resume_accepts_saved_state_with_five_transaction_budget(
+    monkeypatch, api_client
+):
+    state = _authorized_saved_state()
+    state.max_retries = 4
+    observed = []
+
+    monkeypatch.setattr(main, "load_run", lambda _run_id: state)
+
+    async def fake_resume(run_id, human_answer, *, state=None):
+        observed.append((run_id, human_answer, state))
+        return {"success": True, "error": None}
+
+    monkeypatch.setattr(main, "resume_agent_v2", fake_resume)
+    response = await api_client.post(
+        "/agent/v2/resume",
+        json={"run_id": state.trace_id, "human_answer": "Proceed."},
+    )
+
+    assert response.status_code == 200
+    assert observed == [(state.trace_id, "Proceed.", state)]
+    assert observed[0][2].max_retries == 4
+
+
 async def test_post_agent_v2_resume_routes_to_resume_agent(monkeypatch, api_client):
     calls = []
 

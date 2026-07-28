@@ -139,6 +139,8 @@ def _result_payload(**overrides: object) -> dict[str, object]:
         "instance_id": INSTANCE_ID,
         "base_commit": "d" * 40,
         "model_patch": "",
+        "patch_generated": False,
+        "tests_passed": None,
     }
     payload.update(overrides)
     if "token_used" not in overrides:
@@ -385,6 +387,7 @@ def test_result_record_accepts_complete_producer_schema() -> None:
 
     assert record.instance_id == INSTANCE_ID
     assert record.model_invocations[0].provider == "primary"
+    assert record.tests_passed is None
 
 
 @pytest.mark.parametrize("scope", ["result", "invocation"])
@@ -969,16 +972,56 @@ def test_empty_invocation_history_uses_primary_model_fallback() -> None:
     assert record.models_used == ["gemini-3.5-flash:stable"]
 
 
+def test_patch_only_result_allows_unverified_model_patch() -> None:
+    record = _result_record_model().model_validate(
+        _result_payload(
+            model_patch="diff --git a/a.py b/a.py\n",
+            patch_generated=True,
+            tests_passed=None,
+            success=False,
+            agent_success=False,
+        )
+    )
+
+    assert record.patch_generated is True
+    assert record.tests_passed is None
+    assert record.agent_success is False
+
+
+@pytest.mark.parametrize(
+    ("model_patch", "patch_generated"),
+    [
+        ("", True),
+        ("diff --git a/a.py b/a.py\n", False),
+    ],
+)
+def test_patch_generated_must_match_model_patch_presence(
+    model_patch: str,
+    patch_generated: bool,
+) -> None:
+    with pytest.raises(ValidationError, match="patch_generated|model_patch"):
+        _result_record_model().model_validate(
+            _result_payload(
+                model_patch=model_patch,
+                patch_generated=patch_generated,
+            )
+        )
+
+
+@pytest.mark.parametrize("tests_passed", [True, False])
+def test_tests_passed_requires_model_patch(tests_passed: bool) -> None:
+    with pytest.raises(ValidationError, match="tests_passed|model_patch"):
+        _result_record_model().model_validate(
+            _result_payload(tests_passed=tests_passed)
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
         {
             "model_patch": "diff --git a/a.py b/a.py\n",
-            "success": False,
-            "agent_success": False,
-        },
-        {
-            "model_patch": "diff --git a/a.py b/a.py\n",
+            "patch_generated": True,
             "success": True,
             "agent_success": True,
             "failure_class": "agent_success",
@@ -988,6 +1031,7 @@ def test_empty_invocation_history_uses_primary_model_fallback() -> None:
         },
         {
             "model_patch": "diff --git a/a.py b/a.py\n",
+            "patch_generated": True,
             "success": True,
             "agent_success": True,
             "failure_class": "agent_success",

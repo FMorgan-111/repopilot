@@ -25,6 +25,8 @@ from .exception_safety import normalize_exception_class
 from .repo_paths import canonical_repo_path
 from .summary_safety import sanitize_summary_text
 
+DEFAULT_AGENT_V2_MAX_RETRIES = 4
+MAX_AGENT_V2_MAX_RETRIES = 4
 DEFAULT_AGENT_V2_TOKEN_BUDGET = 100_000
 
 _REPAIR_SMUGGLING_RE = re.compile(
@@ -64,6 +66,8 @@ APPROVED_ESCALATION_REASONS = frozenset(
     {
         "empty_completion_after_retries",
         "invalid_structured_response_after_retries",
+        "primary_gateway_unavailable_after_retries",
+        "primary_repair_round_limit",
         "primary_budget_reserve",
         "repeated_no_progress",
         "test_generation_retry",
@@ -122,9 +126,7 @@ def sanitize_node_diagnostics(value: Any) -> list[dict[str, Any]]:
             continue
         diagnostic = dict(item)
         if diagnostic.get("event") == "model_escalated":
-            diagnostic["reason"] = sanitize_escalation_reason(
-                diagnostic.get("reason")
-            )
+            diagnostic["reason"] = sanitize_escalation_reason(diagnostic.get("reason"))
         sanitized.append(diagnostic)
     return sanitized
 
@@ -220,13 +222,13 @@ class PatchEdit(BaseModel):
             and bool(self.replace)
         )
         if not self.search and not self.node_target and not intentional_new:
-            raise ValueError(
-                "PatchEdit requires either `search` or `node_target`."
-            )
+            raise ValueError("PatchEdit requires either `search` or `node_target`.")
         return self
 
 
 class FixAttempt(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+
     patch_content: str = ""
     patch_edits: list[PatchEdit] = Field(default_factory=list)
     file_path: str = ""
@@ -234,6 +236,63 @@ class FixAttempt(BaseModel):
     failure_kind: str = ""
     error_log: str = ""
     success: bool = False
+    patch_gate_fingerprint: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        frozen=True,
+    )
+    episode_recording_attempted: bool = False
+    repair_provider: Literal["primary", "escalation"] | None = None
+    repair_model: str = Field(default="", max_length=200)
+    repair_round_id: int = Field(default=0, ge=0)
+
+    @field_validator("repair_provider")
+    @classmethod
+    def _prevent_orphaned_repair_provider(cls, value: Any, info: Any) -> Any:
+        if value is None and info.data.get("repair_round_id", 0) > 0:
+            raise ValueError(
+                "positive repair round requires runtime repair attribution"
+            )
+        return value
+
+    @field_validator("repair_model")
+    @classmethod
+    def _prevent_orphaned_repair_model(cls, value: str, info: Any) -> str:
+        if not value and info.data.get("repair_round_id", 0) > 0:
+            raise ValueError(
+                "positive repair round requires runtime repair attribution"
+            )
+        return value
+
+    @field_validator("repair_round_id")
+    @classmethod
+    def _require_bound_repair_author(cls, value: int, info: Any) -> int:
+        if value > 0 and (
+            info.data.get("repair_provider") is None
+            or not info.data.get("repair_model")
+        ):
+            raise ValueError(
+                "positive repair round requires runtime repair attribution"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _require_runtime_repair_attribution(self) -> "FixAttempt":
+        if self.patch_gate_fingerprint is not None and (
+            self.repair_round_id <= 0
+            or self.repair_provider is None
+            or not self.repair_model
+        ):
+            raise ValueError(
+                "PatchGate receipt requires positive repair author attribution"
+            )
+        if self.repair_round_id > 0 and (
+            self.repair_provider is None or not self.repair_model
+        ):
+            raise ValueError(
+                "positive repair round requires runtime repair attribution"
+            )
+        return self
 
 
 def _normalize_string_list(value: Any) -> Any:
@@ -241,9 +300,7 @@ def _normalize_string_list(value: Any) -> Any:
         return []
     if isinstance(value, str):
         return [value]
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         normalized: list[str] = []
         for item in value:
             if not isinstance(item, str):
@@ -469,9 +526,7 @@ class VerifiedEdit(BaseModel):
     @classmethod
     def _reject_evaluator_metadata(cls, value: Any) -> Any:
         if isinstance(value, dict) and any(
-            contains_evaluator_only(item)
-            for item in value.values()
-            if item is not None
+            contains_evaluator_only(item) for item in value.values() if item is not None
         ):
             raise ValueError("VerifiedEdit cannot contain evaluator metadata")
         return value
@@ -518,9 +573,7 @@ class VerifiedEditBatch(BaseModel):
     edits: list[VerifiedEdit] = Field(min_length=1, max_length=16)
 
 
-CoverageStatus = Literal[
-    "pending", "existing_verified", "generated_verified", "failed"
-]
+CoverageStatus = Literal["pending", "existing_verified", "generated_verified", "failed"]
 
 
 class TestRunFingerprint(BaseModel):
@@ -531,9 +584,7 @@ class TestRunFingerprint(BaseModel):
     exit_code: int
     outcome: Literal["pass", "assertion_failure", "infra"]
     failing_test_ids: list[str] = Field(default_factory=list, max_length=100)
-    assertion_fingerprint: str = Field(
-        default="", pattern=r"^(?:|[0-9a-f]{64})$"
-    )
+    assertion_fingerprint: str = Field(default="", pattern=r"^(?:|[0-9a-f]{64})$")
     summary: str = Field(default="", max_length=500)
 
     @field_validator("failing_test_ids", mode="before")
@@ -542,9 +593,7 @@ class TestRunFingerprint(BaseModel):
         if not isinstance(value, list):
             raise ValueError("test run IDs must be an array")
         return [
-            sanitized
-            for item in value
-            if (sanitized := sanitize_evaluator_text(item))
+            sanitized for item in value if (sanitized := sanitize_evaluator_text(item))
         ]
 
     @field_validator("summary", mode="before")
@@ -557,9 +606,7 @@ class TestRunFingerprint(BaseModel):
         if any(not item or len(item) > 500 for item in self.failing_test_ids):
             raise ValueError("test run IDs must be non-empty and bounded")
         if self.outcome == "pass" and (
-            self.exit_code != 0
-            or self.failing_test_ids
-            or self.assertion_fingerprint
+            self.exit_code != 0 or self.failing_test_ids or self.assertion_fingerprint
         ):
             raise ValueError("passing run cannot carry failure evidence")
         if self.outcome == "assertion_failure" and (
@@ -636,9 +683,7 @@ class ToolSandboxConfig(BaseModel):
 
     backend: Literal["docker", "podman"]
     image: str = Field(
-        pattern=(
-            r"^(?:[A-Za-z0-9][A-Za-z0-9._:/-]*@)?sha256:[0-9a-f]{64}$"
-        ),
+        pattern=(r"^(?:[A-Za-z0-9][A-Za-z0-9._:/-]*@)?sha256:[0-9a-f]{64}$"),
         max_length=512,
     )
     python_executable: str = "/usr/bin/python3"
@@ -655,7 +700,9 @@ class ToolSandboxConfig(BaseModel):
         if (
             not candidate.startswith("/")
             or "\\" in candidate
-            or any(character.isspace() or ord(character) < 32 for character in candidate)
+            or any(
+                character.isspace() or ord(character) < 32 for character in candidate
+            )
             or ".." in path.parts
             or candidate.endswith("/")
             or len(candidate) > 256
@@ -752,9 +799,7 @@ class GeneratedTestApproval(BaseModel):
 
     path: str
     change: Literal["added", "modified"] = "added"
-    base_content_sha256: str | None = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$"
-    )
+    base_content_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     content_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     patch_gate_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -819,7 +864,7 @@ class AgentState(BaseModel):
     fix_attempts: list[FixAttempt] = Field(default_factory=list)
     conversation_history: list[ConversationTurn] = Field(default_factory=list)
     token_usage: int = 0
-    max_retries: int = 3
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET
     retry_count: int = 0
     tool_calls: list[ToolCall] = Field(default_factory=list)
@@ -864,6 +909,16 @@ class AgentState(BaseModel):
     active_provider: Literal["primary", "escalation"] = "primary"
     escalated: bool = False
     escalation_reason: str = ""
+    primary_failed_repair_rounds: int = Field(default=0, ge=0)
+    repair_round_sequence: int = Field(default=0, ge=0)
+    current_repair_round_id: int = Field(default=0, ge=0)
+    current_repair_provider: Literal["primary", "escalation"] | None = None
+    current_repair_model: str = Field(default="", max_length=200)
+    authorized_repair_round_id: int = Field(default=0, ge=0)
+    authorized_repair_provider: Literal["primary", "escalation"] | None = None
+    authorized_repair_model: str = Field(default="", max_length=200)
+    last_counted_repair_round_id: int = Field(default=0, ge=0)
+    repair_correction_context: str = Field(default="", max_length=8_000)
     no_progress_rounds: int = 0
     last_plan_signature: str = ""
     last_context_fingerprint: str = ""
@@ -874,9 +929,7 @@ class AgentState(BaseModel):
     opus_no_progress_rounds: dict[str, int] = Field(default_factory=dict)
     model_history: list[ModelInvocation] = Field(default_factory=list)
     no_progress_history: list[NoProgressEvent] = Field(default_factory=list)
-    attempt_outcome_summary: str = Field(
-        default="", max_length=200
-    )
+    attempt_outcome_summary: str = Field(default="", max_length=200)
     summary_token_usage: int = Field(default=0, ge=0)
     evidence: list[Evidence] = Field(default_factory=list)
     tool_history: list[ToolInvocation] = Field(default_factory=list)
@@ -889,6 +942,7 @@ class AgentState(BaseModel):
     tool_sandbox_config: ToolSandboxConfig | None = None
     # Benchmark/eval mode skips COMMIT only after differential coverage proof.
     skip_commit: bool = False
+    patch_only: bool = False
     _reasoning_tool_counter: list[int] = PrivateAttr(default_factory=lambda: [0])
 
     @model_validator(mode="before")

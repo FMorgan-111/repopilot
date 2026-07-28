@@ -476,7 +476,7 @@ async def test_generate_uses_exact_limits_and_temporary_oci_environment(
     assert seen["instance_id"] == INSTANCE_ID
     assert seen["kwargs"] == {
         "output_dir": tmp_path,
-        "max_retries": 3,
+        "max_retries": 4,
         "token_budget": 100_000,
     }
     assert seen["environment"] == {

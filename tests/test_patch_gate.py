@@ -10,6 +10,7 @@ from src.patch_gate import (
     revalidate_approved_patch,
     validate_patch_batch,
 )
+from src.repair_rounds import begin_repair_round
 from src.state import AgentState, RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
@@ -45,7 +46,7 @@ def _plan(*paths: str, symbols: list[str] | None = None) -> RepairPlan:
 
 
 def _state(root: Path, ref: str, plan: RepairPlan) -> AgentState:
-    return AgentState(
+    state = AgentState(
         issue_url="https://github.com/a/b/issues/1",
         repo_path=str(root),
         repo_ref=ref,
@@ -54,6 +55,8 @@ def _state(root: Path, ref: str, plan: RepairPlan) -> AgentState:
         escalated=True,
         active_repair_plan=plan,
     )
+    begin_repair_round(state)
+    return state
 
 
 def _edit(path: str, *, search: str = "", replace: str, node: str | None = None, before: bytes = b"") -> VerifiedEdit:
@@ -86,6 +89,9 @@ def test_gate_accepts_exact_search_without_mutating_and_builds_approval(tmp_path
     assert state.tool_patch_approval is not None
     assert state.tool_patch_approval.base_ref == ref
     assert state.tool_patch_approval.changed_manifest[0].path == "src/a.py"
+    assert state.authorized_repair_round_id == state.current_repair_round_id
+    assert state.authorized_repair_provider == "escalation"
+    assert state.authorized_repair_model == "claude-opus-4-8:stable"
     revalidate_approved_patch(state)
 
 
@@ -184,6 +190,7 @@ def test_gate_rejects_unsafe_new_targets(tmp_path, path, code):
 
     assert not result.accepted
     assert result.issues[0].code == code
+    assert result.issues[0].failure_class == "model_correctable"
 
 
 def test_gate_rejects_missing_ambiguous_noop_and_keeps_batch_atomic(tmp_path):
@@ -197,11 +204,13 @@ def test_gate_rejects_missing_ambiguous_noop_and_keeps_batch_atomic(tmp_path):
         plan,
         VerifiedEditBatch(edits=[_edit("src/a.py", search="x = 1", replace="x = 2", before=source)]),
     )
+    state.active_repair_plan = plan
     missing = validate_patch_batch(
         state,
         plan,
         VerifiedEditBatch(edits=[_edit("src/a.py", search="missing", replace="x = 2", before=source)]),
     )
+    state.active_repair_plan = plan
     noop = validate_patch_batch(
         state,
         plan,
@@ -209,8 +218,11 @@ def test_gate_rejects_missing_ambiguous_noop_and_keeps_batch_atomic(tmp_path):
     )
 
     assert ambiguous.issues[0].code == "target_ambiguous"
+    assert ambiguous.issues[0].failure_class == "model_correctable"
     assert missing.issues[0].code == "search_missing"
+    assert missing.issues[0].failure_class == "model_correctable"
     assert noop.issues[0].code == "empty_patch"
+    assert noop.issues[0].failure_class == "model_correctable"
     assert (root / "src/a.py").read_bytes() == source
 
 
@@ -315,7 +327,462 @@ def test_gate_rejects_when_generated_patch_fails_real_git_apply_check(tmp_path, 
 
     assert not result.accepted
     assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "model_correctable"
     assert state.tool_patch_approval is None
+
+
+def test_exact_checkout_failure_is_environment(tmp_path):
+    source = b"value = 1\n"
+    root, _ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, "0" * 40, plan)
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_active_plan_invariant_failure_is_environment(tmp_path):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    active = _plan("a.py")
+    submitted = active.model_copy(update={"root_cause": "A different bounded defect."})
+    state = _state(root, ref, active)
+
+    result = validate_patch_batch(
+        state,
+        submitted,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_live_preimage_drift_is_environment(tmp_path):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    (root / "a.py").write_text("value = 9\n", encoding="utf-8")
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_filesystem_failure_is_environment(tmp_path, monkeypatch):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+
+    def fail_read(*_args, **_kwargs):
+        raise OSError("injected read failure")
+
+    monkeypatch.setattr("src.patch_gate._read_regular_no_follow", fail_read)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].failure_class == "environment"
+
+
+@pytest.mark.parametrize("content", [b"\xff", b"value = 1\0\n"])
+def test_tracked_non_text_content_is_model_correctable(tmp_path, content):
+    root, _ref = _repo(tmp_path, {"a.py": "value = 1\n"})
+    (root / "a.py").write_bytes(content)
+    subprocess.run(["git", "-C", str(root), "add", "a.py"], check=True)
+    subprocess.run(
+        ["git", "-C", str(root), "commit", "--amend", "-qm", "binary-base"],
+        check=True,
+    )
+    ref = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=content)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "binary_artifact"
+    assert result.issues[0].failure_class == "model_correctable"
+
+
+def test_absent_tracked_path_is_model_correctable(tmp_path):
+    root, ref = _repo(tmp_path, {"a.py": "value = 1\n"})
+    plan = _plan("src/missing.py")
+    state = _state(root, ref, plan)
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                _edit(
+                    "src/missing.py",
+                    search="missing anchor",
+                    replace="replacement",
+                )
+            ]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "target_missing"
+    assert result.issues[0].failure_class == "model_correctable"
+
+
+def test_untracked_existing_regular_file_is_environment_drift(tmp_path):
+    root, ref = _repo(tmp_path, {"a.py": "value = 1\n"})
+    (root / "src").mkdir()
+    (root / "src" / "new.py").write_text("untracked = True\n", encoding="utf-8")
+    plan = _plan("src/new.py")
+    state = _state(root, ref, plan)
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("src/new.py", replace="created = True\n")]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+    assert state.patch_content == ""
+    assert state.patch_edits == []
+    assert state.active_repair_plan is None
+    assert state.tool_patch_approval is None
+    assert state.authorized_repair_round_id == 0
+
+
+@pytest.mark.parametrize("failing_git_command", ["ls-tree", "show"])
+def test_git_tree_or_blob_failure_is_environment(
+    tmp_path, monkeypatch, failing_git_command
+):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    actual_git = __import__("src.patch_gate", fromlist=["_git"])._git
+
+    def fail_selected_git(repo, *args):
+        if args and args[0] == failing_git_command:
+            return subprocess.CompletedProcess(args, 128, stdout=b"", stderr=b"injected")
+        return actual_git(repo, *args)
+
+    monkeypatch.setattr("src.patch_gate._git", fail_selected_git)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_git_tree_decode_failure_is_environment(tmp_path, monkeypatch):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    actual_git = __import__("src.patch_gate", fromlist=["_git"])._git
+
+    def undecodable_mode(repo, *args):
+        if args and args[0] == "ls-tree":
+            record = b"\xff blob " + b"0" * 40 + b"\ta.py\0"
+            return subprocess.CompletedProcess(args, 0, stdout=record, stderr=b"")
+        return actual_git(repo, *args)
+
+    monkeypatch.setattr("src.patch_gate._git", undecodable_mode)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_untracked_target_filesystem_failure_is_environment(tmp_path, monkeypatch):
+    root, ref = _repo(
+        tmp_path,
+        {
+            "a.py": "value = 1\n",
+            "tests/test_existing.py": "def test_existing():\n    assert True\n",
+        },
+    )
+    plan = _plan("tests/test_new.py")
+    state = _state(root, ref, plan)
+    actual_lstat = Path.lstat
+
+    def fail_target_lstat(path, *args, **kwargs):
+        if path.name == "test_new.py":
+            raise OSError("injected lstat failure")
+        return actual_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", fail_target_lstat)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("tests/test_new.py", replace="def test_new():\n    assert True\n")]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
+
+
+def test_production_acceptance_without_runtime_binding_fails_closed(tmp_path):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = AgentState(
+        issue_url="https://github.com/a/b/issues/1",
+        repo_path=str(root),
+        repo_ref=ref,
+        active_provider="primary",
+        active_model="gemini-3.5-flash:stable",
+        active_repair_plan=plan,
+    )
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    )
+
+    assert not result.accepted
+    assert result.issues[0].failure_class == "environment"
+    assert state.patch_content == ""
+    assert state.patch_edits == []
+    assert state.active_repair_plan is None
+    assert state.tool_patch_approval is None
+    assert state.authorized_repair_round_id == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("authorized_repair_round_id", 2),
+        ("authorized_repair_provider", "primary"),
+        ("authorized_repair_model", "tampered-model"),
+    ],
+)
+def test_revalidation_rejects_authorized_attribution_tampering(
+    tmp_path, field, value
+):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    plan = _plan("a.py")
+    state = _state(root, ref, plan)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    ).accepted
+
+    object.__setattr__(state, field, value)
+
+    with pytest.raises(ValueError, match="PatchGate|authorization|fingerprint|binding"):
+        revalidate_approved_patch(state)
+
+
+def test_test_only_success_never_replaces_production_attribution(tmp_path):
+    source = b"value = 1\n"
+    root, ref = _repo(
+        tmp_path,
+        {
+            "a.py": source.decode(),
+            "tests/test_existing.py": "def test_existing():\n    assert True\n",
+        },
+    )
+    production_plan = _plan("a.py")
+    state = _state(root, ref, production_plan)
+    assert validate_patch_batch(
+        state,
+        production_plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    ).accepted
+    frozen = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    )
+    object.__setattr__(state, "current_repair_provider", "primary")
+    object.__setattr__(state, "current_repair_model", "different-runtime-model")
+    test_plan = _plan("tests/test_generated.py")
+    state.active_repair_plan = test_plan
+
+    result = validate_patch_batch(
+        state,
+        test_plan,
+        VerifiedEditBatch(
+            edits=[_edit("tests/test_generated.py", replace="def test_it():\n    assert True\n")]
+        ),
+        test_only=True,
+    )
+
+    assert result.accepted
+    assert (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    ) == frozen
+
+
+def test_test_only_rejection_never_clears_production_attribution(tmp_path):
+    source = b"value = 1\n"
+    root, ref = _repo(tmp_path, {"a.py": source.decode()})
+    production_plan = _plan("a.py")
+    state = _state(root, ref, production_plan)
+    assert validate_patch_batch(
+        state,
+        production_plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 2", before=source)]
+        ),
+    ).accepted
+    frozen = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    )
+    test_plan = _plan("a.py")
+    state.active_repair_plan = test_plan
+
+    result = validate_patch_batch(
+        state,
+        test_plan,
+        VerifiedEditBatch(
+            edits=[_edit("a.py", search="value = 1", replace="value = 3", before=source)]
+        ),
+        test_only=True,
+    )
+
+    assert not result.accepted
+    assert (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    ) == frozen
+
+
+def test_test_only_malformed_attribution_fails_without_mutating_it(tmp_path):
+    root, ref = _repo(
+        tmp_path,
+        {
+            "a.py": "value = 1\n",
+            "tests/test_existing.py": "def test_existing():\n    assert True\n",
+        },
+    )
+    plan = _plan("tests/test_new.py")
+    state = _state(root, ref, plan)
+    object.__setattr__(state, "authorized_repair_round_id", 9)
+    malformed = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    )
+
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("tests/test_new.py", replace="def test_new():\n    assert True\n")]
+        ),
+        test_only=True,
+    )
+
+    assert not result.accepted
+    assert result.issues[0].failure_class == "environment"
+    assert (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    ) == malformed
+
+
+def test_test_only_path_admission_filesystem_error_is_environment(
+    tmp_path, monkeypatch
+):
+    root, ref = _repo(
+        tmp_path,
+        {
+            "a.py": "value = 1\n",
+            "tests/test_existing.py": "def test_existing():\n    assert True\n",
+        },
+    )
+    plan = _plan("tests/test_new.py")
+    state = _state(root, ref, plan)
+
+    def fail_admission(*_args, **_kwargs):
+        raise OSError("injected test path inspection failure")
+
+    monkeypatch.setattr("src.patch_gate.inspect_allowed_test_path", fail_admission)
+    result = validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[_edit("tests/test_new.py", replace="def test_new():\n    assert True\n")]
+        ),
+        test_only=True,
+    )
+
+    assert not result.accepted
+    assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].failure_class == "environment"
 
 
 def _approved_two_edit_state(tmp_path):

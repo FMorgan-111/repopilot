@@ -9,11 +9,17 @@ This module is a thin re-export wrapper. The implementation lives in:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
+import subprocess
 from typing import Any
 
 from .async_safety import CancellationDrainError, drain_task, wait_for_phase
-from .coverage_gate import LiveCoverageBinding, validate_terminal_coverage_binding
+from .coverage_gate import (
+    LiveCoverageBinding,
+    validate_live_coverage_binding,
+    validate_terminal_coverage_binding,
+)
 from .evaluator_safety import safe_prediction_patch
 from .graph import (
     END,
@@ -33,10 +39,12 @@ from .nodes.locate import locate_code
 from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
-from .nodes.verify import verify_fix
+from .nodes.verify import _attempt_binding, _trusted_authorized_binding, verify_fix
+from .patch_gate import revalidate_approved_patch
 from .run_store import claim_run_for_resume, load_run, save_run
 from .safe_subprocess import tool_sandbox_config_from_env
 from .state import (
+    DEFAULT_AGENT_V2_MAX_RETRIES,
     DEFAULT_AGENT_V2_TOKEN_BUDGET,
     AgentState,
     ConversationTurn,
@@ -327,9 +335,89 @@ def final_report_from_state(state: AgentState, turns_taken: int) -> FinalReport:
     return report
 
 
+def _validated_patch_for_report(state: AgentState) -> str:
+    preflight_state = state.model_copy(deep=True)
+    try:
+        revalidate_approved_patch(preflight_state)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        pass
+    else:
+        return safe_prediction_patch(preflight_state.patch_content)
+
+    live_state = state.model_copy(deep=True)
+    attempt = _trusted_attempt_for_patch(live_state, live_state.patch_content)
+    if attempt is None:
+        return ""
+    try:
+        binding = validate_live_coverage_binding(live_state)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return ""
+    return safe_prediction_patch(binding.patch_content)
+
+
+def _trusted_attempt_for_patch(
+    state: AgentState, patch: str
+) -> FixAttempt | None:
+    for attempt in reversed(state.fix_attempts):
+        if attempt.patch_content != patch:
+            continue
+        try:
+            if _attempt_binding(attempt) != _trusted_authorized_binding(state, attempt):
+                continue
+        except ValueError:
+            continue
+        completed, _ = _attempt_test_completion(attempt)
+        if not completed:
+            continue
+        return attempt
+    return None
+
+
+def _attempt_test_completion(attempt: FixAttempt) -> tuple[bool, bool | None]:
+    if attempt.test_result == "execution_error":
+        completed = attempt.failure_kind == "infra_error" and attempt.success is False
+        return completed, None
+
+    try:
+        result = json.loads(attempt.test_result)
+    except (TypeError, ValueError):
+        return False, None
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"command", "returncode", "success"}
+        or not isinstance(result["command"], str)
+        or not result["command"].strip()
+        or type(result["returncode"]) is not int
+        or type(result["success"]) is not bool
+    ):
+        return False, None
+
+    success = result["success"]
+    expected_failure_kind = "" if success else "test_failed"
+    if (
+        success is not (result["returncode"] == 0)
+        or success is not attempt.success
+        or attempt.failure_kind != expected_failure_kind
+    ):
+        return False, None
+    return True, success
+
+
+def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
+    if not patch:
+        return None
+    attempt = _trusted_attempt_for_patch(state, patch)
+    if attempt is None:
+        return None
+    _, tests_passed = _attempt_test_completion(attempt)
+    return tests_passed
+
+
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
-    report, live_binding = _final_report_and_binding(state, turns_taken)
+    report, _ = _final_report_and_binding(state, turns_taken)
     terminal_success = report.fix_applied
+    model_patch = _validated_patch_for_report(state)
+    tests_passed = _tests_passed_for_patch(state, model_patch)
     payload = report.model_dump()
     payload.update(
         {
@@ -374,9 +462,9 @@ def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, A
                 if state.coverage_proof
                 else None
             ),
-            "model_patch": safe_prediction_patch(
-                live_binding.patch_content if live_binding is not None else ""
-            ),
+            "patch_generated": bool(model_patch),
+            "tests_passed": tests_passed,
+            "model_patch": model_patch,
             "error": state.failure_reason or None,
         }
     )
@@ -405,11 +493,12 @@ def _best_effort_save_run(state: AgentState) -> None:
 
 async def agent_v2(
     issue_url: str,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
     save_final_run: bool = False,
     skip_commit: bool = False,
     seed: dict | None = None,
+    patch_only: bool = True,
 ) -> dict:
     """Run the full RepoPilot v2 graph with progress output and trace saving.
 
@@ -431,6 +520,7 @@ async def agent_v2(
         token_budget=token_budget,
         trace_id=tracer.trace_id,
         skip_commit=skip_commit,
+        patch_only=patch_only,
         active_model=get_model_config("primary").model,
         active_provider="primary",
         tool_sandbox_config=tool_sandbox_config_from_env(),
@@ -500,7 +590,6 @@ async def agent_v2(
                 "fix_applied": False,
                 "waiting_for_user": False,
                 "final_phase": "CRASHED",
-                "model_patch": "",
             }
         )
         if save_final_run:
@@ -638,7 +727,7 @@ def _save_trace(tracer: Tracer, path: str, state: AgentState | None = None) -> N
 
 async def intelligent_analyze_issue(
     issue_url: str,
-    max_retries: int = 3,
+    max_retries: int = DEFAULT_AGENT_V2_MAX_RETRIES,
     token_budget: int = DEFAULT_AGENT_V2_TOKEN_BUDGET,
 ) -> dict:
     """Backward-compatible alias for the previous experimental endpoint."""

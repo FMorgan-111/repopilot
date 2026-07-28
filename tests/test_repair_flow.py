@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from src import repair_flow as repair_flow_module
 from src.async_safety import CancellationDrainError
 from src.escalation import (
     ESCALATION_PACKET_RENDER_LIMIT,
@@ -209,20 +210,99 @@ def test_build_target_context_rejects_oversized_complete_definition(tmp_path):
         )
 
 
+def test_strict_symbol_resolution_returns_symbol_or_legitimate_none(tmp_path):
+    source = "MODULE_VALUE = 1\n\ndef widget():\n    return 'old-sentinel'\n"
+    repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
+    state = _state(repo, ref)
+
+    assert (
+        repair_flow_module.resolve_search_target_symbol_strict(
+            state,
+            "src/widget.py",
+            "return 'old-sentinel'",
+        )
+        == "widget"
+    )
+    assert (
+        repair_flow_module.resolve_search_target_symbol_strict(
+            state,
+            "src/widget.py",
+            "MODULE_VALUE = 1",
+        )
+        is None
+    )
+    assert (
+        repair_flow_module.resolve_search_target_symbol_strict(
+            state, "src/widget.txt", "anything"
+        )
+        is None
+    )
+
+
+def test_strict_symbol_resolution_treats_syntax_error_as_no_symbol(tmp_path):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def broken(:\n    target = 1\n"},
+    )
+
+    assert (
+        repair_flow_module.resolve_search_target_symbol_strict(
+            _state(repo, ref),
+            "src/widget.py",
+            "target = 1",
+        )
+        is None
+    )
+
+
+def test_strict_symbol_resolution_propagates_checkout_drift(tmp_path):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def widget():\n    return 1\n"},
+    )
+    state = _state(repo, ref)
+    state.repo_ref = "f" * 40
+
+    with pytest.raises(RepairContextError, match="base commit"):
+        repair_flow_module.resolve_search_target_symbol_strict(
+            state,
+            "src/widget.py",
+            "return 1",
+        )
+
+
+def test_strict_symbol_resolution_normalizes_read_io_to_context_error(
+    tmp_path, monkeypatch
+):
+    repo, ref = _git_repo(
+        tmp_path,
+        {"src/widget.py": "def widget():\n    return 1\n"},
+    )
+
+    def fail_read(*_args, **_kwargs):
+        raise OSError("read failed")
+
+    monkeypatch.setattr("src.repair_flow.read_exact_checkout_text", fail_read)
+    with pytest.raises(RepairContextError, match="read"):
+        repair_flow_module.resolve_search_target_symbol_strict(
+            _state(repo, ref),
+            "src/widget.py",
+            "return 1",
+        )
+
+
 async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_context(
     tmp_path, monkeypatch
 ):
-    source = (
-        "class Widget:\n"
-        "    def compute(self, value):\n"
-        "        return value\n"
-    )
+    source = "class Widget:\n    def compute(self, value):\n        return value\n"
     repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
     state = _state(repo, ref)
     packet = build_escalation_packet(state)
     calls: list[dict[str, object]] = []
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
         calls.append(
             {
                 "system": system,
@@ -240,10 +320,7 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
                     "file_path": "src/widget.py",
                     "node_target": "Widget.compute",
                     "search": "",
-                    "replace": (
-                        "def compute(self, value):\n"
-                        "    return value + 1\n"
-                    ),
+                    "replace": ("def compute(self, value):\n    return value + 1\n"),
                     "intent": "Apply the required offset.",
                 }
             ]
@@ -278,8 +355,7 @@ async def test_generate_opus_repair_calls_plan_then_verified_edits_with_exact_co
         "plan_fix",
     ]
     assert state.token_usage == sum(
-        item.input_tokens + item.output_tokens
-        for item in state.model_history
+        item.input_tokens + item.output_tokens for item in state.model_history
     )
 
 
@@ -419,8 +495,7 @@ async def test_opus_inner_repair_tool_uses_delta_evidence_and_pre_call_policy(
     assert "new-evidence-sentinel-2" in calls[3]
     assert "old-evidence-sentinel" not in calls[3]
     assert state.token_usage == sum(
-        item.input_tokens + item.output_tokens
-        for item in state.model_history
+        item.input_tokens + item.output_tokens for item in state.model_history
     )
 
 
@@ -511,12 +586,9 @@ async def test_default_repairplan_tool_reprompt_retains_initial_source_evidence(
     assert seeded[3].evidence_id not in {
         item["evidence_id"] for item in packet["evidence"]
     }
-    assert stale.evidence_id not in {
-        item["evidence_id"] for item in packet["evidence"]
-    }
+    assert stale.evidence_id not in {item["evidence_id"] for item in packet["evidence"]}
     assert all(
-        len(item["content"]) <= EVIDENCE_CONTENT_LIMIT
-        for item in packet["evidence"]
+        len(item["content"]) <= EVIDENCE_CONTENT_LIMIT for item in packet["evidence"]
     )
     rendered_evidence = "\n".join(
         json.dumps(item, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
@@ -561,10 +633,7 @@ async def test_direct_repair_hydrates_source_for_first_and_inner_plan_prompts(
                     "file_path": "src/widget.py",
                     "node_target": "Widget.compute",
                     "search": "",
-                    "replace": (
-                        "def compute(self, value):\n"
-                        "    return value + 1\n"
-                    ),
+                    "replace": ("def compute(self, value):\n    return value + 1\n"),
                     "intent": "Apply the required offset.",
                 }
             ],
@@ -642,10 +711,7 @@ async def test_direct_repair_truncates_hydrated_source_candidates_to_three(
                     "file_path": "src/widget.py",
                     "node_target": "Widget.compute",
                     "search": "",
-                    "replace": (
-                        "def compute(self, value):\n"
-                        "    return value + 1\n"
-                    ),
+                    "replace": ("def compute(self, value):\n    return value + 1\n"),
                     "intent": "Apply the required offset.",
                 }
             ]
@@ -671,7 +737,9 @@ async def test_direct_repair_truncates_hydrated_source_candidates_to_three(
         "src/second.py",
         "src/third.py",
     ]
-    assert all(len(item["content"]) <= EVIDENCE_CONTENT_LIMIT for item in source_evidence)
+    assert all(
+        len(item["content"]) <= EVIDENCE_CONTENT_LIMIT for item in source_evidence
+    )
     assert "fourth-source-sentinel" not in calls[0]
 
 
@@ -710,10 +778,7 @@ async def test_direct_repair_reserves_state_capacity_for_real_tool_evidence(
                     "file_path": "src/widget.py",
                     "node_target": "Widget.compute",
                     "search": "",
-                    "replace": (
-                        "def compute(self, value):\n"
-                        "    return value + 1\n"
-                    ),
+                    "replace": ("def compute(self, value):\n    return value + 1\n"),
                     "intent": "Apply the required offset.",
                 }
             ],
@@ -761,26 +826,19 @@ async def test_opus_inner_repair_stop_terminates_without_schema_retry(
     assert calls == 1
     [invocation] = state.model_history
     assert invocation.status == "invalid_response"
-    assert state.token_usage == (
-        invocation.input_tokens + invocation.output_tokens
-    )
+    assert state.token_usage == (invocation.input_tokens + invocation.output_tokens)
 
 
 async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(
     tmp_path, monkeypatch
 ):
-    source = (
-        "class Widget:\n"
-        "    def compute(self, value):\n"
-        "        return value\n"
-    )
+    source = "class Widget:\n    def compute(self, value):\n        return value\n"
     repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
     state = _state(repo, ref)
     packet = build_escalation_packet(state)
     summary_section = "Completed attempts (rolling summary):"
     first_stage_prompt = (
-        f"{render_escalation_packet(packet)}\n\n{summary_section}\n"
-        "safe rolling outcome"
+        f"{render_escalation_packet(packet)}\n\n{summary_section}\nsafe rolling outcome"
     )
     calls = []
 
@@ -794,10 +852,7 @@ async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(
                     "file_path": "src/widget.py",
                     "node_target": "Widget.compute",
                     "search": "",
-                    "replace": (
-                        "def compute(self, value):\n"
-                        "    return value + 1\n"
-                    ),
+                    "replace": ("def compute(self, value):\n    return value + 1\n"),
                     "intent": "Apply the required offset.",
                 }
             ]
@@ -817,15 +872,11 @@ async def test_generate_opus_repair_uses_custom_prompt_only_for_first_stage(
     assert "safe rolling outcome" not in calls[1]["user"]
 
 
-async def test_custom_first_stage_prompt_retains_hydrated_source(
-    tmp_path, monkeypatch
-):
+async def test_custom_first_stage_prompt_retains_hydrated_source(tmp_path, monkeypatch):
     source = "def widget():\n    return 'old-sentinel'\n"
     repo, ref = _git_repo(tmp_path, {"src/widget.py": source})
     state = _state(repo, ref)
-    state.relevant_files = [
-        FileInfo(path="src/widget.py", content=source)
-    ]
+    state.relevant_files = [FileInfo(path="src/widget.py", content=source)]
     packet = build_escalation_packet(state)
     suffix = "\n\nCompleted attempts (rolling summary):\nsafe rolling outcome"
     first_stage_prompt = f"{render_escalation_packet(packet)}{suffix}"
@@ -881,9 +932,7 @@ async def test_custom_first_stage_prompt_rejects_unclassified_tail(
         )
 
 
-async def test_custom_inner_reprompt_rejects_second_packet_tail(
-    tmp_path, monkeypatch
-):
+async def test_custom_inner_reprompt_rejects_second_packet_tail(tmp_path, monkeypatch):
     repo, ref = _git_repo(
         tmp_path,
         {"src/widget.py": "def widget():\n    return 1\n"},
@@ -936,16 +985,14 @@ async def test_generate_opus_repair_renders_one_bounded_packet_with_suffix(
 ):
     files = {
         f"src/module_{index}.py": (
-            f"def function_{index}():\n"
-            f"    return {'x' * 5900!r}\n"
+            f"def function_{index}():\n    return {'x' * 5900!r}\n"
         )
         for index in range(3)
     }
     repo, ref = _git_repo(tmp_path, files)
     state = _state(repo, ref)
     state.relevant_files = [
-        FileInfo(path=path, content=content)
-        for path, content in files.items()
+        FileInfo(path=path, content=content) for path, content in files.items()
     ]
     state.evidence = [
         Evidence(
@@ -953,9 +1000,7 @@ async def test_generate_opus_repair_renders_one_bounded_packet_with_suffix(
             tool="search_text",
             summary=f"stale evidence {index}",
             content=f"stale-{index}-" + ("y" * 1900),
-            fingerprint=hashlib.sha256(
-                f"stale-{index}".encode("utf-8")
-            ).hexdigest(),
+            fingerprint=hashlib.sha256(f"stale-{index}".encode("utf-8")).hexdigest(),
         )
         for index in range(15)
     ]
@@ -982,15 +1027,18 @@ async def test_generate_opus_repair_renders_one_bounded_packet_with_suffix(
     assert rendered[offset:] == suffix
     assert rendered.count('"issue_title"') == 1
     assert len(payload["evidence"]) <= EVIDENCE_LIMIT
-    assert sum(
-        item["tool"] == "planner_relevant_file"
-        for item in payload["evidence"]
-    ) <= 3
-    assert len(
-        EvidenceStore.render_for_prompt(
-            [Evidence.model_validate(item) for item in payload["evidence"]]
+    assert (
+        sum(item["tool"] == "planner_relevant_file" for item in payload["evidence"])
+        <= 3
+    )
+    assert (
+        len(
+            EvidenceStore.render_for_prompt(
+                [Evidence.model_validate(item) for item in payload["evidence"]]
+            )
         )
-    ) <= EVIDENCE_TOTAL_LIMIT
+        <= EVIDENCE_TOTAL_LIMIT
+    )
 
 
 async def test_generate_opus_repair_fails_before_second_call_for_invalid_target(
@@ -1000,7 +1048,9 @@ async def test_generate_opus_repair_fails_before_second_call_for_invalid_target(
     state = _state(repo, ref)
     calls = []
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
         calls.append((system, user))
         return _plan(
             target_files=["missing.bin"],
@@ -1342,7 +1392,9 @@ async def test_crlf_target_uses_lf_semantics_but_keeps_raw_preimage_digest(
     state = _state(repo, ref)
     calls = 0
 
-    async def fake_llm_call(system, user, model=None, *, provider="primary", temperature=0.2):
+    async def fake_llm_call(
+        system, user, model=None, *, provider="primary", temperature=0.2
+    ):
         nonlocal calls
         calls += 1
         if calls == 1:
