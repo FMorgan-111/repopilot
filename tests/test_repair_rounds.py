@@ -102,6 +102,7 @@ def test_failed_rounds_are_counted_once_and_switch_after_two_primary_failures(
     assert state.retry_count == 1
     assert state.primary_failed_repair_rounds == 1
     assert state.active_provider == "primary"
+    assert state.node_diagnostics[-1]["failure_reason"] == "invalid_edit"
 
     second = begin_repair_round(state)
     bind_repair_round_author(state)

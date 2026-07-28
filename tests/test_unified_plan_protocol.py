@@ -193,6 +193,7 @@ async def test_patch_gate_rejection_requests_one_new_full_plan_decision(
     assert second.repair_round_sequence == 2
     assert second.tool_patch_approval is not None
     assert len(calls) == 2
+    assert "CORRECTION FOR THE NEXT PATCH_EDITS RESPONSE:" in calls[1][1]
 
 
 @pytest.mark.parametrize("provider", ["primary", "escalation"])

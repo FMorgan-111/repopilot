@@ -248,6 +248,7 @@ def record_failed_repair_round(
         repair_round_id=round_id,
         retry_count=state.retry_count,
         primary_failed_repair_rounds=state.primary_failed_repair_rounds,
+        failure_reason=str(failure_reason or "")[:64],
     )
     return RepairRetryDecision(
         counted=True,

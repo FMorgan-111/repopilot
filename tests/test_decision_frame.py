@@ -339,13 +339,9 @@ async def test_invalid_structured_plan_counts_one_failed_transaction(
 
     async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
         calls.append((system, user, model, provider))
-        return {
-            "plan": "invalid frame stage",
-            "decision_frame": {
-                "stage": "reflect",
-                "summary": "This cannot validate as a plan.",
-            },
-        }
+        response = _exact_plan_response()
+        response["patch_edits"][0]["replace"] = ""
+        return response
 
     monkeypatch.setattr(plan_node, "llm_call", fake_llm_call)
 
@@ -357,8 +353,14 @@ async def test_invalid_structured_plan_counts_one_failed_transaction(
     assert next_state.primary_failed_repair_rounds == 1
     assert next_state.last_counted_repair_round_id == 1
     assert next_state.current_repair_round_id == 0
+    assert next_state.failure_reason == "invalid_replacement"
     assert next_state.model_history[-1].status == "ok"
     assert next_state.node_diagnostics[-1]["event"] == "repair_round_failed"
+    assert next_state.node_diagnostics[-1]["failure_reason"] == "invalid_replacement"
+    assert not any(
+        item.get("reason") == "missing_explicit_decision_frame"
+        for item in next_state.decision_warnings
+    )
 
 
 async def test_invalid_plan_response_never_persists_response_bearing_error(monkeypatch):
@@ -683,7 +685,7 @@ async def test_plan_fix_no_patch_execute_recommendation_routes_to_failure(monkey
     route = new_agent.route_from_state(planned_state)
 
     assert planned_state.current_phase == new_agent.Phase.PLAN
-    assert planned_state.failure_reason == "patch_authorization_rejected"
+    assert planned_state.failure_reason == "missing_edits"
     assert planned_state.retry_count == 1
     assert planned_state.decision_frame.recommended_action == "plan"
     assert route == "plan_fix"

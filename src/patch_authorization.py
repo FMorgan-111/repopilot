@@ -160,7 +160,7 @@ def _reject(
     state: AgentState,
     issues: list[PatchAuthorizationIssue],
 ) -> PatchAuthorizationOutcome:
-    bounded = tuple(issues[:16]) or (
+    bounded = tuple(issues[:1]) or (
         _issue("invalid_proposal", "The patch proposal is invalid."),
     )
     state.repair_correction_context = render_patch_correction(bounded)
@@ -534,40 +534,22 @@ def render_patch_correction(
     issues: tuple[PatchAuthorizationIssue, ...] | list[PatchAuthorizationIssue],
 ) -> str:
     """Serialize bounded, non-sensitive correction evidence for one PLAN turn."""
-    selected = list(issues[:16])
-    limits = {
-        "file_path": 500,
-        "message": 500,
-        "correction_context": 1_200,
-    }
-    while True:
-        payload = [
+    if not issues:
+        return "[]"
+    issue = list(issues[:1])[0]
+    return json.dumps(
+        [
             {
                 "code": issue.code,
-                "file_path": issue.file_path[: limits["file_path"]],
-                "message": issue.message[: limits["message"]],
-                "correction_context": issue.correction_context[
-                    : limits["correction_context"]
-                ],
+                "file_path": issue.file_path,
+                "message": issue.message,
+                "correction_context": issue.correction_context,
             }
-            for issue in selected
-        ]
-        rendered = json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-        if len(rendered) <= 8_000:
-            return rendered
-        if limits["correction_context"]:
-            limits["correction_context"] //= 2
-        elif limits["message"] > 80:
-            limits["message"] //= 2
-        elif limits["file_path"] > 80:
-            limits["file_path"] //= 2
-        else:
-            return rendered[:8_000]
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
 
 
 __all__ = [

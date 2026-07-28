@@ -582,7 +582,7 @@ def build_plan_user_prompt(
         )
         if safe_correction:
             correction_context = (
-                "\n\nCORRECTION FOR THE NEXT COMPLETE PLAN DECISION:\n"
+                "\n\nCORRECTION FOR THE NEXT PATCH_EDITS RESPONSE:\n"
                 f"{safe_correction}"
             )
     files_terms = _issue_search_terms(state.issue_title, state.issue_body)
@@ -793,12 +793,13 @@ def _record_model_correctable_plan_failure(
         state.repair_correction_context = ""
     elif issues:
         state.repair_correction_context = render_patch_correction(list(issues))
+    failure_reason = issues[0].code if issues else reason
     decision = record_failed_repair_round(
         state,
         round_id=state.current_repair_round_id,
         provider=provider,
         model=model,
-        failure_reason=reason,
+        failure_reason=failure_reason,
         retry_phase=Phase.PLAN,
         immediate_reason=immediate_reason,
     )
@@ -815,7 +816,7 @@ def _record_model_correctable_plan_failure(
     _record_plan_frame(
         state,
         next_frame,
-        has_explicit_frame=frame is not None,
+        has_explicit_frame=True,
     )
     return state
 

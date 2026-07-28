@@ -1084,7 +1084,7 @@ async def test_legacy_block_counter_cannot_terminate_before_global_budget(
 
     assert next_state.current_phase == new_agent.Phase.PLAN
     assert next_state.retry_count == 2
-    assert next_state.failure_reason == "identical_to_failed_patch"
+    assert next_state.failure_reason == "repeated_failed_patch"
 
 
 async def test_final_global_attempt_dead_patch_exhausts_shared_budget(

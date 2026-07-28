@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import subprocess
 from pathlib import Path
 
@@ -515,9 +516,10 @@ def test_render_patch_correction_is_bounded_and_contains_only_issue_fields():
     )
 
     rendered = render_patch_correction(issues)
+    payload = json.loads(rendered)
 
     assert len(rendered) <= 8_000
-    assert "invalid_0" in rendered
-    assert "invalid_15" in rendered
-    assert "invalid_16" not in rendered
+    assert len(payload) == 1
+    assert payload[0]["code"] == "invalid_0"
+    assert "invalid_1" not in rendered
     assert "failure_class" not in rendered
