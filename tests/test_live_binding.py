@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from src.coverage_gate import CoverageCandidate, validate_differential_coverage
+from src.coverage_gate import (
+    CoverageCandidate,
+    validate_differential_coverage,
+    validate_live_coverage_binding,
+)
 from src.new_agent import agent_payload_from_state
 from src.nodes.commit import commit_fix
 from src.patch_gate import apply_approved_patch, validate_patch_batch
@@ -15,11 +20,13 @@ from src.safe_subprocess import BoundedProcessResult
 from src.state import (
     AgentState,
     CoverageProof,
+    FixAttempt,
     Phase,
     RepairPlan,
     ToolSandboxConfig,
     VerifiedEdit,
     VerifiedEditBatch,
+    tool_manifest_fingerprint,
 )
 from src.state import (
     TestRunFingerprint as RunFingerprint,
@@ -91,6 +98,29 @@ def _approved_state(tmp_path: Path) -> AgentState:
     assert state.authorized_repair_model == "gemini-3.5-flash:stable"
     apply_approved_patch(state)
     return state
+
+
+def _attach_trusted_attempt(state: AgentState) -> None:
+    approval = state.tool_patch_approval
+    assert approval is not None
+    state.fix_attempts.append(
+        FixAttempt(
+            patch_content=state.patch_content,
+            patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+            test_result=json.dumps(
+                {
+                    "command": "python -m pytest tests/test_maths.py -q",
+                    "returncode": 0,
+                    "success": True,
+                }
+            ),
+            success=True,
+            patch_gate_fingerprint=approval.patch_gate_fingerprint,
+            repair_provider=state.authorized_repair_provider,
+            repair_model=state.authorized_repair_model,
+            repair_round_id=state.authorized_repair_round_id,
+        )
+    )
 
 
 def _attach_proof(state: AgentState) -> None:
@@ -171,6 +201,7 @@ async def test_coverage_fails_closed_when_live_patch_drifts_between_runs(
 
 def test_terminal_prediction_uses_only_the_approved_live_patch(tmp_path: Path):
     state = _approved_state(tmp_path)
+    _attach_trusted_attempt(state)
     _attach_proof(state)
     state.current_phase = Phase.DONE
     approved_patch = state.patch_content
@@ -190,18 +221,66 @@ def test_terminal_prediction_uses_only_the_approved_live_patch(tmp_path: Path):
 
 def test_terminal_prediction_exports_approved_live_patch_without_proof(tmp_path: Path):
     state = _approved_state(tmp_path)
+    _attach_trusted_attempt(state)
     state.current_phase = Phase.DONE
 
     payload = agent_payload_from_state(state, turns_taken=1)
 
     assert payload["success"] is False
     assert payload["patch_generated"] is True
-    assert payload["tests_passed"] is None
+    assert payload["tests_passed"] is True
     assert payload["model_patch"] == state.patch_content
+
+
+def test_terminal_prediction_rejects_forged_live_approval_without_receipt(
+    tmp_path: Path,
+):
+    state = _approved_state(tmp_path)
+    root = Path(state.repo_path)
+    (root / "src" / "maths.py").write_text(
+        "def answer():\n    return 3\n", encoding="utf-8"
+    )
+    forged_patch = subprocess.run(
+        ["git", "-C", str(root), "diff"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    approval = state.tool_patch_approval
+    assert approval is not None
+    forged_manifest = [
+        entry.model_copy(
+            update={
+                "content_sha256": hashlib.sha256(
+                    (root / "src" / "maths.py").read_bytes()
+                ).hexdigest(),
+                "size": (root / "src" / "maths.py").stat().st_size,
+            }
+        )
+        for entry in approval.changed_manifest
+    ]
+    state.patch_content = forged_patch
+    state.tool_patch_approval = approval.model_copy(
+        update={
+            "patch_sha256": hashlib.sha256(forged_patch.encode("utf-8")).hexdigest(),
+            "patch_gate_fingerprint": "f" * 64,
+            "changed_manifest": forged_manifest,
+            "manifest_fingerprint": tool_manifest_fingerprint(forged_manifest),
+        }
+    )
+    state.current_phase = Phase.DONE
+    assert validate_live_coverage_binding(state).patch_content == forged_patch
+
+    payload = agent_payload_from_state(state, turns_taken=1)
+
+    assert payload["patch_generated"] is False
+    assert payload["tests_passed"] is None
+    assert payload["model_patch"] == ""
 
 
 def test_terminal_prediction_rejects_tampered_approved_patch_content(tmp_path: Path):
     state = _approved_state(tmp_path)
+    _attach_trusted_attempt(state)
     state.current_phase = Phase.DONE
     state.patch_content += "\n# tampered after approval\n"
 
@@ -218,6 +297,7 @@ def test_terminal_prediction_rejects_mismatched_or_tampered_proof(
     tamper: str,
 ):
     state = _approved_state(tmp_path)
+    _attach_trusted_attempt(state)
     _attach_proof(state)
     state.current_phase = Phase.DONE
     if tamper == "status":
@@ -242,7 +322,7 @@ def test_terminal_prediction_rejects_mismatched_or_tampered_proof(
     assert payload["success"] is False
     expected_patch = "" if tamper == "fingerprint" else state.patch_content
     assert payload["patch_generated"] is bool(expected_patch)
-    assert payload["tests_passed"] is None
+    assert payload["tests_passed"] is (True if expected_patch else None)
     assert payload["model_patch"] == expected_patch
 
 

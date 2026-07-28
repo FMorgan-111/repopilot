@@ -9,6 +9,7 @@ This module is a thin re-export wrapper. The implementation lives in:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 from typing import Any
@@ -38,7 +39,7 @@ from .nodes.locate import locate_code
 from .nodes.plan import plan_fix
 from .nodes.reflect import reflect_on_failure
 from .nodes.understand import understand_issue
-from .nodes.verify import verify_fix
+from .nodes.verify import _attempt_binding, _trusted_authorized_binding, verify_fix
 from .patch_gate import revalidate_approved_patch
 from .run_store import claim_run_for_resume, load_run, save_run
 from .safe_subprocess import tool_sandbox_config_from_env
@@ -344,6 +345,9 @@ def _validated_patch_for_report(state: AgentState) -> str:
         return safe_prediction_patch(preflight_state.patch_content)
 
     live_state = state.model_copy(deep=True)
+    attempt = _trusted_attempt_for_patch(live_state, live_state.patch_content)
+    if attempt is None:
+        return ""
     try:
         binding = validate_live_coverage_binding(live_state)
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
@@ -351,13 +355,42 @@ def _validated_patch_for_report(state: AgentState) -> str:
     return safe_prediction_patch(binding.patch_content)
 
 
+def _trusted_attempt_for_patch(
+    state: AgentState, patch: str
+) -> FixAttempt | None:
+    for attempt in reversed(state.fix_attempts):
+        if attempt.patch_content != patch:
+            continue
+        try:
+            if _attempt_binding(attempt) != _trusted_authorized_binding(state, attempt):
+                continue
+        except ValueError:
+            continue
+        return attempt
+    return None
+
+
 def _tests_passed_for_patch(state: AgentState, patch: str) -> bool | None:
     if not patch:
         return None
-    for attempt in reversed(state.fix_attempts):
-        if attempt.patch_content == patch and attempt.test_result:
-            return attempt.success
-    return None
+    attempt = _trusted_attempt_for_patch(state, patch)
+    if attempt is None or attempt.failure_kind == "infra_error":
+        return None
+    try:
+        result = json.loads(attempt.test_result)
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(result, dict)
+        or set(result) != {"command", "returncode", "success"}
+        or not isinstance(result["command"], str)
+        or not result["command"].strip()
+        or type(result["returncode"]) is not int
+        or type(result["success"]) is not bool
+        or result["success"] is not attempt.success
+    ):
+        return None
+    return attempt.success
 
 
 def agent_payload_from_state(state: AgentState, turns_taken: int) -> dict[str, Any]:
