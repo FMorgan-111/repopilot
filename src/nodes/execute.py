@@ -28,6 +28,7 @@ from ..patch_match import (
 )
 from ..patch_repair import repair_unified_diff
 from ..repair_flow import resolve_search_target_symbol
+from ..repair_rounds import validate_repair_round_state
 from ..safe_subprocess import (
     BoundedProcessResult,
     minimal_subprocess_env,
@@ -1295,6 +1296,10 @@ async def run_pytest(repo_path: str, command: str | None = None) -> dict[str, An
 
 def _validate_execution_state(state: AgentState) -> None:
     """Require one complete, frozen PatchGate transaction in every mode."""
+    try:
+        validate_repair_round_state(state)
+    except ValueError as exc:
+        raise RuntimeError(f"repair ledger state-integrity failure: {exc}") from exc
     if not _COMMIT_RE.fullmatch(state.repo_ref):
         raise RuntimeError(
             "PatchGate execution state-integrity requires an exact "
@@ -1332,6 +1337,25 @@ def _validate_execution_state(state: AgentState) -> None:
         raise RuntimeError(
             "PatchGate execution state-integrity requires frozen repair attribution"
         )
+    authorized_binding = (
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+    )
+    current_binding = (
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+    )
+    if (
+        authorized_binding != current_binding
+        or state.authorized_repair_round_id != state.repair_round_sequence
+        or state.authorized_repair_round_id <= state.last_counted_repair_round_id
+    ):
+        raise RuntimeError(
+            "PatchGate execution state-integrity requires the current "
+            "uncounted repair authorization"
+        )
     from ..patch_gate import revalidate_approved_patch
 
     revalidate_approved_patch(state)
@@ -1350,6 +1374,11 @@ def _fix_attempt_from_state(state: AgentState) -> FixAttempt:
             "repair_provider": state.authorized_repair_provider,
             "repair_model": state.authorized_repair_model,
             "repair_round_id": state.authorized_repair_round_id,
+            "patch_gate_fingerprint": (
+                state.tool_patch_approval.patch_gate_fingerprint
+                if state.tool_patch_approval is not None
+                else None
+            ),
         }
     return FixAttempt(
         patch_content=state.patch_content,

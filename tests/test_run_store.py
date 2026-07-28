@@ -277,9 +277,7 @@ def test_run_store_rejects_symlinked_intermediate_root_component(tmp_path):
     linked.symlink_to(real, target_is_directory=True)
 
     with pytest.raises(ValueError, match="root directory components"):
-        run_store.save_run(
-            paused_state("safe-id"), root_dir=linked / "nested" / "root"
-        )
+        run_store.save_run(paused_state("safe-id"), root_dir=linked / "nested" / "root")
 
 
 def test_run_store_rejects_runs_directory_swap_during_open(tmp_path, monkeypatch):
@@ -466,9 +464,7 @@ def test_save_run_rejects_unsafe_per_run_lock(tmp_path, kind):
 
 
 @pytest.mark.parametrize("mode", [0o644, 0o666])
-def test_save_run_rejects_per_run_lock_without_exact_permissions(
-    tmp_path, mode
-):
+def test_save_run_rejects_per_run_lock_without_exact_permissions(tmp_path, mode):
     root = tmp_path / "root"
     runs = root / "runs"
     runs.mkdir(parents=True)
@@ -620,9 +616,7 @@ def test_claim_run_for_resume_rejects_stale_expected_state(tmp_path):
     run_store.save_run(original, root_dir=root_dir)
     stale = run_store.load_run(original.trace_id, root_dir=root_dir)
     updated = stale.model_copy(deep=True)
-    updated.human_input_request["question"] = (
-        "Durably updated after authorization"
-    )
+    updated.human_input_request["question"] = "Durably updated after authorization"
     run_store.save_run(updated, root_dir=root_dir)
 
     with pytest.raises(run_store.ResumeConflictError):
@@ -651,9 +645,10 @@ def test_claim_run_for_resume_requires_matching_trace_id(tmp_path):
             root_dir=root_dir,
         )
 
-    assert run_store.load_run(
-        original.trace_id, root_dir=root_dir
-    ).resume_in_progress is False
+    assert (
+        run_store.load_run(original.trace_id, root_dir=root_dir).resume_in_progress
+        is False
+    )
 
 
 def test_claim_run_for_resume_maps_missing_durable_state_to_conflict(tmp_path):
@@ -716,9 +711,10 @@ def test_simultaneous_claims_for_same_run_succeed_exactly_once(tmp_path):
         results = list(executor.map(lambda _index: attempt_claim(), range(2)))
 
     assert sorted(results) == ["claimed", "conflict"]
-    assert run_store.load_run(
-        original.trace_id, root_dir=root_dir
-    ).resume_in_progress is True
+    assert (
+        run_store.load_run(original.trace_id, root_dir=root_dir).resume_in_progress
+        is True
+    )
 
 
 def test_cross_process_claims_for_same_run_succeed_exactly_once(tmp_path):
@@ -816,9 +812,7 @@ def test_save_and_load_preserves_model_routing_state(tmp_path):
         )
     ]
     state.no_progress_history = [
-        NoProgressEvent(
-            kind="repeated_edit", fingerprint="edit-sha", node="plan_fix"
-        )
+        NoProgressEvent(kind="repeated_edit", fingerprint="edit-sha", node="plan_fix")
     ]
 
     run_store.save_run(state, root_dir=root_dir)
@@ -847,13 +841,52 @@ def _repair_gate_approval() -> ToolPatchApproval:
     )
 
 
+def test_fix_attempt_patch_gate_receipt_is_strict_and_legacy_compatible():
+    legacy = FixAttempt()
+    receipt = "a" * 64
+    current = FixAttempt(
+        patch_gate_fingerprint=receipt,
+        repair_provider="primary",
+        repair_model="gemini-3.5-flash:stable",
+        repair_round_id=1,
+    )
+
+    assert legacy.patch_gate_fingerprint is None
+    assert current.patch_gate_fingerprint == receipt
+    for invalid in ("", "not-a-sha256", "A" * 64):
+        with pytest.raises(ValueError):
+            FixAttempt(patch_gate_fingerprint=invalid)
+    with pytest.raises(ValueError):
+        FixAttempt(patch_gate_fingerprint=receipt)
+    with pytest.raises(ValueError):
+        current.patch_gate_fingerprint = "b" * 64
+
+
+def test_run_store_persists_fix_attempt_patch_gate_receipt(tmp_path):
+    root_dir = tmp_path / ".repopilot"
+    state = paused_state("fix-attempt-receipt")
+    state.fix_attempts.append(
+        FixAttempt(
+            patch_gate_fingerprint="e" * 64,
+            episode_recording_attempted=True,
+            repair_provider="primary",
+            repair_model="gemini-3.5-flash:stable",
+            repair_round_id=1,
+        )
+    )
+
+    run_store.save_run(state, root_dir=root_dir)
+    loaded = run_store.load_run(state.trace_id, root_dir=root_dir)
+
+    assert loaded.fix_attempts[-1].patch_gate_fingerprint == "e" * 64
+    assert loaded.fix_attempts[-1].episode_recording_attempted is True
+
+
 def test_same_round_failure_is_idempotent_after_run_store_roundtrip(
     tmp_path, monkeypatch
 ):
     root_dir = tmp_path / ".repopilot"
-    monkeypatch.setattr(
-        "src.model_policy.escalation_is_configured", lambda: False
-    )
+    monkeypatch.setattr("src.model_policy.escalation_is_configured", lambda: False)
     state = paused_state("repair-round-idempotency")
     state.current_phase = Phase.PLAN
     first = begin_repair_round(state)
@@ -867,9 +900,7 @@ def test_same_round_failure_is_idempotent_after_run_store_roundtrip(
     )
     second = begin_repair_round(state)
     state.patch_content = "diff --git a/widget.py b/widget.py"
-    state.patch_edits = [
-        PatchEdit(file_path="widget.py", search="old", replace="new")
-    ]
+    state.patch_edits = [PatchEdit(file_path="widget.py", search="old", replace="new")]
     state.tool_patch_approval = _repair_gate_approval()
     freeze_authorized_repair_round(state)
     state.fix_attempts.append(
@@ -907,9 +938,7 @@ def test_terminal_roundtrip_with_cleared_current_id_rejects_sixth_round(
     tmp_path, monkeypatch
 ):
     root_dir = tmp_path / ".repopilot"
-    monkeypatch.setattr(
-        "src.model_policy.escalation_is_configured", lambda: False
-    )
+    monkeypatch.setattr("src.model_policy.escalation_is_configured", lambda: False)
     state = paused_state("terminal-repair-ledger")
     state.max_retries = 4
     state.current_phase = Phase.PLAN
@@ -1020,8 +1049,7 @@ def test_run_store_load_and_replay_sanitize_hostile_file(tmp_path):
                 "trace_id": "hostile-summary-file",
                 "current_phase": "PLAN",
                 "attempt_outcome_summary": (
-                    "safe loaded prefix raw HTTP response body: "
-                    "raw-load-sentinel"
+                    "safe loaded prefix raw HTTP response body: raw-load-sentinel"
                 ),
             }
         ),
@@ -1157,7 +1185,10 @@ def test_inspect_run_returns_stable_summary(tmp_path):
     assert summary["issue_url"] == "https://github.com/acme/widget/issues/7"
     assert summary["current_phase"] == "WAITING_FOR_USER"
     assert summary["pending_human_input"] is True
-    assert summary["human_input_question"] == "Confirm whether breaking changes are allowed."
+    assert (
+        summary["human_input_question"]
+        == "Confirm whether breaking changes are allowed."
+    )
     assert summary["latest_decision_frame"]["frame_id"] == "df_0001"
     assert summary["latest_decision_frame"]["recommended_action"] == "ask_user"
     assert summary["updated_at"].endswith("+00:00")
@@ -1184,7 +1215,9 @@ def test_replay_run_returns_white_box_timeline(tmp_path):
     assert replay["run_id"] == "abc123def456"
     assert replay["issue_url"] == "https://github.com/acme/widget/issues/7"
     assert replay["current_phase"] == "WAITING_FOR_USER"
-    assert replay["pause"]["question"] == "Confirm whether breaking changes are allowed."
+    assert (
+        replay["pause"]["question"] == "Confirm whether breaking changes are allowed."
+    )
     assert replay["timeline"] == [
         {
             "index": 1,

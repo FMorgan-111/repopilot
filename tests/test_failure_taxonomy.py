@@ -2,6 +2,7 @@
 so pin each category to a representative error log."""
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -29,6 +30,7 @@ def _append_authorized_failure(
     failure_kind: str,
     error_log: str,
     legacy_attribution: bool = False,
+    success: bool = False,
 ):
     if state.tool_patch_approval is not None:
         retire_patch_authorization(state)
@@ -54,13 +56,14 @@ def _append_authorized_failure(
         VerifiedEditBatch(edits=[edit]),
     ).accepted
     round_id = state.authorized_repair_round_id
+    assert state.tool_patch_approval is not None
     attempt = new_agent.FixAttempt(
         patch_content=state.patch_content,
         patch_edits=[item.model_copy(deep=True) for item in state.patch_edits],
         file_path=state.patch_edits[0].file_path,
         failure_kind=failure_kind,
         error_log=error_log,
-        success=False,
+        success=success,
         **(
             {}
             if legacy_attribution
@@ -68,12 +71,24 @@ def _append_authorized_failure(
                 "repair_provider": state.authorized_repair_provider,
                 "repair_model": state.authorized_repair_model,
                 "repair_round_id": round_id,
+                "patch_gate_fingerprint": (
+                    state.tool_patch_approval.patch_gate_fingerprint
+                ),
             }
         ),
     )
     state.fix_attempts.append(attempt)
     state.current_phase = new_agent.Phase.VERIFY
     return attempt
+
+
+def _fake_episode_store(monkeypatch):
+    store = SimpleNamespace(arecord=AsyncMock())
+    monkeypatch.setattr(
+        "src.memory.error_episode_store.get_episode_store",
+        lambda: store,
+    )
+    return store
 
 
 def verified_coverage():
@@ -520,6 +535,102 @@ async def test_verify_loaded_counted_attempt_is_idempotent(exact_repair_state):
     ) == first
 
 
+async def test_verify_counted_replay_after_retirement_is_pure_noop(
+    exact_repair_state,
+    monkeypatch,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    _append_authorized_failure(
+        state,
+        failure_kind="test_failed",
+        error_log="FAILED tests/test_widget.py::test_widget - assert False",
+    )
+    state = await new_agent.verify_fix(state)
+    assert store.arecord.await_count == 1
+    retire_patch_authorization(state)
+    state.current_phase = new_agent.Phase.WAITING_FOR_USER
+    before = state.model_copy(deep=True)
+
+    replayed = await new_agent.verify_fix(state)
+
+    assert replayed == before
+    assert store.arecord.await_count == 1
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "retry",
+        "sequence",
+        "primary",
+        "orphan",
+        "authorized_orphan",
+        "authorized_without_gate",
+    ],
+)
+async def test_verify_counted_replay_fails_closed_on_impossible_ledger(
+    exact_repair_state,
+    monkeypatch,
+    tamper,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    _append_authorized_failure(
+        state,
+        failure_kind="test_failed",
+        error_log="FAILED tests/test_widget.py::test_widget - assert False",
+    )
+    state = await new_agent.verify_fix(state)
+    retire_patch_authorization(state)
+    if tamper == "retry":
+        state.retry_count = state.max_retries + 1
+    elif tamper == "sequence":
+        state.repair_round_sequence = state.last_counted_repair_round_id + 2
+    elif tamper == "primary":
+        state.primary_failed_repair_rounds = state.last_counted_repair_round_id + 1
+    elif tamper == "orphan":
+        state.current_repair_provider = "primary"
+    elif tamper == "authorized_orphan":
+        state.authorized_repair_provider = "primary"
+    else:
+        state.authorized_repair_round_id = state.last_counted_repair_round_id
+        state.authorized_repair_provider = "primary"
+        state.authorized_repair_model = "gemini-3.5-flash:stable"
+    attempt_before = state.fix_attempts[-1].model_copy(deep=True)
+    ledger_before = (
+        state.retry_count,
+        state.primary_failed_repair_rounds,
+        state.repair_round_sequence,
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+        state.last_counted_repair_round_id,
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert "state-integrity" in result.failure_reason.lower()
+    assert result.fix_attempts[-1] == attempt_before
+    assert (
+        result.retry_count,
+        result.primary_failed_repair_rounds,
+        result.repair_round_sequence,
+        result.current_repair_round_id,
+        result.current_repair_provider,
+        result.current_repair_model,
+        result.authorized_repair_round_id,
+        result.authorized_repair_provider,
+        result.authorized_repair_model,
+        result.last_counted_repair_round_id,
+    ) == ledger_before
+    assert store.arecord.await_count == 1
+
+
 async def test_verify_missing_historical_attribution_is_infrastructure():
     state = new_agent.AgentState(
         issue_url="https://github.com/acme/widget/issues/7",
@@ -545,7 +656,7 @@ async def test_verify_migrates_historical_attempt_from_matching_authorization(
     exact_repair_state,
 ):
     state = exact_repair_state
-    attempt = _append_authorized_failure(
+    _append_authorized_failure(
         state,
         failure_kind="test_failed",
         error_log="FAILED tests/test_widget.py::test_widget - assert False",
@@ -556,17 +667,16 @@ async def test_verify_migrates_historical_attempt_from_matching_authorization(
         state.authorized_repair_provider,
         state.authorized_repair_model,
     )
-    state.current_repair_round_id = 0
-    state.current_repair_provider = None
-    state.current_repair_model = ""
-
+    assert state.tool_patch_approval is not None
+    expected_receipt = state.tool_patch_approval.patch_gate_fingerprint
     result = await new_agent.verify_fix(state)
 
     assert (
-        attempt.repair_round_id,
-        attempt.repair_provider,
-        attempt.repair_model,
+        result.fix_attempts[-1].repair_round_id,
+        result.fix_attempts[-1].repair_provider,
+        result.fix_attempts[-1].repair_model,
     ) == expected
+    assert result.fix_attempts[-1].patch_gate_fingerprint == expected_receipt
     assert result.retry_count == 1
     assert result.current_phase == new_agent.Phase.REFLECT
 
@@ -575,7 +685,7 @@ async def test_verify_rejects_mismatched_orphaned_current_author_on_restore(
     exact_repair_state,
 ):
     state = exact_repair_state
-    _append_authorized_failure(
+    attempt = _append_authorized_failure(
         state,
         failure_kind="test_failed",
         error_log="FAILED tests/test_widget.py::test_widget - assert False",
@@ -584,6 +694,19 @@ async def test_verify_rejects_mismatched_orphaned_current_author_on_restore(
     state.current_repair_round_id = 0
     state.current_repair_provider = "escalation"
     state.current_repair_model = "claude-opus-4-8:stable"
+    attempt_before = attempt.model_copy(deep=True)
+    ledger_before = (
+        state.retry_count,
+        state.primary_failed_repair_rounds,
+        state.repair_round_sequence,
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+        state.last_counted_repair_round_id,
+    )
 
     result = await new_agent.verify_fix(state)
 
@@ -591,9 +714,360 @@ async def test_verify_rejects_mismatched_orphaned_current_author_on_restore(
     assert result.retry_count == 0
     assert result.primary_failed_repair_rounds == 0
     assert "state-integrity" in result.failure_reason.lower()
-    assert result.current_repair_round_id == 0
-    assert result.current_repair_provider == "escalation"
-    assert result.current_repair_model == "claude-opus-4-8:stable"
+    assert result.fix_attempts[-1] == attempt_before
+    assert (
+        result.retry_count,
+        result.primary_failed_repair_rounds,
+        result.repair_round_sequence,
+        result.current_repair_round_id,
+        result.current_repair_provider,
+        result.current_repair_model,
+        result.authorized_repair_round_id,
+        result.authorized_repair_provider,
+        result.authorized_repair_model,
+        result.last_counted_repair_round_id,
+    ) == ledger_before
+
+
+async def test_historical_attempt_cannot_inherit_later_identical_authorization(
+    exact_repair_state,
+    monkeypatch,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    historical = _append_authorized_failure(
+        state,
+        failure_kind="test_failed",
+        error_log="FAILED tests/test_widget.py::test_widget - assert False",
+        legacy_attribution=True,
+    )
+    round_one = state.authorized_repair_round_id
+    record_failed_repair_round(
+        state,
+        round_id=round_one,
+        provider="primary",
+        model="gemini-3.5-flash:stable",
+        failure_reason="test_failed",
+        retry_phase=new_agent.Phase.REFLECT,
+    )
+    retire_patch_authorization(state)
+    plan = RepairPlan(
+        root_cause="widget returns the old sentinel",
+        target_files=["src/widget.py"],
+        target_symbols=["widget"],
+        required_behavior="widget returns the new sentinel",
+        regression_test_strategy="run the focused widget test",
+    )
+    state.active_repair_plan = plan
+    begin_repair_round(state)
+    bind_repair_round_author(state)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                VerifiedEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                    intent="return the new sentinel",
+                )
+            ]
+        ),
+    ).accepted
+    state.current_phase = new_agent.Phase.VERIFY
+    before_attempt = historical.model_copy(deep=True)
+    ledger_before = (
+        state.retry_count,
+        state.primary_failed_repair_rounds,
+        state.repair_round_sequence,
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+        state.last_counted_repair_round_id,
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert "state-integrity" in result.failure_reason.lower()
+    assert result.fix_attempts[-1] == before_attempt
+    assert result.fix_attempts[-1].repair_round_id == 0
+    assert (
+        result.retry_count,
+        result.primary_failed_repair_rounds,
+        result.repair_round_sequence,
+        result.current_repair_round_id,
+        result.current_repair_provider,
+        result.current_repair_model,
+        result.authorized_repair_round_id,
+        result.authorized_repair_provider,
+        result.authorized_repair_model,
+        result.last_counted_repair_round_id,
+    ) == ledger_before
+    assert store.arecord.await_count == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    ["patch", "edit", "plan", "fingerprint", "receipt"],
+)
+async def test_historical_attempt_migration_mismatch_is_atomic(
+    exact_repair_state,
+    monkeypatch,
+    tamper,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    attempt = _append_authorized_failure(
+        state,
+        failure_kind="test_failed",
+        error_log="FAILED tests/test_widget.py::test_widget - assert False",
+        legacy_attribution=True,
+    )
+    if tamper == "patch":
+        attempt.patch_content += "\n# mismatched attempt patch"
+    elif tamper == "edit":
+        attempt.patch_edits[0].replace = "return 'different-sentinel'"
+    elif tamper == "plan":
+        assert state.active_repair_plan is not None
+        state.active_repair_plan = state.active_repair_plan.model_copy(
+            update={"required_behavior": "different behavior"}
+        )
+    elif tamper == "fingerprint":
+        assert state.tool_patch_approval is not None
+        state.tool_patch_approval = state.tool_patch_approval.model_copy(
+            update={"patch_gate_fingerprint": "f" * 64}
+        )
+    else:
+        state.fix_attempts[-1] = attempt.model_copy(
+            update={"patch_gate_fingerprint": "e" * 64},
+            deep=True,
+        )
+        attempt = state.fix_attempts[-1]
+    attempt_before = attempt.model_copy(deep=True)
+    ledger_before = (
+        state.retry_count,
+        state.primary_failed_repair_rounds,
+        state.repair_round_sequence,
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+        state.last_counted_repair_round_id,
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.fix_attempts[-1] == attempt_before
+    assert (
+        result.retry_count,
+        result.primary_failed_repair_rounds,
+        result.repair_round_sequence,
+        result.current_repair_round_id,
+        result.current_repair_provider,
+        result.current_repair_model,
+        result.authorized_repair_round_id,
+        result.authorized_repair_provider,
+        result.authorized_repair_model,
+        result.last_counted_repair_round_id,
+    ) == ledger_before
+    assert store.arecord.await_count == 0
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        "round",
+        "provider",
+        "model",
+        "receipt",
+        "missing_receipt",
+        "patch",
+        "edit",
+        "plan",
+        "manifest",
+        "base",
+        "gate_fingerprint",
+    ],
+)
+async def test_verify_rejects_positive_attempt_binding_mismatch_without_episode(
+    exact_repair_state,
+    monkeypatch,
+    tamper,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    attempt = _append_authorized_failure(
+        state,
+        failure_kind="test_failed",
+        error_log="FAILED tests/test_widget.py::test_widget - assert False",
+    )
+    if tamper in {"round", "provider", "model", "receipt", "missing_receipt"}:
+        updates = {
+            "round": {"repair_round_id": attempt.repair_round_id + 1},
+            "provider": {"repair_provider": "escalation"},
+            "model": {"repair_model": "claude-opus-4-8:stable"},
+            "receipt": {"patch_gate_fingerprint": "f" * 64},
+            "missing_receipt": {"patch_gate_fingerprint": None},
+        }[tamper]
+        state.fix_attempts[-1] = attempt.model_copy(update=updates, deep=True)
+    elif tamper == "patch":
+        state.fix_attempts[-1].patch_content += "\n# mismatched patch"
+    elif tamper == "edit":
+        state.fix_attempts[-1].patch_edits[0].replace = "return 'different-sentinel'"
+    elif tamper == "plan":
+        assert state.active_repair_plan is not None
+        state.active_repair_plan = state.active_repair_plan.model_copy(
+            update={"required_behavior": "different behavior"}
+        )
+    else:
+        assert state.tool_patch_approval is not None
+        approval_updates = {
+            "manifest": {"manifest_fingerprint": "f" * 64},
+            "base": {"base_ref": "b" * 40},
+            "gate_fingerprint": {"patch_gate_fingerprint": "f" * 64},
+        }[tamper]
+        state.tool_patch_approval = state.tool_patch_approval.model_copy(
+            update=approval_updates
+        )
+    attempt_before = state.fix_attempts[-1].model_copy(deep=True)
+    ledger_before = (
+        state.retry_count,
+        state.primary_failed_repair_rounds,
+        state.repair_round_sequence,
+        state.current_repair_round_id,
+        state.current_repair_provider,
+        state.current_repair_model,
+        state.authorized_repair_round_id,
+        state.authorized_repair_provider,
+        state.authorized_repair_model,
+        state.last_counted_repair_round_id,
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert result.fix_attempts[-1] == attempt_before
+    assert (
+        result.retry_count,
+        result.primary_failed_repair_rounds,
+        result.repair_round_sequence,
+        result.current_repair_round_id,
+        result.current_repair_provider,
+        result.current_repair_model,
+        result.authorized_repair_round_id,
+        result.authorized_repair_provider,
+        result.authorized_repair_model,
+        result.last_counted_repair_round_id,
+    ) == ledger_before
+    assert store.arecord.await_count == 0
+
+
+async def test_verify_infra_attempt_records_no_episode(monkeypatch):
+    store = _fake_episode_store(monkeypatch)
+    state = new_agent.AgentState(
+        issue_url="https://github.com/acme/widget/issues/7",
+        current_phase=new_agent.Phase.VERIFY,
+        fix_attempts=[
+            new_agent.FixAttempt(
+                failure_kind="infra_error",
+                error_log="runner unavailable",
+            )
+        ],
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert store.arecord.await_count == 0
+
+
+async def test_verify_valid_success_records_once_and_replay_is_idempotent(
+    exact_repair_state,
+    monkeypatch,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    _append_authorized_failure(
+        state,
+        failure_kind="",
+        error_log="1 passed",
+        success=True,
+    )
+
+    state = await new_agent.verify_fix(state)
+
+    assert state.current_phase == new_agent.Phase.COVERAGE
+    assert state.retry_count == 0
+    assert state.fix_attempts[-1].episode_recording_attempted is True
+    assert store.arecord.await_count == 1
+    before = state.model_copy(deep=True)
+
+    replayed = await new_agent.verify_fix(state)
+
+    assert replayed == before
+    assert store.arecord.await_count == 1
+
+
+@pytest.mark.parametrize("tamper", ["bare", "receipt"])
+async def test_verify_untrusted_success_fails_before_episode_or_coverage(
+    exact_repair_state,
+    monkeypatch,
+    tamper,
+):
+    store = _fake_episode_store(monkeypatch)
+    if tamper == "bare":
+        state = new_agent.AgentState(
+            issue_url="https://github.com/acme/widget/issues/7",
+            current_phase=new_agent.Phase.VERIFY,
+            fix_attempts=[new_agent.FixAttempt(success=True, error_log="1 passed")],
+        )
+    else:
+        state = exact_repair_state
+        attempt = _append_authorized_failure(
+            state,
+            failure_kind="",
+            error_log="1 passed",
+            success=True,
+        )
+        state.fix_attempts[-1] = attempt.model_copy(
+            update={"patch_gate_fingerprint": "f" * 64},
+            deep=True,
+        )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.FAILURE
+    assert "state-integrity" in result.failure_reason.lower()
+    assert store.arecord.await_count == 0
+
+
+async def test_verify_trusted_success_episode_failure_is_best_effort(
+    exact_repair_state,
+    monkeypatch,
+):
+    state = exact_repair_state
+    store = _fake_episode_store(monkeypatch)
+    store.arecord.side_effect = RuntimeError("episode store unavailable")
+    _append_authorized_failure(
+        state,
+        failure_kind="",
+        error_log="1 passed",
+        success=True,
+    )
+
+    result = await new_agent.verify_fix(state)
+
+    assert result.current_phase == new_agent.Phase.COVERAGE
+    assert result.fix_attempts[-1].episode_recording_attempted is True
+    assert store.arecord.await_count == 1
 
 
 async def test_invalid_then_failed_primary_patch_switches_before_next_plan(

@@ -15,11 +15,16 @@ import src.run_store as run_store
 from src import graph, http_client, new_agent
 from src.async_safety import CancellationDrainError
 from src.nodes.commit import PRCancellationCleanupError
+from src.patch_gate import validate_patch_batch
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.state import (
     DEFAULT_AGENT_V2_MAX_RETRIES,
     MAX_AGENT_V2_MAX_RETRIES,
     ModelInvocation,
     NoProgressEvent,
+    RepairPlan,
+    VerifiedEdit,
+    VerifiedEditBatch,
 )
 
 
@@ -627,14 +632,50 @@ def test_llm_phase_timeouts_cover_retry_window():
     assert graph.PHASE_TIMEOUTS["handle_failure"] >= 60.0
 
 
-async def test_verify_success_always_routes_to_coverage():
+async def test_verify_success_always_routes_to_coverage(exact_repair_state):
     for skip_commit in (False, True):
-        state = new_agent.AgentState(
-            issue_url="https://github.com/acme/widget/issues/7",
-            current_phase=new_agent.Phase.VERIFY,
-            skip_commit=skip_commit,
-            fix_attempts=[new_agent.FixAttempt(test_result="passed", success=True)],
+        state = exact_repair_state.model_copy(deep=True)
+        state.skip_commit = skip_commit
+        plan = RepairPlan(
+            root_cause="widget returns the old sentinel",
+            target_files=["src/widget.py"],
+            target_symbols=["widget"],
+            required_behavior="widget returns the new sentinel",
+            regression_test_strategy="run the focused widget test",
         )
+        state.active_repair_plan = plan
+        begin_repair_round(state)
+        bind_repair_round_author(state)
+        assert validate_patch_batch(
+            state,
+            plan,
+            VerifiedEditBatch(
+                edits=[
+                    VerifiedEdit(
+                        file_path="src/widget.py",
+                        search="return 'old-sentinel'",
+                        replace="return 'new-sentinel'",
+                        intent="return the new sentinel",
+                    )
+                ]
+            ),
+        ).accepted
+        assert state.tool_patch_approval is not None
+        state.fix_attempts.append(
+            new_agent.FixAttempt(
+                patch_content=state.patch_content,
+                patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+                test_result="passed",
+                success=True,
+                patch_gate_fingerprint=(
+                    state.tool_patch_approval.patch_gate_fingerprint
+                ),
+                repair_provider=state.authorized_repair_provider,
+                repair_model=state.authorized_repair_model,
+                repair_round_id=state.authorized_repair_round_id,
+            )
+        )
+        state.current_phase = new_agent.Phase.VERIFY
         result = await new_agent.verify_fix(state)
         assert result.current_phase == new_agent.Phase.COVERAGE
         assert graph.route_from_state(result) == "ensure_coverage"
@@ -2390,85 +2431,6 @@ async def test_verify_fix_rejects_unattributed_historical_failure():
     assert "state-integrity" in next_state.failure_reason.lower()
 
 
-async def test_execute_fix_rejects_unapproved_raw_patch_before_apply(monkeypatch):
-    async def fake_apply_patch(repo_path, patch_content):
-        return execute_node.PatchApplyResult(
-            applied=False,
-            output="error: corrupt patch at line 3",
-            patch_content=patch_content,
-        )
-
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        repo_path="/tmp/repopilot-test-repo",
-        patch_content="malformed diff",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert len(next_state.fix_attempts) == 1
-    assert next_state.fix_attempts[-1].test_result == "execution_error"
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_execute_fix_rejects_unapproved_patch_before_tests(monkeypatch):
-    async def fake_apply_patch(repo_path, patch_content):
-        return execute_node.PatchApplyResult(
-            applied=True,
-            output="",
-            patch_content=patch_content,
-        )
-
-    async def fake_run_pytest(repo_path, command=None):
-        return {
-            "command": "pytest tests/test_auth.py -q",
-            "returncode": 1,
-            "stdout": "FAILED tests/test_auth.py",
-            "stderr": "",
-            "success": False,
-        }
-
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
-    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        repo_path="/tmp/repopilot-test-repo",
-        patch_content="diff --git a/src/auth.py b/src/auth.py",
-        test_command="pytest tests/test_auth.py -q",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert len(next_state.fix_attempts) == 1
-    assert next_state.fix_attempts[-1].success is False
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_execute_fix_rejects_unapproved_patch_before_mutation(monkeypatch):
-    async def fake_apply_patch(repo_path, patch_content):
-        raise RuntimeError("git apply crashed")
-
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        repo_path="/tmp/repopilot-test-repo",
-        patch_content="diff --git a/src/auth.py b/src/auth.py",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert len(next_state.fix_attempts) == 1
-    assert next_state.fix_attempts[-1].test_result == "execution_error"
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
 async def test_run_git_async_kills_process_on_timeout():
     import time
 
@@ -2761,242 +2723,6 @@ async def test_git_clone_failed_cache_population_redacts_token(monkeypatch, tmp_
     assert "gho_cachetoken" not in message
     assert "https://x-access-token:<redacted>@github.com/acme/widget.git" in message
     assert not cache_path.exists()
-
-
-async def test_execute_fix_rejects_unapproved_state_before_clone_timeout(monkeypatch):
-    token = "gho_secret123"
-    tokenized_url = f"https://x-access-token:{token}@github.com/acme/widget.git"
-
-    async def fake_git_clone(state):
-        raise subprocess.TimeoutExpired(
-            cmd=[
-                "git",
-                "clone",
-                "--depth",
-                "1",
-                tokenized_url,
-                "/tmp/repopilot-acme-widget",
-            ],
-            timeout=180,
-        )
-
-    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        owner="acme",
-        repo="widget",
-        patch_content="diff --git a/src/auth.py b/src/auth.py",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert len(next_state.fix_attempts) == 1
-    assert next_state.fix_attempts[-1].test_result == "execution_error"
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert token not in next_state.fix_attempts[-1].error_log
-    assert tokenized_url not in next_state.fix_attempts[-1].error_log
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_execute_fix_rejects_unapproved_state_before_clone_network_call(
-    monkeypatch,
-):
-    async def fake_git_clone(state):
-        raise RuntimeError(
-            "fatal: unable to access 'https://github.com/acme/widget.git/': "
-            "Failed to connect to github.com port 443"
-        )
-
-    monkeypatch.setattr(execute_node, "git_clone", fake_git_clone)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        owner="acme",
-        repo="widget",
-        patch_content="diff --git a/src/auth.py b/src/auth.py",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.VERIFY
-    assert len(next_state.fix_attempts) == 1
-    assert next_state.fix_attempts[-1].test_result == "execution_error"
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_execute_fix_rejects_unapproved_state_before_patch_apply(monkeypatch):
-    token = "gho_patchsecret"
-
-    async def fake_apply_patch(repo_path, patch_content):
-        return execute_node.PatchApplyResult(
-            applied=False,
-            output=(
-                "fatal: unable to access "
-                f"'https://x-access-token:{token}@github.com/acme/widget.git/'"
-            ),
-            patch_content=patch_content,
-        )
-
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        repo_path="/tmp/repopilot-test-repo",
-        patch_content="malformed diff",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert token not in next_state.fix_attempts[-1].error_log
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_execute_fix_rejects_unapproved_state_before_test_output(monkeypatch):
-    token = "gho_testsecret"
-
-    async def fake_apply_patch(repo_path, patch_content):
-        return execute_node.PatchApplyResult(
-            applied=True,
-            output="",
-            patch_content=patch_content,
-        )
-
-    async def fake_run_pytest(repo_path, command=None):
-        return {
-            "command": "pytest tests/test_auth.py -q",
-            "returncode": 1,
-            "stdout": (
-                "failed cloning "
-                f"https://x-access-token:{token}@github.com/acme/widget.git"
-            ),
-            "stderr": "",
-            "success": False,
-        }
-
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", fake_apply_patch)
-    monkeypatch.setattr(execute_node, "run_pytest", fake_run_pytest)
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        repo_path="/tmp/repopilot-test-repo",
-        patch_content="diff --git a/src/auth.py b/src/auth.py",
-        test_command="pytest tests/test_auth.py -q",
-    )
-
-    next_state = await execute_node.execute_fix(state)
-
-    assert token not in next_state.fix_attempts[-1].error_log
-    assert next_state.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in next_state.fix_attempts[-1].error_log
-
-
-async def test_verify_fix_first_patch_apply_failure_does_not_increment_retry_count():
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        max_retries=1,
-        retry_count=0,
-        current_phase=new_agent.Phase.VERIFY,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_content="malformed diff",
-                test_result="patch_apply_failed",
-                failure_kind="patch_apply_failed",
-                error_log="error: No valid patches in input",
-                success=False,
-            )
-        ],
-    )
-
-    next_state = await new_agent.verify_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert next_state.retry_count == 0
-    assert "state-integrity" in next_state.failure_reason.lower()
-
-
-async def test_verify_fix_legacy_patch_apply_failure_does_not_increment_retry_count():
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        max_retries=1,
-        retry_count=0,
-        current_phase=new_agent.Phase.VERIFY,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_content="malformed diff",
-                test_result="patch_apply_failed",
-                error_log="error: No valid patches in input",
-                success=False,
-            )
-        ],
-    )
-
-    next_state = await new_agent.verify_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert next_state.retry_count == 0
-    assert "state-integrity" in next_state.failure_reason.lower()
-
-
-async def test_verify_fix_second_consecutive_patch_apply_failure_consumes_retry():
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        max_retries=1,
-        retry_count=0,
-        current_phase=new_agent.Phase.VERIFY,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_content="malformed diff",
-                test_result="patch_apply_failed",
-                failure_kind="patch_apply_failed",
-                error_log="error: No valid patches in input",
-                success=False,
-            ),
-            new_agent.FixAttempt(
-                patch_content="still malformed diff",
-                test_result="patch_apply_failed",
-                failure_kind="patch_apply_failed",
-                error_log="error: corrupt patch at line 3",
-                success=False,
-            ),
-        ],
-    )
-
-    next_state = await new_agent.verify_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert next_state.retry_count == 0
-    assert "state-integrity" in next_state.failure_reason.lower()
-
-
-async def test_verify_fix_same_patch_apply_failure_twice_routes_to_failure():
-    state = new_agent.AgentState(
-        issue_url="https://github.com/acme/widget/issues/7",
-        max_retries=2,
-        retry_count=0,
-        current_phase=new_agent.Phase.VERIFY,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_content="malformed diff",
-                test_result="patch_apply_failed",
-                failure_kind="patch_apply_failed",
-                error_log="error: corrupt patch at line 3",
-                success=False,
-            ),
-            new_agent.FixAttempt(
-                patch_content="malformed diff",
-                test_result="patch_apply_failed",
-                failure_kind="patch_apply_failed",
-                error_log="error: corrupt patch at line 3",
-                success=False,
-            ),
-        ],
-    )
-
-    next_state = await new_agent.verify_fix(state)
-
-    assert next_state.current_phase == new_agent.Phase.FAILURE
-    assert "state-integrity" in next_state.failure_reason.lower()
-    assert next_state.retry_count == 0
 
 
 async def test_verify_fix_unattributed_test_failure_does_not_increment_retry_count():

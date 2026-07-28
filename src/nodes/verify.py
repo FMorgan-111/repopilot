@@ -56,6 +56,10 @@ def _trusted_authorized_binding(
         raise ValueError("PatchGate authorization manifest changed")
     if latest.patch_content != state.patch_content:
         raise ValueError("FixAttempt patch does not match frozen authorization")
+    if latest.patch_gate_fingerprint is None:
+        raise ValueError("FixAttempt lacks an immutable PatchGate receipt")
+    if latest.patch_gate_fingerprint != approval.patch_gate_fingerprint:
+        raise ValueError("FixAttempt PatchGate receipt does not match authorization")
 
     from ..patch_gate import _approval_edit_payload, _fingerprint
 
@@ -76,49 +80,137 @@ def _trusted_authorized_binding(
     return binding
 
 
-def _prepare_failure_attribution(
+def _attempt_binding(latest: FixAttempt) -> tuple[int, str, str]:
+    binding = (
+        latest.repair_round_id,
+        latest.repair_provider or "",
+        latest.repair_model,
+    )
+    if binding[0] <= 0 or not binding[1] or not binding[2]:
+        raise ValueError("FixAttempt lacks positive repair author attribution")
+    receipt = latest.patch_gate_fingerprint
+    if receipt is not None and not re.fullmatch(r"[0-9a-f]{64}", receipt):
+        raise ValueError("FixAttempt PatchGate receipt is malformed")
+    return binding
+
+
+def _validate_counted_replay(state: AgentState, latest: FixAttempt) -> None:
+    """Validate immutable attribution and the durable ledger on a candidate."""
+    round_id, _provider, _model = _attempt_binding(latest)
+    if round_id > state.last_counted_repair_round_id:
+        raise ValueError("FixAttempt is not a counted repair round")
+    candidate = state.model_copy(deep=True)
+    validate_repair_round_state(candidate)
+
+
+def _restore_open_binding(
     state: AgentState,
-    latest: FixAttempt,
-) -> tuple[int, str, str]:
-    binding = _trusted_authorized_binding(state, latest)
+    binding: tuple[int, str, str],
+) -> None:
+    current = (
+        state.current_repair_round_id,
+        state.current_repair_provider or "",
+        state.current_repair_model,
+    )
+    if current == binding:
+        return
+    if current != (0, "", ""):
+        raise ValueError("open repair ledger does not match FixAttempt")
+    state.current_repair_round_id = binding[0]
+    state.current_repair_provider = binding[1]
+    state.current_repair_model = binding[2]
+
+
+def _prepare_positive_attribution(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    """Validate an uncounted receipt-bound attempt on an isolated candidate."""
+    candidate = state.model_copy(deep=True)
+    latest = candidate.fix_attempts[-1]
+    validate_repair_round_state(candidate)
+    attempt_binding = _attempt_binding(latest)
+    binding = _trusted_authorized_binding(candidate, latest)
+    if attempt_binding != binding:
+        raise ValueError("FixAttempt attribution does not match authorization")
+    if (
+        binding[0] <= candidate.last_counted_repair_round_id
+        or binding[0] != candidate.repair_round_sequence
+    ):
+        raise ValueError("FixAttempt does not identify the open uncounted round")
+    _restore_open_binding(candidate, binding)
+    validate_repair_round_state(candidate)
+    return candidate, binding
+
+
+def _prepare_legacy_first_round(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    """Migrate only a sole, pristine, exact first-round historical attempt."""
+    candidate = state.model_copy(deep=True)
+    latest = candidate.fix_attempts[-1]
     attempt_binding = (
         latest.repair_round_id,
         latest.repair_provider or "",
         latest.repair_model,
     )
-    if latest.repair_round_id == 0:
-        if attempt_binding != (0, "", ""):
-            raise ValueError("historical FixAttempt attribution is partial")
-        latest.repair_provider = binding[1]
-        latest.repair_model = binding[2]
-        latest.repair_round_id = binding[0]
-    elif attempt_binding != binding:
-        raise ValueError("FixAttempt attribution does not match authorization")
+    authorized = (
+        candidate.authorized_repair_round_id,
+        candidate.authorized_repair_provider or "",
+        candidate.authorized_repair_model,
+    )
+    current = (
+        candidate.current_repair_round_id,
+        candidate.current_repair_provider or "",
+        candidate.current_repair_model,
+    )
+    if (
+        len(candidate.fix_attempts) != 1
+        or candidate.current_phase != Phase.VERIFY
+        or _failure_kind(latest) == "infra_error"
+        or attempt_binding != (0, "", "")
+        or latest.patch_gate_fingerprint is not None
+        or candidate.repair_round_sequence != 1
+        or authorized[0] != 1
+        or not authorized[1]
+        or not authorized[2]
+        or candidate.last_counted_repair_round_id != 0
+        or candidate.retry_count != 0
+        or candidate.primary_failed_repair_rounds != 0
+        or current not in {authorized, (0, "", "")}
+    ):
+        raise ValueError("historical FixAttempt is not a pristine first round")
+    validate_repair_round_state(candidate)
 
-    if binding[0] > state.last_counted_repair_round_id:
-        if state.current_repair_round_id == 0:
-            orphaned_author = (
-                state.current_repair_provider or "",
-                state.current_repair_model,
-            )
-            if orphaned_author not in {
-                ("", ""),
-                (binding[1], binding[2]),
-            }:
-                raise ValueError(
-                    "orphaned current repair author does not match authorization"
-                )
-            state.current_repair_round_id = binding[0]
-            state.current_repair_provider = binding[1]
-            state.current_repair_model = binding[2]
-        elif (
-            state.current_repair_round_id,
-            state.current_repair_provider or "",
-            state.current_repair_model,
-        ) != binding:
-            raise ValueError("open repair ledger does not match FixAttempt")
-        validate_repair_round_state(state)
-    return binding
+    assert candidate.tool_patch_approval is not None
+    binding = authorized
+    migrated_payload = latest.model_dump(mode="python")
+    migrated_payload.update(
+        {
+            "repair_round_id": binding[0],
+            "repair_provider": binding[1],
+            "repair_model": binding[2],
+            "patch_gate_fingerprint": (
+                candidate.tool_patch_approval.patch_gate_fingerprint
+            ),
+        }
+    )
+    migrated = FixAttempt.model_validate(migrated_payload)
+    binding = _trusted_authorized_binding(candidate, migrated)
+    if binding != authorized:
+        raise ValueError("historical authorization does not match first binding")
+    candidate.fix_attempts[-1] = migrated
+    _restore_open_binding(candidate, binding)
+    validate_repair_round_state(candidate)
+    return candidate, binding
+
+
+def _prepare_failure_attribution(
+    state: AgentState,
+) -> tuple[AgentState, tuple[int, str, str]]:
+    latest = state.fix_attempts[-1]
+    if latest.repair_round_id == 0:
+        return _prepare_legacy_first_round(state)
+    return _prepare_positive_attribution(state)
 
 
 def _route_state_integrity_failure(state: AgentState, exc: Exception) -> AgentState:
@@ -296,8 +388,21 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     latest = state.fix_attempts[-1]
-    await _record_episode_best_effort(state, latest)
+    if _failure_kind(latest) == "infra_error":
+        message = latest.error_log.strip() or "execution infrastructure failed"
+        state.failure_reason = f"Infrastructure error during execution: {message[:500]}"
+        state.current_phase = Phase.FAILURE
+        return state
+
     if latest.success:
+        try:
+            state, _binding = _prepare_positive_attribution(state)
+        except (TypeError, ValueError) as exc:
+            return _route_state_integrity_failure(state, exc)
+        latest = state.fix_attempts[-1]
+        if not latest.episode_recording_attempted:
+            await _record_episode_best_effort(state, latest)
+            latest.episode_recording_attempted = True
         state.last_assertion_failure_signature = ""
         state.assertion_no_progress_rounds = 0
         state.assertion_diversity_required = False
@@ -305,35 +410,30 @@ async def verify_fix(state: AgentState | dict[str, Any]) -> AgentState:
         return state
 
     failure_class = _test_failure_class(latest)
-    if _failure_kind(latest) == "infra_error":
-        message = latest.error_log.strip() or "execution infrastructure failed"
-        state.failure_reason = f"Infrastructure error during execution: {message[:500]}"
-        state.current_phase = Phase.FAILURE
+    if latest.repair_round_id > 0 and (
+        latest.repair_round_id <= state.last_counted_repair_round_id
+    ):
+        try:
+            _validate_counted_replay(state, latest)
+        except (TypeError, ValueError) as exc:
+            return _route_state_integrity_failure(state, exc)
         return state
 
     try:
-        round_id, provider, model = _prepare_failure_attribution(state, latest)
+        state, binding = _prepare_failure_attribution(state)
     except (TypeError, ValueError) as exc:
         return _route_state_integrity_failure(state, exc)
+    round_id, provider, model = binding
+    latest = state.fix_attempts[-1]
 
     retry_phase = (
         Phase.PLAN
         if failure_class in {"syntax_error", "import_error"}
         else Phase.REFLECT
     )
-    if round_id <= state.last_counted_repair_round_id:
-        try:
-            record_failed_repair_round(
-                state,
-                round_id=round_id,
-                provider=provider,
-                model=model,
-                failure_reason=failure_class,
-                retry_phase=retry_phase,
-            )
-        except (TypeError, ValueError) as exc:
-            return _route_state_integrity_failure(state, exc)
-        return state
+    if not latest.episode_recording_attempted:
+        await _record_episode_best_effort(state, latest)
+        latest.episode_recording_attempted = True
 
     repeated_failure = _record_test_failure_progress(state, latest, failure_class)
 

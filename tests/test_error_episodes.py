@@ -20,6 +20,9 @@ from src.memory.numpy_vector_index import NumpyVectorIndex
 from src.memory.sqlite_vec_index import SqliteVecIndex
 from src.nodes import plan as plan_node
 from src.nodes import verify as verify_node
+from src.patch_gate import validate_patch_batch
+from src.repair_rounds import begin_repair_round, bind_repair_round_author
+from src.state import RepairPlan, VerifiedEdit, VerifiedEditBatch
 
 
 class FakeEmbedder:
@@ -280,19 +283,49 @@ async def test_plan_recall_disabled_by_default(exact_repair_state, monkeypatch):
 # ---- VERIFY records episodes ------------------------------------------------
 
 
-async def test_verify_records_episode(monkeypatch):
+async def test_verify_records_episode(exact_repair_state, monkeypatch):
     store = ErrorEpisodeStore(db_path=":memory:", embedder=FakeEmbedder())
     monkeypatch.setattr(eps, "get_episode_store", lambda: store)
-    state = _base_state(
-        skip_commit=True,
-        fix_attempts=[
-            new_agent.FixAttempt(
-                patch_content="the winning patch",
-                test_result="passed",
-                success=True,
-            )
-        ],
+    state = _exact_plan_state(exact_repair_state)
+    state.skip_commit = True
+    plan = RepairPlan(
+        root_cause="widget returns the old sentinel",
+        target_files=["src/widget.py"],
+        target_symbols=["widget"],
+        required_behavior="widget returns the new sentinel",
+        regression_test_strategy="run the focused widget test",
     )
+    state.active_repair_plan = plan
+    begin_repair_round(state)
+    bind_repair_round_author(state)
+    assert validate_patch_batch(
+        state,
+        plan,
+        VerifiedEditBatch(
+            edits=[
+                VerifiedEdit(
+                    file_path="src/widget.py",
+                    search="return 'old-sentinel'",
+                    replace="return 'new-sentinel'",
+                    intent="return the new sentinel",
+                )
+            ]
+        ),
+    ).accepted
+    assert state.tool_patch_approval is not None
+    state.fix_attempts.append(
+        new_agent.FixAttempt(
+            patch_content=state.patch_content,
+            patch_edits=[edit.model_copy(deep=True) for edit in state.patch_edits],
+            test_result="passed",
+            success=True,
+            patch_gate_fingerprint=(state.tool_patch_approval.patch_gate_fingerprint),
+            repair_provider=state.authorized_repair_provider,
+            repair_model=state.authorized_repair_model,
+            repair_round_id=state.authorized_repair_round_id,
+        )
+    )
+    state.current_phase = new_agent.Phase.VERIFY
     await verify_node.verify_fix(state)
 
     recalled = store.recall(
@@ -300,4 +333,4 @@ async def test_verify_records_episode(monkeypatch):
     )
     assert recalled
     assert recalled[0].success is True
-    assert recalled[0].patch == "the winning patch"
+    assert recalled[0].patch == state.patch_content

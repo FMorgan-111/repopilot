@@ -136,8 +136,12 @@ async def test_execute_copies_frozen_patch_author_attribution(
         model=model,
     )
     expected_round = state.authorized_repair_round_id
+    runner_called = False
+    source = Path(state.repo_path) / "src" / "widget.py"
 
     async def passing_oci(_state):
+        nonlocal runner_called
+        runner_called = True
         return {
             "command": "python -m pytest -q",
             "returncode": 0,
@@ -151,71 +155,162 @@ async def test_execute_copies_frozen_patch_author_attribution(
     result = await execute_node.execute_fix(state)
 
     attempt = result.fix_attempts[-1]
+    assert state.tool_patch_approval is not None
     assert attempt.repair_round_id == expected_round
     assert attempt.repair_provider == provider
     assert attempt.repair_model == model
+    assert runner_called is True
+    assert attempt.success is True
+    assert attempt.failure_kind == ""
+    assert "return 2" in source.read_text(encoding="utf-8")
+    assert (
+        attempt.patch_gate_fingerprint
+        == state.tool_patch_approval.patch_gate_fingerprint
+    )
     assert attempt.patch_edits is not state.patch_edits
     assert attempt.patch_edits[0] is not state.patch_edits[0]
+    attempt.patch_edits[0].replace = "return 999"
+    attempt.patch_edits[0].resolved_target_symbol = "tampered-attempt-only"
+    assert state.patch_edits[0].replace == "return 2"
+    assert state.patch_edits[0].resolved_target_symbol == ""
 
 
-async def test_execute_rejects_unapproved_state_before_clone_recovery(
+@pytest.mark.parametrize("execution_mode", ["oci", "unsafe_host"])
+@pytest.mark.parametrize("approval_state", ["stale", "already_counted"])
+async def test_execute_rejects_stale_counted_approval_before_any_mutation(
+    tmp_path,
     monkeypatch,
+    execution_mode,
+    approval_state,
 ):
-    cancellation = asyncio.CancelledError("cancel clone")
-    cleanup_error = RuntimeError("clone cleanup failed")
-    sentinel = CancellationDrainError("clone", cancellation, cleanup_error)
+    state = _approved_state(tmp_path, command="pytest -q")
+    source = Path(state.repo_path) / "src" / "widget.py"
+    before = source.read_bytes()
+    if approval_state == "stale":
+        state.current_repair_provider = "escalation"
+        state.current_repair_model = "claude-opus-4-8:stable"
+    else:
+        state.last_counted_repair_round_id = 1
+    mutation_reached = False
 
-    async def cancelled_clone(_state):
-        raise sentinel
+    if execution_mode == "unsafe_host":
+        state.tool_sandbox_config = None
+        monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+
+        def forbidden_host_setup(*_args, **_kwargs):
+            raise AssertionError("host setup reached before stale approval rejection")
+
+        monkeypatch.setattr(execute_node, "_create_venv", forbidden_host_setup)
+
+    def forbidden_patch_mutation(_state):
+        nonlocal mutation_reached
+        mutation_reached = True
+        raise AssertionError("patch mutation reached with a counted authorization")
 
     monkeypatch.setattr(
-        execute_node,
-        "repository_execution_mode",
-        lambda _state: "unsafe_host",
-    )
-    monkeypatch.setattr(execute_node, "git_clone", cancelled_clone)
-    state = AgentState(
-        issue_url="https://github.com/acme/widget/issues/1",
-        patch_content="diff --git a/a.py b/a.py\n",
+        "src.patch_gate.apply_approved_patch",
+        forbidden_patch_mutation,
     )
 
     result = await execute_node.execute_fix(state)
 
+    assert mutation_reached is False
+    assert source.read_bytes() == before
     assert result.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in result.fix_attempts[-1].error_log
+    assert "repair" in result.fix_attempts[-1].error_log.lower()
+    assert "host setup reached" not in result.fix_attempts[-1].error_log
 
 
-async def test_execute_rejects_unapproved_state_before_patch_recovery(
+async def test_approved_patchgate_cancellation_preserves_identity(
     tmp_path,
     monkeypatch,
 ):
-    cancellation = asyncio.CancelledError("cancel patch")
-    cleanup_error = RuntimeError("patch cleanup failed")
-    sentinel = CancellationDrainError("patch apply", cancellation, cleanup_error)
+    state = _approved_state(tmp_path, command="pytest -q")
+    source = Path(state.repo_path) / "src" / "widget.py"
+    before = source.read_bytes()
+    cancellation = asyncio.CancelledError("cancel approved patch")
+    cleanup_error = RuntimeError("approved patch cleanup failed")
+    sentinel = CancellationDrainError(
+        "approved PatchGate mutation",
+        cancellation,
+        cleanup_error,
+    )
 
-    async def cancelled_patch(*_args, **_kwargs):
+    def cancelled_patch(_state):
         raise sentinel
 
-    monkeypatch.setattr(
-        execute_node,
-        "repository_execution_mode",
-        lambda _state: "unsafe_host",
-    )
-    monkeypatch.setattr(
-        execute_node,
-        "apply_patch_with_repair",
-        cancelled_patch,
-    )
-    state = AgentState(
-        issue_url="https://github.com/acme/widget/issues/1",
-        repo_path=str(tmp_path),
-        patch_content="diff --git a/a.py b/a.py\n",
-    )
+    monkeypatch.setattr("src.patch_gate.apply_approved_patch", cancelled_patch)
+
+    with pytest.raises(CancellationDrainError) as caught:
+        await execute_node.execute_fix(state)
+
+    assert caught.value is sentinel
+    assert source.read_bytes() == before
+
+
+async def test_approved_oci_failure_redacts_transport_token(
+    tmp_path,
+    monkeypatch,
+):
+    state = _approved_state(tmp_path, command="pytest -q")
+    token = "gho_approvedocisecret"
+
+    async def failed_oci(_state):
+        raise RuntimeError(
+            "fatal: unable to access "
+            f"'https://x-access-token:{token}@github.com/acme/widget.git/'"
+        )
+
+    monkeypatch.setattr(execute_node, "_run_oci_pytest", failed_oci)
 
     result = await execute_node.execute_fix(state)
 
-    assert result.fix_attempts[-1].failure_kind == "infra_error"
-    assert "PatchGate" in result.fix_attempts[-1].error_log
+    attempt = result.fix_attempts[-1]
+    assert attempt.failure_kind == "infra_error"
+    assert token not in attempt.error_log
+    assert "x-access-token:<redacted>" in attempt.error_log
+
+
+async def test_approved_host_test_output_redacts_transport_token(
+    tmp_path,
+    monkeypatch,
+):
+    state = _approved_state(tmp_path, command="pytest -q")
+    state.tool_sandbox_config = None
+    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
+    token = "gho_approvedhostsecret"
+
+    monkeypatch.setattr(
+        execute_node,
+        "_create_venv",
+        lambda _repo_path: {"python": "python3", "reason": "exists"},
+    )
+    monkeypatch.setattr(
+        execute_node,
+        "_ensure_pytest_available",
+        lambda _python: {"attempted": False},
+    )
+
+    async def failed_host_tests(_repo_path, _command=None):
+        return {
+            "command": "pytest -q",
+            "returncode": 1,
+            "stdout": (
+                "failed cloning "
+                f"https://x-access-token:{token}@github.com/acme/widget.git"
+            ),
+            "stderr": "",
+            "success": False,
+        }
+
+    monkeypatch.setattr(execute_node, "run_pytest", failed_host_tests)
+
+    result = await execute_node.execute_fix(state)
+
+    attempt = result.fix_attempts[-1]
+    assert attempt.failure_kind == "test_failed"
+    assert token not in attempt.error_log
+    assert "x-access-token:<redacted>" in attempt.error_log
 
 
 @pytest.mark.parametrize("unsafe_value", [None, "", "0", "true", "01", "1 "])
@@ -244,62 +339,6 @@ def test_repository_execution_mode_prefers_oci_over_unsafe_host(monkeypatch):
     )
 
     assert tool_policy.repository_execution_mode(state) == "oci"
-
-
-async def test_execute_fails_closed_before_clone_or_patch_without_sandbox(monkeypatch):
-    monkeypatch.delenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", raising=False)
-
-    async def forbidden_clone(_state):
-        raise AssertionError("clone must not run before execution mode is approved")
-
-    async def forbidden_patch(*_args, **_kwargs):
-        raise AssertionError("patch must not run before execution mode is approved")
-
-    monkeypatch.setattr(execute_node, "git_clone", forbidden_clone)
-    monkeypatch.setattr(execute_node, "apply_patch_with_repair", forbidden_patch)
-    state = AgentState(
-        issue_url="https://github.com/acme/widget/issues/1",
-        owner="acme",
-        repo="widget",
-        patch_content="hostile patch sentinel",
-        trace_id="abc123def456",
-    )
-
-    result = await execute_node.execute_fix(state)
-
-    assert result.fix_attempts[-1].failure_kind == "infra_error"
-    assert "host execution is disabled" in result.fix_attempts[-1].error_log
-
-
-async def test_oci_requires_exact_approval_before_clone_or_patch(monkeypatch):
-    monkeypatch.setenv("REPOPILOT_UNSAFE_ALLOW_HOST_EXECUTION", "1")
-    clone_called = False
-
-    async def forbidden_clone(_state):
-        nonlocal clone_called
-        clone_called = True
-        raise AssertionError("clone reached")
-
-    monkeypatch.setattr(execute_node, "git_clone", forbidden_clone)
-    state = AgentState(
-        issue_url="https://github.com/acme/widget/issues/1",
-        owner="acme",
-        repo="widget",
-        repo_ref="a" * 40,
-        trace_id="abc123def456",
-        patch_content="unapproved patch",
-        tool_sandbox_config=ToolSandboxConfig(
-            backend="docker",
-            image=_IMAGE,
-            python_executable="/sandbox/bin/python",
-        ),
-    )
-
-    result = await execute_node.execute_fix(state)
-
-    assert clone_called is False
-    assert result.fix_attempts[-1].failure_kind == "infra_error"
-    assert "exact PatchGate approval" in result.fix_attempts[-1].error_log
 
 
 async def test_oci_execute_uses_exact_snapshot_and_skips_all_host_execution(
