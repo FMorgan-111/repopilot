@@ -499,16 +499,27 @@ def authorize_plan_patch(
             ],
         )
     if not gate.accepted:
-        converted = [
-            PatchAuthorizationIssue(
-                code=issue.code,
-                file_path=issue.file_path,
-                message=issue.message,
-                correction_context=issue.correction_context,
-                failure_class=issue.failure_class,
-            )
-            for issue in gate.issues[:16]
-        ]
+        selected_gate_issue = next(
+            (
+                issue
+                for issue in gate.issues
+                if issue.failure_class == "environment"
+            ),
+            gate.issues[0] if gate.issues else None,
+        )
+        converted = (
+            [
+                PatchAuthorizationIssue(
+                    code=selected_gate_issue.code,
+                    file_path=selected_gate_issue.file_path,
+                    message=selected_gate_issue.message,
+                    correction_context=selected_gate_issue.correction_context,
+                    failure_class=selected_gate_issue.failure_class,
+                )
+            ]
+            if selected_gate_issue is not None
+            else []
+        )
         return _reject(state, converted)
 
     summary = f"Apply {len(state.patch_edits)} validated structured edit(s)."

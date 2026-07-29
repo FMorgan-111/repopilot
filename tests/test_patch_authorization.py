@@ -336,23 +336,27 @@ def test_mixed_valid_and_invalid_edits_reject_the_entire_batch(
     assert state.authorized_repair_round_id == 0
 
 
-def test_rejected_gate_selects_later_environment_issue(
+def test_rejected_gate_selects_environment_issue_after_sixteen_model_issues(
     exact_repair_state, monkeypatch
 ):
     state = _bind(exact_repair_state)
+    model_issues = [
+        PatchGateIssue(
+            code="search_missing",
+            file_path=f"src/model_{index}.py",
+            message=f"Model-correctable issue {index}.",
+            correction_context=f"model correction sentinel {index}",
+            failure_class="model_correctable",
+        )
+        for index in range(16)
+    ]
     gate = PatchGateResult(
         accepted=False,
         issues=[
-            PatchGateIssue(
-                code="search_missing",
-                file_path="src/widget.py",
-                message="The search anchor is absent.",
-                correction_context="model correction sentinel",
-                failure_class="model_correctable",
-            ),
+            *model_issues,
             PatchGateIssue(
                 code="apply_failed",
-                file_path="src/widget.py",
+                file_path="src/environment.py",
                 message="The exact checkout is unavailable.",
                 correction_context="environment failure sentinel",
                 failure_class="environment",
@@ -370,11 +374,45 @@ def test_rejected_gate_selects_later_environment_issue(
     assert len(result.issues) == 1
     assert result.issues[0].failure_class == "environment"
     assert result.issues[0].code == "apply_failed"
+    assert result.issues[0].file_path == "src/environment.py"
     correction = json.loads(state.repair_correction_context)
     assert len(correction) == 1
     assert correction[0]["code"] == "apply_failed"
     assert "environment failure sentinel" in state.repair_correction_context
-    assert "model correction sentinel" not in state.repair_correction_context
+    assert "model correction sentinel 0" not in state.repair_correction_context
+
+
+def test_rejected_gate_with_all_model_issues_selects_first_issue(
+    exact_repair_state, monkeypatch
+):
+    state = _bind(exact_repair_state)
+    gate = PatchGateResult(
+        accepted=False,
+        issues=[
+            PatchGateIssue(
+                code="search_missing",
+                file_path=f"src/model_{index}.py",
+                message=f"Model-correctable issue {index}.",
+                correction_context=f"model correction sentinel {index}",
+                failure_class="model_correctable",
+            )
+            for index in range(17)
+        ],
+    )
+    monkeypatch.setattr(
+        "src.patch_authorization.validate_patch_batch",
+        lambda *_args, **_kwargs: gate,
+    )
+
+    result = authorize_plan_patch(state, _response())
+
+    assert result.status == "model_correctable"
+    assert len(result.issues) == 1
+    assert result.issues[0].file_path == "src/model_0.py"
+    correction = json.loads(state.repair_correction_context)
+    assert len(correction) == 1
+    assert correction[0]["file_path"] == "src/model_0.py"
+    assert "model correction sentinel 1" not in state.repair_correction_context
 
 
 def test_non_execute_without_payload_returns_sanitized_not_requested(
