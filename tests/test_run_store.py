@@ -25,7 +25,6 @@ from src.state import (
     ToolPatchApproval,
 )
 
-
 TASK2_REPAIR_STATE_FIELDS = frozenset(
     {
         "primary_failed_repair_rounds",

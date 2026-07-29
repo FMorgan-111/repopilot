@@ -15,7 +15,6 @@ from src.repair_rounds import (
 )
 from src.state import AgentState, FixAttempt, PatchEdit, Phase, ToolPatchApproval
 
-
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
 ESCALATION_MODEL = "claude-opus-4-8:stable"
 

@@ -14,7 +14,13 @@ from .model_provider import redact_secrets
 from .patch_gate import RepairFailureClass, validate_patch_batch
 from .repair_rounds import retire_patch_authorization
 from .schemas import PlanDecision
-from .state import AgentState, DecisionFrame, RepairPlan, VerifiedEdit, VerifiedEditBatch
+from .state import (
+    AgentState,
+    DecisionFrame,
+    RepairPlan,
+    VerifiedEdit,
+    VerifiedEditBatch,
+)
 
 PatchAuthorizationStatus = Literal[
     "not_requested",

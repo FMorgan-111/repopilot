@@ -24,7 +24,6 @@ from src.state import (
 )
 from src.tool_router import ToolRouteResult
 
-
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
 ESCALATION_MODEL = "claude-opus-4-8:stable"
 

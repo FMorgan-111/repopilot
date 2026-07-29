@@ -4,8 +4,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
-from src import model_policy
-from src import repair_flow
+from src import model_policy, repair_flow
 from src.nodes import plan as plan_node
 from src.patch_authorization import (
     PatchAuthorizationIssue,
@@ -15,7 +14,6 @@ from src.patch_authorization import (
 from src.repair_rounds import begin_repair_round
 from src.state import Evidence, FixAttempt, GeneratedTestApproval, PatchEdit, Phase
 from src.tool_router import ToolRouteResult
-
 
 PRIMARY_MODEL = "gemini-3.5-flash:stable"
 ESCALATION_MODEL = "claude-opus-4-8:stable"

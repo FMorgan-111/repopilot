@@ -8,13 +8,13 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from src.patch_gate import PatchGateIssue, PatchGateResult
 from src.patch_authorization import (
     PatchAuthorizationIssue,
     PatchAuthorizationOutcome,
     authorize_plan_patch,
     render_patch_correction,
 )
+from src.patch_gate import PatchGateIssue, PatchGateResult
 from src.repair_rounds import begin_repair_round, bind_repair_round_author
 from src.schemas import PlanDecision
 
