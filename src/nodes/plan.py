@@ -300,13 +300,13 @@ def _force_patch_instructions(state: AgentState) -> str:
     """Push the planner to commit a patch rather than spiral on
     collect_more_context — the dominant eval failure mode."""
     text = (
-        " You MUST return at least one patch_edit. If you are unsure, make your "
+        " You MUST return at least one item in patch_edits. If you are unsure, make your "
         "best guess at the fix rather than deferring."
     )
     if _is_first_plan(state):
         text += (
-            " This is your FIRST plan: do NOT recommend collect_more_context — "
-            "produce a concrete patch from the files already provided."
+            " This is your FIRST plan: do NOT request a tool; produce patch_edits "
+            "from the supplied files."
         )
     return text
 

@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from src.patch_gate import PatchGateIssue, PatchGateResult
 from src.patch_authorization import (
     PatchAuthorizationIssue,
     PatchAuthorizationOutcome,
@@ -72,6 +73,11 @@ def test_bare_patch_edits_are_authorized_with_runtime_metadata(exact_repair_stat
     assert result.decision.decision_frame.recommended_action == "execute"
     assert result.decision.decision_frame.risk == "unknown"
     assert result.decision.decision_frame.confidence == 0.0
+    assert state.active_repair_plan is not None
+    assert (
+        state.active_repair_plan.regression_test_strategy
+        == "Use the runtime-selected or default test command."
+    )
 
 
 def test_patch_edits_ignore_untrusted_top_level_narrative(exact_repair_state):
@@ -328,6 +334,47 @@ def test_mixed_valid_and_invalid_edits_reject_the_entire_batch(
     assert state.active_repair_plan is None
     assert state.tool_patch_approval is None
     assert state.authorized_repair_round_id == 0
+
+
+def test_rejected_gate_selects_later_environment_issue(
+    exact_repair_state, monkeypatch
+):
+    state = _bind(exact_repair_state)
+    gate = PatchGateResult(
+        accepted=False,
+        issues=[
+            PatchGateIssue(
+                code="search_missing",
+                file_path="src/widget.py",
+                message="The search anchor is absent.",
+                correction_context="model correction sentinel",
+                failure_class="model_correctable",
+            ),
+            PatchGateIssue(
+                code="apply_failed",
+                file_path="src/widget.py",
+                message="The exact checkout is unavailable.",
+                correction_context="environment failure sentinel",
+                failure_class="environment",
+            ),
+        ],
+    )
+    monkeypatch.setattr(
+        "src.patch_authorization.validate_patch_batch",
+        lambda *_args, **_kwargs: gate,
+    )
+
+    result = authorize_plan_patch(state, _response())
+
+    assert result.status == "environment"
+    assert len(result.issues) == 1
+    assert result.issues[0].failure_class == "environment"
+    assert result.issues[0].code == "apply_failed"
+    correction = json.loads(state.repair_correction_context)
+    assert len(correction) == 1
+    assert correction[0]["code"] == "apply_failed"
+    assert "environment failure sentinel" in state.repair_correction_context
+    assert "model correction sentinel" not in state.repair_correction_context
 
 
 def test_non_execute_without_payload_returns_sanitized_not_requested(

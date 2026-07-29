@@ -889,7 +889,7 @@ async def test_plan_prompt_includes_final_attempt_instruction(monkeypatch):
     assert captured["provider"] == "primary"
 
 
-async def test_plan_first_plan_forbids_collect_more_context(monkeypatch):
+async def test_complete_first_plan_prompt_uses_patch_edits_contract(monkeypatch):
     captured = {}
 
     async def fake_llm_call(system, user, model=None, *, provider="primary", **_kwargs):
@@ -901,9 +901,21 @@ async def test_plan_first_plan_forbids_collect_more_context(monkeypatch):
     await plan_node.plan_fix(_base_state())
 
     assert captured["system"] == plan_node.PLAN_SYSTEM
-    assert "at least one patch_edit" in captured["user"]
-    assert "FIRST plan" in captured["user"]
-    assert "do NOT recommend collect_more_context" in captured["user"]
+    prompt = captured["user"]
+    assert "at least one item in patch_edits" in prompt
+    assert "FIRST plan" in prompt
+    assert "do NOT request a tool" in prompt
+    assert "produce patch_edits from the supplied files" in prompt
+    for stale in (
+        "at least one patch_edit",
+        "recommend collect_more_context",
+        "recommended_action",
+        "next_checks",
+        "risk",
+        "confidence",
+        "DecisionFrame",
+    ):
+        assert stale not in prompt
     assert captured["model"] == "gemini-3.5-flash:stable"
     assert captured["provider"] == "primary"
 
@@ -921,7 +933,7 @@ async def test_plan_non_first_plan_still_requires_patch_but_allows_context(monke
     await plan_node.plan_fix(_base_state(context_collection_count=1))
 
     assert captured["system"] == plan_node.PLAN_SYSTEM
-    assert "at least one patch_edit" in captured["user"]
+    assert "at least one item in patch_edits" in captured["user"]
     assert "FIRST plan" not in captured["user"]
     assert captured["model"] == "gemini-3.5-flash:stable"
     assert captured["provider"] == "primary"

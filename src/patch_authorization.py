@@ -160,13 +160,17 @@ def _reject(
     state: AgentState,
     issues: list[PatchAuthorizationIssue],
 ) -> PatchAuthorizationOutcome:
-    bounded = tuple(issues[:1]) or (
-        _issue("invalid_proposal", "The patch proposal is invalid."),
+    selected = next(
+        (issue for issue in issues if issue.failure_class == "environment"),
+        issues[0]
+        if issues
+        else _issue("invalid_proposal", "The patch proposal is invalid."),
     )
+    bounded = (selected,)
     state.repair_correction_context = render_patch_correction(bounded)
     status: Literal["model_correctable", "environment"] = (
         "environment"
-        if any(issue.failure_class == "environment" for issue in bounded)
+        if selected.failure_class == "environment"
         else "model_correctable"
     )
     return PatchAuthorizationOutcome(status=status, issues=bounded)
@@ -475,7 +479,7 @@ def authorize_plan_patch(
         target_files=target_files,
         target_symbols=target_symbols,
         required_behavior="Apply only the exact validated structured edits.",
-        regression_test_strategy="Run the planner-selected bounded test command.",
+        regression_test_strategy="Use the runtime-selected or default test command.",
         rejected_approaches=[],
     )
     batch = VerifiedEditBatch(edits=verified)
